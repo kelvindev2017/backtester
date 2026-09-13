@@ -48,36 +48,36 @@ def check_password():
             st.error("😕 Password incorrect")
     return False
 
-    # Generic condition builder
-    def build_condition(left, operator, right):
-    
-        if operator == ">":
-            return left > right
-    
-        elif operator == "<":
-            return left < right
-    
-        elif operator == ">=":
-            return left >= right
-    
-        elif operator == "<=":
-            return left <= right
-    
-        elif operator == "Cross Above":
-            return (
-                (left > right)
-                &
-                (left.shift(1) <= right.shift(1))
-            )
-    
-        elif operator == "Cross Below":
-            return (
-                (left < right)
-                &
-                (left.shift(1) >= right.shift(1))
-            )
-    
-        return pd.Series(False, index=left.index)
+# Generic condition builder
+def build_condition(left, operator, right):
+
+    if operator == ">":
+        return left > right
+
+    elif operator == "<":
+        return left < right
+
+    elif operator == ">=":
+        return left >= right
+
+    elif operator == "<=":
+        return left <= right
+
+    elif operator == "Cross Above":
+        return (
+            (left > right)
+            &
+            (left.shift(1) <= right.shift(1))
+        )
+
+    elif operator == "Cross Below":
+        return (
+            (left < right)
+            &
+            (left.shift(1) >= right.shift(1))
+        )
+
+    return pd.Series(False, index=left.index)
 
 
 
@@ -223,28 +223,44 @@ if check_password():
             
             position = []
             
+            buy_markers = []
+            sell_markers = []
+            
             in_trade = False
             
             for i in range(len(df)):
             
-                if not in_trade and buy_condition.ilocin_trade = True
+                buy_signal = False
+                sell_signal = False
+            
+                if (not in_trade) and buy_condition.ilocin_trade = True
+                    buy_signal = True
             
                 elif in_trade and sell_condition.ilocin_trade = False
+                    sell_signal = True
             
-                position.append(1 if in_trade else 0)
+                position.append(
+                    1 if in_trade else 0
+                )
+            
+                buy_markers.append(buy_signal)
+                sell_markers.append(sell_signal)
             
             df["Position"] = position
             
             # Avoid lookahead bias
-            #df["Position"] = df["Position"].shift(1).fillna(0)
+            df["Position"] = (
+                df["Position"]
+                .shift(1)
+                .fillna(0)
+            )
             
-            # Save entry/exit signals for charting
-            df["Buy_Signal"] = buy_condition
-            df["Sell_Signal"] = sell_condition
+            df["Buy_Signal"] = buy_markers
+            df["Sell_Signal"] = sell_markers
 
 
             ###############################################################################    
-            df['Position'] = df['Signal'].shift(1).fillna(0)  # Avoid lookahead bias
+            
     
             # Performance Calculations
             df['Returns'] = df['Close'].pct_change()
@@ -285,6 +301,21 @@ if check_password():
             fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name='Close', line=dict(color='gray', width=1)), row=1, col=1)
             fig.add_trace(go.Scatter(x=df.index, y=df['Fast_MA'], name=f'{fast_type} {fast_period}', line=dict(color='orange', width=1.5)), row=1, col=1)
             fig.add_trace(go.Scatter(x=df.index, y=df['Slow_MA'], name=f'{slow_type} {slow_period}', line=dict(color='blue', width=1.5)), row=1, col=1)
+            buy_points = df[df["Buy_Signal"]]
+            fig.add_trace(go.Scatter(x=buy_points.index, y=buy_points["Close"], mode="markers", name="BUY",
+                    marker=dict(
+                        symbol="triangle-up",
+                        size=12,
+                        color="lime"
+                    )), row=1, col=1)
+            
+            sell_points = df[df["Sell_Signal"]]
+            fig.add_trace(go.Scatter(x=sell_points.index, y=sell_points["Close"], mode="markers", name="SELL",
+                    marker=dict(
+                        symbol="triangle-down",
+                        size=12,
+                        color="red"
+                    )), row=1, col=1)
     
             # 2. Equity Curve
             fig.add_trace(go.Scatter(x=df.index, y=df['Equity'], name='Equity', line=dict(color='green', width=2)), row=2, col=1)
