@@ -6,8 +6,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # Page Configuration for Mobile
-st.set_page_config(page_title="Swing Backtest", layout="wide", initial_sidebar_state="collapsed")
-st.title("📈 Swing Strategy Backtester")
+st.set_page_config(page_title="Trade Strategy Backtest", layout="wide", initial_sidebar_state="collapsed")
+st.title("📈 Trade Strategy Backtester")
 
 
 # Helper: Compute MA
