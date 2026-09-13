@@ -233,10 +233,10 @@ if check_password():
                 buy_signal = False
                 sell_signal = False
             
-                if (not in_trade) and buy_condition.ilocin_trade = True
+                if (not in_trade) and buy_condition.ilocin_trade == True:
                     buy_signal = True
             
-                elif in_trade and sell_condition.ilocin_trade = False
+                elif in_trade and sell_condition.ilocin_trade == False:
                     sell_signal = True
             
                 position.append(
