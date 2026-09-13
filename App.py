@@ -222,44 +222,39 @@ if check_password():
             # ===================================
             
             position = []
-            
             buy_markers = []
             sell_markers = []
             
             in_trade = False
-            ilocin_trade = False
             
             for i in range(len(df)):
             
                 buy_signal = False
                 sell_signal = False
             
-                # Enter trade
-                if (not in_trade) and (buy_condition.ilocin_trade == True):
+                # Enter a long position when the buy condition is True
+                if (not in_trade) and bool(buy_condition.iloc[i]):
+                    in_trade = True
                     buy_signal = True
             
-                # Exit trade
-                elif in_trade and (sell_condition.ilocin_trade == False):
+                # Exit the long position when the sell condition is True
+                elif in_trade and bool(sell_condition.iloc[i]):
+                    in_trade = False
                     sell_signal = True
             
-                position.append(
-                    1 if in_trade else 0
-                )
-            
+                position.append(1 if in_trade else 0)
                 buy_markers.append(buy_signal)
                 sell_markers.append(sell_signal)
             
-            df["Position"] = position
+            df["Raw_Position"] = pd.Series(position, index=df.index)
+            df["Buy_Signal"] = pd.Series(buy_markers, index=df.index)
+            df["Sell_Signal"] = pd.Series(sell_markers, index=df.index)
             
-            # Avoid lookahead bias
-            df["Position"] = (
-                df["Position"]
-                .shift(1)
-                .fillna(0)
-            )
+            # Execute each signal on the following bar to avoid lookahead bias
+            df["Position"] = df["Raw_Position"].shift(1).fillna(0).astype(int)
             
-            df["Buy_Signal"] = buy_markers
-            df["Sell_Signal"] = sell_markers
+            #df["Buy_Signal"] = buy_markers
+            #df["Sell_Signal"] = sell_markers
 
 
             ###############################################################################    
