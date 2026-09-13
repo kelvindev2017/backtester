@@ -227,6 +227,7 @@ if check_password():
             sell_markers = []
             
             in_trade = False
+            ilocin_trade = False
             
             for i in range(len(df)):
             
@@ -234,11 +235,11 @@ if check_password():
                 sell_signal = False
             
                 # Enter trade
-                if (not in_trade) and buy_condition.ilocin_trade = True
+                if (not in_trade) and (buy_condition.ilocin_trade == True):
                     buy_signal = True
             
                 # Exit trade
-                elif in_trade and sell_condition.ilocin_trade = False
+                elif in_trade and (sell_condition.ilocin_trade == False):
                     sell_signal = True
             
                 position.append(
