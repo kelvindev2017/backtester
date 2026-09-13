@@ -7,22 +7,8 @@ from plotly.subplots import make_subplots
 
 # Page Configuration for Mobile
 st.set_page_config(page_title="Swing Backtest", layout="wide", initial_sidebar_state="collapsed")
-
 st.title("📈 Swing Strategy Backtester")
 
-# Sidebar Controls (Collapsible on Mobile)
-st.sidebar.header("Strategy Settings")
-ticker = st.sidebar.text_input("Ticker Symbol", value="AAPL")
-timeframe = st.sidebar.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0)
-date_range = st.sidebar.date_input("Date Range", [pd.to_datetime("2022-01-01"), pd.to_datetime("2026-01-01")])
-initial_capital = st.sidebar.number_input("Initial Capital ($)", value=10000)
-
-st.sidebar.subheader("Moving Averages")
-fast_type = st.sidebar.selectbox("Fast MA Type", ["EMA", "SMA"], index=0)
-fast_period = st.sidebar.number_input("Fast MA Period", value=20, min_value=1)
-
-slow_type = st.sidebar.selectbox("Slow MA Type", ["EMA", "SMA"], index=1)
-slow_period = st.sidebar.number_input("Slow MA Period", value=50, min_value=1)
 
 # Helper: Compute MA
 def compute_ma(series, ma_type, period):
@@ -65,7 +51,33 @@ def check_password():
 # Main()
 if check_password():
     st.write("Welcome to the protected app!")
-    # Put your main app code here
+    # Sidebar Controls (Collapsible on Mobile)
+    st.sidebar.header("Strategy Settings")
+    ticker = st.sidebar.text_input("Ticker Symbol", value="AAPL")
+    timeframe = st.sidebar.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0)
+    date_range = st.sidebar.date_input("Date Range", [pd.to_datetime("2022-01-01"), pd.to_datetime("2026-01-01")])
+    initial_capital = st.sidebar.number_input("Initial Capital ($)", value=10000)
+    
+    st.sidebar.subheader("Moving Averages")
+    fast_type = st.sidebar.selectbox("Fast MA Type", ["EMA", "SMA"], index=0)
+    fast_period = st.sidebar.number_input("Fast MA Period", value=20, min_value=1)
+    
+    slow_type = st.sidebar.selectbox("Slow MA Type", ["EMA", "SMA"], index=1)
+    slow_period = st.sidebar.number_input("Slow MA Period", value=50, min_value=1)
+
+    st.sidebar.subheader("Trade Logic")
+    logic_type = st.sidebar.selectbox("Entry Condition",
+        [
+            ">",
+            "<",
+            ">=",
+            "<=",
+            "Cross Above",
+            "Cross Below"
+        ],
+        index=0
+    )
+    
     # Run Backtest
     if len(date_range) == 2:
         start_d, end_d = date_range
@@ -78,20 +90,6 @@ if check_password():
 
             # Signal Logic: Long when Fast MA > Slow MA
             #df['Signal'] = np.where(df['Fast_MA'] > df['Slow_MA'], 1, 0)
-
-            st.sidebar.subheader("Trade Logic")
-            logic_type = st.sidebar.selectbox(
-                "Entry Condition",
-                [
-                    ">",
-                    "<",
-                    ">=",
-                    "<=",
-                    "Cross Above",
-                    "Cross Below"
-                ],
-                index=0
-            )
 
             if logic_type == ">":
                 df['Signal'] = np.where(df['Fast_MA'] > df['Slow_MA'], 1, 0)
