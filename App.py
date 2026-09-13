@@ -43,7 +43,7 @@ def load_data(symbol, start, end, tf):
         df = df.resample("ME").agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
     return df
 
-# Check 心assword
+# Check password
 def check_password():
     """Returns `True` if the user had the correct password."""
     if "password_correct" not in st.session_state:
@@ -62,7 +62,7 @@ def check_password():
             st.error("😕 Password incorrect")
     return False
 
-
+# Main()
 if check_password():
     st.write("Welcome to the protected app!")
     # Put your main app code here
