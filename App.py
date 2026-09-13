@@ -117,60 +117,105 @@ if check_password():
     # Trade Logic
     # ===================================
     
+    signal_options = [
+        "Close",
+        "Fast_MA",
+        "Slow_MA"
+    ]
+    
+    operator_options = [
+        ">",
+        "<",
+        ">=",
+        "<=",
+        "Cross Above",
+        "Cross Below"
+    ]
+    
+    # -----------------------------------
+    # Buy Signal
+    # -----------------------------------
+    
     st.sidebar.subheader("Buy Signal")
     
-    buy_left = st.sidebar.selectbox(
-        "Buy Signal A",
-        ["Close", "Fast_MA", "Slow_MA"],
-        index=1
+    buy_col_left, buy_col_operator, buy_col_right = st.sidebar.columns(
+        [1.25, 1.1, 1.25]
     )
     
-    buy_operator = st.sidebar.selectbox(
-        "Buy Operator",
-        [
-            ">",
-            "<",
-            ">=",
-            "<=",
-            "Cross Above",
-            "Cross Below"
-        ],
-        index=4
-    )
+    with buy_col_left:
+        buy_left = st.selectbox(
+            "Buy left signal",
+            signal_options,
+            index=1,
+            key="buy_left",
+            label_visibility="collapsed"
+        )
     
-    buy_right = st.sidebar.selectbox(
-        "Buy Signal B",
-        ["Close", "Fast_MA", "Slow_MA"],
-        index=2
+    with buy_col_operator:
+        buy_operator = st.selectbox(
+            "Buy operator",
+            operator_options,
+            index=4,
+            key="buy_operator",
+            label_visibility="collapsed"
+        )
+    
+    with buy_col_right:
+        buy_right = st.selectbox(
+            "Buy right signal",
+            signal_options,
+            index=2,
+            key="buy_right",
+            label_visibility="collapsed"
+        )
+    
+    # Show the selected buy rule clearly
+    st.sidebar.caption(
+        f"Buy when: `{buy_left} {buy_operator} {buy_right}`"
     )
     
     st.sidebar.divider()
     
+    # -----------------------------------
+    # Sell Signal
+    # -----------------------------------
+    
     st.sidebar.subheader("Sell Signal")
     
-    sell_left = st.sidebar.selectbox(
-        "Sell Signal A",
-        ["Close", "Fast_MA", "Slow_MA"],
-        index=1
+    sell_col_left, sell_col_operator, sell_col_right = st.sidebar.columns(
+        [1.25, 1.1, 1.25]
     )
     
-    sell_operator = st.sidebar.selectbox(
-        "Sell Operator",
-        [
-            ">",
-            "<",
-            ">=",
-            "<=",
-            "Cross Above",
-            "Cross Below"
-        ],
-        index=5
-    )
+    with sell_col_left:
+        sell_left = st.selectbox(
+            "Sell left signal",
+            signal_options,
+            index=1,
+            key="sell_left",
+            label_visibility="collapsed"
+        )
     
-    sell_right = st.sidebar.selectbox(
-        "Sell Signal B",
-        ["Close", "Fast_MA", "Slow_MA"],
-        index=2
+    with sell_col_operator:
+        sell_operator = st.selectbox(
+            "Sell operator",
+            operator_options,
+            index=5,
+            key="sell_operator",
+            label_visibility="collapsed"
+        )
+    
+    with sell_col_right:
+        sell_right = st.selectbox(
+            "Sell right signal",
+            signal_options,
+            index=2,
+            key="sell_right",
+            label_visibility="collapsed"
+        )
+    
+    # Show the selected sell rule clearly
+    st.sidebar.caption(
+        f"Sell when: `{sell_left} {sell_operator} {sell_right}`"
     )
     
     #######################################################################
