@@ -48,7 +48,42 @@ def check_password():
             st.error("😕 Password incorrect")
     return False
 
+    # Generic condition builder
+    def build_condition(left, operator, right):
+    
+        if operator == ">":
+            return left > right
+    
+        elif operator == "<":
+            return left < right
+    
+        elif operator == ">=":
+            return left >= right
+    
+        elif operator == "<=":
+            return left <= right
+    
+        elif operator == "Cross Above":
+            return (
+                (left > right)
+                &
+                (left.shift(1) <= right.shift(1))
+            )
+    
+        elif operator == "Cross Below":
+            return (
+                (left < right)
+                &
+                (left.shift(1) >= right.shift(1))
+            )
+    
+        return pd.Series(False, index=left.index)
+
+
+
+#############################################
 # Main()
+#############################################
 if check_password():
     st.write("Welcome to the protected app!")
     # Sidebar Controls (Collapsible on Mobile)
@@ -65,8 +100,33 @@ if check_password():
     slow_type = st.sidebar.selectbox("Slow MA Type", ["EMA", "SMA"], index=1)
     slow_period = st.sidebar.number_input("Slow MA Period", value=50, min_value=1)
 
-    st.sidebar.subheader("Trade Logic")
-    logic_type = st.sidebar.selectbox("Entry Condition",
+    #st.sidebar.subheader("Trade Logic")
+    #logic_type = st.sidebar.selectbox("Entry Condition",
+    #    [
+    #        ">",
+    #        "<",
+    #        ">=",
+    #        "<=",
+    #        "Cross Above",
+    #        "Cross Below"
+    #    ],
+    #    index=0
+    #)
+
+    # ===================================
+    # Trade Logic
+    # ===================================
+    
+    st.sidebar.subheader("Buy Signal")
+    
+    buy_left = st.sidebar.selectbox(
+        "Buy Signal A",
+        ["Close", "Fast_MA", "Slow_MA"],
+        index=1
+    )
+    
+    buy_operator = st.sidebar.selectbox(
+        "Buy Operator",
         [
             ">",
             "<",
@@ -75,9 +135,45 @@ if check_password():
             "Cross Above",
             "Cross Below"
         ],
-        index=0
+        index=4
     )
     
+    buy_right = st.sidebar.selectbox(
+        "Buy Signal B",
+        ["Close", "Fast_MA", "Slow_MA"],
+        index=2
+    )
+    
+    st.sidebar.divider()
+    
+    st.sidebar.subheader("Sell Signal")
+    
+    sell_left = st.sidebar.selectbox(
+        "Sell Signal A",
+        ["Close", "Fast_MA", "Slow_MA"],
+        index=1
+    )
+    
+    sell_operator = st.sidebar.selectbox(
+        "Sell Operator",
+        [
+            ">",
+            "<",
+            ">=",
+            "<=",
+            "Cross Above",
+            "Cross Below"
+        ],
+        index=5
+    )
+    
+    sell_right = st.sidebar.selectbox(
+        "Sell Signal B",
+        ["Close", "Fast_MA", "Slow_MA"],
+        index=2
+    )
+    
+    #######################################################################
     # Run Backtest
     if len(date_range) == 2:
         start_d, end_d = date_range
@@ -91,28 +187,63 @@ if check_password():
             # Signal Logic: Long when Fast MA > Slow MA
             #df['Signal'] = np.where(df['Fast_MA'] > df['Slow_MA'], 1, 0)
 
-            if logic_type == ">":
-                df['Signal'] = np.where(df['Fast_MA'] > df['Slow_MA'], 1, 0)
+            # ===================================
+            # Signal Mapping
+            # ===================================
             
-            elif logic_type == "<":
-                df['Signal'] = np.where(df['Fast_MA'] < df['Slow_MA'], 1, 0)
+            signal_map = {
+                "Close": df["Close"],
+                "Fast_MA": df["Fast_MA"],
+                "Slow_MA": df["Slow_MA"]
+            }
             
-            elif logic_type == ">=":
-                df['Signal'] = np.where(df['Fast_MA'] >= df['Slow_MA'], 1, 0)
+            # ===================================
+            # Buy Condition
+            # ===================================
             
-            elif logic_type == "<=":
-                df['Signal'] = np.where(df['Fast_MA'] <= df['Slow_MA'], 1, 0)
+            buy_condition = build_condition(
+                signal_map[buy_left],
+                buy_operator,
+                signal_map[buy_right]
+            )
             
-            elif logic_type == "Cross Above":
-                df['Signal'] = np.where(
-                    (df['Fast_MA'] > df['Slow_MA']) &
-                    (df['Fast_MA'].shift(1) <= df['Slow_MA'].shift(1)), 1, 0)
+            # ===================================
+            # Sell Condition
+            # ===================================
             
-            elif logic_type == "Cross Below":
-                df['Signal'] = np.where(
-                    (df['Fast_MA'] < df['Slow_MA']) &
-                    (df['Fast_MA'].shift(1) >= df['Slow_MA'].shift(1)), 1, 0)
-                
+            sell_condition = build_condition(
+                signal_map[sell_left],
+                sell_operator,
+                signal_map[sell_right]
+            )
+            
+            # ===================================
+            # Position Engine
+            # ===================================
+            
+            position = []
+            
+            in_trade = False
+            
+            for i in range(len(df)):
+            
+                if not in_trade and buy_condition.ilocin_trade = True
+            
+                elif in_trade and sell_condition.ilocin_trade = False
+            
+                position.append(1 if in_trade else 0)
+            
+            df["Position"] = position
+            
+            # Avoid lookahead bias
+            #df["Position"] = df["Position"].shift(1).fillna(0)
+            
+            # Save entry/exit signals for charting
+            df["Buy_Signal"] = buy_condition
+            df["Sell_Signal"] = sell_condition
+
+
+            ###############################################################################    
             df['Position'] = df['Signal'].shift(1).fillna(0)  # Avoid lookahead bias
     
             # Performance Calculations
@@ -132,6 +263,14 @@ if check_password():
             col1.metric("Final Equity", f"${df['Equity'].iloc[-1]:,.2f}", f"{total_return:.2f}%")
             col2.metric("Max Drawdown", f"{max_dd:.2f}%")
             col3.metric("Win Rate", f"{win_rate:.1f}%")
+
+            st.info(
+                f"""
+                BUY : {buy_left} {buy_operator} {buy_right}
+            
+                SELL : {sell_left} {sell_operator} {sell_right}
+                """
+            )
     
             # Interactive Mobile Plotly Charts
             fig = make_subplots(
