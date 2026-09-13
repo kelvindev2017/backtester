@@ -75,9 +75,46 @@ if check_password():
             # Calculate MAs
             df['Fast_MA'] = compute_ma(df['Close'], fast_type, fast_period)
             df['Slow_MA'] = compute_ma(df['Close'], slow_type, slow_period)
-    
+
             # Signal Logic: Long when Fast MA > Slow MA
-            df['Signal'] = np.where(df['Fast_MA'] > df['Slow_MA'], 1, 0)
+            #df['Signal'] = np.where(df['Fast_MA'] > df['Slow_MA'], 1, 0)
+
+            st.sidebar.subheader("Trade Logic")
+            logic_type = st.sidebar.selectbox(
+                "Entry Condition",
+                [
+                    ">",
+                    "<",
+                    ">=",
+                    "<=",
+                    "Cross Above",
+                    "Cross Below"
+                ],
+                index=0
+            )
+
+            if logic_type == ">":
+                df['Signal'] = np.where(df['Fast_MA'] > df['Slow_MA'], 1, 0)
+            
+            elif logic_type == "<":
+                df['Signal'] = np.where(df['Fast_MA'] < df['Slow_MA'], 1, 0)
+            
+            elif logic_type == ">=":
+                df['Signal'] = np.where(df['Fast_MA'] >= df['Slow_MA'], 1, 0)
+            
+            elif logic_type == "<=":
+                df['Signal'] = np.where(df['Fast_MA'] <= df['Slow_MA'], 1, 0)
+            
+            elif logic_type == "Cross Above":
+                df['Signal'] = np.where(
+                    (df['Fast_MA'] > df['Slow_MA']) &
+                    (df['Fast_MA'].shift(1) <= df['Slow_MA'].shift(1)), 1, 0)
+            
+            elif logic_type == "Cross Below":
+                df['Signal'] = np.where(
+                    (df['Fast_MA'] < df['Slow_MA']) &
+                    (df['Fast_MA'].shift(1) >= df['Slow_MA'].shift(1)), 1, 0)
+                
             df['Position'] = df['Signal'].shift(1).fillna(0)  # Avoid lookahead bias
     
             # Performance Calculations
