@@ -80,6 +80,156 @@ def build_condition(left, operator, right):
     return pd.Series(False, index=left.index)
 
 
+# ============================================================
+# Load historical quarterly EPS
+# ============================================================
+
+@st.cache_data(ttl=3600)
+def load_earnings_data(symbol, start, end):
+    """
+    Retrieves historical earnings dates, reported EPS,
+    analyst EPS estimates, and surprise percentage.
+
+    Availability depends on Yahoo Finance and the selected ticker.
+    """
+
+    try:
+        stock = yf.Ticker(symbol)
+
+        earnings = stock.get_earnings_dates(limit=100)
+
+        if earnings is None or earnings.empty:
+            return pd.DataFrame()
+
+        earnings = earnings.copy()
+
+        # Convert the earnings-date index into a normal column
+        earnings = earnings.reset_index()
+
+        # The first column is normally named "Earnings Date"
+        date_column = earnings.columns[0]
+
+        earnings[date_column] = pd.to_datetime(
+            earnings[date_column],
+            errors="coerce",
+            utc=True
+        ).dt.tz_convert(None)
+
+        earnings = earnings.rename(
+            columns={date_column: "Earnings_Date"}
+        )
+
+        # Make sure EPS columns are numeric
+        for column in [
+            "EPS Estimate",
+            "Reported EPS",
+            "Surprise(%)"
+        ]:
+            if column in earnings.columns:
+                earnings[column] = pd.to_numeric(
+                    earnings[column],
+                    errors="coerce"
+                )
+
+        start_timestamp = pd.Timestamp(start)
+        end_timestamp = pd.Timestamp(end)
+
+        # Keep earnings within the selected date range
+        earnings = earnings[
+            (earnings["Earnings_Date"] >= start_timestamp)
+            & (earnings["Earnings_Date"] <= end_timestamp)
+        ]
+
+        earnings = earnings.sort_values("Earnings_Date")
+
+        earnings = earnings.set_index("Earnings_Date")
+
+        return earnings
+
+    except Exception:
+        return pd.DataFrame()
+
+
+# ============================================================
+# Load S&P 500 and Nasdaq-100 data
+# ============================================================
+
+@st.cache_data(ttl=3600)
+def load_benchmark_data(start, end, tf):
+    """
+    Downloads S&P 500 and Nasdaq-100 index history
+    and normalizes both series to 100.
+    """
+
+    benchmark_symbols = ["^GSPC", "^NDX"]
+
+    try:
+        benchmark_data = yf.download(
+            benchmark_symbols,
+            start=start,
+            end=end,
+            auto_adjust=False,
+            progress=False
+        )
+
+        if benchmark_data is None or benchmark_data.empty:
+            return pd.DataFrame()
+
+        # Extract Close from the MultiIndex structure
+        if isinstance(benchmark_data.columns, pd.MultiIndex):
+            benchmark_close = benchmark_data["Close"].copy()
+        else:
+            benchmark_close = benchmark_data.copy()
+
+        benchmark_close = benchmark_close.rename(
+            columns={
+                "^GSPC": "S&P 500",
+                "^NDX": "Nasdaq-100"
+            }
+        )
+
+        # Match the selected timeframe
+        if tf == "Weekly":
+            benchmark_close = (
+                benchmark_close
+                .resample("W-FRI")
+                .last()
+                .dropna(how="all")
+            )
+
+        elif tf == "Monthly":
+            benchmark_close = (
+                benchmark_close
+                .resample("ME")
+                .last()
+                .dropna(how="all")
+            )
+
+        # Remove rows for which both indices are unavailable
+        benchmark_close = benchmark_close.dropna(how="all")
+
+        # Normalize each index to 100
+        normalized = pd.DataFrame(
+            index=benchmark_close.index
+        )
+
+        for column in benchmark_close.columns:
+            valid_values = benchmark_close[column].dropna()
+
+            if not valid_values.empty:
+                first_value = valid_values.iloc[0]
+
+                normalized[column] = (
+                    benchmark_close[column]
+                    / first_value
+                    * 100
+                )
+
+        return normalized
+
+    except Exception:
+        return pd.DataFrame()
+
 
 #############################################
 # Main()
@@ -223,6 +373,8 @@ if check_password():
     if len(date_range) == 2:
         start_d, end_d = date_range
         df = load_data(ticker, start_d, end_d, timeframe)
+        earnings_df = load_earnings_data(ticker, start_d, end_d)
+        benchmark_df = load_benchmark_data(start_d, end_d, timeframe)
     
         if not df.empty:
             # Calculate MAs
@@ -331,43 +483,396 @@ if check_password():
                 """
             )
     
-            # Interactive Mobile Plotly Charts
+            # ============================================================
+            # Interactive Plotly Charts
+            # ============================================================
+            
             fig = make_subplots(
-                rows=3, cols=1, 
-                shared_xaxes=True, 
-                vertical_spacing=0.05,
-                subplot_titles=(f"{ticker} Price & Indicators", "Portfolio Equity Curve ($)", "Drawdown Profile (%)"),
-                row_heights=[0.5, 0.3, 0.2]
+                rows=5,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.035,
+                subplot_titles=(
+                    f"{ticker} Price, Indicators and Trade Signals",
+                    f"{ticker} Quarterly EPS",
+                    "Market Benchmark Performance, Normalized to 100",
+                    "Portfolio Equity Curve ($)",
+                    "Drawdown Profile (%)"
+                ),
+                row_heights=[
+                    0.36,
+                    0.17,
+                    0.17,
+                    0.18,
+                    0.12
+                ]
             )
-    
-            # 1. Price + MAs
-            fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name='Close', line=dict(color='gray', width=1)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df['Fast_MA'], name=f'{fast_type} {fast_period}', line=dict(color='orange', width=1.5)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df['Slow_MA'], name=f'{slow_type} {slow_period}', line=dict(color='blue', width=1.5)), row=1, col=1)
+            
+            # ============================================================
+            # Row 1: Price, moving averages and trade markers
+            # ============================================================
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["Close"],
+                    name="Close",
+                    line=dict(
+                        color="gray",
+                        width=1
+                    )
+                ),
+                row=1,
+                col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["Fast_MA"],
+                    name=f"{fast_type} {fast_period}",
+                    line=dict(
+                        color="orange",
+                        width=1.5
+                    )
+                ),
+                row=1,
+                col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["Slow_MA"],
+                    name=f"{slow_type} {slow_period}",
+                    line=dict(
+                        color="blue",
+                        width=1.5
+                    )
+                ),
+                row=1,
+                col=1
+            )
+            
+            # Actual entry markers generated by the position engine
             buy_points = df[df["Buy_Signal"]]
-            fig.add_trace(go.Scatter(x=buy_points.index, y=buy_points["Close"], mode="markers", name="BUY",
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=buy_points.index,
+                    y=buy_points["Close"],
+                    mode="markers",
+                    name="BUY",
                     marker=dict(
                         symbol="triangle-up",
                         size=12,
-                        color="lime"
-                    )), row=1, col=1)
+                        color="lime",
+                        line=dict(
+                            color="darkgreen",
+                            width=1
+                        )
+                    ),
+                    hovertemplate=(
+                        "BUY<br>"
+                        "Date: %{x|%Y-%m-%d}<br>"
+                        "Price: %{y:.2f}"
+                        "<extra></extra>"
+                    )
+                ),
+                row=1,
+                col=1
+            )
             
+            # Actual exit markers generated by the position engine
             sell_points = df[df["Sell_Signal"]]
-            fig.add_trace(go.Scatter(x=sell_points.index, y=sell_points["Close"], mode="markers", name="SELL",
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=sell_points.index,
+                    y=sell_points["Close"],
+                    mode="markers",
+                    name="SELL",
                     marker=dict(
                         symbol="triangle-down",
                         size=12,
-                        color="red"
-                    )), row=1, col=1)
-    
-            # 2. Equity Curve
-            fig.add_trace(go.Scatter(x=df.index, y=df['Equity'], name='Equity', line=dict(color='green', width=2)), row=2, col=1)
-    
-            # 3. Drawdown
-            fig.add_trace(go.Scatter(x=df.index, y=df['Drawdown'] * 100, name='Drawdown %', fill='tozeroy', line=dict(color='red', width=1)), row=3, col=1)
-    
-            fig.update_layout(height=750, margin=dict(l=10, r=10, t=40, b=10), showlegend=True)
-        st.plotly_chart(fig, use_container_width=True)
+                        color="red",
+                        line=dict(
+                            color="darkred",
+                            width=1
+                        )
+                    ),
+                    hovertemplate=(
+                        "SELL<br>"
+                        "Date: %{x|%Y-%m-%d}<br>"
+                        "Price: %{y:.2f}"
+                        "<extra></extra>"
+                    )
+                ),
+                row=1,
+                col=1
+            )
+            
+            # ============================================================
+            # Row 2: Historical reported and estimated quarterly EPS
+            # ============================================================
+            
+            if not earnings_df.empty:
+            
+                if "Reported EPS" in earnings_df.columns:
+                    reported_eps = earnings_df["Reported EPS"].dropna()
+            
+                    fig.add_trace(
+                        go.Bar(
+                            x=reported_eps.index,
+                            y=reported_eps,
+                            name="Reported EPS",
+                            marker_color="royalblue",
+                            opacity=0.75,
+                            hovertemplate=(
+                                "Reported EPS<br>"
+                                "Date: %{x|%Y-%m-%d}<br>"
+                                "EPS: %{y:.3f}"
+                                "<extra></extra>"
+                            )
+                        ),
+                        row=2,
+                        col=1
+                    )
+            
+                if "EPS Estimate" in earnings_df.columns:
+                    estimated_eps = earnings_df["EPS Estimate"].dropna()
+            
+                    fig.add_trace(
+                        go.Scatter(
+                            x=estimated_eps.index,
+                            y=estimated_eps,
+                            mode="lines+markers",
+                            name="Analyst EPS Estimate",
+                            line=dict(
+                                color="orange",
+                                width=2,
+                                dash="dot"
+                            ),
+                            marker=dict(
+                                symbol="diamond",
+                                size=8,
+                                color="orange"
+                            ),
+                            hovertemplate=(
+                                "EPS Estimate<br>"
+                                "Date: %{x|%Y-%m-%d}<br>"
+                                "Estimate: %{y:.3f}"
+                                "<extra></extra>"
+                            )
+                        ),
+                        row=2,
+                        col=1
+                    )
+            
+            # If EPS data is unavailable, add an annotation
+            else:
+                fig.add_annotation(
+                    x=0.5,
+                    y=0.5,
+                    xref="x2 domain",
+                    yref="y2 domain",
+                    text="Quarterly EPS data is unavailable for this ticker",
+                    showarrow=False,
+                    font=dict(
+                        color="gray",
+                        size=12
+                    )
+                )
+            
+            # Add horizontal zero line for positive/negative EPS
+            fig.add_hline(
+                y=0,
+                line_width=1,
+                line_dash="dot",
+                line_color="gray",
+                row=2,
+                col=1
+            )
+            
+            # ============================================================
+            # Row 3: S&P 500 and Nasdaq-100
+            # ============================================================
+            
+            if not benchmark_df.empty:
+            
+                if "S&P 500" in benchmark_df.columns:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=benchmark_df.index,
+                            y=benchmark_df["S&P 500"],
+                            name="S&P 500",
+                            line=dict(
+                                color="deepskyblue",
+                                width=2
+                            ),
+                            hovertemplate=(
+                                "S&P 500<br>"
+                                "Date: %{x|%Y-%m-%d}<br>"
+                                "Normalized value: %{y:.2f}"
+                                "<extra></extra>"
+                            )
+                        ),
+                        row=3,
+                        col=1
+                    )
+            
+                if "Nasdaq-100" in benchmark_df.columns:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=benchmark_df.index,
+                            y=benchmark_df["Nasdaq-100"],
+                            name="Nasdaq-100",
+                            line=dict(
+                                color="magenta",
+                                width=2
+                            ),
+                            hovertemplate=(
+                                "Nasdaq-100<br>"
+                                "Date: %{x|%Y-%m-%d}<br>"
+                                "Normalized value: %{y:.2f}"
+                                "<extra></extra>"
+                            )
+                        ),
+                        row=3,
+                        col=1
+                    )
+            
+            else:
+                fig.add_annotation(
+                    x=0.5,
+                    y=0.5,
+                    xref="x3 domain",
+                    yref="y3 domain",
+                    text="Benchmark data is unavailable",
+                    showarrow=False,
+                    font=dict(
+                        color="gray",
+                        size=12
+                    )
+                )
+            
+            fig.add_hline(
+                y=100,
+                line_width=1,
+                line_dash="dot",
+                line_color="gray",
+                row=3,
+                col=1
+            )
+            
+            # ============================================================
+            # Row 4: Strategy equity
+            # ============================================================
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["Equity"],
+                    name="Strategy Equity",
+                    line=dict(
+                        color="green",
+                        width=2
+                    ),
+                    hovertemplate=(
+                        "Strategy Equity<br>"
+                        "Date: %{x|%Y-%m-%d}<br>"
+                        "Equity: $%{y:,.2f}"
+                        "<extra></extra>"
+                    )
+                ),
+                row=4,
+                col=1
+            )
+            
+            # ============================================================
+            # Row 5: Drawdown
+            # ============================================================
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["Drawdown"] * 100,
+                    name="Drawdown %",
+                    fill="tozeroy",
+                    line=dict(
+                        color="red",
+                        width=1
+                    ),
+                    hovertemplate=(
+                        "Drawdown<br>"
+                        "Date: %{x|%Y-%m-%d}<br>"
+                        "Drawdown: %{y:.2f}%"
+                        "<extra></extra>"
+                    )
+                ),
+                row=5,
+                col=1
+            )
+            
+            # ============================================================
+            # Axis titles
+            # ============================================================
+            
+            fig.update_yaxes(
+                title_text="Price",
+                row=1,
+                col=1
+            )
+            
+            fig.update_yaxes(
+                title_text="EPS",
+                row=2,
+                col=1
+            )
+            
+            fig.update_yaxes(
+                title_text="Indexed",
+                row=3,
+                col=1
+            )
+            
+            fig.update_yaxes(
+                title_text="Equity ($)",
+                row=4,
+                col=1
+            )
+            
+            fig.update_yaxes(
+                title_text="DD (%)",
+                row=5,
+                col=1
+            )
+            
+            fig.update_xaxes(
+                rangeslider_visible=False
+            )
+            
+            # ============================================================
+            # Overall chart layout
+            # ============================================================
+            
+            fig.update_layout(
+                height=1250,
+                margin=dict(
+                    l=20,
+                    r=20,
+                    t=50,
+                    b=20
+                ),
+                showlegend=True,
+                hovermode="x unified",
+                barmode="group"
+            )
+            
+            st.plotly_chart(
+                fig,
+                use_container_width=True
+            )
     else:
         st.error("No data found for this ticker and date range.")
 
