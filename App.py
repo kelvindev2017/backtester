@@ -151,6 +151,119 @@ def load_earnings_data(symbol, start, end):
 
 
 # ============================================================
+# Build historical P/E and estimated P/E proxy
+# ============================================================
+
+def build_valuation_data(price_df, earnings_df):
+    """
+    Calculates:
+
+    1. Trailing P/E:
+       Close / rolling four-quarter reported EPS
+
+    2. Forward P/E proxy:
+       Close / rolling four-quarter analyst EPS estimates
+
+    Important:
+    The estimated P/E is a proxy based on the EPS estimates
+    associated with quarterly earnings events. It is not a
+    complete point-in-time Refinitiv forward P/E history.
+    """
+
+    valuation = pd.DataFrame(index=price_df.index)
+    valuation["Close"] = price_df["Close"]
+
+    if earnings_df is None or earnings_df.empty:
+        valuation["TTM_Reported_EPS"] = np.nan
+        valuation["TTM_Estimated_EPS"] = np.nan
+        valuation["Trailing_PE"] = np.nan
+        valuation["Forward_PE_Proxy"] = np.nan
+        return valuation
+
+    earnings = earnings_df.copy().sort_index()
+
+    # --------------------------------------------------------
+    # Trailing four-quarter reported EPS
+    # --------------------------------------------------------
+
+    if "Reported EPS" in earnings.columns:
+        reported_eps = pd.to_numeric(
+            earnings["Reported EPS"],
+            errors="coerce"
+        )
+
+        earnings["TTM_Reported_EPS"] = (
+            reported_eps
+            .rolling(window=4, min_periods=4)
+            .sum()
+        )
+
+    else:
+        earnings["TTM_Reported_EPS"] = np.nan
+
+    # --------------------------------------------------------
+    # Trailing four-quarter analyst-estimated EPS
+    # --------------------------------------------------------
+
+    if "EPS Estimate" in earnings.columns:
+        estimated_eps = pd.to_numeric(
+            earnings["EPS Estimate"],
+            errors="coerce"
+        )
+
+        earnings["TTM_Estimated_EPS"] = (
+            estimated_eps
+            .rolling(window=4, min_periods=4)
+            .sum()
+        )
+
+    else:
+        earnings["TTM_Estimated_EPS"] = np.nan
+
+    # --------------------------------------------------------
+    # Forward-fill quarterly EPS values onto daily price dates
+    # --------------------------------------------------------
+
+    earnings_daily = earnings[
+        [
+            "TTM_Reported_EPS",
+            "TTM_Estimated_EPS"
+        ]
+    ].reindex(valuation.index, method="ffill")
+
+    valuation["TTM_Reported_EPS"] = (
+        earnings_daily["TTM_Reported_EPS"]
+    )
+
+    valuation["TTM_Estimated_EPS"] = (
+        earnings_daily["TTM_Estimated_EPS"]
+    )
+
+    # --------------------------------------------------------
+    # Calculate valuation multiples
+    # --------------------------------------------------------
+
+    valuation["Trailing_PE"] = np.where(
+        valuation["TTM_Reported_EPS"] > 0,
+        valuation["Close"] / valuation["TTM_Reported_EPS"],
+        np.nan
+    )
+
+    valuation["Forward_PE_Proxy"] = np.where(
+        valuation["TTM_Estimated_EPS"] > 0,
+        valuation["Close"] / valuation["TTM_Estimated_EPS"],
+        np.nan
+    )
+
+    # Replace infinite results
+    valuation = valuation.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    return valuation
+
+# ============================================================
 # Load S&P 500 and Nasdaq-100 data
 # ============================================================
 
@@ -380,6 +493,7 @@ if check_password():
             # Calculate MAs
             df['Fast_MA'] = compute_ma(df['Close'], fast_type, fast_period)
             df['Slow_MA'] = compute_ma(df['Close'], slow_type, slow_period)
+            valuation_df = build_valuation_data(df, earnings_df)
 
             # Signal Logic: Long when Fast MA > Slow MA
             #df['Signal'] = np.where(df['Fast_MA'] > df['Slow_MA'], 1, 0)
@@ -488,23 +602,25 @@ if check_password():
             # ============================================================
             
             fig = make_subplots(
-                rows=5,
+                rows=6,
                 cols=1,
                 shared_xaxes=True,
-                vertical_spacing=0.035,
+                vertical_spacing=0.03,
                 subplot_titles=(
                     f"{ticker} Price, Indicators and Trade Signals",
                     f"{ticker} Quarterly EPS",
+                    f"{ticker} Historical and Estimated P/E",
                     "Market Benchmark Performance, Normalized to 100",
                     "Portfolio Equity Curve ($)",
                     "Drawdown Profile (%)"
                 ),
                 row_heights=[
-                    0.36,
-                    0.17,
-                    0.17,
-                    0.18,
-                    0.12
+                    0.30,
+                    0.16,
+                    0.15,
+                    0.15,
+                    0.15,
+                    0.09
                 ]
             )
             
@@ -693,6 +809,120 @@ if check_password():
                 row=2,
                 col=1
             )
+
+            # ============================================================
+            # Row 3: Historical P/E and forward P/E proxy
+            # ============================================================
+            
+            trailing_pe = valuation_df["Trailing_PE"].dropna()
+            
+            if not trailing_pe.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=trailing_pe.index,
+                        y=trailing_pe,
+                        mode="lines",
+                        name="Trailing P/E",
+                        line=dict(
+                            color="gold",
+                            width=2
+                        ),
+                        hovertemplate=(
+                            "Trailing P/E<br>"
+                            "Date: %{x|%Y-%m-%d}<br>"
+                            "P/E: %{y:.2f}x"
+                            "<extra></extra>"
+                        )
+                    ),
+                    row=3,
+                    col=1
+                )
+            
+            
+            forward_pe_proxy = (
+                valuation_df["Forward_PE_Proxy"]
+                .dropna()
+            )
+            
+            if not forward_pe_proxy.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=forward_pe_proxy.index,
+                        y=forward_pe_proxy,
+                        mode="lines",
+                        name="Forward P/E Proxy",
+                        line=dict(
+                            color="cyan",
+                            width=2,
+                            dash="dot"
+                        ),
+                        hovertemplate=(
+                            "Forward P/E Proxy<br>"
+                            "Date: %{x|%Y-%m-%d}<br>"
+                            "P/E: %{y:.2f}x"
+                            "<extra></extra>"
+                        )
+                    ),
+                    row=3,
+                    col=1
+                )
+            
+            
+            # Add median trailing P/E reference line
+            if not trailing_pe.empty:
+                median_trailing_pe = trailing_pe.median()
+            
+                fig.add_hline(
+                    y=median_trailing_pe,
+                    line_width=1,
+                    line_dash="dash",
+                    line_color="goldenrod",
+                    annotation_text=(
+                        f"Median trailing P/E: "
+                        f"{median_trailing_pe:.1f}x"
+                    ),
+                    annotation_position="top left",
+                    row=3,
+                    col=1
+                )
+            
+            
+            # Add median estimated P/E reference line
+            if not forward_pe_proxy.empty:
+                median_forward_pe = forward_pe_proxy.median()
+            
+                fig.add_hline(
+                    y=median_forward_pe,
+                    line_width=1,
+                    line_dash="dash",
+                    line_color="darkcyan",
+                    annotation_text=(
+                        f"Median estimated P/E: "
+                        f"{median_forward_pe:.1f}x"
+                    ),
+                    annotation_position="bottom left",
+                    row=3,
+                    col=1
+                )
+            
+            
+            # Show annotation if no P/E data can be calculated
+            if trailing_pe.empty and forward_pe_proxy.empty:
+                fig.add_annotation(
+                    x=0.5,
+                    y=0.5,
+                    xref="x3 domain",
+                    yref="y3 domain",
+                    text=(
+                        "Insufficient quarterly EPS history "
+                        "to calculate P/E"
+                    ),
+                    showarrow=False,
+                    font=dict(
+                        color="gray",
+                        size=12
+                    )
+                )
             
             # ============================================================
             # Row 3: S&P 500 and Nasdaq-100
@@ -717,7 +947,7 @@ if check_password():
                                 "<extra></extra>"
                             )
                         ),
-                        row=3,
+                        row=4,
                         col=1
                     )
             
@@ -738,7 +968,7 @@ if check_password():
                                 "<extra></extra>"
                             )
                         ),
-                        row=3,
+                        row=4,
                         col=1
                     )
             
@@ -761,7 +991,7 @@ if check_password():
                 line_width=1,
                 line_dash="dot",
                 line_color="gray",
-                row=3,
+                row=4,
                 col=1
             )
             
@@ -785,7 +1015,7 @@ if check_password():
                         "<extra></extra>"
                     )
                 ),
-                row=4,
+                row=5,
                 col=1
             )
             
@@ -810,7 +1040,7 @@ if check_password():
                         "<extra></extra>"
                     )
                 ),
-                row=5,
+                row=6,
                 col=1
             )
             
@@ -831,20 +1061,27 @@ if check_password():
             )
             
             fig.update_yaxes(
-                title_text="Indexed",
+                title_text="P/E (x)",
+                rangemode="tozero",
                 row=3,
                 col=1
             )
             
             fig.update_yaxes(
-                title_text="Equity ($)",
+                title_text="Indexed",
                 row=4,
                 col=1
             )
             
             fig.update_yaxes(
-                title_text="DD (%)",
+                title_text="Equity ($)",
                 row=5,
+                col=1
+            )
+            
+            fig.update_yaxes(
+                title_text="DD (%)",
+                row=6,
                 col=1
             )
             
@@ -857,7 +1094,7 @@ if check_password():
             # ============================================================
             
             fig.update_layout(
-                height=1250,
+                height=1450,
                 margin=dict(
                     l=20,
                     r=20,
