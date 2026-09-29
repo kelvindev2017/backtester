@@ -1,5 +1,9 @@
 import hashlib
 from datetime import date
+import json
+import os
+import re
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -259,33 +263,18 @@ def extract_statement_row(statement, candidate_names):
     return pd.Series(dtype=float)
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def load_quarterly_fundamentals(symbol, start_date_str, end_date_str):
-    """
-    Load quarterly revenue, operating expenses, CapEx and net income.
-
-    CapEx is converted to a positive spending amount. Yahoo Finance
-    availability and field names vary by ticker and reporting standard.
-    """
+def load_yahoo_quarterly_fundamentals(symbol):
+    """Load the recent quarters available through Yahoo Finance."""
 
     try:
         stock = yf.Ticker(symbol)
-
         income_statement = first_available_statement(
             stock,
-            [
-                "quarterly_income_stmt",
-                "quarterly_financials",
-                "get_income_stmt",
-            ],
+            ["quarterly_income_stmt", "quarterly_financials"],
         )
         cash_flow_statement = first_available_statement(
             stock,
-            [
-                "quarterly_cashflow",
-                "quarterly_cash_flow",
-                "get_cash_flow",
-            ],
+            ["quarterly_cashflow", "quarterly_cash_flow"],
         )
 
         revenue = extract_statement_row(
@@ -294,11 +283,15 @@ def load_quarterly_fundamentals(symbol, start_date_str, end_date_str):
         )
         operating_expense = extract_statement_row(
             income_statement,
-            [
-                "Operating Expense",
-                "Total Operating Expenses",
-                "Operating Expenses",
-            ],
+            ["Operating Expense", "Total Operating Expenses", "Operating Expenses"],
+        )
+        total_expense = extract_statement_row(
+            income_statement,
+            ["Total Expenses", "Costs And Expenses", "Total Costs And Expenses"],
+        )
+        operating_income = extract_statement_row(
+            income_statement,
+            ["Operating Income", "Operating Income Loss"],
         )
         net_income = extract_statement_row(
             income_statement,
@@ -319,29 +312,208 @@ def load_quarterly_fundamentals(symbol, start_date_str, end_date_str):
         ).abs()
 
         all_dates = revenue.index.union(operating_expense.index)
-        all_dates = all_dates.union(capex.index).union(net_income.index).sort_values()
-
+        all_dates = all_dates.union(total_expense.index).union(capex.index)
+        all_dates = all_dates.union(net_income.index).sort_values()
         if len(all_dates) == 0:
             return pd.DataFrame()
 
-        fundamentals = pd.DataFrame(index=all_dates)
-        fundamentals["Revenue"] = revenue.reindex(all_dates)
-        fundamentals["Operating_Expense"] = operating_expense.reindex(all_dates)
-        fundamentals["CapEx"] = capex.reindex(all_dates)
-        fundamentals["Net_Income"] = net_income.reindex(all_dates)
+        result = pd.DataFrame(index=all_dates)
+        result["Revenue"] = revenue.reindex(all_dates)
+        result["Operating_Expense"] = operating_expense.reindex(all_dates)
+        result["Total_Expense"] = total_expense.reindex(all_dates)
+        result["CapEx"] = capex.reindex(all_dates)
+        result["Net_Income"] = net_income.reindex(all_dates)
 
-        start_timestamp = pd.Timestamp(start_date_str).normalize()
-        end_exclusive = pd.Timestamp(end_date_str).normalize() + pd.Timedelta(days=1)
-        fundamentals = fundamentals.loc[
-            (fundamentals.index >= start_timestamp)
-            & (fundamentals.index < end_exclusive)
-        ]
-        fundamentals = fundamentals.sort_index()
-        fundamentals = fundamentals.loc[~fundamentals.index.duplicated(keep="last")]
-        return fundamentals.dropna(how="all")
+        # If Yahoo omits total expenses, derive it as revenue minus operating income.
+        derived_total_expense = revenue.reindex(all_dates) - operating_income.reindex(all_dates)
+        result["Total_Expense"] = result["Total_Expense"].combine_first(
+            derived_total_expense
+        )
+        return result.dropna(how="all")
 
     except Exception:
         return pd.DataFrame()
+
+
+def sec_request_json(url):
+    """Read JSON from SEC with an identifying User-Agent."""
+
+    user_agent = os.getenv(
+        "SEC_USER_AGENT",
+        "StreamlitBacktester/1.0 research-use",
+    )
+    request = Request(
+        url,
+        headers={
+            "User-Agent": user_agent,
+            "Accept-Encoding": "gzip, deflate",
+            "Host": "data.sec.gov" if "data.sec.gov" in url else "www.sec.gov",
+        },
+    )
+    with urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def extract_sec_quarters(company_facts, candidate_tags):
+    """Extract SEC quarterly values identified by CYyyyyQn frame labels."""
+
+    us_gaap = company_facts.get("facts", {}).get("us-gaap", {})
+    selected_entries = []
+
+    for tag in candidate_tags:
+        fact = us_gaap.get(tag)
+        if not fact:
+            continue
+        units = fact.get("units", {})
+        entries = units.get("USD", [])
+        if entries:
+            selected_entries = entries
+            break
+
+    if not selected_entries:
+        return pd.Series(dtype=float)
+
+    records = []
+    for entry in selected_entries:
+        frame = str(entry.get("frame", ""))
+        if not re.fullmatch(r"CY\d{4}Q[1-4]", frame):
+            continue
+        if entry.get("form") not in {"10-Q", "10-K", "20-F", "40-F"}:
+            continue
+        end_date = pd.to_datetime(entry.get("end"), errors="coerce")
+        value = pd.to_numeric(entry.get("val"), errors="coerce")
+        filed_date = pd.to_datetime(entry.get("filed"), errors="coerce")
+        if pd.isna(end_date) or pd.isna(value):
+            continue
+        records.append((frame, end_date, value, filed_date))
+
+    if not records:
+        return pd.Series(dtype=float)
+
+    records_df = pd.DataFrame(
+        records,
+        columns=["Frame", "End_Date", "Value", "Filed_Date"],
+    )
+    records_df = records_df.sort_values(["Frame", "Filed_Date"])
+    records_df = records_df.drop_duplicates(subset=["Frame"], keep="last")
+    series = pd.Series(
+        records_df["Value"].to_numpy(),
+        index=pd.DatetimeIndex(records_df["End_Date"]),
+        dtype=float,
+    )
+    return series.loc[~series.index.duplicated(keep="last")].sort_index()
+
+
+def load_sec_quarterly_fundamentals(symbol):
+    """Load a longer quarterly history for SEC-reporting companies."""
+
+    try:
+        ticker_map = sec_request_json(
+            "https://www.sec.gov/files/company_tickers.json"
+        )
+        symbol_upper = symbol.upper().replace(".", "-")
+        cik = None
+        for item in ticker_map.values():
+            if str(item.get("ticker", "")).upper() == symbol_upper:
+                cik = int(item["cik_str"])
+                break
+        if cik is None:
+            return pd.DataFrame()
+
+        company_facts = sec_request_json(
+            f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+        )
+
+        revenue = extract_sec_quarters(
+            company_facts,
+            [
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "SalesRevenueNet",
+                "Revenues",
+            ],
+        )
+        operating_expense = extract_sec_quarters(
+            company_facts,
+            ["OperatingExpenses"],
+        )
+        total_expense = extract_sec_quarters(
+            company_facts,
+            ["CostsAndExpenses", "CostOfRevenue"],
+        )
+        operating_income = extract_sec_quarters(
+            company_facts,
+            ["OperatingIncomeLoss"],
+        )
+        capex = extract_sec_quarters(
+            company_facts,
+            [
+                "PaymentsToAcquirePropertyPlantAndEquipment",
+                "PaymentsForAdditionsToPropertyPlantAndEquipment",
+            ],
+        ).abs()
+        net_income = extract_sec_quarters(
+            company_facts,
+            ["NetIncomeLoss", "ProfitLoss"],
+        )
+
+        all_dates = revenue.index.union(operating_expense.index)
+        all_dates = all_dates.union(total_expense.index).union(capex.index)
+        all_dates = all_dates.union(net_income.index).sort_values()
+        if len(all_dates) == 0:
+            return pd.DataFrame()
+
+        result = pd.DataFrame(index=all_dates)
+        result["Revenue"] = revenue.reindex(all_dates)
+        result["Operating_Expense"] = operating_expense.reindex(all_dates)
+        result["Total_Expense"] = total_expense.reindex(all_dates)
+        result["CapEx"] = capex.reindex(all_dates)
+        result["Net_Income"] = net_income.reindex(all_dates)
+
+        derived_total_expense = revenue.reindex(all_dates) - operating_income.reindex(all_dates)
+        result["Total_Expense"] = result["Total_Expense"].combine_first(
+            derived_total_expense
+        )
+        return result.dropna(how="all")
+
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_quarterly_fundamentals(symbol, start_date_str, end_date_str):
+    """
+    Combine SEC history with recent Yahoo Finance quarterly statements.
+
+    SEC data normally provides the longer history for US-reporting companies.
+    Yahoo data fills recent values and remains the fallback for non-US tickers.
+    CapEx is displayed as positive spending.
+    """
+
+    sec_data = load_sec_quarterly_fundamentals(symbol)
+    yahoo_data = load_yahoo_quarterly_fundamentals(symbol)
+
+    if sec_data.empty and yahoo_data.empty:
+        return pd.DataFrame()
+    if sec_data.empty:
+        fundamentals = yahoo_data.copy()
+    elif yahoo_data.empty:
+        fundamentals = sec_data.copy()
+    else:
+        all_dates = sec_data.index.union(yahoo_data.index).sort_values()
+        fundamentals = sec_data.reindex(all_dates)
+        yahoo_aligned = yahoo_data.reindex(all_dates)
+        # Prefer Yahoo for matching recent dates, retain SEC for older history.
+        fundamentals = yahoo_aligned.combine_first(fundamentals)
+
+    start_timestamp = pd.Timestamp(start_date_str).normalize()
+    end_exclusive = pd.Timestamp(end_date_str).normalize() + pd.Timedelta(days=1)
+    fundamentals = fundamentals.loc[
+        (fundamentals.index >= start_timestamp)
+        & (fundamentals.index < end_exclusive)
+    ]
+    fundamentals = fundamentals.sort_index()
+    fundamentals = fundamentals.loc[~fundamentals.index.duplicated(keep="last")]
+    return fundamentals.dropna(how="all")
 
 
 def choose_fundamental_scale(fundamentals_df):
@@ -349,15 +521,11 @@ def choose_fundamental_scale(fundamentals_df):
 
     if fundamentals_df is None or fundamentals_df.empty:
         return 1e9, "USD billions"
-
     numeric_values = fundamentals_df.select_dtypes(include=[np.number])
     if numeric_values.empty:
         return 1e9, "USD billions"
-
     maximum_value = numeric_values.abs().max().max()
-    if pd.isna(maximum_value):
-        return 1e9, "USD billions"
-    if maximum_value >= 1e9:
+    if pd.isna(maximum_value) or maximum_value >= 1e9:
         return 1e9, "USD billions"
     return 1e6, "USD millions"
 
@@ -650,7 +818,7 @@ if check_password():
         subplot_titles=(
             f"{ticker} Price, Indicators and Trade Signals",
             f"{ticker} Quarterly and TTM EPS",
-            f"{ticker} Quarterly Revenue, OpEx, CapEx and Net Income",
+            f"{ticker} Quarterly Revenue, OpEx, Total Expense, CapEx and Net Income",
             f"{ticker} Trailing P/E and Estimate-Based P/E Proxy",
             "Market Benchmark Performance, Normalized to 100",
             "Portfolio Equity Curve ($)",
@@ -732,6 +900,7 @@ if check_password():
     fundamental_definitions = [
         ("Revenue", "Revenue", "royalblue"),
         ("Operating_Expense", "Operating expenses", "orange"),
+        ("Total_Expense", "Total expenses", "crimson"),
         ("CapEx", "CapEx spending", "purple"),
         ("Net_Income", "Net income", "limegreen"),
     ]
@@ -761,7 +930,7 @@ if check_password():
     if not fundamentals_trace_added:
         fig.add_annotation(
             x=0.5, y=0.5, xref="x3 domain", yref="y3 domain",
-            text="Quarterly revenue, OpEx, CapEx and net income data are unavailable",
+            text="Quarterly revenue, OpEx, total expense, CapEx and net income data are unavailable",
             showarrow=False, font=dict(color="gray", size=12)
         )
     fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray", row=3, col=1)
