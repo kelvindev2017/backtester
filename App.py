@@ -336,22 +336,32 @@ def load_yahoo_quarterly_fundamentals(symbol):
 
 
 def sec_request_json(url):
-    """Read JSON from SEC with an identifying User-Agent."""
+    """
+    Read JSON from the SEC with an identifying User-Agent.
+
+    Set SEC_USER_AGENT in the Streamlit environment to a value
+    containing an application name and contact email.
+    """
 
     user_agent = os.getenv(
         "SEC_USER_AGENT",
-        "StreamlitBacktester/1.0 research-use",
+        "StreamlitBacktester/1.0 contact@example.com",
     )
+
     request = Request(
         url,
         headers={
             "User-Agent": user_agent,
-            "Accept-Encoding": "gzip, deflate",
-            "Host": "data.sec.gov" if "data.sec.gov" in url else "www.sec.gov",
+            "Accept": "application/json",
         },
     )
-    with urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+
+    with urlopen(
+        request,
+        timeout=30
+    ) as response:
+        response_text = response.read().decode("utf-8")
+        return json.loads(response_text)
 
 
 def extract_sec_quarters(company_facts, candidate_tags):
@@ -475,7 +485,11 @@ def load_sec_quarterly_fundamentals(symbol):
         )
         return result.dropna(how="all")
 
-    except Exception:
+    except Exception as error:
+        st.warning(
+            "SEC quarterly fundamentals could not be loaded: "
+            f"{type(error).__name__}: {error}"
+        )
         return pd.DataFrame()
 
 
