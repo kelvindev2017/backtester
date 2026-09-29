@@ -1774,51 +1774,55 @@ if check_password():
     # --------------------------------------------------------
     # Generate a stable chart revision and Streamlit key
     # --------------------------------------------------------
-
+    
     chart_state_text = "|".join(
         [
-            ticker,
-            start_date_str,
-            end_date_str,
-            timeframe,
-            fast_type,
+            str(ticker),
+            str(start_date_str),
+            str(end_date_str),
+            str(timeframe),
+            str(fast_type),
             str(fast_period),
-            slow_type,
+            str(slow_type),
             str(slow_period),
-            buy_left,
-            buy_operator,
-            buy_right,
-            sell_left,
-            sell_operator,
-            sell_right,
+            str(buy_left),
+            str(buy_operator),
+            str(buy_right),
+            str(sell_left),
+            str(sell_operator),
+            str(sell_right),
             str(initial_capital)
         ]
     )
-
+    
     chart_revision = hashlib.sha256(
         chart_state_text.encode("utf-8")
     ).hexdigest()[:16]
-
+    
+    
     # --------------------------------------------------------
-    # Overall layout
+    # Overall Plotly layout
     # --------------------------------------------------------
-
+    
     fig.update_layout(
         height=1450,
         margin=dict(
-            left=20,
-            right=20,
-            top=50,
-            bottom=20
+            l=20,
+            r=20,
+            t=50,
+            b=20
         ),
         showlegend=True,
         hovermode="x unified",
         barmode="group",
-
-        # Change Plotly UI state when input settings change.
-        uirevision=chart_revision
+        uirevision=str(chart_revision)
     )
-
+    
+    
+    # --------------------------------------------------------
+    # Display chart
+    # --------------------------------------------------------
+    
     st.plotly_chart(
         fig,
         use_container_width=True,
