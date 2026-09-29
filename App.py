@@ -899,10 +899,10 @@ if check_password():
     scale_divisor, fundamentals_axis_title = choose_fundamental_scale(fundamentals_df)
     fundamental_definitions = [
         ("Revenue", "Revenue", "royalblue"),
-        ("Operating_Expense", "Operating expenses", "orange"),
         ("Total_Expense", "Total expenses", "crimson"),
-        ("CapEx", "CapEx spending", "purple"),
         ("Net_Income", "Net income", "limegreen"),
+        ("Operating_Expense", "Operating expenses", "orange"),
+        ("CapEx", "CapEx spending", "purple"),
     ]
 
     for column, trace_name, color in fundamental_definitions:
