@@ -847,6 +847,133 @@ def choose_fundamental_scale(fundamentals_df):
         return 1e9, "USD billions"
     return 1e6, "USD millions"
 
+def align_fundamentals_to_earnings_dates(
+    fundamentals_df,
+    earnings_df,
+    maximum_days=120,
+):
+    """
+    Align fiscal quarter-end fundamentals with earnings announcement dates.
+
+    Fundamentals from SEC and Yahoo statements normally use fiscal
+    quarter-end dates, while the EPS plot uses earnings announcement
+    dates. This function maps each fundamentals quarter to the first
+    earnings announcement occurring after that quarter-end date.
+
+    If no suitable earnings announcement is found, the original
+    fiscal quarter-end date is retained.
+    """
+
+    if fundamentals_df is None or fundamentals_df.empty:
+        return pd.DataFrame()
+
+    aligned_fundamentals = (
+        fundamentals_df
+        .copy()
+        .sort_index()
+    )
+
+    aligned_fundamentals.index = pd.DatetimeIndex(
+        pd.to_datetime(
+            aligned_fundamentals.index,
+            errors="coerce",
+        )
+    )
+
+    aligned_fundamentals = aligned_fundamentals.loc[
+        ~aligned_fundamentals.index.isna()
+    ]
+
+    if aligned_fundamentals.index.tz is not None:
+        aligned_fundamentals.index = (
+            aligned_fundamentals.index.tz_localize(None)
+        )
+
+    # Keep the original fiscal quarter-end date for hover information.
+    aligned_fundamentals["Fiscal_Quarter_End"] = (
+        aligned_fundamentals.index
+    )
+
+    if earnings_df is None or earnings_df.empty:
+        aligned_fundamentals["Display_Date"] = (
+            aligned_fundamentals.index
+        )
+
+        return aligned_fundamentals.set_index(
+            "Display_Date"
+        )
+
+    earnings_dates = pd.DatetimeIndex(
+        pd.to_datetime(
+            earnings_df.index,
+            errors="coerce",
+        )
+    )
+
+    earnings_dates = earnings_dates[
+        ~earnings_dates.isna()
+    ]
+
+    if earnings_dates.tz is not None:
+        earnings_dates = (
+            earnings_dates.tz_localize(None)
+        )
+
+    earnings_dates = (
+        earnings_dates
+        .sort_values()
+        .unique()
+    )
+
+    display_dates = []
+
+    for fiscal_quarter_end in aligned_fundamentals.index:
+        # An earnings announcement should normally occur after
+        # the corresponding fiscal quarter has ended.
+        later_earnings_dates = earnings_dates[
+            earnings_dates >= fiscal_quarter_end
+        ]
+
+        if len(later_earnings_dates) == 0:
+            display_dates.append(
+                fiscal_quarter_end
+            )
+            continue
+
+        matching_earnings_date = pd.Timestamp(
+            later_earnings_dates[0]
+        )
+
+        date_difference_days = (
+            matching_earnings_date
+            - fiscal_quarter_end
+        ).days
+
+        if (
+            0
+            <= date_difference_days
+            <= maximum_days
+        ):
+            display_dates.append(
+                matching_earnings_date
+            )
+        else:
+            display_dates.append(
+                fiscal_quarter_end
+            )
+
+    aligned_fundamentals["Display_Date"] = (
+        pd.DatetimeIndex(display_dates)
+    )
+
+    aligned_fundamentals = (
+        aligned_fundamentals
+        .set_index("Display_Date")
+        .sort_index()
+    )
+
+    return aligned_fundamentals
+
 
 # ============================================================
 # EPS and valuation calculations
@@ -1118,6 +1245,17 @@ if check_password():
             & (earnings_calculated_df.index < display_end)
         ].copy()
 
+    # --------------------------------------------------------
+    # Align quarterly fundamentals with EPS announcement dates
+    # --------------------------------------------------------
+    fundamentals_plot_df = (
+        align_fundamentals_to_earnings_dates(
+            fundamentals_df=fundamentals_df,
+            earnings_df=earnings_calculated_df,
+            maximum_days=120,
+        )
+    )
+
     pe_error = valuation_df["PE_Reconstruction_Error"].dropna()
     if not pe_error.empty:
         st.caption(f"Maximum internal P/E calculation error: ${pe_error.max():.8f}")
@@ -1232,46 +1370,136 @@ if check_password():
         )
     fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray", row=2, col=1, secondary_y=False)
 
-    # Row 3: quarterly fundamentals
+    # Row 3: quarterly fundamentals   
     fundamentals_trace_added = False
-    scale_divisor, fundamentals_axis_title = choose_fundamental_scale(fundamentals_df)
+    
+    scale_divisor, fundamentals_axis_title = (
+        choose_fundamental_scale(
+            fundamentals_plot_df
+        )
+    )
+    
     fundamental_definitions = [
-        ("Revenue", "Revenue", "royalblue"),
-        ("Total_Expense", "Total expenses", "crimson"),
-        ("Net_Income", "Net income", "limegreen"),
-        ("Operating_Expense", "Operating expenses", "orange"),
-        ("CapEx", "CapEx spending", "purple"),
+        (
+            "Revenue",
+            "Revenue",
+            "royalblue",
+        ),
+        (
+            "Total_Expense",
+            "Total expenses",
+            "crimson",
+        ),
+        (
+            "Net_Income",
+            "Net income",
+            "limegreen",
+        ),
+        (
+            "Operating_Expense",
+            "Operating expenses",
+            "orange",
+        ),
+        (
+            "CapEx",
+            "CapEx spending",
+            "purple",
+        ),
     ]
-
-    for column, trace_name, color in fundamental_definitions:
-        if not fundamentals_df.empty and column in fundamentals_df.columns:
-            series = fundamentals_df[column].dropna() / scale_divisor
-            if series.empty:
-                continue
-            fundamentals_trace_added = True
-            fig.add_trace(
-                go.Bar(
-                    x=series.index,
-                    y=series,
-                    name=trace_name,
-                    marker_color=color,
-                    opacity=0.78,
-                    hovertemplate=(
-                        f"{trace_name}<br>Date: %{{x|%Y-%m-%d}}<br>"
-                        f"Value: %{{y:,.2f}} {fundamentals_axis_title}<extra></extra>"
-                    ),
+    
+    
+    for (
+        column,
+        trace_name,
+        color,
+    ) in fundamental_definitions:
+    
+        if (
+            fundamentals_plot_df.empty
+            or column not in fundamentals_plot_df.columns
+        ):
+            continue
+    
+        trace_data = fundamentals_plot_df[
+            [
+                column,
+                "Fiscal_Quarter_End",
+            ]
+        ].dropna(
+            subset=[column]
+        )
+    
+        if trace_data.empty:
+            continue
+    
+        fundamentals_trace_added = True
+    
+        scaled_values = (
+            trace_data[column]
+            / scale_divisor
+        )
+    
+        fiscal_quarter_end_text = (
+            trace_data["Fiscal_Quarter_End"]
+            .dt.strftime("%Y-%m-%d")
+        )
+    
+        fig.add_trace(
+            go.Bar(
+                x=trace_data.index,
+                y=scaled_values,
+                name=trace_name,
+                marker_color=color,
+                opacity=0.78,
+                customdata=np.column_stack(
+                    [
+                        fiscal_quarter_end_text,
+                    ]
                 ),
-                row=3,
-                col=1,
-            )
-
+                hovertemplate=(
+                    f"{trace_name}<br>"
+                    "Earnings date: "
+                    "%{x|%Y-%m-%d}<br>"
+                    "Fiscal quarter end: "
+                    "%{customdata[0]}<br>"
+                    "Value: "
+                    f"%{{y:,.2f}} "
+                    f"{fundamentals_axis_title}"
+                    "<extra></extra>"
+                ),
+            ),
+            row=3,
+            col=1,
+        )
+    
+    
     if not fundamentals_trace_added:
         fig.add_annotation(
-            x=0.5, y=0.5, xref="x3 domain", yref="y3 domain",
-            text="Quarterly revenue, OpEx, total expense, CapEx and net income data are unavailable",
-            showarrow=False, font=dict(color="gray", size=12)
+            x=0.5,
+            y=0.5,
+            xref="x3 domain",
+            yref="y3 domain",
+            text=(
+                "Quarterly revenue, total expenses, "
+                "net income, operating expenses and "
+                "CapEx data are unavailable"
+            ),
+            showarrow=False,
+            font=dict(
+                color="gray",
+                size=12,
+            ),
         )
-    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray", row=3, col=1)
+    
+    
+    fig.add_hline(
+        y=0,
+        line_width=1,
+        line_dash="dot",
+        line_color="gray",
+        row=3,
+        col=1,
+    )
 
     # Row 4: P/E
     trailing_pe = valuation_df["Trailing_PE"].dropna()
@@ -1354,11 +1582,20 @@ if check_password():
     fig.update_yaxes(title_text="Equity ($)", row=6, col=1)
     fig.update_yaxes(title_text="DD (%)", row=7, col=1)
 
-    fig.update_xaxes(
-        range=[df.index.min(), df.index.max()],
-        autorange=False,
-        rangeslider_visible=False,
-    )
+    # Apply the exact same time range to every subplot.
+    common_x_start = pd.Timestamp(df.index.min())
+    common_x_end = pd.Timestamp(df.index.max())
+    for subplot_row in range(1, 8):
+        fig.update_xaxes(
+            range=[
+                common_x_start,
+                common_x_end,
+            ],
+            autorange=False,
+            rangeslider_visible=False,
+            row=subplot_row,
+            col=1,
+        )
 
     chart_state_text = "|".join(
         [
