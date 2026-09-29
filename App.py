@@ -725,7 +725,7 @@ def load_quarterly_fundamentals(
     symbol,
     start_date_str,
     end_date_str,
-    cache_version="2026-09-29-v4",
+    cache_version="2026-09-29-v5",
 ):
     """Combine long SEC history with recent Yahoo Finance statements."""
 
@@ -754,16 +754,69 @@ def load_quarterly_fundamentals(
                 fundamentals.loc[yahoo_date] = yahoo_row
                 continue
 
-            date_distance = (fundamentals.index - yahoo_date).to_series().abs()
-            nearest_date = date_distance.idxmin()
-            nearest_distance_days = abs((nearest_date - yahoo_date).days)
-
+            # Convert the Yahoo date into a timezone-naive Timestamp.
+            yahoo_timestamp = pd.Timestamp(yahoo_date)
+            
+            if yahoo_timestamp.tzinfo is not None:
+                yahoo_timestamp = yahoo_timestamp.tz_localize(None)
+            
+            # Ensure the SEC fundamentals index contains timezone-naive timestamps.
+            fundamentals.index = pd.DatetimeIndex(
+                pd.to_datetime(
+                    fundamentals.index,
+                    errors="coerce"
+                )
+            )
+            
+            # Remove invalid dates.
+            fundamentals = fundamentals.loc[
+                ~fundamentals.index.isna()
+            ]
+            
+            if fundamentals.index.tz is not None:
+                fundamentals.index = (
+                    fundamentals.index.tz_localize(None)
+                )
+            
+            # Calculate distance from every SEC quarter date to the Yahoo date.
+            # The index of this Series must contain the actual quarter dates.
+            date_distances = pd.Series(
+                np.abs(
+                    fundamentals.index
+                    - yahoo_timestamp
+                ),
+                index=fundamentals.index
+            )
+            
+            # idxmin now returns the actual nearest Timestamp.
+            nearest_date = pd.Timestamp(
+                date_distances.idxmin()
+            )
+            
+            nearest_distance_days = abs(
+                (
+                    nearest_date
+                    - yahoo_timestamp
+                ).days
+            )
+            
+            # Match Yahoo and SEC records when their quarter-end dates
+            # differ by no more than 14 days.
             if nearest_distance_days <= 14:
                 for column in yahoo_data.columns:
-                    if pd.notna(yahoo_row.get(column)):
-                        fundamentals.loc[nearest_date, column] = yahoo_row[column]
+                    yahoo_value = yahoo_row.get(column)
+            
+                    if pd.notna(yahoo_value):
+                        fundamentals.loc[
+                            nearest_date,
+                            column
+                        ] = yahoo_value
+            
             else:
-                fundamentals.loc[yahoo_date] = yahoo_row
+                # No nearby SEC quarter exists, so add the Yahoo row.
+                fundamentals.loc[
+                    yahoo_timestamp
+                ] = yahoo_row
 
         source = "SEC Company Facts plus Yahoo Finance"
 
