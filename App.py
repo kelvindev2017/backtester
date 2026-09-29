@@ -1,5 +1,5 @@
 import hashlib
-from datetime import date
+from datetime import date, timedelta
 import json
 import os
 import re
@@ -335,106 +335,333 @@ def load_yahoo_quarterly_fundamentals(symbol):
         return pd.DataFrame()
 
 
-def sec_request_json(url):
-    """
-    Read JSON from the SEC with an identifying User-Agent.
+def get_sec_user_agent():
+    """Return an SEC-compliant identifying User-Agent."""
 
-    Set SEC_USER_AGENT in the Streamlit environment to a value
-    containing an application name and contact email.
-    """
+    try:
+        configured_value = st.secrets.get("SEC_USER_AGENT", "")
+    except Exception:
+        configured_value = ""
 
-    user_agent = os.getenv(
-        "SEC_USER_AGENT",
-        "StreamlitBacktester/1.0 contact@example.com",
+    return (
+        configured_value
+        or os.getenv("SEC_USER_AGENT", "")
+        or "StreamlitBacktester/1.0 kelvin@example.com"
     )
+
+
+def sec_request_json(url):
+    """Read JSON from an SEC endpoint with an identifying User-Agent."""
 
     request = Request(
         url,
         headers={
-            "User-Agent": user_agent,
+            "User-Agent": get_sec_user_agent(),
             "Accept": "application/json",
+            "Accept-Encoding": "identity",
         },
     )
 
-    with urlopen(
-        request,
-        timeout=30
-    ) as response:
-        response_text = response.read().decode("utf-8")
-        return json.loads(response_text)
+    with urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
-def extract_sec_quarters(company_facts, candidate_tags):
-    """Extract SEC quarterly values identified by CYyyyyQn frame labels."""
+def get_sec_cik(symbol):
+    """Resolve a US-listed ticker to its SEC CIK."""
 
-    us_gaap = company_facts.get("facts", {}).get("us-gaap", {})
-    selected_entries = []
+    ticker_map = sec_request_json(
+        "https://www.sec.gov/files/company_tickers.json"
+    )
+
+    requested_symbol = symbol.upper().replace(".", "-")
+
+    for item in ticker_map.values():
+        sec_symbol = str(item.get("ticker", "")).upper()
+        if sec_symbol == requested_symbol:
+            return int(item["cik_str"])
+
+    return None
+
+
+def get_sec_fact_entries(company_facts, candidate_tags):
+    """Return USD fact entries for the first SEC tag containing usable data."""
+
+    us_gaap_facts = company_facts.get("facts", {}).get("us-gaap", {})
 
     for tag in candidate_tags:
-        fact = us_gaap.get(tag)
-        if not fact:
-            continue
-        units = fact.get("units", {})
-        entries = units.get("USD", [])
+        fact = us_gaap_facts.get(tag, {})
+        entries = fact.get("units", {}).get("USD", [])
         if entries:
-            selected_entries = entries
-            break
+            return entries
 
-    if not selected_entries:
-        return pd.Series(dtype=float)
+    return []
+
+
+def prepare_sec_duration_entries(entries):
+    """Clean SEC duration facts and keep quarterly/annual filing observations."""
 
     records = []
-    for entry in selected_entries:
-        frame = str(entry.get("frame", ""))
-        if not re.fullmatch(r"CY\d{4}Q[1-4]", frame):
-            continue
+
+    for entry in entries:
         if entry.get("form") not in {"10-Q", "10-K", "20-F", "40-F"}:
             continue
+
+        start_date = pd.to_datetime(entry.get("start"), errors="coerce")
         end_date = pd.to_datetime(entry.get("end"), errors="coerce")
-        value = pd.to_numeric(entry.get("val"), errors="coerce")
         filed_date = pd.to_datetime(entry.get("filed"), errors="coerce")
-        if pd.isna(end_date) or pd.isna(value):
+        value = pd.to_numeric(entry.get("val"), errors="coerce")
+        fiscal_year = pd.to_numeric(entry.get("fy"), errors="coerce")
+        fiscal_period = str(entry.get("fp", "")).upper()
+
+        if (
+            pd.isna(start_date)
+            or pd.isna(end_date)
+            or pd.isna(value)
+            or pd.isna(fiscal_year)
+        ):
             continue
-        records.append((frame, end_date, value, filed_date))
+
+        duration_days = int((end_date - start_date).days) + 1
+
+        if duration_days < 60 or duration_days > 390:
+            continue
+
+        records.append(
+            {
+                "Start_Date": start_date,
+                "End_Date": end_date,
+                "Filed_Date": filed_date,
+                "Value": float(value),
+                "Fiscal_Year": int(fiscal_year),
+                "Fiscal_Period": fiscal_period,
+                "Duration_Days": duration_days,
+                "Form": entry.get("form"),
+            }
+        )
 
     if not records:
+        return pd.DataFrame()
+
+    return pd.DataFrame(records).sort_values(
+        ["Fiscal_Year", "End_Date", "Duration_Days", "Filed_Date"]
+    )
+
+
+def select_latest_shortest(group, minimum_days, maximum_days):
+    """Select the latest-filed value among the shortest matching durations."""
+
+    candidates = group.loc[
+        (group["Duration_Days"] >= minimum_days)
+        & (group["Duration_Days"] <= maximum_days)
+    ].copy()
+
+    if candidates.empty:
+        return None
+
+    shortest_duration = candidates["Duration_Days"].min()
+    candidates = candidates.loc[
+        candidates["Duration_Days"] <= shortest_duration + 7
+    ]
+    candidates = candidates.sort_values("Filed_Date")
+    return candidates.iloc[-1]
+
+
+def select_latest_longest(group, minimum_days, maximum_days):
+    """Select the latest-filed value among the longest matching durations."""
+
+    candidates = group.loc[
+        (group["Duration_Days"] >= minimum_days)
+        & (group["Duration_Days"] <= maximum_days)
+    ].copy()
+
+    if candidates.empty:
+        return None
+
+    longest_duration = candidates["Duration_Days"].max()
+    candidates = candidates.loc[
+        candidates["Duration_Days"] >= longest_duration - 7
+    ]
+    candidates = candidates.sort_values("Filed_Date")
+    return candidates.iloc[-1]
+
+
+def extract_sec_fiscal_quarters(company_facts, candidate_tags):
+    """
+    Build fiscal-quarter values from SEC duration facts.
+
+    Q1-Q3 use standalone approximately three-month facts whenever available.
+    Q4 is derived from the full fiscal-year value less Q1, Q2 and Q3. This
+    avoids relying on CYyyyyQn frame labels, which omit many fiscal quarters.
+    """
+
+    entries = get_sec_fact_entries(company_facts, candidate_tags)
+    facts = prepare_sec_duration_entries(entries)
+
+    if facts.empty:
         return pd.Series(dtype=float)
 
-    records_df = pd.DataFrame(
-        records,
-        columns=["Frame", "End_Date", "Value", "Filed_Date"],
+    quarter_records = []
+
+    for fiscal_year, fiscal_year_group in facts.groupby("Fiscal_Year"):
+        selected_quarters = {}
+
+        for quarter_name in ["Q1", "Q2", "Q3"]:
+            period_group = fiscal_year_group.loc[
+                fiscal_year_group["Fiscal_Period"] == quarter_name
+            ]
+            selected = select_latest_shortest(period_group, 60, 120)
+
+            if selected is not None:
+                selected_quarters[quarter_name] = selected
+                quarter_records.append(
+                    (
+                        selected["End_Date"],
+                        selected["Value"],
+                        fiscal_year,
+                        quarter_name,
+                    )
+                )
+
+        annual_group = fiscal_year_group.loc[
+            fiscal_year_group["Fiscal_Period"] == "FY"
+        ]
+        annual = select_latest_longest(annual_group, 300, 390)
+
+        if annual is not None and all(
+            quarter_name in selected_quarters
+            for quarter_name in ["Q1", "Q2", "Q3"]
+        ):
+            q4_value = annual["Value"] - sum(
+                selected_quarters[quarter_name]["Value"]
+                for quarter_name in ["Q1", "Q2", "Q3"]
+            )
+
+            # Accept ordinary positive/negative accounting values but reject
+            # implausibly large derivation errors caused by mixed contexts.
+            comparison_scale = max(abs(annual["Value"]), 1.0)
+            if abs(q4_value) <= comparison_scale * 1.5:
+                quarter_records.append(
+                    (annual["End_Date"], q4_value, fiscal_year, "Q4")
+                )
+
+    if not quarter_records:
+        return pd.Series(dtype=float)
+
+    quarter_df = pd.DataFrame(
+        quarter_records,
+        columns=["End_Date", "Value", "Fiscal_Year", "Fiscal_Quarter"],
     )
-    records_df = records_df.sort_values(["Frame", "Filed_Date"])
-    records_df = records_df.drop_duplicates(subset=["Frame"], keep="last")
-    series = pd.Series(
-        records_df["Value"].to_numpy(),
-        index=pd.DatetimeIndex(records_df["End_Date"]),
+    quarter_df = quarter_df.sort_values(
+        ["End_Date", "Fiscal_Year", "Fiscal_Quarter"]
+    )
+    quarter_df = quarter_df.drop_duplicates(
+        subset=["End_Date"],
+        keep="last",
+    )
+
+    return pd.Series(
+        quarter_df["Value"].to_numpy(),
+        index=pd.DatetimeIndex(quarter_df["End_Date"]),
         dtype=float,
-    )
-    return series.loc[~series.index.duplicated(keep="last")].sort_index()
+    ).sort_index()
+
+
+def extract_sec_cumulative_quarters(company_facts, candidate_tags):
+    """
+    Convert cumulative SEC cash-flow facts into individual fiscal quarters.
+
+    This is used for CapEx because 10-Q cash-flow statements commonly report
+    year-to-date values rather than standalone Q2 and Q3 amounts.
+    """
+
+    entries = get_sec_fact_entries(company_facts, candidate_tags)
+    facts = prepare_sec_duration_entries(entries)
+
+    if facts.empty:
+        return pd.Series(dtype=float)
+
+    quarter_records = []
+
+    for fiscal_year, fiscal_year_group in facts.groupby("Fiscal_Year"):
+        cumulative = {}
+
+        period_ranges = {
+            "Q1": (60, 120),
+            "Q2": (120, 220),
+            "Q3": (200, 310),
+            "FY": (300, 390),
+        }
+
+        for period_name, (minimum_days, maximum_days) in period_ranges.items():
+            period_group = fiscal_year_group.loc[
+                fiscal_year_group["Fiscal_Period"] == period_name
+            ]
+            selected = select_latest_longest(
+                period_group,
+                minimum_days,
+                maximum_days,
+            )
+            if selected is not None:
+                cumulative[period_name] = selected
+
+        if "Q1" in cumulative:
+            quarter_records.append(
+                (cumulative["Q1"]["End_Date"], cumulative["Q1"]["Value"])
+            )
+
+        if "Q2" in cumulative and "Q1" in cumulative:
+            quarter_records.append(
+                (
+                    cumulative["Q2"]["End_Date"],
+                    cumulative["Q2"]["Value"] - cumulative["Q1"]["Value"],
+                )
+            )
+
+        if "Q3" in cumulative and "Q2" in cumulative:
+            quarter_records.append(
+                (
+                    cumulative["Q3"]["End_Date"],
+                    cumulative["Q3"]["Value"] - cumulative["Q2"]["Value"],
+                )
+            )
+
+        if "FY" in cumulative and "Q3" in cumulative:
+            quarter_records.append(
+                (
+                    cumulative["FY"]["End_Date"],
+                    cumulative["FY"]["Value"] - cumulative["Q3"]["Value"],
+                )
+            )
+
+    if not quarter_records:
+        return pd.Series(dtype=float)
+
+    quarter_df = pd.DataFrame(
+        quarter_records,
+        columns=["End_Date", "Value"],
+    ).sort_values("End_Date")
+    quarter_df = quarter_df.drop_duplicates(subset=["End_Date"], keep="last")
+
+    return pd.Series(
+        quarter_df["Value"].abs().to_numpy(),
+        index=pd.DatetimeIndex(quarter_df["End_Date"]),
+        dtype=float,
+    ).sort_index()
 
 
 def load_sec_quarterly_fundamentals(symbol):
-    """Load a longer quarterly history for SEC-reporting companies."""
+    """Load extended quarterly financial history from SEC Company Facts."""
 
     try:
-        ticker_map = sec_request_json(
-            "https://www.sec.gov/files/company_tickers.json"
-        )
-        symbol_upper = symbol.upper().replace(".", "-")
-        cik = None
-        for item in ticker_map.values():
-            if str(item.get("ticker", "")).upper() == symbol_upper:
-                cik = int(item["cik_str"])
-                break
+        cik = get_sec_cik(symbol)
         if cik is None:
-            return pd.DataFrame()
+            return pd.DataFrame(), "Ticker is not mapped to an SEC CIK."
 
         company_facts = sec_request_json(
             f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
         )
 
-        revenue = extract_sec_quarters(
+        revenue = extract_sec_fiscal_quarters(
             company_facts,
             [
                 "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -442,26 +669,26 @@ def load_sec_quarterly_fundamentals(symbol):
                 "Revenues",
             ],
         )
-        operating_expense = extract_sec_quarters(
+        operating_expense = extract_sec_fiscal_quarters(
             company_facts,
             ["OperatingExpenses"],
         )
-        total_expense = extract_sec_quarters(
+        total_expense = extract_sec_fiscal_quarters(
             company_facts,
-            ["CostsAndExpenses", "CostOfRevenue"],
+            ["CostsAndExpenses"],
         )
-        operating_income = extract_sec_quarters(
+        operating_income = extract_sec_fiscal_quarters(
             company_facts,
             ["OperatingIncomeLoss"],
         )
-        capex = extract_sec_quarters(
+        capex = extract_sec_cumulative_quarters(
             company_facts,
             [
                 "PaymentsToAcquirePropertyPlantAndEquipment",
                 "PaymentsForAdditionsToPropertyPlantAndEquipment",
             ],
-        ).abs()
-        net_income = extract_sec_quarters(
+        )
+        net_income = extract_sec_fiscal_quarters(
             company_facts,
             ["NetIncomeLoss", "ProfitLoss"],
         )
@@ -469,8 +696,9 @@ def load_sec_quarterly_fundamentals(symbol):
         all_dates = revenue.index.union(operating_expense.index)
         all_dates = all_dates.union(total_expense.index).union(capex.index)
         all_dates = all_dates.union(net_income.index).sort_values()
+
         if len(all_dates) == 0:
-            return pd.DataFrame()
+            return pd.DataFrame(), "SEC returned no usable quarterly duration facts."
 
         result = pd.DataFrame(index=all_dates)
         result["Revenue"] = revenue.reindex(all_dates)
@@ -479,45 +707,65 @@ def load_sec_quarterly_fundamentals(symbol):
         result["CapEx"] = capex.reindex(all_dates)
         result["Net_Income"] = net_income.reindex(all_dates)
 
-        derived_total_expense = revenue.reindex(all_dates) - operating_income.reindex(all_dates)
+        derived_total_expense = (
+            revenue.reindex(all_dates) - operating_income.reindex(all_dates)
+        )
         result["Total_Expense"] = result["Total_Expense"].combine_first(
             derived_total_expense
         )
-        return result.dropna(how="all")
+
+        return result.dropna(how="all"), ""
 
     except Exception as error:
-        st.warning(
-            "SEC quarterly fundamentals could not be loaded: "
-            f"{type(error).__name__}: {error}"
-        )
-        return pd.DataFrame()
+        return pd.DataFrame(), f"{type(error).__name__}: {error}"
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_quarterly_fundamentals(symbol, start_date_str, end_date_str):
-    """
-    Combine SEC history with recent Yahoo Finance quarterly statements.
+def load_quarterly_fundamentals(
+    symbol,
+    start_date_str,
+    end_date_str,
+    cache_version="2026-09-29-v4",
+):
+    """Combine long SEC history with recent Yahoo Finance statements."""
 
-    SEC data normally provides the longer history for US-reporting companies.
-    Yahoo data fills recent values and remains the fallback for non-US tickers.
-    CapEx is displayed as positive spending.
-    """
+    del cache_version
 
-    sec_data = load_sec_quarterly_fundamentals(symbol)
+    sec_data, sec_error = load_sec_quarterly_fundamentals(symbol)
     yahoo_data = load_yahoo_quarterly_fundamentals(symbol)
 
     if sec_data.empty and yahoo_data.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), "No SEC or Yahoo quarterly fundamentals were returned.", "None"
+
     if sec_data.empty:
         fundamentals = yahoo_data.copy()
+        source = "Yahoo Finance only"
     elif yahoo_data.empty:
         fundamentals = sec_data.copy()
+        source = "SEC Company Facts only"
     else:
-        all_dates = sec_data.index.union(yahoo_data.index).sort_values()
-        fundamentals = sec_data.reindex(all_dates)
-        yahoo_aligned = yahoo_data.reindex(all_dates)
-        # Prefer Yahoo for matching recent dates, retain SEC for older history.
-        fundamentals = yahoo_aligned.combine_first(fundamentals)
+        # Quarter-end dates can differ by a few days between data suppliers.
+        # Keep SEC as the historical base, then use Yahoo only for dates not
+        # already represented within 14 days of an SEC fiscal quarter end.
+        fundamentals = sec_data.copy()
+
+        for yahoo_date, yahoo_row in yahoo_data.iterrows():
+            if fundamentals.empty:
+                fundamentals.loc[yahoo_date] = yahoo_row
+                continue
+
+            date_distance = (fundamentals.index - yahoo_date).to_series().abs()
+            nearest_date = date_distance.idxmin()
+            nearest_distance_days = abs((nearest_date - yahoo_date).days)
+
+            if nearest_distance_days <= 14:
+                for column in yahoo_data.columns:
+                    if pd.notna(yahoo_row.get(column)):
+                        fundamentals.loc[nearest_date, column] = yahoo_row[column]
+            else:
+                fundamentals.loc[yahoo_date] = yahoo_row
+
+        source = "SEC Company Facts plus Yahoo Finance"
 
     start_timestamp = pd.Timestamp(start_date_str).normalize()
     end_exclusive = pd.Timestamp(end_date_str).normalize() + pd.Timedelta(days=1)
@@ -526,8 +774,11 @@ def load_quarterly_fundamentals(symbol, start_date_str, end_date_str):
         & (fundamentals.index < end_exclusive)
     ]
     fundamentals = fundamentals.sort_index()
-    fundamentals = fundamentals.loc[~fundamentals.index.duplicated(keep="last")]
-    return fundamentals.dropna(how="all")
+    fundamentals = fundamentals.loc[
+        ~fundamentals.index.duplicated(keep="last")
+    ]
+
+    return fundamentals.dropna(how="all"), sec_error, source
 
 
 def choose_fundamental_scale(fundamentals_df):
@@ -761,7 +1012,11 @@ if check_password():
     with st.spinner(f"Loading {ticker} data from {start_date_str} to {end_date_str}..."):
         df = load_data(ticker, start_date_str, end_date_str, timeframe)
         earnings_history_df = load_earnings_data(ticker, earnings_lookback_start, end_date_str)
-        fundamentals_df = load_quarterly_fundamentals(ticker, start_date_str, end_date_str)
+        fundamentals_df, fundamentals_sec_error, fundamentals_source = load_quarterly_fundamentals(
+            ticker,
+            start_date_str,
+            end_date_str,
+        )
         benchmark_df = load_benchmark_data(start_date_str, end_date_str, timeframe)
 
     if df.empty:
@@ -772,6 +1027,22 @@ if check_password():
         f"Loaded {len(df):,} {timeframe.lower()} bars: "
         f"{df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d}"
     )
+
+
+    if fundamentals_df.empty:
+        st.warning(
+            "No quarterly fundamentals were available for the selected period. "
+            f"SEC diagnostic: {fundamentals_sec_error or 'No SEC error reported.'}"
+        )
+    else:
+        st.caption(
+            f"Quarterly fundamentals source: {fundamentals_source}. "
+            f"Loaded {len(fundamentals_df)} quarter-end records from "
+            f"{fundamentals_df.index.min():%Y-%m-%d} to "
+            f"{fundamentals_df.index.max():%Y-%m-%d}."
+        )
+        if fundamentals_sec_error:
+            st.caption(f"SEC fallback diagnostic: {fundamentals_sec_error}")
 
     df["Fast_MA"] = compute_ma(df["Close"], fast_type, fast_period)
     df["Slow_MA"] = compute_ma(df["Close"], slow_type, slow_period)
