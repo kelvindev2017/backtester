@@ -11,7 +11,7 @@ P/E, benchmark, equity and drawdown panels.
 
 | Step | What it does | Module |
 |---|---|---|
-| Setup (sidebar) | **Breakout**: fresh close beyond the prior N-bar high/low (default 20), volume-confirmed (default 1.5x the 50-bar average). **Pullback in trend**: 50-bar MA above a rising 200-bar MA, a dip of at least 1.5 ATR to the 20-bar EMA on light volume, then a close above the prior bar's high (mirror image for downtrends). | `analysis/patterns.py` |
+| Setup (sidebar) | **Breakout**: fresh close beyond the prior N-bar high/low (default 20), volume-confirmed (default 1.5x the 50-bar average). **Pullback in trend**: 50-bar MA above a rising 200-bar MA, a dip of at least 1.5 ATR to the 20-bar EMA on light volume, then a close above the prior bar's high (mirror image for downtrends). **Reversal**: in a long-term uptrend, buy the first close below the prior 20-bar low. | `analysis/patterns.py` |
 | Trend | Daily and weekly trend from MA position/slope, swing structure (HH/HL) and ADX. | `analysis/patterns.py` |
 | Support / resistance | Clustered swing pivots (more touches = stronger), volume-profile high-volume nodes, and the lookback high/low. | `analysis/levels.py` |
 | Volume | Up/down-day volume ratio, OBV trend and divergence, Chaikin Money Flow. | `analysis/patterns.py` |
@@ -37,6 +37,43 @@ and whether each score component actually ranks outcomes better than a random sc
 any sidebar setting across many tickers before trusting it (`analysis/validation.py`).
 
 The tool never places orders. The report is the gate before you execute.
+
+
+## What validation found (October 2026)
+
+Every number below comes from the Validate tab's walk-forward replay (signals use only data available on the
+day, trades enter at the next open, 20-bar maximum hold, R measured against the planned risk). Each signal is
+compared with five random entry days in the same stock and period that copy its stop and target distances,
+so market drift and the exit rules are netted out.
+
+Rules were fixed before testing. Results were checked on a design set (AAPL MSFT NVDA AMZN META GOOGL JPM XOM
+KO COST UNH CAT), confirmed on a holdout set of 20 other large US stocks, and in two periods (2016-21, 2022-26).
+
+**Long trades the engine would take - edge over matched random entries:**
+
+| Setup | Stocks | 2016-21 | 2022-26 |
+|---|---|---|---|
+| Breakout | design | -0.03R (t -0.3) | -0.03R (t -0.3) |
+| Breakout | holdout | -0.03R (t -0.3) | -0.26R (t -2.5) |
+| Pullback | design | -0.03R (t -0.7) | -0.02R (t -0.4) |
+| Pullback | holdout | -0.08R (t -2.7) | -0.10R (t -2.2) |
+
+* **No setup beat random entries.** Raw results look positive (pullbacks earned +0.20R per trade in
+  2016-21 on the design set), but random days with the same stops and targets did as well or better - the
+  profit came from a rising market, not from the signal timing.
+* **The confidence score and its components did not rank outcomes** consistently better than a random score.
+  The weights were therefore not re-tuned: fitting them to this data would only fit noise.
+* **Bearish signals were poor exit signals.** In all eight cells (2 setups x 2 stock sets x 2 periods) the stock
+  rose *more* in the 10 bars after a bearish signal than after an average day.
+* That pattern suggested a **reversal** rule (buy a 20-bar breakdown inside an uptrend). Tested afterwards on 20
+  fresh stocks (QCOM IBM GE AMGN GS MS BLK SBUX MCD LOW ABT TMO DHR NEE LIN UPS MMM AXP SPGI ISRG), it was **not
+  confirmed**: +0.11R (t 1.2) in 2016-21 and -0.10R (t -0.8) in 2022-26 versus random entries.
+
+**What this means:** the data, levels, sizing, reports and validation work as designed, but none of the
+built-in signal rules has a demonstrated edge on large US stocks. Use the Signal Analysis tab as a structured
+checklist and risk calculator, and require any rule you add or tune to show a positive edge versus random
+(|t| >= 2) on tickers and years you did not tune it on. Limits of this study: large US stocks only, daily bars
+(the intraday trigger cannot be replayed beyond ~60 days of Yahoo data), no commissions or slippage.
 
 ## Secrets
 

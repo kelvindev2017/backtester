@@ -213,11 +213,66 @@ def detect_pullbacks(
     return result
 
 
+def detect_reversals(df, lookback=20, mid=50, slow=200, volume_period=50, atr_period=14):
+    """Short-term reversal: buy a breakdown inside a long-term uptrend (long only).
+
+    Long-term uptrend: close above the 200-bar MA and the 50-bar MA above the
+    200-bar MA. Signal: the first close below the prior ``lookback``-bar low.
+    Large, liquid stocks tend to recover such short-term drops; the
+    validation tab tests this on the user's own tickers. The signal day's
+    low is the invalidation level. There is no bearish counterpart.
+    """
+
+    close = df["Close"]
+    prior_low = df["Low"].shift(1).rolling(lookback, min_periods=lookback).min()
+    mid_ma, slow_ma = sma(close, mid), sma(close, slow)
+    up_trend = (close > slow_ma) & (mid_ma > slow_ma)
+    below = (close < prior_low).fillna(False)
+    fresh = below & ~below.shift(1, fill_value=False)
+    atr_series = atr(df, atr_period)
+    bar_range = (df["High"] - df["Low"]).replace(0, np.nan)
+
+    result = pd.DataFrame(index=df.index)
+    result["Signal_Up"] = (fresh & up_trend).fillna(False)
+    result["Signal_Down"] = False
+    result["Trigger_Up"] = close
+    result["Trigger_Down"] = np.nan
+    result["Invalidation_Up"] = df["Low"]
+    result["Invalidation_Down"] = np.nan
+    result["Prior_Low"] = prior_low
+    result["Drop_ATR"] = (close.shift(5) - close) / atr_series
+    result["Distance_200_ATR"] = (close - slow_ma) / atr_series
+    result["RVOL"] = relative_volume(df["Volume"], volume_period)
+    result["ATR"] = atr_series
+    result["Close_Location"] = ((close - df["Low"]) / bar_range).fillna(0.5)
+    result["Volume_Confirmed"] = True
+    return result
+
+
+def reversal_quality(row, close, direction):
+    """Describe a reversal entry. Scored neutrally on purpose: validation showed
+    no reliable link between bar-level quality features and outcomes."""
+
+    details = [
+        f"Close {close:,.2f} broke below the prior 20-bar low {row['Prior_Low']:,.2f} while the long-term trend is up.",
+    ]
+    if np.isfinite(row["Drop_ATR"]):
+        details.append(f"Price fell {row['Drop_ATR']:.1f} ATR over the last 5 bars.")
+    if np.isfinite(row["Distance_200_ATR"]):
+        details.append(f"Close is still {row['Distance_200_ATR']:.1f} ATR above the 200-bar MA.")
+    if np.isfinite(row["RVOL"]):
+        details.append(f"Volume was {row['RVOL']:.1f}x its 50-bar average.")
+    details.append(f"Bar closed {row['Close_Location'] * 100:.0f}% of the way up its range.")
+    return 0.0, details, float(row["Trigger_Up"])
+
+
 def detect_signals(df, setup="breakout", lookback=20, volume_multiple=1.5, volume_period=50):
-    """Dispatch to the detector for ``setup`` ("breakout" or "pullback")."""
+    """Dispatch to the detector for ``setup`` ("breakout", "pullback" or "reversal")."""
 
     if setup == "pullback":
         return detect_pullbacks(df, volume_period=volume_period)
+    if setup == "reversal":
+        return detect_reversals(df, lookback, volume_period=volume_period)
     return detect_breakouts(df, lookback, volume_period=volume_period, volume_multiple=volume_multiple)
 
 

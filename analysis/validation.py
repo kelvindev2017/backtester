@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.engine import AnalysisSettings, analyze
-from analysis.indicators import resample_ohlcv
+from analysis.indicators import atr, resample_ohlcv
 from analysis.patterns import detect_signals
 from analysis.risk import RiskSettings
 
@@ -45,6 +45,7 @@ class ValidationSettings:
     horizons: tuple = (5, 10, 20)
     history_bars: int = 1260
     min_history_bars: int = 260
+    random_entries_per_signal: int = 5
 
 
 def simulate_trade(daily, signal_position, direction, stop, target, max_hold=20, risk_per_share=None):
@@ -163,6 +164,7 @@ def walk_forward(
 
     closes = daily["Close"].to_numpy(dtype=float)
     opens = daily["Open"].to_numpy(dtype=float)
+    atr_values = atr(daily).to_numpy(dtype=float)
     rows = []
     for count, position in enumerate(positions):
         if progress is not None:
@@ -207,6 +209,8 @@ def walk_forward(
             "Planned_RR": report.plan.reward_risk,
             "Stop": report.plan.stop,
             "Target": report.plan.target,
+            "Signal_Close": closes[position],
+            "Signal_ATR": atr_values[position],
         }
         row.update(trade)
         for horizon in validation_settings.horizons:
@@ -220,7 +224,64 @@ def walk_forward(
 
     if progress is not None:
         progress(1.0)
-    return pd.DataFrame(rows)
+    trades = pd.DataFrame(rows)
+    if not trades.empty and validation_settings.random_entries_per_signal > 0:
+        trades["Random_R"] = matched_random_r(
+            daily,
+            trades,
+            in_window,
+            validation_settings,
+            seed=sum(ord(character) for character in symbol),
+        )
+    return trades
+
+
+def matched_random_r(daily, trades, in_window, validation_settings, seed=0):
+    """Average R of random entries that copy each signal's stop and target distances.
+
+    For every replayed signal, ``random_entries_per_signal`` random days are
+    drawn from the same ticker and test window. Each gets the same stop and
+    target distance, measured in ATR, in the same direction, and is
+    simulated identically. If the signal's timing has value, its R must beat
+    this baseline - otherwise the result comes from market drift and the exit
+    structure, not from the signal.
+    """
+
+    rng = np.random.default_rng(seed)
+    closes = daily["Close"].to_numpy(dtype=float)
+    atr_values = atr(daily).to_numpy(dtype=float)
+    candidates = np.flatnonzero(in_window)
+    candidates = candidates[
+        (candidates >= validation_settings.min_history_bars)
+        & (candidates < len(daily) - 1)
+        & np.isfinite(atr_values[candidates])
+        & (atr_values[candidates] > 0)
+    ]
+    if len(candidates) == 0:
+        return pd.Series(np.nan, index=trades.index)
+
+    results = []
+    for _, trade in trades.iterrows():
+        direction = trade["Direction"]
+        signal_atr = trade["Signal_ATR"]
+        if not np.isfinite(signal_atr) or signal_atr <= 0:
+            results.append(np.nan)
+            continue
+        stop_atr = direction * (trade["Signal_Close"] - trade["Stop"]) / signal_atr
+        target_atr = direction * (trade["Target"] - trade["Signal_Close"]) / signal_atr
+        samples = []
+        for position in rng.choice(candidates, size=validation_settings.random_entries_per_signal):
+            close, atr_value = closes[position], atr_values[position]
+            stop = close - direction * stop_atr * atr_value
+            target = close + direction * target_atr * atr_value
+            simulated = simulate_trade(
+                daily, position, direction, stop, target, validation_settings.max_hold,
+                risk_per_share=stop_atr * atr_value,
+            )
+            if simulated is not None and np.isfinite(simulated["R"]):
+                samples.append(simulated["R"])
+        results.append(float(np.mean(samples)) if samples else np.nan)
+    return pd.Series(results, index=trades.index)
 
 
 def base_rates(daily, start=None, end=None, horizon=10):
@@ -251,6 +312,13 @@ def trade_stats(trades):
     std = r.std(ddof=1) if n > 1 else np.nan
     t_stat = r.mean() / (std / np.sqrt(n)) if n > 1 and std > 0 else np.nan
     reasons = trades.loc[r.index, "Exit_Reason"].str.split(" ").str[0]
+    edge, edge_t, random_average = np.nan, np.nan, np.nan
+    if "Random_R" in trades:
+        paired = (trades.loc[r.index, "R"] - trades.loc[r.index, "Random_R"]).dropna()
+        random_average = float(trades.loc[r.index, "Random_R"].mean())
+        if len(paired) > 1 and paired.std(ddof=1) > 0:
+            edge = float(paired.mean())
+            edge_t = float(paired.mean() / (paired.std(ddof=1) / np.sqrt(len(paired))))
     return {
         "Trades": n,
         "Win rate": float((r > 0).mean()),
@@ -263,6 +331,9 @@ def trade_stats(trades):
         "Stopped out": float((reasons == "stop").mean()),
         "Time exit": float((reasons == "time").mean()),
         "Avg bars held": float(trades.loc[r.index, "Bars_Held"].mean()),
+        "Random-entry avg R": random_average,
+        "Edge vs random (R)": edge,
+        "t-stat (edge)": edge_t,
     }
 
 
@@ -332,11 +403,31 @@ def threshold_table(trades, thresholds=(0, 50, 55, 60, 65, 70, 75, 80)):
 
 
 def verdict(stats):
-    """Plain-language judgement on whether the results show a real edge."""
+    """Plain-language judgement on whether the results show a real edge.
+
+    When a random-entry baseline is available, the judgement is about the
+    edge over random entries with the same stops and targets: positive R
+    that random entries also achieve is market drift, not signal skill.
+    """
 
     n = stats.get("Trades", 0)
     if n < 30:
         return "Too few trades to judge (fewer than 30). Add tickers or widen the date range."
+    edge, edge_t = stats.get("Edge vs random (R)", np.nan), stats.get("t-stat (edge)", np.nan)
+    if edge is not None and np.isfinite(edge_t):
+        average, random_average = stats.get("Average R", np.nan), stats.get("Random-entry avg R", np.nan)
+        context = (
+            f"signals averaged {average:+.2f}R per trade vs {random_average:+.2f}R for random entry days with "
+            f"the same stops and targets"
+        )
+        if edge_t >= 2:
+            return f"Positive edge: {context} - an edge of {edge:+.2f}R that is unlikely to be luck (t = {edge_t:.1f})."
+        if edge_t <= -2:
+            return f"Negative edge: {context} - the signal timing is reliably worse than random (t = {edge_t:.1f})."
+        return (
+            f"No reliable edge: {context}. The difference ({edge:+.2f}R, t = {edge_t:.1f}) is within luck; "
+            "any profit comes from market drift and the exit rules, not from the signal timing."
+        )
     t_stat = stats.get("t-stat (avg R)", np.nan)
     average = stats.get("Average R", np.nan)
     if not np.isfinite(t_stat):
@@ -351,6 +442,25 @@ def verdict(stats):
     )
 
 
+def exit_signal_stats(trades, base_forward=None, horizon=10):
+    """How the stock moved after bearish signals, i.e. the value of exiting a long on them."""
+
+    bearish = trades.loc[trades["Direction"] < 0]
+    column = f"Fwd_{horizon}"
+    if bearish.empty or column not in bearish:
+        return {}
+    stock_move = -bearish[column].dropna()  # Fwd is oriented to the short side.
+    result = {
+        "Bearish signals": int(len(stock_move)),
+        f"Stock {horizon}-bar return after signal": float(stock_move.mean()),
+        "Share of signals followed by a rise": float((stock_move > 0).mean()),
+    }
+    if base_forward is not None and len(base_forward):
+        result[f"Any-day {horizon}-bar return"] = float(base_forward.mean())
+        result["Exit helped vs holding"] = bool(stock_move.mean() < base_forward.mean())
+    return result
+
+
 def summarize(trades):
     """Bundle every summary table used by the app."""
 
@@ -361,6 +471,7 @@ def summarize(trades):
     trades["Year"] = pd.to_datetime(trades["Signal_Date"]).dt.year
     taken = trades.loc[trades["Taken"]]
     return {
+        "exits": exit_signal_stats(trades),
         "all": trade_stats(trades),
         "taken": trade_stats(taken),
         "by_action": grouped_stats(trades, "Action"),

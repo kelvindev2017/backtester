@@ -17,7 +17,7 @@ from analysis.indicators import resample_ohlcv
 from analysis.notify import send_webhook, short_summary
 from analysis.risk import RiskSettings
 from analysis.scoring import COMPONENT_WEIGHTS
-from analysis.validation import ValidationSettings, base_rates, summarize, verdict, walk_forward
+from analysis.validation import ValidationSettings, base_rates, exit_signal_stats, summarize, verdict, walk_forward
 
 
 # ============================================================
@@ -1365,6 +1365,12 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
     fundamentals_start = (end_timestamp - pd.DateOffset(years=7)).strftime("%Y-%m-%d")
     is_live = end_timestamp >= pd.Timestamp(date.today()) - pd.Timedelta(days=5)
 
+    st.info(
+        "**Validation note:** replayed on 52 large US stocks over 2016-2026, the breakout, pullback and reversal "
+        "setups did not beat random entry days with the same stops and targets, and the confidence score did not "
+        "rank trades better than chance. Treat signals as a structured checklist, and use the **Validate** tab on "
+        "your own tickers before acting on them."
+    )
     st.caption(
         "Daily/weekly breakout and trend analysis with volume confirmation, a 5-min/15-min entry "
         "trigger, fundamental confirmation and risk-based sizing. The analysis date is the end of the "
@@ -1600,9 +1606,9 @@ def format_stats_table(frame):
     for column in formatted.columns:
         if column in percent_columns:
             formatted[column] = formatted[column].map(lambda v: "" if pd.isna(v) else f"{v * 100:.1f}%")
-        elif column in ("Average R", "Median R"):
+        elif column in ("Average R", "Median R", "Random-entry avg R", "Edge vs random (R)"):
             formatted[column] = formatted[column].map(lambda v: "" if pd.isna(v) else f"{v:+.2f}R")
-        elif column in ("t-stat (avg R)", "Profit factor", "Avg bars held", "Rank correlation with R", "95% noise band"):
+        elif column in ("t-stat (avg R)", "t-stat (edge)", "Profit factor", "Avg bars held", "Rank correlation with R", "95% noise band"):
             formatted[column] = formatted[column].map(lambda v: "" if pd.isna(v) else f"{v:.2f}")
     for column in formatted.columns:
         if formatted[column].dtype.name == "category" or column == "Confidence bucket":
@@ -1698,9 +1704,18 @@ def render_validation(signal_settings, risk_settings, default_end):
     if taken_stats.get("Trades", 0):
         metric_columns[2].metric("Win rate", f"{taken_stats['Win rate'] * 100:.1f}%")
         metric_columns[3].metric("Average R", f"{taken_stats['Average R']:+.2f}R")
-        metric_columns[4].metric("t-stat", f"{taken_stats['t-stat (avg R)']:.2f}")
-        profit_factor = taken_stats["Profit factor"]
-        metric_columns[5].metric("Profit factor", "n/a" if pd.isna(profit_factor) else f"{profit_factor:.2f}")
+        random_average = taken_stats.get("Random-entry avg R", np.nan)
+        metric_columns[4].metric("Random entries", "n/a" if pd.isna(random_average) else f"{random_average:+.2f}R")
+        edge, edge_t = taken_stats.get("Edge vs random (R)", np.nan), taken_stats.get("t-stat (edge)", np.nan)
+        metric_columns[5].metric(
+            "Edge vs random" if pd.isna(edge_t) else f"Edge vs random (t = {edge_t:.1f})",
+            "n/a" if pd.isna(edge) else f"{edge:+.2f}R",
+        )
+    st.caption(
+        "**Random entries** copy each signal's stop and target distances (in ATR) onto random days of the same "
+        "ticker and period. Positive R that random entries also earn comes from market drift and the exit rules - "
+        "only the **edge vs random** shows whether the signal's timing adds value (|t| >= 2 to trust it)."
+    )
 
     base = result["base"]
     if not base.empty:
@@ -1712,14 +1727,18 @@ def render_validation(signal_settings, risk_settings, default_end):
 
     # Cumulative R: what following every taken signal (1R risk each) would have produced.
     curve = go.Figure()
-    for label, subset, color in [
-        ("Trades taken", trades.loc[trades["Taken"]], "seagreen"),
-        ("All signals (incl. WATCH / NO TRADE)", trades, "gray"),
+    taken_trades = trades.loc[trades["Taken"]].dropna(subset=["R"]).sort_values("Exit_Date")
+    for label, column, subset, color, dash in [
+        ("Trades taken", "R", taken_trades, "seagreen", "solid"),
+        ("Random entries, same stops/targets", "Random_R", taken_trades, "darkorange", "dot"),
+        ("All signals (incl. WATCH / NO TRADE / EXIT)", "R", trades.dropna(subset=["R"]).sort_values("Exit_Date"), "gray", "solid"),
     ]:
-        ordered = subset.dropna(subset=["R"]).sort_values("Exit_Date")
-        if not ordered.empty:
+        if column in subset and not subset.empty:
             curve.add_trace(
-                go.Scatter(x=ordered["Exit_Date"], y=ordered["R"].cumsum(), name=label, mode="lines", line=dict(color=color, width=2))
+                go.Scatter(
+                    x=subset["Exit_Date"], y=subset[column].fillna(0).cumsum(), name=label, mode="lines",
+                    line=dict(color=color, width=2, dash=dash),
+                )
             )
     curve.add_hline(y=0, line_dash="dot", line_color="gray")
     curve.update_layout(
@@ -1727,6 +1746,20 @@ def render_validation(signal_settings, risk_settings, default_end):
         yaxis_title="Cumulative R", hovermode="x unified",
     )
     st.plotly_chart(curve, width="stretch", config={"displaylogo": False})
+
+    exits = exit_signal_stats(trades, base_forward=base)
+    if exits:
+        move = exits["Stock 10-bar return after signal"]
+        any_day = exits.get("Any-day 10-bar return", np.nan)
+        helped = exits.get("Exit helped vs holding")
+        st.subheader("Were the bearish (EXIT) signals worth acting on?")
+        (st.success if helped else st.warning)(
+            f"After {exits['Bearish signals']:,} bearish signals the stock moved {move * 100:+.2f}% over the next "
+            f"10 bars (rose {exits['Share of signals followed by a rise'] * 100:.0f}% of the time), versus "
+            f"{any_day * 100:+.2f}% after any day. "
+            + ("Exiting on them avoided below-average returns." if helped else
+               "Exiting on them gave up above-average returns - treat EXIT signals with caution.")
+        )
 
     st.subheader("Does the confidence score mean anything?")
     st.caption(
@@ -1811,7 +1844,11 @@ if check_password():
     with st.sidebar.expander("Signal Analysis & Risk", expanded=False):
         setup_label = st.selectbox(
             "Signal setup",
-            ["Breakout (20-bar high/low on volume)", "Pullback in trend (dip to 20 EMA, then reversal)"],
+            [
+                "Breakout (20-bar high/low on volume)",
+                "Pullback in trend (dip to 20 EMA, then reversal)",
+                "Reversal (buy a 20-bar breakdown in an uptrend)",
+            ],
             index=0,
         )
         allow_short = st.checkbox("Allow short trades (otherwise bearish signals mean exit)", value=False)
@@ -1825,7 +1862,7 @@ if check_password():
         opening_range_minutes = st.selectbox("Intraday opening range (minutes)", [15, 30, 60], index=1)
 
     signal_settings = AnalysisSettings(
-        setup="pullback" if setup_label.startswith("Pullback") else "breakout",
+        setup=setup_label.split(" ")[0].lower(),
         allow_short=allow_short,
         breakout_lookback=breakout_lookback,
         volume_multiple=float(volume_multiple),

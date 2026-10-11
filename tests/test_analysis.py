@@ -382,3 +382,43 @@ def test_r_uses_planned_risk_when_given():
     trade = simulate_trade(bars, 0, 1, stop=97.0, target=110.0, max_hold=5, risk_per_share=3.0)
     assert trade["Exit_Reason"] == "stop"
     assert trade["R"] == pytest.approx(-1.5 / 3.0)
+
+
+def test_matched_random_baseline_is_attached_and_deterministic(breakout_daily):
+    daily = pd.concat([breakout_daily, make_bars(np.linspace(107.5, 115, 25), index=pd.bdate_range(
+        breakout_daily.index[-1] + pd.offsets.BDay(), periods=25), seed=9)])
+    first = walk_forward("TEST", daily)
+    second = walk_forward("TEST", daily)
+    assert "Random_R" in first and first["Random_R"].notna().all()
+    pd.testing.assert_series_equal(first["Random_R"], second["Random_R"])
+    stats = trade_stats(first)
+    assert np.isfinite(stats["Random-entry avg R"])
+
+
+def test_verdict_judges_edge_over_random_not_raw_r():
+    drift_only = {"Trades": 200, "Average R": 0.20, "t-stat (avg R)": 4.0,
+                  "Random-entry avg R": 0.22, "Edge vs random (R)": -0.02, "t-stat (edge)": -0.3}
+    assert verdict(drift_only).startswith("No reliable edge")
+    real = dict(drift_only, **{"Edge vs random (R)": 0.25, "t-stat (edge)": 3.1})
+    assert verdict(real).startswith("Positive edge")
+
+
+def test_exit_signal_stats_reports_stock_move():
+    from analysis.validation import exit_signal_stats
+    trades = pd.DataFrame({"Direction": [-1, -1, 1], "Fwd_10": [-0.02, 0.01, 0.05]})
+    stats = exit_signal_stats(trades, base_forward=pd.Series([0.001, 0.002]))
+    assert stats["Bearish signals"] == 2
+    assert stats["Stock 10-bar return after signal"] == pytest.approx(0.005)
+    assert stats["Exit helped vs holding"] is False
+
+
+def test_reversal_detector_buys_breakdown_only_in_uptrend():
+    from analysis.patterns import detect_reversals
+    rng = np.random.default_rng(1)
+    up = make_bars(np.concatenate([np.linspace(50, 120, 300) + rng.normal(0, 0.6, 300), [112.0]]), seed=5)
+    signals = detect_reversals(up)
+    assert bool(signals["Signal_Up"].iloc[-1]) and not signals["Signal_Down"].any()
+    down = make_bars(np.concatenate([np.linspace(120, 50, 300) + rng.normal(0, 0.6, 300), [44.0]]), seed=5)
+    assert not detect_reversals(down)["Signal_Up"].iloc[-1]
+    report = analyze("RV", up, to_weekly(up), settings=AnalysisSettings(setup="reversal"))
+    assert report.direction == 1 and report.plan.stop < up["Low"].iloc[-1]

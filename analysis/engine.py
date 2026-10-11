@@ -33,6 +33,7 @@ from analysis.patterns import (
     historical_signal_stats,
     latest_active_signal,
     pullback_quality,
+    reversal_quality,
 )
 from analysis.risk import RiskSettings, plan_trade
 from analysis.scoring import COMPONENT_WEIGHTS, ComponentResult, combine_confidence
@@ -82,6 +83,7 @@ class SignalReport:
 SETUP_NAMES = {
     "breakout": ("breakout above", "breakdown below"),
     "pullback": ("pullback entry above", "bounce-failure entry below"),
+    "reversal": ("reversal buy after breakdown at", "-"),
 }
 
 
@@ -146,7 +148,13 @@ def analyze(
 
     if signal is None:
         last = signals.iloc[-1]
-        if settings.setup == "pullback":
+        if settings.setup == "reversal":
+            report.headline = (
+                f"No reversal buy in the last {settings.signal_window} bars. A BUY needs a long-term uptrend "
+                f"(close above the 200-bar MA, 50-bar MA above it) and a daily close below the prior "
+                f"{settings.breakout_lookback}-bar low (currently {last['Prior_Low']:,.2f})."
+            )
+        elif settings.setup == "pullback":
             report.headline = (
                 f"No pullback entry in the last {settings.signal_window} bars. A BUY needs an uptrend (50-bar MA above "
                 "a rising 200-bar MA), a dip of at least 1.5 ATR toward the 20-bar EMA, then a close above the prior "
@@ -179,7 +187,14 @@ def analyze(
     components = []
 
     # 1. Signal quality --------------------------------------------------
-    if settings.setup == "pullback":
+    if settings.setup == "reversal":
+        quality, quality_details, trigger = reversal_quality(signal_row, signal_close, direction)
+        signal_text = (
+            f"Daily breakdown inside an uptrend on {signal['date']:%Y-%m-%d} ({signal['bars_ago']} bar(s) ago): "
+            f"a short-term reversal buy, invalidated below {signal['invalidation']:,.2f}."
+        )
+        quality_metrics = {"Drop over 5 bars (ATR)": float(signal_row["Drop_ATR"]), "RVOL": float(signal_row["RVOL"])}
+    elif settings.setup == "pullback":
         quality, quality_details, trigger = pullback_quality(signal_row, signal_close, direction)
         signal_text = (
             f"Daily {setup_phrase} {signal['trigger']:,.2f} on {signal['date']:%Y-%m-%d} "
@@ -298,8 +313,8 @@ def analyze(
         entry = float(daily["Close"].iloc[-1])
         entry_basis = "last daily close (indicative - final entry comes from the intraday trigger)"
 
-    if settings.setup == "pullback":
-        # The pullback extreme is the level that invalidates the setup.
+    if settings.setup in ("pullback", "reversal"):
+        # The pullback / signal-bar extreme is the level that invalidates the setup.
         invalidation = signal["invalidation"]
         broken_level = PriceZone(
             low=invalidation if direction > 0 else invalidation - 0.25 * atr_value,
