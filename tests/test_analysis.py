@@ -261,3 +261,19 @@ def test_period_high_becomes_resistance_even_with_one_touch():
     bars = make_bars(closes, seed=11)
     _, resistances = support_resistance(bars, atr_value=1.5, min_touches=2)
     assert any(zone.source == "period_high" or zone.high >= bars["High"].max() - 1.5 for zone in resistances)
+
+
+def test_ordinal_wording():
+    from analysis.fundamentals import ordinal
+    assert [ordinal(n) for n in (1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 100)] == [
+        "1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "23rd", "100th"]
+
+
+def test_unconfirmed_breakout_is_watch_with_no_live_size(breakout_daily):
+    weak = breakout_daily.copy()
+    weak.iloc[-1, weak.columns.get_loc("Volume")] = 1.0e6  # breakout on ordinary volume
+    report = analyze("WEAK", weak, to_weekly(weak))
+    assert report.action == "WATCH"
+    assert report.plan.shares == 0 and report.plan.dollar_risk == 0
+    assert "half size" not in report.headline and "full size" not in report.headline
+    assert any("Size once the signal is confirmed" in note for note in report.plan.notes)

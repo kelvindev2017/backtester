@@ -299,6 +299,14 @@ def analyze(
         report.action = f"{word} SETUP"
 
     size_text = {1.0: "full size", 0.5: "half size", 0.0: "no position"}.get(plan.size_multiplier, "")
+    if report.action in ("WATCH", "NO TRADE") and plan.shares > 0:
+        # Not actionable yet: keep the levels, but do not present a live position size.
+        plan.notes.append(
+            f"Size once the signal is confirmed: {plan.shares:,} shares ({size_text}), "
+            f"${plan.dollar_risk:,.0f} at risk."
+        )
+        plan.shares, plan.position_value, plan.dollar_risk = 0, 0.0, 0.0
+        size_text = "no position until confirmed" if report.action == "WATCH" else "no position"
     report.headline = (
         f"{report.action}: {symbol} {('breakout above' if direction > 0 else 'breakdown below')} {trigger:,.2f} "
         f"- confidence {confidence:.0f}/100 ({size_text})."

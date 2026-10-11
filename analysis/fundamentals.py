@@ -37,6 +37,14 @@ def value_as_of(series, timestamp):
     return float(clean.iloc[-1]) if not clean.empty else np.nan
 
 
+def ordinal(number):
+    """1 -> '1st', 3 -> '3rd', 12 -> '12th'."""
+
+    number = int(number)
+    suffix = "th" if 10 <= number % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+    return f"{number}{suffix}"
+
+
 def _finite(value):
     try:
         return value is not None and np.isfinite(float(value))
@@ -81,6 +89,10 @@ def ttm_margin_change(fundamentals_df, as_of):
 def assess_fundamentals(as_of, valuation_df, fundamentals_df=None, snapshot=None, rerating_bars=126):
     """Return ``(score, details, metrics)`` for the stock as of ``as_of``.
 
+    ``fundamentals_df`` must be indexed by the date each quarter became public
+    (its earnings announcement), not the fiscal quarter end, or a historical
+    analysis would see results before they were released.
+
     ``snapshot`` holds point-in-time fields from Yahoo (forward P/E, PEG ...).
     Pass ``None`` when analysing a historical date, because those fields
     describe *today* and would leak future information.
@@ -110,7 +122,7 @@ def assess_fundamentals(as_of, valuation_df, fundamentals_df=None, snapshot=None
             metrics["P/E percentile vs own history"] = percentile
             scored.append((clamp((0.5 - percentile) * 2.0), 0.20))
             details.append(
-                f"Trailing P/E {trailing_pe:.1f}x sits at the {percentile * 100:.0f}th percentile of its "
+                f"Trailing P/E {trailing_pe:.1f}x sits at the {ordinal(round(percentile * 100))} percentile of its "
                 f"{history.index.min():%Y}-{history.index.max():%Y} range (median {history.median():.1f}x)."
             )
 

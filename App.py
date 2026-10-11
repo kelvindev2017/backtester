@@ -1199,6 +1199,26 @@ def load_fundamental_snapshot(symbol):
     return {key: info.get(key) for key in keys if info.get(key) is not None}
 
 
+def fundamentals_by_release_date(fundamentals_df, earnings_df, fallback_lag_days=45):
+    """Re-index quarterly fundamentals by the date they became public.
+
+    Quarters are matched to their earnings announcement; a quarter with no
+    matching announcement is assumed public ``fallback_lag_days`` after its
+    fiscal quarter end. This keeps historical analysis free of look-ahead.
+    """
+
+    if fundamentals_df is None or fundamentals_df.empty:
+        return pd.DataFrame()
+    aligned = align_fundamentals_to_earnings_dates(fundamentals_df, earnings_df, maximum_days=120)
+    unmatched = aligned.index == pd.DatetimeIndex(aligned["Fiscal_Quarter_End"])
+    release_dates = aligned.index.where(
+        ~unmatched, aligned.index + pd.Timedelta(days=fallback_lag_days)
+    )
+    aligned.index = pd.DatetimeIndex(release_dates)
+    aligned = aligned.drop(columns=["Fiscal_Quarter_End"]).sort_index()
+    return aligned.loc[~aligned.index.duplicated(keep="last")]
+
+
 def drop_in_progress_daily_bar(daily):
     """Exclude today's daily bar while the US session is still open."""
 
@@ -1370,7 +1390,8 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
     if dropped_today:
         st.caption("Today's daily bar is still forming and was excluded - daily signals use completed bars only.")
 
-    valuation_df, _ = build_valuation_data(daily, earnings)
+    valuation_df, earnings_calculated = build_valuation_data(daily, earnings)
+    fundamentals = fundamentals_by_release_date(fundamentals, earnings_calculated)
     report = analyze(
         ticker,
         daily,
@@ -1450,7 +1471,9 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
         st.subheader("Confidence breakdown")
         st.caption(
             "Each component scores from -1 (argues against the trade) to +1 (supports it). "
-            "Confidence = 50 + 50 x weighted average; unavailable components are left out and the weights re-normalised."
+            "Confidence = 50 + 50 x weighted average; unavailable components are left out and the weights re-normalised. "
+            "The weights are a starting point and have not been validated against outcomes yet - treat the score as a "
+            "structured checklist, not a probability."
         )
         for component in report.components:
             weight = COMPONENT_WEIGHTS.get(component.name, 0) * 100
