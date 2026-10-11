@@ -374,3 +374,11 @@ def test_long_only_bearish_signal_is_exit_without_short():
     assert report.plan.shares == 0
     short = analyze("DN", bars, to_weekly(bars), settings=AnalysisSettings(allow_short=True))
     assert not short.action.startswith("EXIT")
+
+
+def test_r_uses_planned_risk_when_given():
+    bars = _bars([[100, 100, 100, 100], [98.5, 99, 97, 98], [98, 99, 97, 98]])
+    # Planned at the 100 close with a 97 stop (3 risk); next open gaps to 98.5, then the stop is hit.
+    trade = simulate_trade(bars, 0, 1, stop=97.0, target=110.0, max_hold=5, risk_per_share=3.0)
+    assert trade["Exit_Reason"] == "stop"
+    assert trade["R"] == pytest.approx(-1.5 / 3.0)

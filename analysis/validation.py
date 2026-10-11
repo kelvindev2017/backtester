@@ -47,8 +47,14 @@ class ValidationSettings:
     min_history_bars: int = 260
 
 
-def simulate_trade(daily, signal_position, direction, stop, target, max_hold=20):
+def simulate_trade(daily, signal_position, direction, stop, target, max_hold=20, risk_per_share=None):
     """Simulate one trade entered at the open after ``signal_position``.
+
+    ``risk_per_share`` is the planned risk the position was sized on (signal
+    close to stop). R is measured against it, because the order is sized
+    before the next open; a gap toward the stop then shows up as a smaller
+    loss or larger gain in R instead of shrinking the denominator. Without
+    it, the risk from the actual entry is used.
 
     Returns a dict, or None when there is no next bar to enter on.
     """
@@ -97,10 +103,13 @@ def simulate_trade(daily, signal_position, direction, stop, target, max_hold=20)
         complete = last_position - entry_position + 1 >= max_hold
         exit_reason = "time" if complete else "open (data ends)"
 
-    risk = direction * (entry - stop)
-    if not np.isfinite(risk) or risk <= 0:
-        # Price opened beyond the stop: the trade is stopped at the entry bar.
-        risk = abs(entry - stop) or np.nan
+    if risk_per_share is not None and np.isfinite(risk_per_share) and risk_per_share > 0:
+        risk = risk_per_share
+    else:
+        risk = direction * (entry - stop)
+        if not np.isfinite(risk) or risk <= 0:
+            # Price opened beyond the stop: the trade is stopped at the entry bar.
+            risk = abs(entry - stop) or np.nan
     pnl = direction * (exit_price - entry)
     return {
         "Entry_Date": daily.index[entry_position],
@@ -176,7 +185,15 @@ def walk_forward(
             continue
 
         direction = report.direction
-        trade = simulate_trade(daily, position, direction, report.plan.stop, report.plan.target, validation_settings.max_hold)
+        trade = simulate_trade(
+            daily,
+            position,
+            direction,
+            report.plan.stop,
+            report.plan.target,
+            validation_settings.max_hold,
+            risk_per_share=report.plan.risk_per_share,
+        )
         if trade is None:
             continue
 

@@ -373,12 +373,17 @@ def sec_request_json(url):
         return json.loads(response.read().decode("utf-8"))
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_sec_ticker_map():
+    """SEC ticker-to-CIK map (about 1 MB), downloaded once a day."""
+
+    return sec_request_json("https://www.sec.gov/files/company_tickers.json")
+
+
 def get_sec_cik(symbol):
     """Resolve a US-listed ticker to its SEC CIK."""
 
-    ticker_map = sec_request_json(
-        "https://www.sec.gov/files/company_tickers.json"
-    )
+    ticker_map = load_sec_ticker_map()
 
     requested_symbol = symbol.upper().replace(".", "-")
 
@@ -1264,7 +1269,7 @@ def build_signal_chart(daily, report, bars_to_show=180):
                 continue
             fig.add_hrect(
                 y0=zone.low, y1=zone.high, fillcolor=color, opacity=0.12, line_width=0,
-                annotation_text=f"{label}: {zone.describe()}", annotation_position="top left",
+                annotation_text=f"{label} {zone.low:,.2f}-{zone.high:,.2f}", annotation_position="top left",
                 annotation_font_size=10, row=1, col=1,
             )
 
@@ -1405,7 +1410,7 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
     # Headline -------------------------------------------------------------
     if report.action in ("BUY", "SELL"):
         st.success(f"**{report.headline}**")
-    elif report.action.endswith("SETUP") or report.action == "WATCH":
+    elif report.action.endswith("SETUP") or report.action in ("WATCH", "EXIT"):
         st.warning(f"**{report.headline}**")
     elif report.action == "NO TRADE":
         st.error(f"**{report.headline}**")
@@ -1423,7 +1428,12 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
             column.metric(f"{timeframe} trend", "n/a")
     if report.plan is not None:
         metric_columns[3].metric("Reward / risk", f"{report.plan.reward_risk:.2f}")
-        metric_columns[4].metric("Shares", f"{report.plan.shares:,}", f"{report.plan.size_multiplier:g}x size", delta_color="off")
+        metric_columns[4].metric(
+            "Shares",
+            f"{report.plan.shares:,}",
+            f"{report.plan.size_multiplier:g}x size" if report.plan.shares > 0 else None,
+            delta_color="off",
+        )
         metric_columns[5].metric("Dollar risk", f"${report.plan.dollar_risk:,.0f}")
 
     for warning in report.warnings:
@@ -1434,27 +1444,37 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
     if report.plan is not None:
         plan = report.plan
         plan_column, reasons_column = st.columns([1, 1.3])
+        exit_only = plan.direction < 0 and not signal_settings.allow_short
         with plan_column:
-            st.subheader("Trade plan")
-            st.table(
-                pd.DataFrame(
-                    {
-                        "Value": [
-                            plan.side, f"{plan.entry:,.2f}", f"{plan.stop:,.2f}", f"{plan.target:,.2f}",
-                            f"{plan.risk_per_share:,.2f}", f"{plan.reward_risk:.2f}", f"{plan.shares:,}",
-                            f"${plan.position_value:,.0f}", f"${plan.dollar_risk:,.0f}",
-                        ],
-                        "Basis": [
-                            "", plan.notes[0] if plan.notes else "", plan.stop_basis, plan.target_basis,
-                            "", "", f"{risk_settings.risk_pct:g}% risk x {plan.size_multiplier:g} (confidence tier)",
-                            f"cap {risk_settings.max_position_pct:g}% of equity", "",
-                        ],
-                    },
-                    index=["Side", "Entry", "Stop", "Target", "Risk / share", "Reward / risk", "Shares", "Position value", "Dollar risk"],
-                )
+            st.subheader("Exit guidance" if exit_only else "Trade plan")
+        if exit_only:
+            invalidation = report.signal["invalidation"] if report.signal else plan.stop
+            plan_column.info(
+                f"Bearish signal in long-only mode: no new position. If you hold {ticker}, consider closing or "
+                f"reducing it, or raise its stop to about {plan.stop:,.2f}. The signal is invalidated if price "
+                f"closes back above {invalidation:,.2f}. The next support zone is near {plan.target:,.2f}."
             )
-            for note in plan.notes[1:]:
-                st.caption(note)
+        else:
+            with plan_column:
+                st.table(
+                    pd.DataFrame(
+                        {
+                            "Value": [
+                                plan.side, f"{plan.entry:,.2f}", f"{plan.stop:,.2f}", f"{plan.target:,.2f}",
+                                f"{plan.risk_per_share:,.2f}", f"{plan.reward_risk:.2f}", f"{plan.shares:,}",
+                                f"${plan.position_value:,.0f}", f"${plan.dollar_risk:,.0f}",
+                            ],
+                            "Basis": [
+                                "", plan.notes[0] if plan.notes else "", plan.stop_basis, plan.target_basis,
+                                "", "", f"{risk_settings.risk_pct:g}% risk x {plan.size_multiplier:g} (confidence tier)",
+                                f"cap {risk_settings.max_position_pct:g}% of equity", "",
+                            ],
+                        },
+                        index=["Side", "Entry", "Stop", "Target", "Risk / share", "Reward / risk", "Shares", "Position value", "Dollar risk"],
+                    )
+                )
+                for note in plan.notes[1:]:
+                    st.caption(note)
         with reasons_column:
             st.subheader("Reasoning")
             st.markdown("**Supporting evidence**")
