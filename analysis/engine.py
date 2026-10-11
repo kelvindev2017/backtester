@@ -28,9 +28,11 @@ from analysis.patterns import (
     assess_volume,
     breakout_quality,
     detect_breakouts,
+    detect_signals,
     historical_edge_score,
     historical_signal_stats,
     latest_active_signal,
+    pullback_quality,
 )
 from analysis.risk import RiskSettings, plan_trade
 from analysis.scoring import COMPONENT_WEIGHTS, ComponentResult, combine_confidence
@@ -38,6 +40,8 @@ from analysis.scoring import COMPONENT_WEIGHTS, ComponentResult, combine_confide
 
 @dataclass
 class AnalysisSettings:
+    setup: str = "breakout"
+    allow_short: bool = False
     breakout_lookback: int = 20
     weekly_breakout_lookback: int = 10
     volume_multiple: float = 1.5
@@ -69,14 +73,22 @@ class SignalReport:
     resistances: list = field(default_factory=list)
     history_summary: pd.DataFrame = None
     history_events: pd.DataFrame = None
-    breakouts: pd.DataFrame = None
+    signals: pd.DataFrame = None
     reasons_for: list = field(default_factory=list)
     reasons_against: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
 
 
-def _direction_word(direction):
-    return "BUY" if direction > 0 else "SELL"
+SETUP_NAMES = {
+    "breakout": ("breakout above", "breakdown below"),
+    "pullback": ("pullback entry above", "bounce-failure entry below"),
+}
+
+
+def _direction_word(direction, allow_short=True):
+    if direction > 0:
+        return "BUY"
+    return "SELL" if allow_short else "EXIT"
 
 
 def analyze(
@@ -99,7 +111,7 @@ def analyze(
         return SignalReport(symbol, None, "INSUFFICIENT DATA", headline="At least ~60 daily bars are needed.")
 
     as_of = pd.Timestamp(daily.index[-1])
-    breakouts = detect_breakouts(daily, settings.breakout_lookback, volume_multiple=settings.volume_multiple)
+    signals = detect_signals(daily, settings.setup, settings.breakout_lookback, settings.volume_multiple)
     atr_value = float(atr(daily).iloc[-1])
     supports, resistances = support_resistance(
         daily,
@@ -126,32 +138,40 @@ def analyze(
         trends=trends,
         supports=supports,
         resistances=resistances,
-        breakouts=breakouts,
+        signals=signals,
     )
 
-    signal = latest_active_signal(daily, breakouts, settings.signal_window)
+    signal = latest_active_signal(daily, signals, settings.signal_window)
     report.signal = signal
 
     if signal is None:
-        last = breakouts.iloc[-1]
-        report.headline = (
-            f"No fresh breakout in the last {settings.signal_window} bars. Watch a daily close above "
-            f"{last['Prior_High']:,.2f} (BUY trigger) or below {last['Prior_Low']:,.2f} (SELL trigger) "
-            f"on at least {settings.volume_multiple:g}x average volume."
-        )
+        last = signals.iloc[-1]
+        if settings.setup == "pullback":
+            report.headline = (
+                f"No pullback entry in the last {settings.signal_window} bars. A BUY needs an uptrend (50-bar MA above "
+                "a rising 200-bar MA), a dip of at least 1.5 ATR toward the 20-bar EMA, then a close above the prior "
+                "day's high."
+            )
+        else:
+            report.headline = (
+                f"No fresh breakout in the last {settings.signal_window} bars. Watch a daily close above "
+                f"{last['Trigger_Up']:,.2f} (BUY trigger) or below {last['Trigger_Down']:,.2f} "
+                f"({_direction_word(-1, settings.allow_short)} trigger) on at least {settings.volume_multiple:g}x average volume."
+            )
         return report
 
     direction = signal["direction"]
     report.direction = direction
-    word = _direction_word(direction)
-    signal_row = breakouts.loc[signal["date"]]
+    word = _direction_word(direction, settings.allow_short)
+    signal_row = signals.loc[signal["date"]]
     signal_close = float(daily.at[signal["date"], "Close"])
+    setup_phrase = SETUP_NAMES.get(settings.setup, SETUP_NAMES["breakout"])[0 if direction > 0 else 1]
 
     if not signal["holding"]:
         report.action = "NO TRADE"
         report.headline = (
-            f"Failed {'breakout' if direction > 0 else 'breakdown'}: the {signal['date']:%Y-%m-%d} signal through "
-            f"{signal['trigger']:,.2f} has already reversed. Failed breakouts often run the other way."
+            f"Failed signal: price is back through {signal['invalidation']:,.2f} since the "
+            f"{signal['date']:%Y-%m-%d} {setup_phrase.split(' ')[0]} - the setup is invalidated."
         )
         report.warnings.append(report.headline)
         return report
@@ -159,14 +179,30 @@ def analyze(
     components = []
 
     # 1. Signal quality --------------------------------------------------
-    quality, quality_details, trigger = breakout_quality(signal_row, signal_close, direction)
+    if settings.setup == "pullback":
+        quality, quality_details, trigger = pullback_quality(signal_row, signal_close, direction)
+        signal_text = (
+            f"Daily {setup_phrase} {signal['trigger']:,.2f} on {signal['date']:%Y-%m-%d} "
+            f"({signal['bars_ago']} bar(s) ago), invalidated below {signal['invalidation']:,.2f}."
+            if direction > 0 else
+            f"Daily {setup_phrase} {signal['trigger']:,.2f} on {signal['date']:%Y-%m-%d} "
+            f"({signal['bars_ago']} bar(s) ago), invalidated above {signal['invalidation']:,.2f}."
+        )
+        quality_metrics = {"Pullback RVOL": float(signal_row["Pullback_RVOL"])}
+    else:
+        quality, quality_details, trigger = breakout_quality(signal_row, signal_close, direction)
+        signal_text = (
+            f"Daily {settings.breakout_lookback}-bar {'breakout' if direction > 0 else 'breakdown'} on "
+            f"{signal['date']:%Y-%m-%d} ({signal['bars_ago']} bar(s) ago) through {trigger:,.2f}."
+        )
+        quality_metrics = {"RVOL": float(signal_row["RVOL"]), "Base width (ATR)": float(signal_row["Base_Width_ATR"])}
     bonus = 0.0
     tolerance = settings.level_tolerance_atr * atr_value
     known_level = zone_near([zone for zone in supports + resistances if zone.source == "pivot"], trigger, tolerance)
-    if known_level is not None:
+    if known_level is not None and settings.setup == "breakout":
         bonus += 0.15
         quality_details.append(f"The trigger coincides with a known {known_level.touches}-touch level {known_level.describe()}.")
-    if weekly_breakouts is not None:
+    if weekly_breakouts is not None and settings.setup == "breakout":
         column = "Breakout_Up" if direction > 0 else "Breakout_Down"
         if weekly_breakouts[column].iloc[-2:].any():
             bonus += 0.15
@@ -175,11 +211,8 @@ def analyze(
         ComponentResult(
             "Signal quality",
             None if quality is None else float(np.clip(quality + bonus, -1, 1)),
-            [
-                f"Daily {settings.breakout_lookback}-bar {'breakout' if direction > 0 else 'breakdown'} on "
-                f"{signal['date']:%Y-%m-%d} ({signal['bars_ago']} bar(s) ago) through {trigger:,.2f}."
-            ] + quality_details,
-            {"RVOL": float(signal_row["RVOL"]), "Base width (ATR)": float(signal_row["Base_Width_ATR"])},
+            [signal_text] + quality_details,
+            quality_metrics,
         )
     )
 
@@ -243,11 +276,11 @@ def analyze(
     )
 
     # 6. Historical edge of this signal on this ticker ---------------------
-    column = "Breakout_Up" if direction > 0 else "Breakout_Down"
-    mask = breakouts[column]
+    column = "Signal_Up" if direction > 0 else "Signal_Down"
+    mask = signals[column]
     if settings.require_volume_confirmation:
-        mask = mask & breakouts["Volume_Confirmed"]
-    past_dates = breakouts.index[mask.to_numpy()]
+        mask = mask & signals["Volume_Confirmed"].fillna(False).astype(bool)
+    past_dates = signals.index[mask.to_numpy()]
     past_dates = past_dates[past_dates < signal["date"]]
     events, summary = historical_signal_stats(daily, past_dates, direction)
     edge_score, edge_details = historical_edge_score(summary, settings.history_horizon)
@@ -265,14 +298,29 @@ def analyze(
         entry = float(daily["Close"].iloc[-1])
         entry_basis = "last daily close (indicative - final entry comes from the intraday trigger)"
 
-    broken_level = PriceZone(
-        low=trigger - 0.25 * atr_value,
-        high=trigger + 0.25 * atr_value,
-        price=trigger,
-        touches=1,
-        strength=1.0,
-        source="breakout",
-    )
+    if settings.setup == "pullback":
+        # The pullback extreme is the level that invalidates the setup.
+        invalidation = signal["invalidation"]
+        broken_level = PriceZone(
+            low=invalidation if direction > 0 else invalidation - 0.25 * atr_value,
+            high=invalidation + 0.25 * atr_value if direction > 0 else invalidation,
+            price=invalidation,
+            touches=1,
+            strength=1.0,
+            source="pullback",
+        )
+        # Stop goes beyond the invalidation level even if a nearer zone exists.
+        supports = [zone for zone in supports if zone.price < invalidation] if direction > 0 else supports
+        resistances = [zone for zone in resistances if zone.price > invalidation] if direction < 0 else resistances
+    else:
+        broken_level = PriceZone(
+            low=trigger - 0.25 * atr_value,
+            high=trigger + 0.25 * atr_value,
+            price=trigger,
+            touches=1,
+            strength=1.0,
+            source="breakout",
+        )
     if direction > 0:
         stop_zones = sorted([zone for zone in supports + [broken_level] if zone.price < entry], key=lambda z: z.price, reverse=True)
         plan = plan_trade(direction, entry, atr_value, stop_zones, resistances, risk_settings, confidence)
@@ -287,7 +335,11 @@ def analyze(
     intraday_status = intraday.status if intraday is not None else "unavailable"
     if settings.require_volume_confirmation and not volume_ok:
         report.action = "WATCH"
-        report.warnings.append("Breakout volume is below the confirmation threshold - price-only breakouts fail more often.")
+        report.warnings.append(
+            "Volume during the pullback was heavy - sellers may still be in control."
+            if settings.setup == "pullback" else
+            "Breakout volume is below the confirmation threshold - price-only breakouts fail more often."
+        )
     elif confidence is None or confidence < risk_settings.half_size_confidence:
         report.action = "NO TRADE"
     elif intraday_status == "rejected":
@@ -307,8 +359,14 @@ def analyze(
         )
         plan.shares, plan.position_value, plan.dollar_risk = 0, 0.0, 0.0
         size_text = "no position until confirmed" if report.action == "WATCH" else "no position"
+    if direction < 0 and not settings.allow_short:
+        # Long-only mode: a bearish signal means exit or avoid, never a new short.
+        if plan.shares > 0:
+            plan.notes.append("Long-only mode: no short position is opened; the levels are for reference.")
+        plan.shares, plan.position_value, plan.dollar_risk = 0, 0.0, 0.0
+        size_text = "close or reduce existing longs; no new short"
     report.headline = (
-        f"{report.action}: {symbol} {('breakout above' if direction > 0 else 'breakdown below')} {trigger:,.2f} "
+        f"{report.action}: {symbol} {setup_phrase} {trigger:,.2f} "
         f"- confidence {confidence:.0f}/100 ({size_text})."
         if confidence is not None
         else f"{report.action}: {symbol}"

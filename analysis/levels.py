@@ -33,6 +33,8 @@ class PriceZone:
             return f"{label} ({self.touches} swing touches{seen})"
         if self.source == "breakout":
             return f"{label} (broken breakout level)"
+        if self.source == "pullback":
+            return f"{label} (pullback extreme)"
         if self.source in ("period_high", "period_low"):
             kind = "high" if self.source == "period_high" else "low"
             seen = f", {self.last_seen:%Y-%m-%d}" if self.last_seen is not None else ""
@@ -57,14 +59,23 @@ def find_pivots(df, left=5, right=5):
     is_low = df["Low"].eq(rolling_low)
 
     confirmed_at = pd.Series(df.index, index=df.index).shift(-right)
-    records = []
-    for timestamp in df.index[is_high.to_numpy()]:
-        records.append((timestamp, float(df.at[timestamp, "High"]), "high", float(df.at[timestamp, "Volume"]), confirmed_at[timestamp]))
-    for timestamp in df.index[is_low.to_numpy()]:
-        records.append((timestamp, float(df.at[timestamp, "Low"]), "low", float(df.at[timestamp, "Volume"]), confirmed_at[timestamp]))
+    frames = []
+    for mask, column, kind in [(is_high, "High", "high"), (is_low, "Low", "low")]:
+        mask = mask.to_numpy()
+        frames.append(
+            pd.DataFrame(
+                {
+                    "Price": df[column].to_numpy(dtype=float)[mask],
+                    "Type": kind,
+                    "Volume": df["Volume"].to_numpy(dtype=float)[mask],
+                    "Confirmed_At": confirmed_at.to_numpy()[mask],
+                },
+                index=pd.Index(df.index[mask], name="Date"),
+            )
+        )
 
-    pivots = pd.DataFrame(records, columns=["Date", "Price", "Type", "Volume", "Confirmed_At"])
-    pivots = pivots.dropna(subset=["Confirmed_At"]).set_index("Date").sort_index()
+    pivots = pd.concat(frames)
+    pivots = pivots.dropna(subset=["Confirmed_At"]).sort_index(kind="stable")
     return pivots
 
 
@@ -74,34 +85,38 @@ def cluster_pivots(pivots, tolerance):
     if pivots is None or pivots.empty or not np.isfinite(tolerance) or tolerance <= 0:
         return []
 
-    ordered = pivots.sort_values("Price")
-    clusters, current = [], []
-    for timestamp, row in ordered.iterrows():
-        if current and row["Price"] - np.mean([item[1]["Price"] for item in current]) > tolerance:
-            clusters.append(current)
-            current = []
-        current.append((timestamp, row))
-    if current:
-        clusters.append(current)
+    ordered = pivots.sort_values("Price", kind="stable")
+    prices = ordered["Price"].to_numpy(dtype=float)
+    volumes = ordered["Volume"].to_numpy(dtype=float)
+    dates = ordered.index.to_numpy()
 
-    total_volume = float(pivots["Volume"].sum()) or 1.0
+    # Greedy clustering: start a new cluster when a price is more than
+    # ``tolerance`` above the running mean of the current cluster.
+    groups, start, running_sum = [], 0, 0.0
+    for position, price in enumerate(prices):
+        count = position - start
+        if count and price - running_sum / count > tolerance:
+            groups.append((start, position))
+            start, running_sum = position, 0.0
+        running_sum += price
+    groups.append((start, len(prices)))
+
+    total_volume = float(volumes.sum()) or 1.0
     zones = []
-    for cluster in clusters:
-        prices = np.array([row["Price"] for _, row in cluster])
-        volumes = np.array([row["Volume"] for _, row in cluster])
-        weights = volumes if volumes.sum() > 0 else None
-        touches = len(cluster)
-        last_seen = max(timestamp for timestamp, _ in cluster)
-        volume_share = float(volumes.sum()) / total_volume
+    for first, last in groups:
+        cluster_prices = prices[first:last]
+        cluster_volumes = volumes[first:last]
+        weights = cluster_volumes if cluster_volumes.sum() > 0 else None
+        touches = last - first
         zones.append(
             PriceZone(
-                low=float(prices.min()),
-                high=float(prices.max()),
-                price=float(np.average(prices, weights=weights)),
+                low=float(cluster_prices.min()),
+                high=float(cluster_prices.max()),
+                price=float(np.average(cluster_prices, weights=weights)),
                 touches=touches,
-                strength=touches + 5.0 * volume_share,
+                strength=touches + 5.0 * float(cluster_volumes.sum()) / total_volume,
                 source="pivot",
-                last_seen=pd.Timestamp(last_seen),
+                last_seen=pd.Timestamp(dates[first:last].max()),
             )
         )
     return zones

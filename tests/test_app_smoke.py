@@ -76,7 +76,7 @@ def test_app_runs_both_tabs(offline):
     app.text_input[0].input("pw").run()
     assert not app.exception, app.exception
     tab_labels = [tab.label for tab in app.tabs]
-    assert tab_labels == ["Backtest", "Signal Analysis & Trade Plan"]
+    assert tab_labels == ["Backtest", "Signal Analysis & Trade Plan", "Validate"]
     rendered = " ".join(
         [element.value for element in app.success] + [element.value for element in app.warning]
         + [element.value for element in app.info] + [element.value for element in app.error]
@@ -84,3 +84,17 @@ def test_app_runs_both_tabs(offline):
     assert "TEST" not in rendered  # sanity: ticker default is AAPL
     assert "AAPL" in rendered
     assert any("Trade plan" in element.value for element in app.subheader)
+
+
+def test_validate_tab_runs(offline):
+    app = AppTest.from_file(APP_PATH, default_timeout=300)
+    app.secrets["password"] = "pw"
+    app.run()
+    app.text_input[0].input("pw").run()
+    tickers = next(box for box in app.text_input if box.label.startswith("Tickers"))
+    tickers.input("AAA, BBB").run()
+    next(button for button in app.button if button.label == "Run validation").click().run()
+    assert not app.exception, app.exception
+    metrics = {metric.label: metric.value for metric in app.metric}
+    assert int(metrics["Signals replayed"].replace(",", "")) > 0
+    assert any("Does the confidence score mean anything?" in element.value for element in app.subheader)

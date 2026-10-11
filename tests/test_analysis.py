@@ -277,3 +277,100 @@ def test_unconfirmed_breakout_is_watch_with_no_live_size(breakout_daily):
     assert report.plan.shares == 0 and report.plan.dollar_risk == 0
     assert "half size" not in report.headline and "full size" not in report.headline
     assert any("Size once the signal is confirmed" in note for note in report.plan.notes)
+
+
+# ------------------------------------------------------------------ validation
+
+from analysis.validation import simulate_trade, summarize, trade_stats, verdict, walk_forward
+
+
+def _bars(rows, start="2024-01-01"):
+    frame = pd.DataFrame(rows, columns=["Open", "High", "Low", "Close"], index=pd.bdate_range(start, periods=len(rows)))
+    frame["Volume"] = 1e6
+    return frame
+
+
+def test_simulate_long_target_and_stop():
+    bars = _bars([[100, 101, 99, 100], [100, 103, 99.5, 102], [102, 106, 101, 105], [105, 106, 104, 105]])
+    win = simulate_trade(bars, 0, 1, stop=98.0, target=105.0, max_hold=10)
+    assert win["Exit_Reason"] == "target" and win["Exit"] == 105.0
+    assert win["R"] == pytest.approx(5 / 2)
+    loss = simulate_trade(bars, 0, 1, stop=99.6, target=110.0, max_hold=10)
+    assert loss["Exit_Reason"] == "stop" and loss["R"] == pytest.approx(-1.0)
+
+
+def test_simulate_stop_assumed_first_when_both_hit_same_bar():
+    bars = _bars([[100, 100, 100, 100], [100, 110, 90, 100]])
+    trade = simulate_trade(bars, 0, 1, stop=95.0, target=105.0, max_hold=5)
+    assert trade["Exit_Reason"] == "stop"
+
+
+def test_simulate_gap_through_stop_exits_at_open():
+    bars = _bars([[100, 100, 100, 100], [100, 101, 99, 100], [90, 91, 89, 90]])
+    trade = simulate_trade(bars, 0, 1, stop=97.0, target=110.0, max_hold=5)
+    assert trade["Exit_Reason"] == "stop (gap)" and trade["Exit"] == 90
+    assert trade["R"] == pytest.approx(-10 / 3)
+
+
+def test_simulate_short_and_time_exit():
+    bars = _bars([[100, 100, 100, 100], [100, 101, 99, 99], [99, 100, 97, 98], [98, 99, 96, 97]])
+    trade = simulate_trade(bars, 0, -1, stop=103.0, target=80.0, max_hold=3)
+    assert trade["Exit_Reason"] == "time" and trade["Exit"] == 97
+    assert trade["R"] == pytest.approx(3 / 3)
+
+
+def test_trade_stats_and_verdict():
+    trades = pd.DataFrame({"R": [1.0, -1.0, 2.0, -1.0], "Return": [0.01, -0.01, 0.02, -0.01],
+                           "Exit_Reason": ["target", "stop", "target", "stop"], "Bars_Held": [3, 2, 5, 1]})
+    stats = trade_stats(trades)
+    assert stats["Win rate"] == 0.5 and stats["Average R"] == pytest.approx(0.25)
+    assert stats["Profit factor"] == pytest.approx(1.5)
+    assert "Too few trades" in verdict(stats)
+    assert "Positive edge" in verdict({"Trades": 100, "t-stat (avg R)": 2.5, "Average R": 0.3})
+    assert "No reliable edge" in verdict({"Trades": 100, "t-stat (avg R)": 0.5, "Average R": 0.05})
+
+
+def test_walk_forward_uses_only_past_data(breakout_daily):
+    daily = pd.concat([breakout_daily, make_bars(np.linspace(107.5, 115, 25), index=pd.bdate_range(
+        breakout_daily.index[-1] + pd.offsets.BDay(), periods=25), seed=9)])
+    trades = walk_forward("TEST", daily)
+    assert not trades.empty
+    row = trades.loc[trades["Signal_Date"] == breakout_daily.index[-1]].iloc[0]
+    # The engine on the truncated history must give the same confidence as the replay.
+    direct = analyze("TEST", breakout_daily, to_weekly(breakout_daily))
+    assert row["Confidence"] == pytest.approx(direct.confidence)
+    assert row["Entry"] == daily["Open"].iloc[len(breakout_daily)]
+    summary = summarize(trades)
+    assert {"all", "taken", "by_confidence", "components", "thresholds"} <= set(summary)
+
+
+def test_pullback_detector_fires_in_uptrend_after_dip():
+    rng = np.random.default_rng(3)
+    rise = np.linspace(50, 120, 280) + rng.normal(0, 0.3, 280)
+    dip = np.linspace(120, 113, 6)
+    closes = np.concatenate([rise, dip, [116.0]])
+    volumes = np.full(len(closes), 1e6)
+    volumes[-7:-1] = 0.6e6
+    bars = make_bars(closes, volumes, seed=4)
+    bars.iloc[-1, bars.columns.get_loc("High")] = 116.3
+    from analysis.patterns import detect_pullbacks
+    signals = detect_pullbacks(bars)
+    assert bool(signals["Signal_Up"].iloc[-1])
+    assert bool(signals["Volume_Confirmed"].iloc[-1])
+    assert not signals["Signal_Down"].any()
+    report = analyze("PB", bars, to_weekly(bars), settings=AnalysisSettings(setup="pullback"))
+    assert report.direction == 1
+    assert report.plan.stop < signals["Invalidation_Up"].iloc[-1]
+
+
+def test_long_only_bearish_signal_is_exit_without_short():
+    rng = np.random.default_rng(8)
+    closes = np.concatenate([100 + rng.normal(0, 0.5, 300), [94.0]])
+    volumes = np.full(len(closes), 1e6); volumes[-1] = 3e6
+    bars = make_bars(closes, volumes, seed=2)
+    report = analyze("DN", bars, to_weekly(bars))
+    assert report.direction == -1
+    assert report.action.startswith("EXIT") or report.action in ("NO TRADE", "WATCH")
+    assert report.plan.shares == 0
+    short = analyze("DN", bars, to_weekly(bars), settings=AnalysisSettings(allow_short=True))
+    assert not short.action.startswith("EXIT")

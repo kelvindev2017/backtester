@@ -129,7 +129,134 @@ def detect_breakouts(df, lookback=20, volume_period=50, volume_multiple=1.5, atr
     bar_range = (df["High"] - df["Low"]).replace(0, np.nan)
     result["Close_Location"] = ((close - df["Low"]) / bar_range).fillna(0.5)
     result["Volume_Confirmed"] = result["RVOL"] >= volume_multiple
+    # Standard signal columns shared by every setup.
+    result["Signal_Up"] = result["Breakout_Up"]
+    result["Signal_Down"] = result["Breakout_Down"]
+    result["Trigger_Up"] = prior_high
+    result["Trigger_Down"] = prior_low
+    result["Invalidation_Up"] = prior_high
+    result["Invalidation_Down"] = prior_low
     return result
+
+
+def detect_pullbacks(
+    df,
+    fast=20,
+    mid=50,
+    slow=200,
+    swing_bars=20,
+    pullback_bars=5,
+    min_depth_atr=1.5,
+    volume_period=50,
+    atr_period=14,
+):
+    """Pullback entries in an established trend.
+
+    Long: 50-bar MA above the 200-bar MA, close above the 200-bar MA and the
+    50-bar MA rising; price has pulled back at least ``min_depth_atr`` ATR
+    from the recent ``swing_bars`` high to within 0.25 ATR of the ``fast``
+    EMA without closing more than 1 ATR under the 50-bar MA; the signal is
+    the first close above the prior bar's high, in the upper half of the bar.
+    Short is the mirror image. Only past data is used at each bar.
+    """
+
+    close, high, low = df["Close"], df["High"], df["Low"]
+    atr_series = atr(df, atr_period)
+    fast_ema = close.ewm(span=fast, adjust=False).mean()
+    mid_ma = sma(close, mid)
+    slow_ma = sma(close, slow)
+    rvol = relative_volume(df["Volume"], volume_period)
+    bar_range = (high - low).replace(0, np.nan)
+    location = ((close - low) / bar_range).fillna(0.5)
+
+    swing_high = high.shift(1).rolling(swing_bars, min_periods=swing_bars).max()
+    swing_low = low.shift(1).rolling(swing_bars, min_periods=swing_bars).min()
+    pullback_low = low.rolling(pullback_bars, min_periods=pullback_bars).min()
+    pullback_high = high.rolling(pullback_bars, min_periods=pullback_bars).max()
+    pullback_rvol = rvol.shift(1).rolling(pullback_bars - 1, min_periods=2).mean()
+    mid_rising = mid_ma > mid_ma.shift(10)
+    mid_falling = mid_ma < mid_ma.shift(10)
+
+    up_trend = (mid_ma > slow_ma) & (close > slow_ma) & mid_rising
+    down_trend = (mid_ma < slow_ma) & (close < slow_ma) & mid_falling
+    long_pullback = (
+        ((swing_high - pullback_low) >= min_depth_atr * atr_series)
+        & (pullback_low <= fast_ema + 0.25 * atr_series)
+        & (close >= mid_ma - atr_series)
+    )
+    short_pullback = (
+        ((pullback_high - swing_low) >= min_depth_atr * atr_series)
+        & (pullback_high >= fast_ema - 0.25 * atr_series)
+        & (close <= mid_ma + atr_series)
+    )
+    long_trigger = (close > high.shift(1)) & (location >= 0.5)
+    short_trigger = (close < low.shift(1)) & (location <= 0.5)
+
+    raw_up = (up_trend & long_pullback & long_trigger).fillna(False)
+    raw_down = (down_trend & short_pullback & short_trigger).fillna(False)
+
+    result = pd.DataFrame(index=df.index)
+    result["Signal_Up"] = raw_up & ~raw_up.shift(1, fill_value=False)
+    result["Signal_Down"] = raw_down & ~raw_down.shift(1, fill_value=False)
+    result["Trigger_Up"] = high.shift(1)
+    result["Trigger_Down"] = low.shift(1)
+    result["Invalidation_Up"] = pullback_low
+    result["Invalidation_Down"] = pullback_high
+    result["Depth_ATR_Up"] = (swing_high - pullback_low) / atr_series
+    result["Depth_ATR_Down"] = (pullback_high - swing_low) / atr_series
+    result["Pullback_RVOL"] = pullback_rvol
+    result["RVOL"] = rvol
+    result["ATR"] = atr_series
+    result["Close_Location"] = location
+    # For a pullback, confirmation is *light* volume while price pulled back.
+    result["Volume_Confirmed"] = pullback_rvol < 1.0
+    return result
+
+
+def detect_signals(df, setup="breakout", lookback=20, volume_multiple=1.5, volume_period=50):
+    """Dispatch to the detector for ``setup`` ("breakout" or "pullback")."""
+
+    if setup == "pullback":
+        return detect_pullbacks(df, volume_period=volume_period)
+    return detect_breakouts(df, lookback, volume_period=volume_period, volume_multiple=volume_multiple)
+
+
+def pullback_quality(row, close, direction):
+    """Score one pullback entry bar in [-1, 1] and explain it."""
+
+    details = []
+    trigger = row["Trigger_Up"] if direction > 0 else row["Trigger_Down"]
+    invalidation = row["Invalidation_Up"] if direction > 0 else row["Invalidation_Down"]
+    atr_value = row["ATR"]
+
+    depth = row["Depth_ATR_Up"] if direction > 0 else row["Depth_ATR_Down"]
+    depth_score = clamp(1.0 - abs(depth - 3.0) / 2.0) if np.isfinite(depth) else np.nan
+    if np.isfinite(depth):
+        details.append(f"Pullback depth {depth:.1f} ATR from the swing {'high' if direction > 0 else 'low'} (2-4 ATR is ideal).")
+
+    pullback_rvol = row["Pullback_RVOL"]
+    volume_score = clamp((1.0 - pullback_rvol) / 0.4) if np.isfinite(pullback_rvol) else np.nan
+    if np.isfinite(pullback_rvol):
+        details.append(
+            f"Volume during the pullback averaged {pullback_rvol:.2f}x normal "
+            + ("(light - sellers not in control)." if pullback_rvol < 1.0 else "(heavy - distribution risk).")
+            if direction > 0 else
+            f"Volume during the bounce averaged {pullback_rvol:.2f}x normal "
+            + ("(light - buyers not in control)." if pullback_rvol < 1.0 else "(heavy - accumulation risk).")
+        )
+
+    location = row["Close_Location"] if direction > 0 else 1 - row["Close_Location"]
+    location_score = clamp((location - 0.5) * 2.5)
+    details.append(f"Trigger bar closed in the {'top' if direction > 0 else 'bottom'} {(1 - location) * 100:.0f}% of its range.")
+
+    risk_score = np.nan
+    if np.isfinite(atr_value) and atr_value > 0 and np.isfinite(invalidation):
+        risk_atr = direction * (close - invalidation) / atr_value
+        risk_score = clamp(1.0 - max(0.0, risk_atr - 1.5) / 1.5)
+        details.append(f"Close is {risk_atr:.2f} ATR from the pullback {'low' if direction > 0 else 'high'} {invalidation:,.2f} (the invalidation level).")
+
+    score = weighted_score([(depth_score, 0.25), (volume_score, 0.30), (location_score, 0.20), (risk_score, 0.25)])
+    return score, details, float(trigger)
 
 
 def breakout_quality(row, close, direction):
@@ -174,29 +301,30 @@ def breakout_quality(row, close, direction):
     return score, details, float(trigger)
 
 
-def latest_active_signal(df, breakouts, window=3):
-    """Return the most recent breakout within ``window`` bars that still holds.
+def latest_active_signal(df, signals, window=3):
+    """Return the most recent signal within ``window`` bars and whether it still holds.
 
-    The dict contains ``direction``, ``date``, ``bars_ago`` and ``trigger``.
-    A breakout whose price has since moved back through the trigger is
-    reported as failed instead.
+    The dict contains ``direction``, ``date``, ``bars_ago``, ``trigger``,
+    ``invalidation`` and ``holding``. A signal whose price has since moved
+    back through its invalidation level is reported as not holding.
     """
 
-    recent = breakouts.iloc[-int(window):]
+    recent = signals.iloc[-int(window):]
     last_close = float(df["Close"].iloc[-1])
     for timestamp in reversed(recent.index):
         row = recent.loc[timestamp]
-        for direction, column, trigger_column in [(1, "Breakout_Up", "Prior_High"), (-1, "Breakout_Down", "Prior_Low")]:
-            if not row[column]:
+        for direction, suffix in [(1, "Up"), (-1, "Down")]:
+            if not row[f"Signal_{suffix}"]:
                 continue
-            trigger = float(row[trigger_column])
-            holding = direction * (last_close - trigger) > 0
+            trigger = float(row[f"Trigger_{suffix}"])
+            invalidation = float(row[f"Invalidation_{suffix}"])
             return {
                 "direction": direction,
                 "date": timestamp,
                 "bars_ago": len(df) - 1 - df.index.get_loc(timestamp),
                 "trigger": trigger,
-                "holding": holding,
+                "invalidation": invalidation,
+                "holding": direction * (last_close - invalidation) > 0,
             }
     return None
 

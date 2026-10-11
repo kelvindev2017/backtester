@@ -111,3 +111,13 @@ def clamp(value, low=-1.0, high=1.0):
     if value is None or not np.isfinite(value):
         return np.nan
     return float(min(high, max(low, value)))
+
+
+def resample_ohlcv(daily, rule="W-FRI"):
+    """Aggregate daily OHLCV bars (weekly bars ending Friday by default)."""
+
+    return (
+        daily.resample(rule)
+        .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+        .dropna(subset=["Close"])
+    )

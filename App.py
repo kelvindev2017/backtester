@@ -13,9 +13,11 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from analysis.engine import AnalysisSettings, analyze, report_to_dict, report_to_markdown
+from analysis.indicators import resample_ohlcv
 from analysis.notify import send_webhook, short_summary
 from analysis.risk import RiskSettings
 from analysis.scoring import COMPONENT_WEIGHTS
+from analysis.validation import ValidationSettings, base_rates, summarize, verdict, walk_forward
 
 
 # ============================================================
@@ -1234,11 +1236,7 @@ def drop_in_progress_daily_bar(daily):
 def resample_weekly(daily):
     """Weekly bars ending Friday."""
 
-    return (
-        daily.resample("W-FRI")
-        .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
-        .dropna(subset=["Close"])
-    )
+    return resample_ohlcv(daily, "W-FRI")
 
 
 # ============================================================
@@ -1270,13 +1268,13 @@ def build_signal_chart(daily, report, bars_to_show=180):
                 annotation_font_size=10, row=1, col=1,
             )
 
-    breakouts = report.breakouts.reindex(view.index) if report.breakouts is not None else None
-    if breakouts is not None:
+    signals = report.signals.reindex(view.index) if report.signals is not None else None
+    if signals is not None:
         for column, symbol, color, name in [
-            ("Breakout_Up", "triangle-up", "lime", "Breakout (vol. confirmed)"),
-            ("Breakout_Down", "triangle-down", "red", "Breakdown (vol. confirmed)"),
+            ("Signal_Up", "triangle-up", "lime", "Bullish signal (vol. confirmed)"),
+            ("Signal_Down", "triangle-down", "red", "Bearish signal (vol. confirmed)"),
         ]:
-            mask = breakouts[column].fillna(False).astype(bool) & breakouts["Volume_Confirmed"].fillna(False).astype(bool)
+            mask = signals[column].fillna(False).astype(bool) & signals["Volume_Confirmed"].fillna(False).astype(bool)
             points = view.loc[mask]
             if not points.empty:
                 fig.add_trace(
@@ -1536,6 +1534,210 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
 
 
 # ============================================================
+# Validation: walk-forward replay of the signal engine
+# ============================================================
+
+DEFAULT_VALIDATION_TICKERS = "AAPL, MSFT, NVDA, AMZN, META, GOOGL, JPM, XOM, KO, COST, UNH, CAT"
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def run_ticker_validation(ticker, start_str, end_str, settings_dict, risk_dict, max_hold, include_fundamentals):
+    """Walk-forward replay for one ticker. Cached, so re-runs are instant."""
+
+    data_start = (pd.Timestamp(start_str) - pd.DateOffset(years=6)).strftime("%Y-%m-%d")
+    data_end = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
+    daily = load_data(ticker, data_start, data_end, "Daily")
+    if daily.empty:
+        return pd.DataFrame(), pd.Series(dtype=float)
+    daily, _ = drop_in_progress_daily_bar(daily)
+
+    valuation_df, fundamentals_df = None, None
+    if include_fundamentals:
+        earnings = load_earnings_data(ticker, data_start, data_end)
+        valuation_df, earnings_calculated = build_valuation_data(daily, earnings)
+        fundamentals, _, _ = load_quarterly_fundamentals(ticker, data_start, data_end)
+        fundamentals_df = fundamentals_by_release_date(fundamentals, earnings_calculated)
+
+    trades = walk_forward(
+        ticker,
+        daily,
+        valuation_df,
+        fundamentals_df,
+        AnalysisSettings(**settings_dict),
+        RiskSettings(**risk_dict),
+        start_str,
+        end_str,
+        ValidationSettings(max_hold=int(max_hold)),
+    )
+    return trades, base_rates(daily, start_str, end_str, horizon=10)
+
+
+def format_stats_table(frame):
+    """Format R, percentage and count columns for display."""
+
+    formatted = frame.copy()
+    percent_columns = ["Win rate", "Average return", "Target hit", "Stopped out", "Time exit"]
+    for column in formatted.columns:
+        if column in percent_columns:
+            formatted[column] = formatted[column].map(lambda v: "" if pd.isna(v) else f"{v * 100:.1f}%")
+        elif column in ("Average R", "Median R"):
+            formatted[column] = formatted[column].map(lambda v: "" if pd.isna(v) else f"{v:+.2f}R")
+        elif column in ("t-stat (avg R)", "Profit factor", "Avg bars held", "Rank correlation with R", "95% noise band"):
+            formatted[column] = formatted[column].map(lambda v: "" if pd.isna(v) else f"{v:.2f}")
+    for column in formatted.columns:
+        if formatted[column].dtype.name == "category" or column == "Confidence bucket":
+            formatted[column] = formatted[column].astype(str)
+    return formatted
+
+
+def render_validation(signal_settings, risk_settings, default_end):
+    """Validate tab: does the engine make money, and does confidence mean anything?"""
+
+    st.caption(
+        "Replays the Signal Analysis engine on every past day the selected setup fired, using only data available "
+        "on that day, then simulates the trade plan: entry at the next open, exit at the stop or target (stop assumed "
+        "first if both are hit in one bar; gaps fill at the open) or after the maximum holding period. Results are "
+        "in R - profit divided by the amount risked. Setup, volume, risk and confidence settings come from the "
+        "sidebar. The intraday trigger cannot be replayed (Yahoo keeps ~60 days of 5-minute data), so taken trades "
+        "enter at the next open."
+    )
+
+    input_columns = st.columns([2.2, 1, 1])
+    tickers_text = input_columns[0].text_input("Tickers (comma-separated)", DEFAULT_VALIDATION_TICKERS)
+    test_start = input_columns[1].date_input(
+        "Test from", value=(pd.Timestamp(default_end) - pd.DateOffset(years=2)).date(), max_value=date.today(), key="validation_start"
+    )
+    test_end = input_columns[2].date_input("Test to", value=default_end, max_value=date.today(), key="validation_end")
+    option_columns = st.columns([1, 2])
+    max_hold = int(option_columns[0].number_input("Max holding period (bars)", min_value=3, max_value=120, value=20, step=1))
+    include_fundamentals = option_columns[1].checkbox(
+        "Include fundamentals (slower: loads SEC and earnings history for each ticker)", value=True
+    )
+
+    tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
+    settings_dict = dict(signal_settings.__dict__)
+    risk_dict = dict(risk_settings.__dict__)
+    start_str = pd.Timestamp(test_start).strftime("%Y-%m-%d")
+    end_str = pd.Timestamp(test_end).strftime("%Y-%m-%d")
+    run_key = json.dumps([tickers, start_str, end_str, settings_dict, risk_dict, max_hold, include_fundamentals], default=str)
+
+    if st.button("Run validation", type="primary", disabled=not tickers or test_start >= test_end):
+        progress = st.progress(0.0)
+        frames, bases, failed = [], [], []
+        for index, ticker in enumerate(tickers):
+            progress.progress(index / len(tickers), text=f"Replaying {ticker} ({index + 1}/{len(tickers)})...")
+            try:
+                trades, base = run_ticker_validation(
+                    ticker, start_str, end_str, settings_dict, risk_dict, max_hold, include_fundamentals
+                )
+            except Exception as error:
+                trades, base = pd.DataFrame(), pd.Series(dtype=float)
+                failed.append(f"{ticker} ({type(error).__name__})")
+            if trades.empty and base.empty:
+                failed.append(ticker)
+            if not trades.empty:
+                frames.append(trades)
+            if not base.empty:
+                bases.append(base)
+        progress.empty()
+        st.session_state["validation_result"] = {
+            "key": run_key,
+            "trades": pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(),
+            "base": pd.concat(bases) if bases else pd.Series(dtype=float),
+            "failed": failed,
+            "setup": signal_settings.setup,
+        }
+
+    result = st.session_state.get("validation_result")
+    if result is None:
+        st.info("Choose tickers and a test period, then press **Run validation**. Expect roughly 5-15 seconds per ticker.")
+        return
+    if result["key"] != run_key:
+        st.warning("The inputs or sidebar settings changed since this run - press **Run validation** to refresh.")
+    if result["failed"]:
+        st.caption(f"No data for: {', '.join(result['failed'])}")
+
+    trades = result["trades"]
+    if trades.empty:
+        st.warning("No signals fired for these tickers and dates.")
+        return
+
+    summary = summarize(trades)
+    taken_stats = summary["taken"]
+    message = verdict(taken_stats)
+    if message.startswith("Positive"):
+        st.success(f"**Trades the engine would take:** {message}")
+    elif message.startswith("Negative"):
+        st.error(f"**Trades the engine would take:** {message}")
+    else:
+        st.warning(f"**Trades the engine would take:** {message}")
+
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("Signals replayed", f"{len(trades):,}")
+    metric_columns[1].metric("Trades taken", f"{taken_stats.get('Trades', 0):,}")
+    if taken_stats.get("Trades", 0):
+        metric_columns[2].metric("Win rate", f"{taken_stats['Win rate'] * 100:.1f}%")
+        metric_columns[3].metric("Average R", f"{taken_stats['Average R']:+.2f}R")
+        metric_columns[4].metric("t-stat", f"{taken_stats['t-stat (avg R)']:.2f}")
+        profit_factor = taken_stats["Profit factor"]
+        metric_columns[5].metric("Profit factor", "n/a" if pd.isna(profit_factor) else f"{profit_factor:.2f}")
+
+    base = result["base"]
+    if not base.empty:
+        st.caption(
+            f"Benchmark - buying these tickers on *any* day in the window and holding 10 bars: "
+            f"{(base > 0).mean() * 100:.1f}% of holds were profitable, average {base.mean() * 100:+.2f}%. "
+            f"Taken trades averaged {taken_stats.get('Average return', np.nan) * 100:+.2f}% per trade."
+        )
+
+    # Cumulative R: what following every taken signal (1R risk each) would have produced.
+    curve = go.Figure()
+    for label, subset, color in [
+        ("Trades taken", trades.loc[trades["Taken"]], "seagreen"),
+        ("All signals (incl. WATCH / NO TRADE)", trades, "gray"),
+    ]:
+        ordered = subset.dropna(subset=["R"]).sort_values("Exit_Date")
+        if not ordered.empty:
+            curve.add_trace(
+                go.Scatter(x=ordered["Exit_Date"], y=ordered["R"].cumsum(), name=label, mode="lines", line=dict(color=color, width=2))
+            )
+    curve.add_hline(y=0, line_dash="dot", line_color="gray")
+    curve.update_layout(
+        height=380, margin=dict(l=20, r=20, t=40, b=20), title="Cumulative R (each trade risks 1R)",
+        yaxis_title="Cumulative R", hovermode="x unified",
+    )
+    st.plotly_chart(curve, width="stretch", config={"displaylogo": False})
+
+    st.subheader("Does the confidence score mean anything?")
+    st.caption(
+        "If confidence works, higher buckets should show a higher average R, and its rank correlation with R should "
+        "sit outside the 95% noise band (the range a random score would produce)."
+    )
+    st.dataframe(format_stats_table(summary["by_confidence"]), hide_index=True, width="stretch")
+    st.dataframe(format_stats_table(summary["components"]), hide_index=True, width="stretch")
+    with st.expander("Results if only trades at or above a confidence threshold were taken"):
+        st.dataframe(format_stats_table(summary["thresholds"]), hide_index=True, width="stretch")
+
+    for title, key in [
+        ("By action", "by_action"),
+        ("By direction (1 = bullish, -1 = bearish)", "by_direction"),
+        ("By year", "by_year"),
+        ("By ticker", "by_ticker"),
+    ]:
+        with st.expander(title):
+            st.dataframe(format_stats_table(summary[key]), hide_index=True, width="stretch")
+
+    with st.expander(f"All {len(trades):,} replayed signals"):
+        st.dataframe(trades, hide_index=True, width="stretch")
+    st.download_button(
+        "Download replayed signals (CSV)",
+        trades.to_csv(index=False),
+        file_name=f"validation_{result['setup']}_{start_str}_{end_str}.csv",
+        mime="text/csv",
+    )
+
+
+# ============================================================
 # Main application
 # ============================================================
 
@@ -1587,6 +1789,12 @@ if check_password():
 
     st.sidebar.divider()
     with st.sidebar.expander("Signal Analysis & Risk", expanded=False):
+        setup_label = st.selectbox(
+            "Signal setup",
+            ["Breakout (20-bar high/low on volume)", "Pullback in trend (dip to 20 EMA, then reversal)"],
+            index=0,
+        )
+        allow_short = st.checkbox("Allow short trades (otherwise bearish signals mean exit)", value=False)
         account_equity = st.number_input("Account equity for sizing ($)", min_value=1000.0, value=100000.0, step=5000.0)
         risk_pct = st.number_input("Risk per trade (% of equity)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
         max_position_pct = st.number_input("Max position (% of equity)", min_value=1.0, max_value=100.0, value=25.0, step=1.0)
@@ -1597,6 +1805,8 @@ if check_password():
         opening_range_minutes = st.selectbox("Intraday opening range (minutes)", [15, 30, 60], index=1)
 
     signal_settings = AnalysisSettings(
+        setup="pullback" if setup_label.startswith("Pullback") else "breakout",
+        allow_short=allow_short,
         breakout_lookback=breakout_lookback,
         volume_multiple=float(volume_multiple),
         opening_range_minutes=int(opening_range_minutes),
@@ -1643,12 +1853,15 @@ if check_password():
         st.error(f"No price data was returned for {ticker} between {start_date_str} and {end_date_str}.")
         st.stop()
 
-    tab_backtest, tab_signals = st.tabs(
-        ["Backtest", "Signal Analysis & Trade Plan"]
+    tab_backtest, tab_signals, tab_validate = st.tabs(
+        ["Backtest", "Signal Analysis & Trade Plan", "Validate"]
     )
 
     with tab_signals:
         render_signal_analysis(ticker, end_date, signal_settings, risk_settings)
+
+    with tab_validate:
+        render_validation(signal_settings, risk_settings, end_date)
 
     with tab_backtest:
         st.caption(

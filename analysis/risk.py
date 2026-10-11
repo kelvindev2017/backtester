@@ -43,7 +43,7 @@ class TradePlan:
 
     @property
     def side(self):
-        return "LONG" if self.direction > 0 else "SHORT / EXIT"
+        return "LONG" if self.direction > 0 else ("SHORT" if self.shares > 0 else "EXIT LONGS (no short)")
 
 
 def size_multiplier_for(confidence, settings):
