@@ -266,9 +266,126 @@ def reversal_quality(row, close, direction):
     return 0.0, details, float(row["Trigger_Up"])
 
 
-def detect_signals(df, setup="breakout", lookback=20, volume_multiple=1.5, volume_period=50):
-    """Dispatch to the detector for ``setup`` ("breakout", "pullback" or "reversal")."""
+# ============================================================
+# Moving-average rule (the Backtest tab's buy/sell rule)
+# ============================================================
 
+MA_RULE_SERIES = ["Close", "Fast_MA", "Slow_MA"]
+MA_RULE_OPERATORS = [">", "<", ">=", "<=", "Cross Above", "Cross Below"]
+DEFAULT_MA_RULE = {
+    "fast_type": "EMA",
+    "fast_period": 20,
+    "slow_type": "SMA",
+    "slow_period": 50,
+    "buy": ("Fast_MA", "Cross Above", "Slow_MA"),
+    "sell": ("Fast_MA", "Cross Below", "Slow_MA"),
+}
+
+
+def moving_average(series, ma_type, period):
+    """Exponential or simple moving average."""
+
+    period = int(period)
+    if ma_type == "EMA":
+        return series.ewm(span=period, adjust=False).mean()
+    return series.rolling(window=period, min_periods=period).mean()
+
+
+def rule_condition(left, operator, right):
+    """Boolean condition ``left <operator> right`` on two aligned series."""
+
+    if operator == ">":
+        condition = left > right
+    elif operator == "<":
+        condition = left < right
+    elif operator == ">=":
+        condition = left >= right
+    elif operator == "<=":
+        condition = left <= right
+    elif operator == "Cross Above":
+        condition = (left > right) & (left.shift(1) <= right.shift(1))
+    elif operator == "Cross Below":
+        condition = (left < right) & (left.shift(1) >= right.shift(1))
+    else:
+        condition = pd.Series(False, index=left.index)
+    return condition.fillna(False).astype(bool)
+
+
+def ma_rule_conditions(df, rule):
+    """Moving averages plus the buy and sell conditions of an MA rule."""
+
+    rule = {**DEFAULT_MA_RULE, **(rule or {})}
+    close = df["Close"]
+    series = {
+        "Close": close,
+        "Fast_MA": moving_average(close, rule["fast_type"], rule["fast_period"]),
+        "Slow_MA": moving_average(close, rule["slow_type"], rule["slow_period"]),
+    }
+    buy_left, buy_operator, buy_right = rule["buy"]
+    sell_left, sell_operator, sell_right = rule["sell"]
+    buy = rule_condition(series[buy_left], buy_operator, series[buy_right])
+    sell = rule_condition(series[sell_left], sell_operator, series[sell_right])
+    return series["Fast_MA"], series["Slow_MA"], buy, sell
+
+
+def describe_ma_rule(rule, side="buy"):
+    rule = {**DEFAULT_MA_RULE, **(rule or {})}
+    names = {
+        "Close": "Close",
+        "Fast_MA": f"{rule['fast_type']} {rule['fast_period']}",
+        "Slow_MA": f"{rule['slow_type']} {rule['slow_period']}",
+    }
+    left, operator, right = rule[side]
+    return f"{names[left]} {operator.lower()} {names[right]}"
+
+
+def detect_ma_rule(df, rule=None, volume_period=50, atr_period=14):
+    """Signals from a moving-average rule.
+
+    A signal is the first bar on which the buy (or sell) condition becomes
+    true, so level rules such as ``Close > Slow_MA`` fire once per episode,
+    like the other setups. The slow MA (or the signal bar's extreme, if it
+    lies beyond the MA) is the invalidation level.
+    """
+
+    close = df["Close"]
+    fast_ma, slow_ma, buy, sell = ma_rule_conditions(df, rule)
+    atr_series = atr(df, atr_period)
+    bar_range = (df["High"] - df["Low"]).replace(0, np.nan)
+
+    result = pd.DataFrame(index=df.index)
+    result["Signal_Up"] = buy & ~buy.shift(1, fill_value=False)
+    result["Signal_Down"] = sell & ~sell.shift(1, fill_value=False)
+    result["Trigger_Up"] = close
+    result["Trigger_Down"] = close
+    result["Invalidation_Up"] = np.fmin(slow_ma, df["Low"])
+    result["Invalidation_Down"] = np.fmax(slow_ma, df["High"])
+    result["Fast_MA"] = fast_ma
+    result["Slow_MA"] = slow_ma
+    result["RVOL"] = relative_volume(df["Volume"], volume_period)
+    result["ATR"] = atr_series
+    result["Close_Location"] = ((close - df["Low"]) / bar_range).fillna(0.5)
+    result["Volume_Confirmed"] = True
+    return result
+
+
+def ma_rule_quality(row, close, direction, rule=None):
+    """Describe an MA-rule entry. Scored neutrally: the rule has no quality grading."""
+
+    details = [f"Rule fired: {describe_ma_rule(rule, 'buy' if direction > 0 else 'sell')}."]
+    if np.isfinite(row["Fast_MA"]) and np.isfinite(row["Slow_MA"]):
+        details.append(f"Fast MA {row['Fast_MA']:,.2f}, slow MA {row['Slow_MA']:,.2f}, close {close:,.2f}.")
+    if np.isfinite(row["RVOL"]):
+        details.append(f"Volume was {row['RVOL']:.1f}x its 50-bar average.")
+    trigger = row["Trigger_Up"] if direction > 0 else row["Trigger_Down"]
+    return 0.0, details, float(trigger)
+
+
+def detect_signals(df, setup="breakout", lookback=20, volume_multiple=1.5, volume_period=50, ma_rule=None):
+    """Dispatch to the detector for ``setup`` ("breakout", "pullback", "reversal" or "ma_rule")."""
+
+    if setup == "ma_rule":
+        return detect_ma_rule(df, ma_rule, volume_period=volume_period)
     if setup == "pullback":
         return detect_pullbacks(df, volume_period=volume_period)
     if setup == "reversal":
