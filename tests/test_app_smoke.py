@@ -80,7 +80,7 @@ def test_app_runs_both_tabs(offline):
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)").run()
     assert not app.exception, app.exception
     tab_labels = [tab.label for tab in app.tabs]
-    assert tab_labels == ["Backtest", "Signal Analysis & Trade Plan", "Validate"]
+    assert tab_labels == ["Backtest", "Signal Analysis & Trade Plan", "Validate", "Stock Screener"]
     rendered = " ".join(
         [element.value for element in app.success] + [element.value for element in app.warning]
         + [element.value for element in app.info] + [element.value for element in app.error]
@@ -140,3 +140,22 @@ def test_setup_periods_are_editable(offline):
     next(box for box in app.number_input if box.label == "Breakdown lookback (bars)").set_value(10).run()
     assert not app.exception, app.exception
     assert any("prior 10-bar low" in element.value for element in app.caption)
+
+
+def test_screener_tab_scans_a_custom_list(offline):
+    app = AppTest.from_file(APP_PATH, default_timeout=180)
+    app.secrets["password"] = "pw"
+    app.run()
+    app.text_input[0].input("pw").run()
+    next(box for box in app.selectbox if box.label == "Stocks to scan").select("Custom list").run()
+    load = next(button for button in app.button if button.label.startswith("Load data for"))
+    load.click().run()
+    assert not app.exception, app.exception
+    headers = [element.value for element in app.header]
+    assert [h for h in headers if h[0].isdigit()] == ["1. Market", "2. Industry", "3. Stock"]
+    outcome = " ".join([element.value for element in app.success] + [element.value for element in app.error])
+    assert "Market filter" in outcome
+    assert "stocks pass" in outcome
+
+    next(radio for radio in app.radio if radio.label == "Market").set_value("HK").run()
+    assert not app.exception, app.exception
