@@ -151,7 +151,7 @@ def walk_forward(
         return pd.DataFrame()
 
     signals = detect_signals(
-        daily, settings.setup, settings.breakout_lookback, settings.volume_multiple, ma_rule=settings.ma_rule
+        daily, settings.setup, settings.breakout_lookback, settings.volume_multiple, **settings.detector_kwargs()
     )
     fired = (signals["Signal_Up"] | signals["Signal_Down"]).to_numpy()
     in_window = np.ones(len(daily), dtype=bool)

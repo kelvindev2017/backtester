@@ -57,6 +57,25 @@ class AnalysisSettings:
     intraday_volume_multiple: float = 1.2
     history_horizon: int = 10
     ma_rule: dict = None
+    pullback_ema: int = 20
+    trend_mid: int = 50
+    trend_slow: int = 200
+    swing_bars: int = 20
+    pullback_bars: int = 5
+    min_depth_atr: float = 1.5
+
+    def detector_kwargs(self):
+        """Keyword arguments for ``detect_signals`` beyond setup, lookback and volume multiple."""
+
+        return {
+            "ma_rule": self.ma_rule,
+            "pullback_ema": self.pullback_ema,
+            "trend_mid": self.trend_mid,
+            "trend_slow": self.trend_slow,
+            "swing_bars": self.swing_bars,
+            "pullback_bars": self.pullback_bars,
+            "min_depth_atr": self.min_depth_atr,
+        }
 
 
 @dataclass
@@ -118,7 +137,7 @@ def analyze(
 
     as_of = pd.Timestamp(daily.index[-1])
     signals = detect_signals(
-        daily, settings.setup, settings.breakout_lookback, settings.volume_multiple, ma_rule=settings.ma_rule
+        daily, settings.setup, settings.breakout_lookback, settings.volume_multiple, **settings.detector_kwargs()
     )
     atr_value = float(atr(daily).iloc[-1])
     supports, resistances = support_resistance(
@@ -163,13 +182,14 @@ def analyze(
         elif settings.setup == "reversal":
             report.headline = (
                 f"No reversal buy in the last {settings.signal_window} bars. A BUY needs a long-term uptrend "
-                f"(close above the 200-bar MA, 50-bar MA above it) and a daily close below the prior "
+                f"(close above the {settings.trend_slow}-bar MA, {settings.trend_mid}-bar MA above it) and a daily close below the prior "
                 f"{settings.breakout_lookback}-bar low (currently {last['Prior_Low']:,.2f})."
             )
         elif settings.setup == "pullback":
             report.headline = (
-                f"No pullback entry in the last {settings.signal_window} bars. A BUY needs an uptrend (50-bar MA above "
-                "a rising 200-bar MA), a dip of at least 1.5 ATR toward the 20-bar EMA, then a close above the prior "
+                f"No pullback entry in the last {settings.signal_window} bars. A BUY needs an uptrend ({settings.trend_mid}-bar "
+                f"MA rising and above the {settings.trend_slow}-bar MA), a dip of at least {settings.min_depth_atr:g} ATR from "
+                f"the {settings.swing_bars}-bar high toward the {settings.pullback_ema}-bar EMA, then a close above the prior "
                 "day's high."
             )
         else:
@@ -207,7 +227,9 @@ def analyze(
         )
         quality_metrics = {"RVOL": float(signal_row["RVOL"])}
     elif settings.setup == "reversal":
-        quality, quality_details, trigger = reversal_quality(signal_row, signal_close, direction)
+        quality, quality_details, trigger = reversal_quality(
+            signal_row, signal_close, direction, settings.breakout_lookback, settings.trend_slow
+        )
         signal_text = (
             f"Daily breakdown inside an uptrend on {signal['date']:%Y-%m-%d} ({signal['bars_ago']} bar(s) ago): "
             f"a short-term reversal buy, invalidated below {signal['invalidation']:,.2f}."
