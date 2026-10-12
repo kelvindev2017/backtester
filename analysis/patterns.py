@@ -249,17 +249,17 @@ def detect_reversals(df, lookback=20, mid=50, slow=200, volume_period=50, atr_pe
     return result
 
 
-def reversal_quality(row, close, direction):
+def reversal_quality(row, close, direction, lookback=20, slow=200):
     """Describe a reversal entry. Scored neutrally on purpose: validation showed
     no reliable link between bar-level quality features and outcomes."""
 
     details = [
-        f"Close {close:,.2f} broke below the prior 20-bar low {row['Prior_Low']:,.2f} while the long-term trend is up.",
+        f"Close {close:,.2f} broke below the prior {lookback}-bar low {row['Prior_Low']:,.2f} while the long-term trend is up.",
     ]
     if np.isfinite(row["Drop_ATR"]):
         details.append(f"Price fell {row['Drop_ATR']:.1f} ATR over the last 5 bars.")
     if np.isfinite(row["Distance_200_ATR"]):
-        details.append(f"Close is still {row['Distance_200_ATR']:.1f} ATR above the 200-bar MA.")
+        details.append(f"Close is still {row['Distance_200_ATR']:.1f} ATR above the {slow}-bar MA.")
     if np.isfinite(row["RVOL"]):
         details.append(f"Volume was {row['RVOL']:.1f}x its 50-bar average.")
     details.append(f"Bar closed {row['Close_Location'] * 100:.0f}% of the way up its range.")
@@ -381,15 +381,42 @@ def ma_rule_quality(row, close, direction, rule=None):
     return 0.0, details, float(trigger)
 
 
-def detect_signals(df, setup="breakout", lookback=20, volume_multiple=1.5, volume_period=50, ma_rule=None):
-    """Dispatch to the detector for ``setup`` ("breakout", "pullback", "reversal" or "ma_rule")."""
+def detect_signals(
+    df,
+    setup="breakout",
+    lookback=20,
+    volume_multiple=1.5,
+    volume_period=50,
+    ma_rule=None,
+    pullback_ema=20,
+    trend_mid=50,
+    trend_slow=200,
+    swing_bars=20,
+    pullback_bars=5,
+    min_depth_atr=1.5,
+):
+    """Dispatch to the detector for ``setup`` ("breakout", "pullback", "reversal" or "ma_rule").
+
+    ``lookback`` is the breakout range and the reversal breakdown range;
+    ``trend_mid`` / ``trend_slow`` are the trend-filter moving averages of the
+    pullback and reversal setups.
+    """
 
     if setup == "ma_rule":
         return detect_ma_rule(df, ma_rule, volume_period=volume_period)
     if setup == "pullback":
-        return detect_pullbacks(df, volume_period=volume_period)
+        return detect_pullbacks(
+            df,
+            fast=pullback_ema,
+            mid=trend_mid,
+            slow=trend_slow,
+            swing_bars=swing_bars,
+            pullback_bars=pullback_bars,
+            min_depth_atr=min_depth_atr,
+            volume_period=volume_period,
+        )
     if setup == "reversal":
-        return detect_reversals(df, lookback, volume_period=volume_period)
+        return detect_reversals(df, lookback, mid=trend_mid, slow=trend_slow, volume_period=volume_period)
     return detect_breakouts(df, lookback, volume_period=volume_period, volume_multiple=volume_multiple)
 
 

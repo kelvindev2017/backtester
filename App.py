@@ -1798,10 +1798,10 @@ if check_password():
 
     st.sidebar.subheader("Signal")
     setup_options = {
-        "Moving-average rule (set below)": "ma_rule",
-        "Breakout (20-bar high/low on volume)": "breakout",
-        "Pullback in trend (dip to 20 EMA, then reversal)": "pullback",
-        "Reversal (buy a 20-bar breakdown in an uptrend)": "reversal",
+        "Moving-average rule": "ma_rule",
+        "Breakout (new high/low on volume)": "breakout",
+        "Pullback in trend (dip to the EMA, then reversal)": "pullback",
+        "Reversal (buy a breakdown in an uptrend)": "reversal",
     }
     setup_label = st.sidebar.selectbox(
         "Signal rule",
@@ -1817,6 +1817,8 @@ if check_password():
     buy_left, buy_operator, buy_right = "Fast_MA", "Cross Above", "Slow_MA"
     sell_left, sell_operator, sell_right = "Fast_MA", "Cross Below", "Slow_MA"
     breakout_lookback, volume_multiple = 20, 1.5
+    pullback_ema, trend_mid, trend_slow = 20, 50, 200
+    swing_bars, pullback_bars, min_depth_atr = 20, 5, 1.5
 
     if setup == "ma_rule":
         ma_columns = st.sidebar.columns(2)
@@ -1843,12 +1845,36 @@ if check_password():
         with sell_col_right:
             sell_right = st.selectbox("Sell right signal", MA_RULE_SERIES, index=2, key="sell_right", label_visibility="collapsed")
     elif setup == "breakout":
-        breakout_lookback = int(st.sidebar.number_input("Breakout lookback (daily bars)", min_value=5, max_value=120, value=20, step=1))
+        breakout_lookback = int(st.sidebar.number_input("Breakout lookback (bars)", min_value=2, max_value=250, value=20, step=1))
         volume_multiple = st.sidebar.number_input("Breakout volume (x 50-bar average)", min_value=1.0, max_value=5.0, value=1.5, step=0.1)
+        st.sidebar.caption(
+            f"Buy: the first close above the prior {breakout_lookback}-bar high on at least {volume_multiple:g}x "
+            f"average volume. Sell / exit: the first close below the prior {breakout_lookback}-bar low."
+        )
     elif setup == "pullback":
-        st.sidebar.caption("Buy: 50-bar MA above a rising 200-bar MA, a dip of at least 1.5 ATR toward the 20 EMA, then a close above the prior high. Sell / exit: the mirror image in a downtrend.")
+        trend_columns = st.sidebar.columns(2)
+        trend_mid = int(trend_columns[0].number_input("Trend fast MA (bars)", min_value=5, max_value=250, value=50, step=1))
+        trend_slow = int(trend_columns[1].number_input("Trend slow MA (bars)", min_value=10, max_value=400, value=200, step=1))
+        pullback_columns = st.sidebar.columns(2)
+        pullback_ema = int(pullback_columns[0].number_input("Pullback EMA (bars)", min_value=2, max_value=100, value=20, step=1))
+        swing_bars = int(pullback_columns[1].number_input("Swing high lookback (bars)", min_value=2, max_value=120, value=20, step=1))
+        pullback_bars = int(pullback_columns[0].number_input("Pullback window (bars)", min_value=2, max_value=30, value=5, step=1))
+        min_depth_atr = float(pullback_columns[1].number_input("Min dip depth (ATR)", min_value=0.0, max_value=10.0, value=1.5, step=0.1))
+        st.sidebar.caption(
+            f"Buy: {trend_mid}-bar MA rising and above the {trend_slow}-bar MA, a dip of at least {min_depth_atr:g} ATR "
+            f"from the {swing_bars}-bar high reaching the {pullback_ema} EMA within the last {pullback_bars} bars, then a "
+            "close above the prior high. Sell / exit: the mirror image in a downtrend."
+        )
     else:
-        st.sidebar.caption("Buy: a close below the prior 20-bar low while the stock is above its 200-bar MA. There is no sell signal; trades exit at their stop or target.")
+        breakout_lookback = int(st.sidebar.number_input("Breakdown lookback (bars)", min_value=2, max_value=250, value=20, step=1))
+        trend_columns = st.sidebar.columns(2)
+        trend_mid = int(trend_columns[0].number_input("Trend fast MA (bars)", min_value=5, max_value=250, value=50, step=1))
+        trend_slow = int(trend_columns[1].number_input("Trend slow MA (bars)", min_value=10, max_value=400, value=200, step=1))
+        st.sidebar.caption(
+            f"Buy: the first close below the prior {breakout_lookback}-bar low while the close is above the "
+            f"{trend_slow}-bar MA and the {trend_mid}-bar MA is above it. There is no sell signal; trades exit at "
+            "their stop or target."
+        )
 
     allow_short = st.sidebar.checkbox("Allow short trades (otherwise sell signals mean exit)", value=False)
 
@@ -1874,6 +1900,12 @@ if check_password():
         volume_multiple=float(volume_multiple),
         opening_range_minutes=int(opening_range_minutes),
         ma_rule=ma_rule if setup == "ma_rule" else None,
+        pullback_ema=pullback_ema,
+        trend_mid=trend_mid,
+        trend_slow=trend_slow,
+        swing_bars=swing_bars,
+        pullback_bars=pullback_bars,
+        min_depth_atr=min_depth_atr,
     )
     risk_settings = RiskSettings(
         account_equity=float(account_size),
@@ -1992,7 +2024,9 @@ if check_password():
                 f"**SELL:** `{sell_left} {sell_operator} {sell_right}`"
             )
         else:
-            backtest_signals = detect_signals(df, setup, breakout_lookback, float(volume_multiple))
+            backtest_signals = detect_signals(
+                df, setup, breakout_lookback, float(volume_multiple), **signal_settings.detector_kwargs()
+            )
             buy_condition = backtest_signals["Signal_Up"].fillna(False).astype(bool)
             sell_condition = backtest_signals["Signal_Down"].fillna(False).astype(bool)
             rule_text = (

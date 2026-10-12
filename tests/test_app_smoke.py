@@ -77,7 +77,7 @@ def test_app_runs_both_tabs(offline):
     app.secrets["password"] = "pw"
     app.run()
     app.text_input[0].input("pw").run()
-    next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (20-bar high/low on volume)").run()
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)").run()
     assert not app.exception, app.exception
     tab_labels = [tab.label for tab in app.tabs]
     assert tab_labels == ["Backtest", "Signal Analysis & Trade Plan", "Validate"]
@@ -110,11 +110,33 @@ def test_one_signal_rule_drives_every_tab(offline):
     app.run()
     app.text_input[0].input("pw").run()
     rule = next(box for box in app.selectbox if box.label == "Signal rule")
-    assert rule.value.startswith("Moving-average rule")
+    assert rule.value == "Moving-average rule"
     assert any(box.label == "Fast MA Type" for box in app.selectbox)
     assert [box.label for box in app.number_input].count("Account size ($)") == 1
 
-    rule.select("Breakout (20-bar high/low on volume)").run()
+    rule.select("Breakout (new high/low on volume)").run()
     assert not app.exception, app.exception
     assert not any(box.label == "Fast MA Type" for box in app.selectbox)
-    assert any("Breakout (20-bar high/low on volume) signals" in element.value for element in app.info)
+    assert any("Breakout (new high/low on volume) signals" in element.value for element in app.info)
+
+
+def test_setup_periods_are_editable(offline):
+    app = AppTest.from_file(APP_PATH, default_timeout=120)
+    app.secrets["password"] = "pw"
+    app.run()
+    app.text_input[0].input("pw").run()
+    rule = next(box for box in app.selectbox if box.label == "Signal rule")
+    assert not any(char.isdigit() for option in rule.options for char in option)
+
+    rule.select("Pullback in trend (dip to the EMA, then reversal)").run()
+    labels = [box.label for box in app.number_input]
+    for label in ["Trend fast MA (bars)", "Trend slow MA (bars)", "Pullback EMA (bars)", "Swing high lookback (bars)",
+                  "Pullback window (bars)", "Min dip depth (ATR)"]:
+        assert label in labels
+    next(box for box in app.number_input if box.label == "Pullback EMA (bars)").set_value(12).run()
+    assert not app.exception, app.exception
+
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Reversal (buy a breakdown in an uptrend)").run()
+    next(box for box in app.number_input if box.label == "Breakdown lookback (bars)").set_value(10).run()
+    assert not app.exception, app.exception
+    assert any("prior 10-bar low" in element.value for element in app.caption)

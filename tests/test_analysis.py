@@ -467,3 +467,29 @@ def test_engine_runs_ma_rule_setup(breakout_daily):
                         settings=AnalysisSettings(setup="ma_rule", ma_rule={"buy": ("Close", ">", "Close"), "sell": ("Close", "<", "Close")}))
     assert no_signal.action == "NO SIGNAL"
     assert "moving-average rule" in no_signal.headline
+
+
+def test_setup_periods_reach_the_detectors(breakout_daily):
+    from analysis.patterns import detect_pullbacks, detect_reversals, detect_signals
+
+    settings = AnalysisSettings(setup="pullback", pullback_ema=10, trend_mid=30, trend_slow=100,
+                                swing_bars=15, pullback_bars=4, min_depth_atr=1.0)
+    via_settings = detect_signals(breakout_daily, "pullback", 20, 1.5, **settings.detector_kwargs())
+    direct = detect_pullbacks(breakout_daily, fast=10, mid=30, slow=100, swing_bars=15, pullback_bars=4, min_depth_atr=1.0)
+    pd.testing.assert_frame_equal(via_settings, direct)
+
+    via_settings = detect_signals(breakout_daily, "reversal", 12, 1.5, trend_mid=30, trend_slow=100)
+    pd.testing.assert_frame_equal(via_settings, detect_reversals(breakout_daily, 12, mid=30, slow=100))
+    assert not via_settings.equals(detect_signals(breakout_daily, "reversal", 20, 1.5))
+
+
+def test_no_signal_headlines_use_chosen_periods(breakout_daily):
+    flat = breakout_daily.copy()
+    report = analyze("TEST", flat.iloc[:200], None, settings=AnalysisSettings(
+        setup="pullback", pullback_ema=13, trend_mid=40, trend_slow=150, swing_bars=17, min_depth_atr=2.5))
+    if report.action == "NO SIGNAL":
+        assert "13-bar EMA" in report.headline and "150-bar MA" in report.headline and "2.5 ATR" in report.headline
+    report = analyze("TEST", flat.iloc[:200], None, settings=AnalysisSettings(
+        setup="reversal", breakout_lookback=9, trend_mid=40, trend_slow=150))
+    if report.action == "NO SIGNAL":
+        assert "9-bar low" in report.headline and "150-bar MA" in report.headline
