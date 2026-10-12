@@ -12,6 +12,13 @@ import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+from analysis.engine import AnalysisSettings, analyze, report_to_dict, report_to_markdown
+from analysis.indicators import resample_ohlcv
+from analysis.notify import send_webhook, short_summary
+from analysis.risk import RiskSettings
+from analysis.scoring import COMPONENT_WEIGHTS
+from analysis.validation import ValidationSettings, base_rates, exit_signal_stats, summarize, verdict, walk_forward
+
 
 # ============================================================
 # Page configuration
@@ -366,12 +373,17 @@ def sec_request_json(url):
         return json.loads(response.read().decode("utf-8"))
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_sec_ticker_map():
+    """SEC ticker-to-CIK map (about 1 MB), downloaded once a day."""
+
+    return sec_request_json("https://www.sec.gov/files/company_tickers.json")
+
+
 def get_sec_cik(symbol):
     """Resolve a US-listed ticker to its SEC CIK."""
 
-    ticker_map = sec_request_json(
-        "https://www.sec.gov/files/company_tickers.json"
-    )
+    ticker_map = load_sec_ticker_map()
 
     requested_symbol = symbol.upper().replace(".", "-")
 
@@ -1120,6 +1132,665 @@ def run_position_engine(price_df, buy_condition, sell_condition):
 
 
 # ============================================================
+# Signal analysis: data loaders
+# ============================================================
+
+def get_secret(name, default=""):
+    """Read a Streamlit secret or environment variable without raising."""
+
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    return value or os.getenv(name, default)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_intraday_data(symbol, interval="5m", period="10d"):
+    """Download regular-session intraday bars (Yahoo keeps ~60 days of 5m data).
+
+    The bar that is still forming is dropped, and timestamps are kept in the
+    exchange's local time so that 09:30 is the open for US listings.
+    """
+
+    try:
+        bars = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            prepost=False,
+            progress=False,
+            threads=False,
+        )
+        if bars is None or bars.empty:
+            return pd.DataFrame()
+
+        bars = bars.copy()
+        if isinstance(bars.columns, pd.MultiIndex):
+            final_level = bars.columns.get_level_values(-1)
+            if symbol in final_level:
+                bars = bars.xs(symbol, axis=1, level=-1)
+            else:
+                bars.columns = bars.columns.get_level_values(0)
+
+        bars.index = pd.to_datetime(bars.index)
+        if bars.index.tz is not None:
+            bar_length = pd.Timedelta(interval.replace("m", "min"))
+            now = pd.Timestamp.now(tz=bars.index.tz)
+            bars = bars.loc[bars.index + bar_length <= now]
+            bars.index = bars.index.tz_localize(None)
+
+        required_columns = ["Open", "High", "Low", "Close", "Volume"]
+        if any(column not in bars.columns for column in required_columns):
+            return pd.DataFrame()
+        bars = bars[required_columns].dropna(subset=["Close"]).sort_index()
+        return bars.loc[~bars.index.duplicated(keep="last")]
+
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_fundamental_snapshot(symbol):
+    """Current valuation fields from Yahoo (forward P/E, PEG, growth ...)."""
+
+    keys = [
+        "trailingPE", "forwardPE", "pegRatio", "trailingPegRatio", "earningsGrowth",
+        "revenueGrowth", "profitMargins", "priceToBook", "debtToEquity", "sector", "industry",
+    ]
+    try:
+        info = yf.Ticker(symbol).info or {}
+    except Exception:
+        return {}
+    return {key: info.get(key) for key in keys if info.get(key) is not None}
+
+
+def fundamentals_by_release_date(fundamentals_df, earnings_df, fallback_lag_days=45):
+    """Re-index quarterly fundamentals by the date they became public.
+
+    Quarters are matched to their earnings announcement; a quarter with no
+    matching announcement is assumed public ``fallback_lag_days`` after its
+    fiscal quarter end. This keeps historical analysis free of look-ahead.
+    """
+
+    if fundamentals_df is None or fundamentals_df.empty:
+        return pd.DataFrame()
+    aligned = align_fundamentals_to_earnings_dates(fundamentals_df, earnings_df, maximum_days=120)
+    unmatched = aligned.index == pd.DatetimeIndex(aligned["Fiscal_Quarter_End"])
+    release_dates = aligned.index.where(
+        ~unmatched, aligned.index + pd.Timedelta(days=fallback_lag_days)
+    )
+    aligned.index = pd.DatetimeIndex(release_dates)
+    aligned = aligned.drop(columns=["Fiscal_Quarter_End"]).sort_index()
+    return aligned.loc[~aligned.index.duplicated(keep="last")]
+
+
+def drop_in_progress_daily_bar(daily):
+    """Exclude today's daily bar while the US session is still open."""
+
+    if daily.empty:
+        return daily, False
+    now_new_york = pd.Timestamp.now(tz="America/New_York")
+    today = now_new_york.normalize().tz_localize(None)
+    if daily.index[-1].normalize() == today and now_new_york.hour < 16:
+        return daily.iloc[:-1], True
+    return daily, False
+
+
+def resample_weekly(daily):
+    """Weekly bars ending Friday."""
+
+    return resample_ohlcv(daily, "W-FRI")
+
+
+# ============================================================
+# Signal analysis: charts and report rendering
+# ============================================================
+
+def build_signal_chart(daily, report, bars_to_show=180):
+    """Daily candles with S/R zones, breakout markers and the trade plan."""
+
+    view = daily.iloc[-bars_to_show:]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
+    fig.add_trace(
+        go.Candlestick(
+            x=view.index, open=view["Open"], high=view["High"], low=view["Low"], close=view["Close"],
+            name="Daily", increasing_line_color="seagreen", decreasing_line_color="indianred",
+        ),
+        row=1, col=1,
+    )
+
+    visible_low = view["Low"].min() * 0.9
+    visible_high = view["High"].max() * 1.1
+    for zones, color, label in [(report.supports, "green", "Support"), (report.resistances, "red", "Resistance")]:
+        for zone in zones[:4]:
+            if zone.high < visible_low or zone.low > visible_high:
+                continue
+            fig.add_hrect(
+                y0=zone.low, y1=zone.high, fillcolor=color, opacity=0.12, line_width=0,
+                annotation_text=f"{label} {zone.low:,.2f}-{zone.high:,.2f}", annotation_position="top left",
+                annotation_font_size=10, row=1, col=1,
+            )
+
+    signals = report.signals.reindex(view.index) if report.signals is not None else None
+    if signals is not None:
+        for column, symbol, color, name in [
+            ("Signal_Up", "triangle-up", "lime", "Bullish signal (vol. confirmed)"),
+            ("Signal_Down", "triangle-down", "red", "Bearish signal (vol. confirmed)"),
+        ]:
+            mask = signals[column].fillna(False).astype(bool) & signals["Volume_Confirmed"].fillna(False).astype(bool)
+            points = view.loc[mask]
+            if not points.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=points.index, y=points["Close"], mode="markers", name=name,
+                        marker=dict(symbol=symbol, size=12, color=color, line=dict(color="black", width=1)),
+                    ),
+                    row=1, col=1,
+                )
+
+    if report.signal:
+        fig.add_hline(
+            y=report.signal["trigger"], line_dash="dot", line_color="orange",
+            annotation_text=f"Trigger {report.signal['trigger']:,.2f}", row=1, col=1,
+        )
+    if report.plan is not None:
+        for value, color, label in [
+            (report.plan.entry, "royalblue", "Entry"),
+            (report.plan.stop, "red", "Stop"),
+            (report.plan.target, "green", "Target"),
+        ]:
+            fig.add_hline(
+                y=value, line_dash="dash", line_color=color,
+                annotation_text=f"{label} {value:,.2f}", annotation_position="bottom right", row=1, col=1,
+            )
+
+    volume_colors = np.where(view["Close"] >= view["Open"], "seagreen", "indianred")
+    fig.add_trace(go.Bar(x=view.index, y=view["Volume"], name="Volume", marker_color=volume_colors, opacity=0.7), row=2, col=1)
+    average_volume = daily["Volume"].rolling(50).mean().reindex(view.index)
+    fig.add_trace(go.Scatter(x=view.index, y=average_volume, name="50-bar avg volume", line=dict(color="gray", width=1)), row=2, col=1)
+
+    fig.update_xaxes(rangeslider_visible=False, rangebreaks=[dict(bounds=["sat", "mon"])])
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    fig.update_layout(height=680, margin=dict(l=20, r=20, t=30, b=20), hovermode="x unified", showlegend=True)
+    return fig
+
+
+def build_intraday_chart(intraday, trigger_level):
+    """5-minute candles for the evaluated session with VWAP and opening range."""
+
+    session = intraday.session_bars
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=session.index, open=session["Open"], high=session["High"], low=session["Low"], close=session["Close"],
+            name="5-min", increasing_line_color="seagreen", decreasing_line_color="indianred",
+        )
+    )
+    if "VWAP" in session.columns:
+        fig.add_trace(go.Scatter(x=session.index, y=session["VWAP"], name="VWAP", line=dict(color="purple", width=1.5)))
+    for value, color, label in [
+        (intraday.opening_range_high, "gray", "OR high"),
+        (intraday.opening_range_low, "gray", "OR low"),
+        (trigger_level, "orange", "Daily trigger"),
+    ]:
+        if value is not None:
+            fig.add_hline(y=value, line_dash="dot", line_color=color, annotation_text=f"{label} {value:,.2f}")
+    if intraday.entry_time is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[intraday.entry_time], y=[intraday.entry_price], mode="markers", name="Entry trigger",
+                marker=dict(symbol="star", size=16, color="gold", line=dict(color="black", width=1)),
+            )
+        )
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_layout(height=420, margin=dict(l=20, r=20, t=30, b=20), hovermode="x unified")
+    return fig
+
+
+def format_metric_value(value):
+    if isinstance(value, (int, float, np.floating)) and np.isfinite(value):
+        return f"{value:,.3f}" if abs(value) < 10 else f"{value:,.1f}"
+    return str(value)
+
+
+def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
+    """Pattern/trend signal, intraday entry, fundamentals, sizing and report."""
+
+    end_timestamp = pd.Timestamp(end_date).normalize()
+    end_str = end_timestamp.strftime("%Y-%m-%d")
+    analysis_start = (end_timestamp - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
+    fundamentals_start = (end_timestamp - pd.DateOffset(years=7)).strftime("%Y-%m-%d")
+    is_live = end_timestamp >= pd.Timestamp(date.today()) - pd.Timedelta(days=5)
+
+    st.info(
+        "**Validation note:** replayed on 52 large US stocks over 2016-2026, the breakout, pullback and reversal "
+        "setups did not beat random entry days with the same stops and targets, and the confidence score did not "
+        "rank trades better than chance. Treat signals as a structured checklist, and use the **Validate** tab on "
+        "your own tickers before acting on them."
+    )
+    st.caption(
+        "Daily/weekly breakout and trend analysis with volume confirmation, a 5-min/15-min entry "
+        "trigger, fundamental confirmation and risk-based sizing. The analysis date is the end of the "
+        "sidebar date range; it always uses up to 5 years of daily history."
+    )
+
+    with st.spinner(f"Running signal analysis for {ticker} as of {end_str}..."):
+        daily = load_data(ticker, analysis_start, end_str, "Daily")
+        earnings = load_earnings_data(ticker, fundamentals_start, end_str)
+        fundamentals, _, fundamentals_source = load_quarterly_fundamentals(ticker, fundamentals_start, end_str)
+        snapshot = load_fundamental_snapshot(ticker) if is_live else None
+        bars_5m = load_intraday_data(ticker) if is_live else pd.DataFrame()
+
+    if daily.empty:
+        st.error(f"No daily data was returned for {ticker}.")
+        return
+
+    dropped_today = False
+    if is_live:
+        daily, dropped_today = drop_in_progress_daily_bar(daily)
+    else:
+        st.info(
+            "Historical analysis date: intraday entry and the live valuation snapshot (forward P/E, Yahoo PEG) "
+            "are skipped to avoid look-ahead bias. Fundamentals use only data reported up to that date."
+        )
+    if dropped_today:
+        st.caption("Today's daily bar is still forming and was excluded - daily signals use completed bars only.")
+
+    valuation_df, earnings_calculated = build_valuation_data(daily, earnings)
+    fundamentals = fundamentals_by_release_date(fundamentals, earnings_calculated)
+    report = analyze(
+        ticker,
+        daily,
+        resample_weekly(daily),
+        bars_5m=bars_5m,
+        valuation_df=valuation_df,
+        fundamentals_df=fundamentals,
+        snapshot=snapshot,
+        settings=signal_settings,
+        risk_settings=risk_settings,
+    )
+
+    # Headline -------------------------------------------------------------
+    if report.action in ("BUY", "SELL"):
+        st.success(f"**{report.headline}**")
+    elif report.action.endswith("SETUP") or report.action in ("WATCH", "EXIT"):
+        st.warning(f"**{report.headline}**")
+    elif report.action == "NO TRADE":
+        st.error(f"**{report.headline}**")
+    else:
+        st.info(f"**{report.headline}**")
+
+    trend_lookup = {trend.timeframe: trend for trend in report.trends}
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("Confidence", "n/a" if report.confidence is None else f"{report.confidence:.0f}/100")
+    for column, timeframe in zip(metric_columns[1:3], ["Daily", "Weekly"]):
+        trend = trend_lookup.get(timeframe)
+        if trend is not None and np.isfinite(trend.score):
+            column.metric(f"{timeframe} trend", trend.label, f"{trend.score:+.2f}", delta_color="off")
+        else:
+            column.metric(f"{timeframe} trend", "n/a")
+    if report.plan is not None:
+        metric_columns[3].metric("Reward / risk", f"{report.plan.reward_risk:.2f}")
+        metric_columns[4].metric(
+            "Shares",
+            f"{report.plan.shares:,}",
+            f"{report.plan.size_multiplier:g}x size" if report.plan.shares > 0 else None,
+            delta_color="off",
+        )
+        metric_columns[5].metric("Dollar risk", f"${report.plan.dollar_risk:,.0f}")
+
+    for warning in report.warnings:
+        if warning != report.headline:
+            st.warning(warning)
+
+    # Trade plan and reasoning ---------------------------------------------
+    if report.plan is not None:
+        plan = report.plan
+        plan_column, reasons_column = st.columns([1, 1.3])
+        exit_only = plan.direction < 0 and not signal_settings.allow_short
+        with plan_column:
+            st.subheader("Exit guidance" if exit_only else "Trade plan")
+        if exit_only:
+            invalidation = report.signal["invalidation"] if report.signal else plan.stop
+            plan_column.info(
+                f"Bearish signal in long-only mode: no new position. If you hold {ticker}, consider closing or "
+                f"reducing it, or raise its stop to about {plan.stop:,.2f}. The signal is invalidated if price "
+                f"closes back above {invalidation:,.2f}. The next support zone is near {plan.target:,.2f}."
+            )
+        else:
+            with plan_column:
+                st.table(
+                    pd.DataFrame(
+                        {
+                            "Value": [
+                                plan.side, f"{plan.entry:,.2f}", f"{plan.stop:,.2f}", f"{plan.target:,.2f}",
+                                f"{plan.risk_per_share:,.2f}", f"{plan.reward_risk:.2f}", f"{plan.shares:,}",
+                                f"${plan.position_value:,.0f}", f"${plan.dollar_risk:,.0f}",
+                            ],
+                            "Basis": [
+                                "", plan.notes[0] if plan.notes else "", plan.stop_basis, plan.target_basis,
+                                "", "", f"{risk_settings.risk_pct:g}% risk x {plan.size_multiplier:g} (confidence tier)",
+                                f"cap {risk_settings.max_position_pct:g}% of equity", "",
+                            ],
+                        },
+                        index=["Side", "Entry", "Stop", "Target", "Risk / share", "Reward / risk", "Shares", "Position value", "Dollar risk"],
+                    )
+                )
+                for note in plan.notes[1:]:
+                    st.caption(note)
+        with reasons_column:
+            st.subheader("Reasoning")
+            st.markdown("**Supporting evidence**")
+            st.markdown("\n".join(f"- {reason}" for reason in report.reasons_for) or "- None")
+            st.markdown("**Risks and conflicts**")
+            risks = report.reasons_against + [warning for warning in report.warnings if warning != report.headline]
+            st.markdown("\n".join(f"- {reason}" for reason in risks) or "- None identified")
+
+    st.plotly_chart(build_signal_chart(daily, report), width="stretch", config={"displaylogo": False})
+
+    if report.components:
+        st.subheader("Confidence breakdown")
+        st.caption(
+            "Each component scores from -1 (argues against the trade) to +1 (supports it). "
+            "Confidence = 50 + 50 x weighted average; unavailable components are left out and the weights re-normalised. "
+            "The weights are a starting point and have not been validated against outcomes yet - treat the score as a "
+            "structured checklist, not a probability."
+        )
+        for component in report.components:
+            weight = COMPONENT_WEIGHTS.get(component.name, 0) * 100
+            score_text = f"{component.score:+.2f}" if component.available else "n/a"
+            with st.expander(f"{component.name} - weight {weight:.0f}% - score {score_text}"):
+                st.markdown("\n".join(f"- {detail}" for detail in component.details))
+                if component.metrics:
+                    st.dataframe(
+                        pd.DataFrame(
+                            {"Value": [format_metric_value(value) for value in component.metrics.values()]},
+                            index=list(component.metrics.keys()),
+                        ),
+                        width="stretch",
+                    )
+
+    if report.intraday is not None and report.intraday.session_bars is not None and not report.intraday.session_bars.empty:
+        st.subheader(f"Intraday entry - session {report.intraday.session_date}")
+        st.caption(f"Status: {report.intraday.status}. 15-minute bars are resampled from the 5-minute data.")
+        st.plotly_chart(
+            build_intraday_chart(report.intraday, report.signal["trigger"]),
+            width="stretch",
+            config={"displaylogo": False},
+        )
+
+    if report.history_summary is not None and not report.history_summary.empty:
+        st.subheader("Historical edge of this signal on this ticker")
+        st.caption("Past volume-confirmed signals in the same direction, entering at the next bar's open.")
+        summary = report.history_summary.copy()
+        for column in ["Win rate", "Average return", "Median return", "Base win rate (any day)", "Base average return"]:
+            summary[column] = summary[column].map(lambda value: "n/a" if pd.isna(value) else f"{value * 100:.1f}%")
+        st.dataframe(summary, hide_index=True, width="stretch")
+        if report.history_events is not None and not report.history_events.empty:
+            with st.expander(f"{len(report.history_events)} past signals"):
+                st.dataframe(report.history_events, hide_index=True, width="stretch")
+
+    if fundamentals is not None and not fundamentals.empty:
+        st.caption(f"Quarterly fundamentals source: {fundamentals_source}.")
+
+    # Report export and notification ----------------------------------------
+    st.subheader("Pre-trade report")
+    markdown_report = report_to_markdown(report)
+    export_columns = st.columns(3)
+    export_columns[0].download_button(
+        "Download report (Markdown)", markdown_report,
+        file_name=f"{ticker}_{end_str}_signal_report.md", mime="text/markdown",
+    )
+    export_columns[1].download_button(
+        "Download report (JSON)", json.dumps(report_to_dict(report), indent=2, default=str),
+        file_name=f"{ticker}_{end_str}_signal_report.json", mime="application/json",
+    )
+    webhook_url = get_secret("ALERT_WEBHOOK_URL")
+    if webhook_url:
+        if export_columns[2].button("Send notification"):
+            ok, message = send_webhook(webhook_url, short_summary(report))
+            (st.success if ok else st.error)(f"Notification {'sent' if ok else 'failed'}: {message}")
+    else:
+        export_columns[2].caption("Add `ALERT_WEBHOOK_URL` (Slack/Discord webhook) to Streamlit secrets to send notifications.")
+    with st.expander("Report preview"):
+        st.markdown(markdown_report)
+
+
+# ============================================================
+# Validation: walk-forward replay of the signal engine
+# ============================================================
+
+DEFAULT_VALIDATION_TICKERS = "AAPL, MSFT, NVDA, AMZN, META, GOOGL, JPM, XOM, KO, COST, UNH, CAT"
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def run_ticker_validation(ticker, start_str, end_str, settings_dict, risk_dict, max_hold, include_fundamentals):
+    """Walk-forward replay for one ticker. Cached, so re-runs are instant."""
+
+    data_start = (pd.Timestamp(start_str) - pd.DateOffset(years=6)).strftime("%Y-%m-%d")
+    data_end = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
+    daily = load_data(ticker, data_start, data_end, "Daily")
+    if daily.empty:
+        return pd.DataFrame(), pd.Series(dtype=float)
+    daily, _ = drop_in_progress_daily_bar(daily)
+
+    valuation_df, fundamentals_df = None, None
+    if include_fundamentals:
+        earnings = load_earnings_data(ticker, data_start, data_end)
+        valuation_df, earnings_calculated = build_valuation_data(daily, earnings)
+        fundamentals, _, _ = load_quarterly_fundamentals(ticker, data_start, data_end)
+        fundamentals_df = fundamentals_by_release_date(fundamentals, earnings_calculated)
+
+    trades = walk_forward(
+        ticker,
+        daily,
+        valuation_df,
+        fundamentals_df,
+        AnalysisSettings(**settings_dict),
+        RiskSettings(**risk_dict),
+        start_str,
+        end_str,
+        ValidationSettings(max_hold=int(max_hold)),
+    )
+    return trades, base_rates(daily, start_str, end_str, horizon=10)
+
+
+def format_stats_table(frame):
+    """Format R, percentage and count columns for display."""
+
+    formatted = frame.copy()
+    percent_columns = ["Win rate", "Average return", "Target hit", "Stopped out", "Time exit"]
+    for column in formatted.columns:
+        if column in percent_columns:
+            formatted[column] = formatted[column].map(lambda v: "" if pd.isna(v) else f"{v * 100:.1f}%")
+        elif column in ("Average R", "Median R", "Random-entry avg R", "Edge vs random (R)"):
+            formatted[column] = formatted[column].map(lambda v: "" if pd.isna(v) else f"{v:+.2f}R")
+        elif column in ("t-stat (avg R)", "t-stat (edge)", "Profit factor", "Avg bars held", "Rank correlation with R", "95% noise band"):
+            formatted[column] = formatted[column].map(lambda v: "" if pd.isna(v) else f"{v:.2f}")
+    for column in formatted.columns:
+        if formatted[column].dtype.name == "category" or column == "Confidence bucket":
+            formatted[column] = formatted[column].astype(str)
+    return formatted
+
+
+def render_validation(signal_settings, risk_settings, default_end):
+    """Validate tab: does the engine make money, and does confidence mean anything?"""
+
+    st.caption(
+        "Replays the Signal Analysis engine on every past day the selected setup fired, using only data available "
+        "on that day, then simulates the trade plan: entry at the next open, exit at the stop or target (stop assumed "
+        "first if both are hit in one bar; gaps fill at the open) or after the maximum holding period. Results are "
+        "in R - profit divided by the amount risked. Setup, volume, risk and confidence settings come from the "
+        "sidebar. The intraday trigger cannot be replayed (Yahoo keeps ~60 days of 5-minute data), so taken trades "
+        "enter at the next open."
+    )
+
+    input_columns = st.columns([2.2, 1, 1])
+    tickers_text = input_columns[0].text_input("Tickers (comma-separated)", DEFAULT_VALIDATION_TICKERS)
+    test_start = input_columns[1].date_input(
+        "Test from", value=(pd.Timestamp(default_end) - pd.DateOffset(years=2)).date(), max_value=date.today(), key="validation_start"
+    )
+    test_end = input_columns[2].date_input("Test to", value=default_end, max_value=date.today(), key="validation_end")
+    option_columns = st.columns([1, 2])
+    max_hold = int(option_columns[0].number_input("Max holding period (bars)", min_value=3, max_value=120, value=20, step=1))
+    include_fundamentals = option_columns[1].checkbox(
+        "Include fundamentals (slower: loads SEC and earnings history for each ticker)", value=True
+    )
+
+    tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
+    settings_dict = dict(signal_settings.__dict__)
+    risk_dict = dict(risk_settings.__dict__)
+    start_str = pd.Timestamp(test_start).strftime("%Y-%m-%d")
+    end_str = pd.Timestamp(test_end).strftime("%Y-%m-%d")
+    run_key = json.dumps([tickers, start_str, end_str, settings_dict, risk_dict, max_hold, include_fundamentals], default=str)
+
+    if st.button("Run validation", type="primary", disabled=not tickers or test_start >= test_end):
+        progress = st.progress(0.0)
+        frames, bases, failed = [], [], []
+        for index, ticker in enumerate(tickers):
+            progress.progress(index / len(tickers), text=f"Replaying {ticker} ({index + 1}/{len(tickers)})...")
+            try:
+                trades, base = run_ticker_validation(
+                    ticker, start_str, end_str, settings_dict, risk_dict, max_hold, include_fundamentals
+                )
+            except Exception as error:
+                trades, base = pd.DataFrame(), pd.Series(dtype=float)
+                failed.append(f"{ticker} ({type(error).__name__})")
+            if trades.empty and base.empty:
+                failed.append(ticker)
+            if not trades.empty:
+                frames.append(trades)
+            if not base.empty:
+                bases.append(base)
+        progress.empty()
+        st.session_state["validation_result"] = {
+            "key": run_key,
+            "trades": pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(),
+            "base": pd.concat(bases) if bases else pd.Series(dtype=float),
+            "failed": failed,
+            "setup": signal_settings.setup,
+        }
+
+    result = st.session_state.get("validation_result")
+    if result is None:
+        st.info("Choose tickers and a test period, then press **Run validation**. Expect roughly 5-15 seconds per ticker.")
+        return
+    if result["key"] != run_key:
+        st.warning("The inputs or sidebar settings changed since this run - press **Run validation** to refresh.")
+    if result["failed"]:
+        st.caption(f"No data for: {', '.join(result['failed'])}")
+
+    trades = result["trades"]
+    if trades.empty:
+        st.warning("No signals fired for these tickers and dates.")
+        return
+
+    summary = summarize(trades)
+    taken_stats = summary["taken"]
+    message = verdict(taken_stats)
+    if message.startswith("Positive"):
+        st.success(f"**Trades the engine would take:** {message}")
+    elif message.startswith("Negative"):
+        st.error(f"**Trades the engine would take:** {message}")
+    else:
+        st.warning(f"**Trades the engine would take:** {message}")
+
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("Signals replayed", f"{len(trades):,}")
+    metric_columns[1].metric("Trades taken", f"{taken_stats.get('Trades', 0):,}")
+    if taken_stats.get("Trades", 0):
+        metric_columns[2].metric("Win rate", f"{taken_stats['Win rate'] * 100:.1f}%")
+        metric_columns[3].metric("Average R", f"{taken_stats['Average R']:+.2f}R")
+        random_average = taken_stats.get("Random-entry avg R", np.nan)
+        metric_columns[4].metric("Random entries", "n/a" if pd.isna(random_average) else f"{random_average:+.2f}R")
+        edge, edge_t = taken_stats.get("Edge vs random (R)", np.nan), taken_stats.get("t-stat (edge)", np.nan)
+        metric_columns[5].metric(
+            "Edge vs random" if pd.isna(edge_t) else f"Edge vs random (t = {edge_t:.1f})",
+            "n/a" if pd.isna(edge) else f"{edge:+.2f}R",
+        )
+    st.caption(
+        "**Random entries** copy each signal's stop and target distances (in ATR) onto random days of the same "
+        "ticker and period. Positive R that random entries also earn comes from market drift and the exit rules - "
+        "only the **edge vs random** shows whether the signal's timing adds value (|t| >= 2 to trust it)."
+    )
+
+    base = result["base"]
+    if not base.empty:
+        st.caption(
+            f"Benchmark - buying these tickers on *any* day in the window and holding 10 bars: "
+            f"{(base > 0).mean() * 100:.1f}% of holds were profitable, average {base.mean() * 100:+.2f}%. "
+            f"Taken trades averaged {taken_stats.get('Average return', np.nan) * 100:+.2f}% per trade."
+        )
+
+    # Cumulative R: what following every taken signal (1R risk each) would have produced.
+    curve = go.Figure()
+    taken_trades = trades.loc[trades["Taken"]].dropna(subset=["R"]).sort_values("Exit_Date")
+    for label, column, subset, color, dash in [
+        ("Trades taken", "R", taken_trades, "seagreen", "solid"),
+        ("Random entries, same stops/targets", "Random_R", taken_trades, "darkorange", "dot"),
+        ("All signals (incl. WATCH / NO TRADE / EXIT)", "R", trades.dropna(subset=["R"]).sort_values("Exit_Date"), "gray", "solid"),
+    ]:
+        if column in subset and not subset.empty:
+            curve.add_trace(
+                go.Scatter(
+                    x=subset["Exit_Date"], y=subset[column].fillna(0).cumsum(), name=label, mode="lines",
+                    line=dict(color=color, width=2, dash=dash),
+                )
+            )
+    curve.add_hline(y=0, line_dash="dot", line_color="gray")
+    curve.update_layout(
+        height=380, margin=dict(l=20, r=20, t=40, b=20), title="Cumulative R (each trade risks 1R)",
+        yaxis_title="Cumulative R", hovermode="x unified",
+    )
+    st.plotly_chart(curve, width="stretch", config={"displaylogo": False})
+
+    exits = exit_signal_stats(trades, base_forward=base)
+    if exits:
+        move = exits["Stock 10-bar return after signal"]
+        any_day = exits.get("Any-day 10-bar return", np.nan)
+        helped = exits.get("Exit helped vs holding")
+        st.subheader("Were the bearish (EXIT) signals worth acting on?")
+        (st.success if helped else st.warning)(
+            f"After {exits['Bearish signals']:,} bearish signals the stock moved {move * 100:+.2f}% over the next "
+            f"10 bars (rose {exits['Share of signals followed by a rise'] * 100:.0f}% of the time), versus "
+            f"{any_day * 100:+.2f}% after any day. "
+            + ("Exiting on them avoided below-average returns." if helped else
+               "Exiting on them gave up above-average returns - treat EXIT signals with caution.")
+        )
+
+    st.subheader("Does the confidence score mean anything?")
+    st.caption(
+        "If confidence works, higher buckets should show a higher average R, and its rank correlation with R should "
+        "sit outside the 95% noise band (the range a random score would produce)."
+    )
+    st.dataframe(format_stats_table(summary["by_confidence"]), hide_index=True, width="stretch")
+    st.dataframe(format_stats_table(summary["components"]), hide_index=True, width="stretch")
+    with st.expander("Results if only trades at or above a confidence threshold were taken"):
+        st.dataframe(format_stats_table(summary["thresholds"]), hide_index=True, width="stretch")
+
+    for title, key in [
+        ("By action", "by_action"),
+        ("By direction (1 = bullish, -1 = bearish)", "by_direction"),
+        ("By year", "by_year"),
+        ("By ticker", "by_ticker"),
+    ]:
+        with st.expander(title):
+            st.dataframe(format_stats_table(summary[key]), hide_index=True, width="stretch")
+
+    with st.expander(f"All {len(trades):,} replayed signals"):
+        st.dataframe(trades, hide_index=True, width="stretch")
+    st.download_button(
+        "Download replayed signals (CSV)",
+        trades.to_csv(index=False),
+        file_name=f"validation_{result['setup']}_{start_str}_{end_str}.csv",
+        mime="text/csv",
+    )
+
+
+# ============================================================
 # Main application
 # ============================================================
 
@@ -1169,6 +1840,42 @@ if check_password():
         sell_right = st.selectbox("Sell right signal", signal_options, index=2, key="sell_right", label_visibility="collapsed")
     st.sidebar.caption(f"Sell when: `{sell_left} {sell_operator} {sell_right}`")
 
+    st.sidebar.divider()
+    with st.sidebar.expander("Signal Analysis & Risk", expanded=False):
+        setup_label = st.selectbox(
+            "Signal setup",
+            [
+                "Breakout (20-bar high/low on volume)",
+                "Pullback in trend (dip to 20 EMA, then reversal)",
+                "Reversal (buy a 20-bar breakdown in an uptrend)",
+            ],
+            index=0,
+        )
+        allow_short = st.checkbox("Allow short trades (otherwise bearish signals mean exit)", value=False)
+        account_equity = st.number_input("Account equity for sizing ($)", min_value=1000.0, value=100000.0, step=5000.0)
+        risk_pct = st.number_input("Risk per trade (% of equity)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
+        max_position_pct = st.number_input("Max position (% of equity)", min_value=1.0, max_value=100.0, value=25.0, step=1.0)
+        breakout_lookback = int(st.number_input("Breakout lookback (daily bars)", min_value=5, max_value=120, value=20, step=1))
+        volume_multiple = st.number_input("Breakout volume (x 50-bar average)", min_value=1.0, max_value=5.0, value=1.5, step=0.1)
+        full_size_confidence = st.slider("Full-size confidence threshold", 50, 95, 75)
+        half_size_confidence = st.slider("Half-size confidence threshold", 40, 90, 60)
+        opening_range_minutes = st.selectbox("Intraday opening range (minutes)", [15, 30, 60], index=1)
+
+    signal_settings = AnalysisSettings(
+        setup=setup_label.split(" ")[0].lower(),
+        allow_short=allow_short,
+        breakout_lookback=breakout_lookback,
+        volume_multiple=float(volume_multiple),
+        opening_range_minutes=int(opening_range_minutes),
+    )
+    risk_settings = RiskSettings(
+        account_equity=float(account_equity),
+        risk_pct=float(risk_pct),
+        max_position_pct=float(max_position_pct),
+        full_size_confidence=float(max(full_size_confidence, half_size_confidence)),
+        half_size_confidence=float(min(full_size_confidence, half_size_confidence)),
+    )
+
     if not isinstance(date_range, (tuple, list)) or len(date_range) != 2:
         st.info("Please select both a start date and an end date.")
         st.stop()
@@ -1203,421 +1910,432 @@ if check_password():
         st.error(f"No price data was returned for {ticker} between {start_date_str} and {end_date_str}.")
         st.stop()
 
-    st.caption(
-        f"Loaded {len(df):,} {timeframe.lower()} bars: "
-        f"{df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d}"
+    tab_backtest, tab_signals, tab_validate = st.tabs(
+        ["Backtest", "Signal Analysis & Trade Plan", "Validate"]
     )
 
+    with tab_signals:
+        render_signal_analysis(ticker, end_date, signal_settings, risk_settings)
 
-    if fundamentals_df.empty:
-        st.warning(
-            "No quarterly fundamentals were available for the selected period. "
-            f"SEC diagnostic: {fundamentals_sec_error or 'No SEC error reported.'}"
-        )
-    else:
+    with tab_validate:
+        render_validation(signal_settings, risk_settings, end_date)
+
+    with tab_backtest:
         st.caption(
-            f"Quarterly fundamentals source: {fundamentals_source}. "
-            f"Loaded {len(fundamentals_df)} quarter-end records from "
-            f"{fundamentals_df.index.min():%Y-%m-%d} to "
-            f"{fundamentals_df.index.max():%Y-%m-%d}."
-        )
-        if fundamentals_sec_error:
-            st.caption(f"SEC fallback diagnostic: {fundamentals_sec_error}")
-
-    df["Fast_MA"] = compute_ma(df["Close"], fast_type, fast_period)
-    df["Slow_MA"] = compute_ma(df["Close"], slow_type, slow_period)
-
-    if len(df) < max(fast_period, slow_period):
-        st.warning(
-            f"The selected period contains only {len(df)} bars, but the longest "
-            f"moving average requires {max(fast_period, slow_period)} bars."
+            f"Loaded {len(df):,} {timeframe.lower()} bars: "
+            f"{df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d}"
         )
 
-    valuation_df, earnings_calculated_df = build_valuation_data(df, earnings_history_df)
 
-    if earnings_calculated_df.empty:
-        earnings_display_df = pd.DataFrame()
-    else:
-        display_start = pd.Timestamp(start_date).normalize()
-        display_end = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
-        earnings_display_df = earnings_calculated_df.loc[
-            (earnings_calculated_df.index >= display_start)
-            & (earnings_calculated_df.index < display_end)
-        ].copy()
+        if fundamentals_df.empty:
+            st.warning(
+                "No quarterly fundamentals were available for the selected period. "
+                f"SEC diagnostic: {fundamentals_sec_error or 'No SEC error reported.'}"
+            )
+        else:
+            st.caption(
+                f"Quarterly fundamentals source: {fundamentals_source}. "
+                f"Loaded {len(fundamentals_df)} quarter-end records from "
+                f"{fundamentals_df.index.min():%Y-%m-%d} to "
+                f"{fundamentals_df.index.max():%Y-%m-%d}."
+            )
+            if fundamentals_sec_error:
+                st.caption(f"SEC fallback diagnostic: {fundamentals_sec_error}")
 
-    # --------------------------------------------------------
-    # Align quarterly fundamentals with EPS announcement dates
-    # --------------------------------------------------------
-    fundamentals_plot_df = (
-        align_fundamentals_to_earnings_dates(
-            fundamentals_df=fundamentals_df,
-            earnings_df=earnings_calculated_df,
-            maximum_days=120,
+        df["Fast_MA"] = compute_ma(df["Close"], fast_type, fast_period)
+        df["Slow_MA"] = compute_ma(df["Close"], slow_type, slow_period)
+
+        if len(df) < max(fast_period, slow_period):
+            st.warning(
+                f"The selected period contains only {len(df)} bars, but the longest "
+                f"moving average requires {max(fast_period, slow_period)} bars."
+            )
+
+        valuation_df, earnings_calculated_df = build_valuation_data(df, earnings_history_df)
+
+        if earnings_calculated_df.empty:
+            earnings_display_df = pd.DataFrame()
+        else:
+            display_start = pd.Timestamp(start_date).normalize()
+            display_end = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
+            earnings_display_df = earnings_calculated_df.loc[
+                (earnings_calculated_df.index >= display_start)
+                & (earnings_calculated_df.index < display_end)
+            ].copy()
+
+        # --------------------------------------------------------
+        # Align quarterly fundamentals with EPS announcement dates
+        # --------------------------------------------------------
+        fundamentals_plot_df = (
+            align_fundamentals_to_earnings_dates(
+                fundamentals_df=fundamentals_df,
+                earnings_df=earnings_calculated_df,
+                maximum_days=120,
+            )
         )
-    )
 
-    pe_error = valuation_df["PE_Reconstruction_Error"].dropna()
-    if not pe_error.empty:
-        st.caption(f"Maximum internal P/E calculation error: ${pe_error.max():.8f}")
+        pe_error = valuation_df["PE_Reconstruction_Error"].dropna()
+        if not pe_error.empty:
+            st.caption(f"Maximum internal P/E calculation error: ${pe_error.max():.8f}")
 
-    signal_map = {"Close": df["Close"], "Fast_MA": df["Fast_MA"], "Slow_MA": df["Slow_MA"]}
-    buy_condition = build_condition(signal_map[buy_left], buy_operator, signal_map[buy_right])
-    sell_condition = build_condition(signal_map[sell_left], sell_operator, signal_map[sell_right])
-    df = run_position_engine(df, buy_condition, sell_condition)
+        signal_map = {"Close": df["Close"], "Fast_MA": df["Fast_MA"], "Slow_MA": df["Slow_MA"]}
+        buy_condition = build_condition(signal_map[buy_left], buy_operator, signal_map[buy_right])
+        sell_condition = build_condition(signal_map[sell_left], sell_operator, signal_map[sell_right])
+        df = run_position_engine(df, buy_condition, sell_condition)
 
-    df["Returns"] = df["Close"].pct_change().fillna(0.0)
-    df["Strat_Returns"] = df["Position"] * df["Returns"]
-    df["Equity"] = float(initial_capital) * (1.0 + df["Strat_Returns"]).cumprod()
-    df["Peak"] = df["Equity"].cummax()
-    df["Drawdown"] = df["Equity"] / df["Peak"] - 1.0
+        df["Returns"] = df["Close"].pct_change().fillna(0.0)
+        df["Strat_Returns"] = df["Position"] * df["Returns"]
+        df["Equity"] = float(initial_capital) * (1.0 + df["Strat_Returns"]).cumprod()
+        df["Peak"] = df["Equity"].cummax()
+        df["Drawdown"] = df["Equity"] / df["Peak"] - 1.0
 
-    final_equity = df["Equity"].iloc[-1]
-    total_return = (final_equity / float(initial_capital) - 1.0) * 100.0
-    max_drawdown = df["Drawdown"].min() * 100.0
-    active_returns = df.loc[df["Strat_Returns"] != 0, "Strat_Returns"]
-    positive_active_bars = 0.0 if active_returns.empty else active_returns.gt(0).mean() * 100.0
+        final_equity = df["Equity"].iloc[-1]
+        total_return = (final_equity / float(initial_capital) - 1.0) * 100.0
+        max_drawdown = df["Drawdown"].min() * 100.0
+        active_returns = df.loc[df["Strat_Returns"] != 0, "Strat_Returns"]
+        positive_active_bars = 0.0 if active_returns.empty else active_returns.gt(0).mean() * 100.0
 
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-    metric_col1.metric("Final Equity", f"${final_equity:,.2f}", f"{total_return:.2f}%")
-    metric_col2.metric("Max Drawdown", f"{max_drawdown:.2f}%")
-    metric_col3.metric("Positive Active Bars", f"{positive_active_bars:.1f}%")
-    st.info(
-        f"**BUY:** `{buy_left} {buy_operator} {buy_right}`\n\n"
-        f"**SELL:** `{sell_left} {sell_operator} {sell_right}`"
-    )
-
-    fig = make_subplots(
-        rows=7,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.025,
-        subplot_titles=(
-            f"{ticker} Price, Indicators and Trade Signals",
-            f"{ticker} Quarterly and TTM EPS",
-            f"{ticker} Quarterly Revenue, OpEx, Total Expense, CapEx and Net Income",
-            f"{ticker} Trailing P/E and Estimate-Based P/E Proxy",
-            "Market Benchmark Performance, Normalized to 100",
-            "Portfolio Equity Curve ($)",
-            "Drawdown Profile (%)",
-        ),
-        row_heights=[0.27, 0.14, 0.16, 0.13, 0.12, 0.11, 0.07],
-        specs=[
-            [{"secondary_y": False}],
-            [{"secondary_y": True}],
-            [{"secondary_y": False}],
-            [{"secondary_y": False}],
-            [{"secondary_y": False}],
-            [{"secondary_y": False}],
-            [{"secondary_y": False}],
-        ],
-    )
-
-    # Row 1: price, moving averages and signals
-    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gray", width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["Fast_MA"], name=f"{fast_type} {fast_period}", line=dict(color="orange", width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
-
-    buy_points = df.loc[df["Buy_Signal"]]
-    sell_points = df.loc[df["Sell_Signal"]]
-    fig.add_trace(
-        go.Scatter(
-            x=buy_points.index, y=buy_points["Close"], mode="markers", name="BUY signal",
-            marker=dict(symbol="triangle-up", size=12, color="lime", line=dict(color="darkgreen", width=1)),
-            hovertemplate="BUY signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
-        ), row=1, col=1
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=sell_points.index, y=sell_points["Close"], mode="markers", name="SELL signal",
-            marker=dict(symbol="triangle-down", size=12, color="red", line=dict(color="darkred", width=1)),
-            hovertemplate="SELL signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
-        ), row=1, col=1
-    )
-
-    # Row 2: quarterly and TTM EPS
-    eps_trace_added = False
-    eps_trace_definitions = [
-        ("Reported EPS", "Quarterly Reported EPS", "bar", "royalblue", False),
-        ("EPS Estimate", "Quarterly EPS Estimate", "scatter", "orange", False),
-        ("TTM_Reported_EPS", "TTM Reported EPS", "scatter", "limegreen", True),
-        ("TTM_Estimated_EPS", "TTM EPS Estimate Proxy", "scatter", "cyan", True),
-    ]
-
-    for column, trace_name, trace_type, color, use_secondary in eps_trace_definitions:
-        if not earnings_display_df.empty and column in earnings_display_df.columns:
-            series = earnings_display_df[column].dropna()
-            if series.empty:
-                continue
-            eps_trace_added = True
-            if trace_type == "bar":
-                trace = go.Bar(x=series.index, y=series, name=trace_name, marker_color=color, opacity=0.75)
-            else:
-                trace = go.Scatter(
-                    x=series.index,
-                    y=series,
-                    mode="lines+markers",
-                    name=trace_name,
-                    line=dict(color=color, width=2, dash="dot" if "Estimate" in trace_name else "solid"),
-                    marker=dict(size=7, color=color),
-                )
-            fig.add_trace(trace, row=2, col=1, secondary_y=use_secondary)
-
-    if not eps_trace_added:
-        fig.add_annotation(
-            x=0.5, y=0.5, xref="x2 domain", yref="y2 domain",
-            text="No quarterly EPS event falls within the selected display period",
-            showarrow=False, font=dict(color="gray", size=12)
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
+        metric_col1.metric("Final Equity", f"${final_equity:,.2f}", f"{total_return:.2f}%")
+        metric_col2.metric("Max Drawdown", f"{max_drawdown:.2f}%")
+        metric_col3.metric("Positive Active Bars", f"{positive_active_bars:.1f}%")
+        st.info(
+            f"**BUY:** `{buy_left} {buy_operator} {buy_right}`\n\n"
+            f"**SELL:** `{sell_left} {sell_operator} {sell_right}`"
         )
-    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray", row=2, col=1, secondary_y=False)
 
-    # Row 3: quarterly fundamentals   
-    fundamentals_trace_added = False
-    
-    scale_divisor, fundamentals_axis_title = (
-        choose_fundamental_scale(
-            fundamentals_plot_df
-        )
-    )
-    
-    fundamental_definitions = [
-        (
-            "Revenue",
-            "Revenue",
-            "royalblue",
-        ),
-        (
-            "Total_Expense",
-            "Total expenses",
-            "crimson",
-        ),
-        (
-            "Net_Income",
-            "Net income",
-            "limegreen",
-        ),
-        (
-            "Operating_Expense",
-            "Operating expenses",
-            "orange",
-        ),
-        (
-            "CapEx",
-            "CapEx spending",
-            "purple",
-        ),
-    ]
-    
-    
-    for (
-        column,
-        trace_name,
-        color,
-    ) in fundamental_definitions:
-    
-        if (
-            fundamentals_plot_df.empty
-            or column not in fundamentals_plot_df.columns
-        ):
-            continue
-    
-        trace_data = fundamentals_plot_df[
-            [
-                column,
-                "Fiscal_Quarter_End",
-            ]
-        ].dropna(
-            subset=[column]
-        )
-    
-        if trace_data.empty:
-            continue
-    
-        fundamentals_trace_added = True
-    
-        scaled_values = (
-            trace_data[column]
-            / scale_divisor
-        )
-    
-        fiscal_quarter_end_text = (
-            trace_data["Fiscal_Quarter_End"]
-            .dt.strftime("%Y-%m-%d")
-        )
-    
-        fig.add_trace(
-            go.Bar(
-                x=trace_data.index,
-                y=scaled_values,
-                name=trace_name,
-                marker_color=color,
-                opacity=0.78,
-                customdata=np.column_stack(
-                    [
-                        fiscal_quarter_end_text,
-                    ]
-                ),
-                hovertemplate=(
-                    f"{trace_name}<br>"
-                    "Earnings date: "
-                    "%{x|%Y-%m-%d}<br>"
-                    "Fiscal quarter end: "
-                    "%{customdata[0]}<br>"
-                    "Value: "
-                    f"%{{y:,.2f}} "
-                    f"{fundamentals_axis_title}"
-                    "<extra></extra>"
-                ),
+        fig = make_subplots(
+            rows=7,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.025,
+            subplot_titles=(
+                f"{ticker} Price, Indicators and Trade Signals",
+                f"{ticker} Quarterly and TTM EPS",
+                f"{ticker} Quarterly Revenue, OpEx, Total Expense, CapEx and Net Income",
+                f"{ticker} Trailing P/E and Estimate-Based P/E Proxy",
+                "Market Benchmark Performance, Normalized to 100",
+                "Portfolio Equity Curve ($)",
+                "Drawdown Profile (%)",
             ),
+            row_heights=[0.27, 0.14, 0.16, 0.13, 0.12, 0.11, 0.07],
+            specs=[
+                [{"secondary_y": False}],
+                [{"secondary_y": True}],
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+            ],
+        )
+
+        # Row 1: price, moving averages and signals
+        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gray", width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["Fast_MA"], name=f"{fast_type} {fast_period}", line=dict(color="orange", width=1.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
+
+        buy_points = df.loc[df["Buy_Signal"]]
+        sell_points = df.loc[df["Sell_Signal"]]
+        fig.add_trace(
+            go.Scatter(
+                x=buy_points.index, y=buy_points["Close"], mode="markers", name="BUY signal",
+                marker=dict(symbol="triangle-up", size=12, color="lime", line=dict(color="darkgreen", width=1)),
+                hovertemplate="BUY signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
+            ), row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=sell_points.index, y=sell_points["Close"], mode="markers", name="SELL signal",
+                marker=dict(symbol="triangle-down", size=12, color="red", line=dict(color="darkred", width=1)),
+                hovertemplate="SELL signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
+            ), row=1, col=1
+        )
+
+        # Row 2: quarterly and TTM EPS
+        eps_trace_added = False
+        eps_trace_definitions = [
+            ("Reported EPS", "Quarterly Reported EPS", "bar", "royalblue", False),
+            ("EPS Estimate", "Quarterly EPS Estimate", "scatter", "orange", False),
+            ("TTM_Reported_EPS", "TTM Reported EPS", "scatter", "limegreen", True),
+            ("TTM_Estimated_EPS", "TTM EPS Estimate Proxy", "scatter", "cyan", True),
+        ]
+
+        for column, trace_name, trace_type, color, use_secondary in eps_trace_definitions:
+            if not earnings_display_df.empty and column in earnings_display_df.columns:
+                series = earnings_display_df[column].dropna()
+                if series.empty:
+                    continue
+                eps_trace_added = True
+                if trace_type == "bar":
+                    trace = go.Bar(x=series.index, y=series, name=trace_name, marker_color=color, opacity=0.75)
+                else:
+                    trace = go.Scatter(
+                        x=series.index,
+                        y=series,
+                        mode="lines+markers",
+                        name=trace_name,
+                        line=dict(color=color, width=2, dash="dot" if "Estimate" in trace_name else "solid"),
+                        marker=dict(size=7, color=color),
+                    )
+                fig.add_trace(trace, row=2, col=1, secondary_y=use_secondary)
+
+        if not eps_trace_added:
+            fig.add_annotation(
+                x=0.5, y=0.5, xref="x2 domain", yref="y2 domain",
+                text="No quarterly EPS event falls within the selected display period",
+                showarrow=False, font=dict(color="gray", size=12)
+            )
+        fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray", row=2, col=1, secondary_y=False)
+
+        # Row 3: quarterly fundamentals   
+        fundamentals_trace_added = False
+    
+        scale_divisor, fundamentals_axis_title = (
+            choose_fundamental_scale(
+                fundamentals_plot_df
+            )
+        )
+    
+        fundamental_definitions = [
+            (
+                "Revenue",
+                "Revenue",
+                "royalblue",
+            ),
+            (
+                "Total_Expense",
+                "Total expenses",
+                "crimson",
+            ),
+            (
+                "Net_Income",
+                "Net income",
+                "limegreen",
+            ),
+            (
+                "Operating_Expense",
+                "Operating expenses",
+                "orange",
+            ),
+            (
+                "CapEx",
+                "CapEx spending",
+                "purple",
+            ),
+        ]
+    
+    
+        for (
+            column,
+            trace_name,
+            color,
+        ) in fundamental_definitions:
+    
+            if (
+                fundamentals_plot_df.empty
+                or column not in fundamentals_plot_df.columns
+            ):
+                continue
+    
+            trace_data = fundamentals_plot_df[
+                [
+                    column,
+                    "Fiscal_Quarter_End",
+                ]
+            ].dropna(
+                subset=[column]
+            )
+    
+            if trace_data.empty:
+                continue
+    
+            fundamentals_trace_added = True
+    
+            scaled_values = (
+                trace_data[column]
+                / scale_divisor
+            )
+    
+            fiscal_quarter_end_text = (
+                trace_data["Fiscal_Quarter_End"]
+                .dt.strftime("%Y-%m-%d")
+            )
+    
+            fig.add_trace(
+                go.Bar(
+                    x=trace_data.index,
+                    y=scaled_values,
+                    name=trace_name,
+                    marker_color=color,
+                    opacity=0.78,
+                    customdata=np.column_stack(
+                        [
+                            fiscal_quarter_end_text,
+                        ]
+                    ),
+                    hovertemplate=(
+                        f"{trace_name}<br>"
+                        "Earnings date: "
+                        "%{x|%Y-%m-%d}<br>"
+                        "Fiscal quarter end: "
+                        "%{customdata[0]}<br>"
+                        "Value: "
+                        f"%{{y:,.2f}} "
+                        f"{fundamentals_axis_title}"
+                        "<extra></extra>"
+                    ),
+                ),
+                row=3,
+                col=1,
+            )
+    
+    
+        if not fundamentals_trace_added:
+            fig.add_annotation(
+                x=0.5,
+                y=0.5,
+                xref="x3 domain",
+                yref="y3 domain",
+                text=(
+                    "Quarterly revenue, total expenses, "
+                    "net income, operating expenses and "
+                    "CapEx data are unavailable"
+                ),
+                showarrow=False,
+                font=dict(
+                    color="gray",
+                    size=12,
+                ),
+            )
+    
+    
+        fig.add_hline(
+            y=0,
+            line_width=1,
+            line_dash="dot",
+            line_color="gray",
             row=3,
             col=1,
         )
-    
-    
-    if not fundamentals_trace_added:
-        fig.add_annotation(
-            x=0.5,
-            y=0.5,
-            xref="x3 domain",
-            yref="y3 domain",
-            text=(
-                "Quarterly revenue, total expenses, "
-                "net income, operating expenses and "
-                "CapEx data are unavailable"
-            ),
-            showarrow=False,
-            font=dict(
-                color="gray",
-                size=12,
-            ),
-        )
-    
-    
-    fig.add_hline(
-        y=0,
-        line_width=1,
-        line_dash="dot",
-        line_color="gray",
-        row=3,
-        col=1,
-    )
 
-    # Row 4: P/E
-    trailing_pe = valuation_df["Trailing_PE"].dropna()
-    estimate_based_pe = valuation_df["Estimate_Based_PE_Proxy"].dropna()
+        # Row 4: P/E
+        trailing_pe = valuation_df["Trailing_PE"].dropna()
+        estimate_based_pe = valuation_df["Estimate_Based_PE_Proxy"].dropna()
 
-    if not trailing_pe.empty:
+        if not trailing_pe.empty:
+            fig.add_trace(
+                go.Scatter(x=trailing_pe.index, y=trailing_pe, mode="lines", name="Trailing P/E", line=dict(color="gold", width=2)),
+                row=4, col=1
+            )
+            median_value = trailing_pe.median()
+            fig.add_hline(
+                y=median_value, line_width=1, line_dash="dash", line_color="goldenrod",
+                annotation_text=f"Median trailing P/E: {median_value:.1f}x",
+                annotation_position="top left", row=4, col=1
+            )
+
+        if not estimate_based_pe.empty:
+            fig.add_trace(
+                go.Scatter(x=estimate_based_pe.index, y=estimate_based_pe, mode="lines", name="Estimate-Based P/E Proxy", line=dict(color="cyan", width=2, dash="dot")),
+                row=4, col=1
+            )
+            median_value = estimate_based_pe.median()
+            fig.add_hline(
+                y=median_value, line_width=1, line_dash="dash", line_color="darkcyan",
+                annotation_text=f"Median estimate-based P/E: {median_value:.1f}x",
+                annotation_position="bottom left", row=4, col=1
+            )
+
+        if trailing_pe.empty and estimate_based_pe.empty:
+            fig.add_annotation(
+                x=0.5, y=0.5, xref="x4 domain", yref="y4 domain",
+                text="Insufficient historical EPS data to calculate P/E",
+                showarrow=False, font=dict(color="gray", size=12)
+            )
+
+        # Row 5: benchmarks
+        benchmark_trace_added = False
+        for column, color in [("S&P 500", "deepskyblue"), ("Nasdaq-100", "magenta")]:
+            if not benchmark_df.empty and column in benchmark_df.columns:
+                series = benchmark_df[column].dropna()
+                if not series.empty:
+                    benchmark_trace_added = True
+                    fig.add_trace(
+                        go.Scatter(x=series.index, y=series, name=column, line=dict(color=color, width=2)),
+                        row=5, col=1
+                    )
+
+        if not benchmark_trace_added:
+            fig.add_annotation(
+                x=0.5, y=0.5, xref="x5 domain", yref="y5 domain",
+                text="Benchmark data is unavailable", showarrow=False,
+                font=dict(color="gray", size=12)
+            )
+        fig.add_hline(y=100, line_width=1, line_dash="dot", line_color="gray", row=5, col=1)
+
+        # Row 6: equity
         fig.add_trace(
-            go.Scatter(x=trailing_pe.index, y=trailing_pe, mode="lines", name="Trailing P/E", line=dict(color="gold", width=2)),
-            row=4, col=1
-        )
-        median_value = trailing_pe.median()
-        fig.add_hline(
-            y=median_value, line_width=1, line_dash="dash", line_color="goldenrod",
-            annotation_text=f"Median trailing P/E: {median_value:.1f}x",
-            annotation_position="top left", row=4, col=1
+            go.Scatter(
+                x=df.index, y=df["Equity"], name="Strategy Equity", line=dict(color="green", width=2),
+                hovertemplate="Strategy Equity<br>Date: %{x|%Y-%m-%d}<br>Equity: $%{y:,.2f}<extra></extra>",
+            ), row=6, col=1
         )
 
-    if not estimate_based_pe.empty:
+        # Row 7: drawdown
         fig.add_trace(
-            go.Scatter(x=estimate_based_pe.index, y=estimate_based_pe, mode="lines", name="Estimate-Based P/E Proxy", line=dict(color="cyan", width=2, dash="dot")),
-            row=4, col=1
-        )
-        median_value = estimate_based_pe.median()
-        fig.add_hline(
-            y=median_value, line_width=1, line_dash="dash", line_color="darkcyan",
-            annotation_text=f"Median estimate-based P/E: {median_value:.1f}x",
-            annotation_position="bottom left", row=4, col=1
+            go.Scatter(
+                x=df.index, y=df["Drawdown"] * 100, name="Drawdown %", fill="tozeroy",
+                line=dict(color="red", width=1),
+                hovertemplate="Drawdown<br>Date: %{x|%Y-%m-%d}<br>Drawdown: %{y:.2f}%<extra></extra>",
+            ), row=7, col=1
         )
 
-    if trailing_pe.empty and estimate_based_pe.empty:
-        fig.add_annotation(
-            x=0.5, y=0.5, xref="x4 domain", yref="y4 domain",
-            text="Insufficient historical EPS data to calculate P/E",
-            showarrow=False, font=dict(color="gray", size=12)
+        fig.update_yaxes(title_text="Price", row=1, col=1)
+        fig.update_yaxes(title_text="Quarterly EPS", row=2, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="TTM EPS", row=2, col=1, secondary_y=True)
+        fig.update_yaxes(title_text=fundamentals_axis_title, row=3, col=1)
+        fig.update_yaxes(title_text="P/E (x)", row=4, col=1)
+        fig.update_yaxes(title_text="Indexed", row=5, col=1)
+        fig.update_yaxes(title_text="Equity ($)", row=6, col=1)
+        fig.update_yaxes(title_text="DD (%)", row=7, col=1)
+
+        # Apply the exact same time range to every subplot.
+        common_x_start = pd.Timestamp(df.index.min())
+        common_x_end = pd.Timestamp(df.index.max())
+        for subplot_row in range(1, 8):
+            fig.update_xaxes(
+                range=[
+                    common_x_start,
+                    common_x_end,
+                ],
+                autorange=False,
+                rangeslider_visible=False,
+                row=subplot_row,
+                col=1,
+            )
+
+        chart_state_text = "|".join(
+            [
+                ticker, start_date_str, end_date_str, timeframe,
+                fast_type, str(fast_period), slow_type, str(slow_period),
+                buy_left, buy_operator, buy_right,
+                sell_left, sell_operator, sell_right, str(initial_capital),
+            ]
+        )
+        chart_revision = hashlib.sha256(chart_state_text.encode("utf-8")).hexdigest()[:16]
+
+        fig.update_layout(
+            height=1725,
+            margin=dict(l=20, r=70, t=50, b=20),
+            showlegend=True,
+            hovermode="x unified",
+            barmode="group",
         )
 
-    # Row 5: benchmarks
-    benchmark_trace_added = False
-    for column, color in [("S&P 500", "deepskyblue"), ("Nasdaq-100", "magenta")]:
-        if not benchmark_df.empty and column in benchmark_df.columns:
-            series = benchmark_df[column].dropna()
-            if not series.empty:
-                benchmark_trace_added = True
-                fig.add_trace(
-                    go.Scatter(x=series.index, y=series, name=column, line=dict(color=color, width=2)),
-                    row=5, col=1
-                )
-
-    if not benchmark_trace_added:
-        fig.add_annotation(
-            x=0.5, y=0.5, xref="x5 domain", yref="y5 domain",
-            text="Benchmark data is unavailable", showarrow=False,
-            font=dict(color="gray", size=12)
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            key=f"backtest_chart_{chart_revision}",
+            config={"responsive": True, "displaylogo": False},
         )
-    fig.add_hline(y=100, line_width=1, line_dash="dot", line_color="gray", row=5, col=1)
-
-    # Row 6: equity
-    fig.add_trace(
-        go.Scatter(
-            x=df.index, y=df["Equity"], name="Strategy Equity", line=dict(color="green", width=2),
-            hovertemplate="Strategy Equity<br>Date: %{x|%Y-%m-%d}<br>Equity: $%{y:,.2f}<extra></extra>",
-        ), row=6, col=1
-    )
-
-    # Row 7: drawdown
-    fig.add_trace(
-        go.Scatter(
-            x=df.index, y=df["Drawdown"] * 100, name="Drawdown %", fill="tozeroy",
-            line=dict(color="red", width=1),
-            hovertemplate="Drawdown<br>Date: %{x|%Y-%m-%d}<br>Drawdown: %{y:.2f}%<extra></extra>",
-        ), row=7, col=1
-    )
-
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Quarterly EPS", row=2, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="TTM EPS", row=2, col=1, secondary_y=True)
-    fig.update_yaxes(title_text=fundamentals_axis_title, row=3, col=1)
-    fig.update_yaxes(title_text="P/E (x)", row=4, col=1)
-    fig.update_yaxes(title_text="Indexed", row=5, col=1)
-    fig.update_yaxes(title_text="Equity ($)", row=6, col=1)
-    fig.update_yaxes(title_text="DD (%)", row=7, col=1)
-
-    # Apply the exact same time range to every subplot.
-    common_x_start = pd.Timestamp(df.index.min())
-    common_x_end = pd.Timestamp(df.index.max())
-    for subplot_row in range(1, 8):
-        fig.update_xaxes(
-            range=[
-                common_x_start,
-                common_x_end,
-            ],
-            autorange=False,
-            rangeslider_visible=False,
-            row=subplot_row,
-            col=1,
-        )
-
-    chart_state_text = "|".join(
-        [
-            ticker, start_date_str, end_date_str, timeframe,
-            fast_type, str(fast_period), slow_type, str(slow_period),
-            buy_left, buy_operator, buy_right,
-            sell_left, sell_operator, sell_right, str(initial_capital),
-        ]
-    )
-    chart_revision = hashlib.sha256(chart_state_text.encode("utf-8")).hexdigest()[:16]
-
-    fig.update_layout(
-        height=1725,
-        margin=dict(l=20, r=70, t=50, b=20),
-        showlegend=True,
-        hovermode="x unified",
-        barmode="group",
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        key=f"backtest_chart_{chart_revision}",
-        config={"responsive": True, "displaylogo": False},
-    )
