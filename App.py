@@ -24,7 +24,22 @@ from analysis.patterns import (
     rule_condition,
 )
 from analysis.risk import RiskSettings
+from analysis.screener import (
+    LINE_KINDS as SCREEN_LINE_KINDS,
+    OPERATORS as SCREEN_OPERATORS,
+    TRADING_DAYS_PER_YEAR,
+    breadth_history,
+    condition_label,
+    fundamental_trend,
+    index_trend,
+    leaders_health,
+    market_gate,
+    screen_stocks,
+    snapshot_table,
+    stock_snapshot,
+)
 from analysis.scoring import COMPONENT_WEIGHTS
+from analysis.universe import MARKETS as SCREENER_MARKETS, hang_seng_members, load_us_index_members, parse_ticker_list
 from analysis.validation import ValidationSettings, base_rates, exit_signal_stats, summarize, verdict, walk_forward
 
 
@@ -1773,6 +1788,450 @@ def render_validation(signal_settings, risk_settings, default_end):
 
 
 # ============================================================
+# Stock screener: data loaders
+# ============================================================
+
+def split_download(data, tickers):
+    """Turn a multi-ticker ``yf.download`` frame into {ticker: OHLCV frame}."""
+
+    frames = {}
+    if data is None or data.empty:
+        return frames
+    fields = ["Open", "High", "Low", "Close", "Volume"]
+    if not isinstance(data.columns, pd.MultiIndex):
+        if len(tickers) == 1:
+            frames[tickers[0]] = data
+    else:
+        level_0 = set(data.columns.get_level_values(0))
+        for ticker in tickers:
+            try:
+                if ticker in level_0:
+                    frame = data[ticker]
+                else:
+                    frame = data.xs(ticker, axis=1, level=1)
+            except KeyError:
+                continue
+            frames[ticker] = frame
+    cleaned = {}
+    for ticker, frame in frames.items():
+        if any(field not in frame.columns for field in fields):
+            continue
+        frame = frame[fields].copy()
+        frame.index = pd.to_datetime(frame.index)
+        if getattr(frame.index, "tz", None) is not None:
+            frame.index = frame.index.tz_localize(None)
+        frame = frame.sort_index()
+        frame = frame.loc[~frame.index.duplicated(keep="last")].dropna(subset=["Close"])
+        if not frame.empty:
+            cleaned[ticker] = frame
+    return cleaned
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_price_chunk(tickers, start_str, end_str):
+    """Daily OHLCV for a batch of tickers. Cached for 6 hours."""
+
+    try:
+        data = yf.download(
+            list(tickers),
+            start=start_str,
+            end=end_str,
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+    except Exception:
+        return {}
+    return split_download(data, list(tickers))
+
+
+def load_price_panel(tickers, chunk_size=50, progress=None):
+    """Daily OHLCV for many tickers (about 3 years), downloaded in batches."""
+
+    end = pd.Timestamp(date.today()) + pd.Timedelta(days=1)
+    start = end - pd.Timedelta(days=1100)
+    tickers = list(tickers)
+    prices = {}
+    for first in range(0, len(tickers), chunk_size):
+        chunk = tuple(tickers[first:first + chunk_size])
+        prices.update(load_price_chunk(chunk, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
+        if progress is not None:
+            progress(min(1.0, (first + chunk_size) / max(1, len(tickers))))
+    return prices
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_universe_members(market, universe):
+    """Members of a screener universe. Cached for a day."""
+
+    if market == "HK":
+        return hang_seng_members(), ""
+    try:
+        return load_us_index_members(universe), ""
+    except Exception as error:
+        return pd.DataFrame(columns=["Ticker", "Name", "Sector", "Industry"]), f"{type(error).__name__}: {error}"
+
+
+# ============================================================
+# Stock screener: page
+# ============================================================
+
+DEFAULT_SCREEN_CONDITIONS = pd.DataFrame(
+    [
+        {"Left": "Close", "Left period": 0, "Operator": ">", "Right": "SMA", "Right period / value": 50.0},
+        {"Left": "SMA", "Left period": 50, "Operator": ">", "Right": "SMA", "Right period / value": 200.0},
+        {"Left": "Close", "Left period": 0, "Operator": ">", "Right": "SMA", "Right period / value": 200.0},
+    ]
+)
+
+
+def editor_conditions(frame):
+    """Valid screen conditions from the data-editor rows (incomplete rows are skipped)."""
+
+    conditions = []
+    for _, row in frame.iterrows():
+        left, operator, right = row.get("Left"), row.get("Operator"), row.get("Right")
+        left_period, right_value = row.get("Left period"), row.get("Right period / value")
+        if left not in ("Close", "SMA", "EMA") or right not in SCREEN_LINE_KINDS or operator not in SCREEN_OPERATORS:
+            continue
+        if left != "Close" and (pd.isna(left_period) or int(left_period) < 1):
+            continue
+        if right != "Close" and pd.isna(right_value):
+            continue
+        if right in ("SMA", "EMA") and int(right_value) < 1:
+            continue
+        conditions.append({
+            "left_kind": left,
+            "left_period": None if left == "Close" else int(left_period),
+            "operator": operator,
+            "right_kind": right,
+            "right_period": None if right == "Close" else (float(right_value) if right == "Value" else int(right_value)),
+        })
+    return conditions
+
+
+def open_in_signal_analysis(ticker):
+    st.session_state["ticker_input"] = ticker
+
+
+def price_lines_chart(frame, title, ma_periods=(), bars=TRADING_DAYS_PER_YEAR, height=380):
+    """Last ``bars`` closes with SMAs (computed on the full history so they start filled)."""
+
+    view = frame.iloc[-bars:]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=view.index, y=view["Close"], name="Close", line=dict(color="gray", width=1.4)))
+    for color, period in zip(["orange", "royalblue", "purple"], ma_periods):
+        moving = frame["Close"].rolling(period, min_periods=period).mean().iloc[-bars:]
+        fig.add_trace(go.Scatter(x=moving.index, y=moving, name=f"SMA {period}", line=dict(color=color, width=1.2)))
+    fig.update_layout(title=title, height=height, margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
+    return fig
+
+
+def render_screener():
+    """Market / industry / stock screener for US or Hong Kong stocks."""
+
+    st.caption(
+        "Scan an index's members in three layers: the **market** (index trends and breadth), an **industry** "
+        "(up to 5 leading companies you pick) and each **stock** (price vs moving averages, distance from the "
+        "52-week high). Data comes from Yahoo Finance and is cached for 6 hours."
+    )
+
+    setup_columns = st.columns([1, 2, 2])
+    market = setup_columns[0].radio("Market", list(SCREENER_MARKETS), horizontal=True, key="screener_market")
+    universe = setup_columns[1].selectbox("Stocks to scan", SCREENER_MARKETS[market]["universes"], key=f"screener_universe_{market}")
+    recent_days = int(setup_columns[2].number_input(
+        "New-high / new-low window (days)", min_value=1, max_value=120, value=20, step=1, key="screener_recent_days",
+        help="Breadth counts stocks that made a new 52-week high (or low) at least once in this many trading days.",
+    ))
+
+    if universe == "Custom list":
+        custom_text = st.text_area(
+            "Tickers (comma or space separated)",
+            value="AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA" if market == "US" else "700, 9988, 3690, 1810, 1211, 5, 1299",
+            key=f"screener_custom_{market}",
+            help="HK codes can be typed as numbers, e.g. 700 for 0700.HK.",
+        )
+        members = pd.DataFrame({"Ticker": parse_ticker_list(custom_text, market), "Name": "", "Sector": "", "Industry": ""})
+        members_error = ""
+    else:
+        members, members_error = load_universe_members(market, universe)
+    if members.empty:
+        st.error(f"Could not load the members of {universe}. {members_error} Try **Custom list** instead.")
+        return
+    if market == "HK" and universe != "Custom list":
+        st.caption(f"{len(members)} Hang Seng Index members (bundled list; it may lag the latest index review).")
+
+    ma_columns = st.columns(3)
+    ma_fast = int(ma_columns[0].number_input("Short MA", min_value=2, max_value=400, value=20, step=1, key="screener_ma_fast"))
+    ma_mid = int(ma_columns[1].number_input("Medium MA", min_value=2, max_value=400, value=50, step=1, key="screener_ma_mid"))
+    ma_slow = int(ma_columns[2].number_input("Long MA", min_value=2, max_value=400, value=200, step=1, key="screener_ma_slow"))
+    ma_periods = tuple(dict.fromkeys([ma_fast, ma_mid, ma_slow]))
+
+    tickers = members["Ticker"].tolist()
+    indexes = SCREENER_MARKETS[market]["indexes"]
+    data_key = json.dumps([market, universe, tickers])
+    loaded = st.session_state.get("screener_data")
+    if st.button(f"Load data for {len(tickers)} stocks and {len(indexes)} indexes", type="primary"):
+        progress = st.progress(0.0, text="Downloading prices...")
+        prices = load_price_panel(tickers, progress=lambda value: progress.progress(value, text="Downloading prices..."))
+        index_prices = load_price_panel(list(indexes.values()))
+        progress.empty()
+        loaded = {"key": data_key, "prices": prices, "index_prices": index_prices}
+        st.session_state["screener_data"] = loaded
+    if loaded is None or loaded["key"] != data_key:
+        st.info("Press **Load data** to download prices. A full index takes about a minute the first time, then it is cached.")
+        return
+
+    prices, index_prices = loaded["prices"], loaded["index_prices"]
+    missing = [ticker for ticker in tickers if ticker not in prices]
+    if missing:
+        st.caption(f"No price data for {len(missing)} ticker(s): {', '.join(missing[:20])}{' ...' if len(missing) > 20 else ''}")
+    if not prices:
+        st.error("No price data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
+        return
+
+    # ---------------------------------------------------------- Market
+    st.header("1. Market")
+    index_rows = {}
+    for name, symbol in indexes.items():
+        if symbol in index_prices:
+            row = stock_snapshot(index_prices[symbol], ma_periods=ma_periods, recent_days=recent_days)
+            row["Trend"] = index_trend(index_prices[symbol], ma_mid, ma_slow)
+            index_rows[name] = row
+    if index_rows:
+        index_table = pd.DataFrame.from_dict(index_rows, orient="index")
+        index_columns = ["Trend", "Close", "Change %"] + [f"Close vs SMA {p} %" for p in ma_periods] + [
+            "% from 52w high", "Return 1m %", "Return 3m %"]
+        st.dataframe(index_table[index_columns].style.format(precision=2), width="stretch")
+        chart_index = st.selectbox("Index chart", list(index_rows), key="screener_index_chart")
+        st.plotly_chart(price_lines_chart(index_prices[indexes[chart_index]], chart_index, ma_periods), width="stretch")
+    else:
+        st.warning("No index data was returned.")
+
+    breadth = breadth_history(prices, ma_periods=(ma_mid, ma_slow), recent_days=recent_days)
+    breadth_latest = None
+    if not breadth.empty:
+        breadth_latest = breadth.dropna(how="all").iloc[-1]
+        st.subheader(f"Breadth of {universe} ({int(breadth_latest['Stocks'])} stocks)")
+        tiles = st.columns(4)
+        tiles[0].metric(f"Above SMA {ma_mid}", f"{breadth_latest[f'% above SMA {ma_mid}']:.0f}%")
+        tiles[1].metric(f"Above SMA {ma_slow}", f"{breadth_latest[f'% above SMA {ma_slow}']:.0f}%")
+        tiles[2].metric(f"New 52w high, last {recent_days}d", f"{breadth_latest[f'% new 52w high in last {recent_days}d']:.1f}%")
+        tiles[3].metric(f"New 52w low, last {recent_days}d", f"{breadth_latest[f'% new 52w low in last {recent_days}d']:.1f}%")
+        recent_breadth = breadth.iloc[-TRADING_DAYS_PER_YEAR:]
+        fig = go.Figure()
+        for column, color in [
+            (f"% above SMA {ma_mid}", "royalblue"), (f"% above SMA {ma_slow}", "purple"),
+            (f"% new 52w high in last {recent_days}d", "seagreen"), (f"% new 52w low in last {recent_days}d", "indianred"),
+        ]:
+            fig.add_trace(go.Scatter(x=recent_breadth.index, y=recent_breadth[column], name=column, line=dict(color=color, width=1.4)))
+        fig.update_layout(title="Market breadth (% of stocks)", height=340, margin=dict(l=10, r=10, t=40, b=10),
+                          hovermode="x unified", yaxis=dict(range=[0, 100]))
+        st.plotly_chart(fig, width="stretch")
+
+    with st.expander("Market filter", expanded=True):
+        gate_columns = st.columns(2)
+        gate_index = gate_columns[0].selectbox("Index", list(indexes), key="screener_gate_index")
+        use_index_ma = gate_columns[0].checkbox(f"Index close above its SMA {ma_slow}", value=True, key="screener_gate_close")
+        use_index_order = gate_columns[0].checkbox(f"Index SMA {ma_mid} above SMA {ma_slow}", value=False, key="screener_gate_order")
+        use_breadth = gate_columns[1].checkbox(f"Minimum % of stocks above SMA {ma_slow}", value=True, key="screener_gate_breadth")
+        breadth_threshold = gate_columns[1].number_input("% above", 0.0, 100.0, 50.0, 5.0, key="screener_gate_breadth_pct", disabled=not use_breadth)
+        use_highs = gate_columns[1].checkbox(f"Minimum % of stocks with a new 52w high in the last {recent_days} days", value=False, key="screener_gate_highs")
+        highs_threshold = gate_columns[1].number_input("% with new highs", 0.0, 100.0, 5.0, 1.0, key="screener_gate_highs_pct", disabled=not use_highs)
+    market_rules = {"index": gate_index}
+    if use_index_ma:
+        market_rules["index_ma"] = ma_slow
+    if use_index_order:
+        market_rules["index_ma_order"] = (ma_mid, ma_slow)
+    if use_breadth:
+        market_rules["min_pct_above_ma"] = (ma_slow, float(breadth_threshold))
+    if use_highs:
+        market_rules["min_pct_new_highs"] = (f"% new 52w high in last {recent_days}d", float(highs_threshold))
+    market_ok, market_checks = market_gate(index_rows, breadth_latest, market_rules)
+    check_lines = "\n".join(
+        f"- {'✅' if ok else ('⚠️ no data:' if ok is None else '❌')} {text}" for text, ok in market_checks
+    )
+    (st.success if market_ok else st.error)(f"**Market filter: {'PASS' if market_ok else 'FAIL'}**\n\n{check_lines}")
+
+    # ---------------------------------------------------------- Industry
+    st.header("2. Industry")
+    sectors = sorted(value for value in members["Sector"].dropna().unique() if value and value != "nan")
+    scan_members = members
+    if sectors:
+        sector_columns = st.columns(2)
+        chosen_sectors = sector_columns[0].multiselect("Limit the stock scan to sector(s)", sectors, key=f"screener_sectors_{universe}")
+        if chosen_sectors:
+            scan_members = scan_members[scan_members["Sector"].isin(chosen_sectors)]
+        industries = sorted(value for value in scan_members["Industry"].dropna().unique() if value and value != "nan")
+        chosen_industries = sector_columns[1].multiselect("... and sub-industry", industries, key=f"screener_industries_{universe}")
+        if chosen_industries:
+            scan_members = scan_members[scan_members["Industry"].isin(chosen_industries)]
+        if chosen_sectors or chosen_industries:
+            st.caption(f"{len(scan_members)} stocks in the selected sector / sub-industry.")
+            with st.expander("Companies in this selection"):
+                st.dataframe(scan_members, hide_index=True, width="stretch")
+
+    default_leaders = {"US": "NVDA, AMD, AVGO, TSM, INTC", "HK": "700, 9988, 3690, 9618, 1024"}[market]
+    leaders_text = st.text_input(
+        "Industry leaders to compare (up to 5 tickers)", value=default_leaders, key=f"screener_leaders_{market}",
+        help="Pick the top players of one industry. They don't need to be in the scanned index.",
+    )
+    leaders = parse_ticker_list(leaders_text, market)
+    if len(leaders) > 5:
+        st.warning(f"Only the first 5 of {len(leaders)} tickers are compared.")
+        leaders = leaders[:5]
+    industry_ok, industry_checks = True, []
+    if leaders:
+        leader_prices = {ticker: prices[ticker] for ticker in leaders if ticker in prices}
+        to_fetch = [ticker for ticker in leaders if ticker not in leader_prices]
+        if to_fetch:
+            leader_prices.update(load_price_panel(to_fetch))
+        leader_table = snapshot_table(leader_prices, ma_periods=ma_periods, recent_days=recent_days)
+        if leader_table.empty:
+            st.warning("No price data for these tickers.")
+        else:
+            leader_columns = ["Close", "Prev close", "Change %"] + [f"SMA {p}" for p in ma_periods] + [
+                f"Close vs SMA {p} %" for p in ma_periods] + ["Volume / avg", "% from 52w high", "Return 1m %", "Return 3m %", "Return 6m %"]
+            st.dataframe(leader_table[leader_columns].style.format(precision=2), width="stretch")
+
+            rebased = pd.DataFrame({
+                ticker: frame["Close"].iloc[-TRADING_DAYS_PER_YEAR:] / frame["Close"].iloc[-TRADING_DAYS_PER_YEAR:].iloc[0] * 100
+                for ticker, frame in leader_prices.items()
+            })
+            fig = go.Figure([go.Scatter(x=rebased.index, y=rebased[column], name=column) for column in rebased.columns])
+            fig.update_layout(title="Price over the last year (rebased to 100)", height=340,
+                              margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
+            st.plotly_chart(fig, width="stretch")
+
+            fundamentals_start = (pd.Timestamp(date.today()) - pd.DateOffset(years=4)).strftime("%Y-%m-%d")
+            today_str = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
+            fundamental_rows, quarterly = {}, {}
+            with st.spinner("Loading quarterly fundamentals..."):
+                for ticker in leader_table.index:
+                    fundamentals, _, _ = load_quarterly_fundamentals(ticker, fundamentals_start, today_str)
+                    trend = fundamental_trend(fundamentals)
+                    if trend:
+                        fundamental_rows[ticker] = trend
+                        quarterly[ticker] = fundamentals
+            if fundamental_rows:
+                st.subheader("Fundamentals")
+                fundamental_table = pd.DataFrame.from_dict(fundamental_rows, orient="index")
+                for column in fundamental_table.columns:
+                    if column.endswith("(last Q)") or column.endswith("TTM"):
+                        fundamental_table[column] = fundamental_table[column] / 1e6
+                fundamental_table = fundamental_table.rename(columns=lambda c: f"{c} ($M)" if c.endswith("(last Q)") or c.endswith("TTM") else c)
+                st.dataframe(fundamental_table.style.format(precision=1), width="stretch")
+                st.caption("Amounts in millions of the reporting currency. YoY compares with the same quarter a year earlier.")
+                metric = st.radio("Quarterly chart", ["Revenue", "Net_Income"], horizontal=True, key="screener_fund_metric",
+                                  format_func=lambda value: value.replace("_", " "))
+                fig = go.Figure()
+                for ticker, frame in quarterly.items():
+                    if metric in frame:
+                        series = frame[metric].dropna().iloc[-8:] / 1e6
+                        fig.add_trace(go.Bar(x=series.index, y=series, name=ticker))
+                fig.update_layout(title=f"{metric.replace('_', ' ')} by quarter (millions)", barmode="group", height=340,
+                                  margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig, width="stretch")
+            else:
+                st.caption("No quarterly fundamentals were available for these tickers.")
+
+            health = leaders_health(leader_table, (ma_mid, ma_slow))
+            health_columns = st.columns(4)
+            health_columns[0].metric(f"Leaders above SMA {ma_mid}", f"{health.get(f'Above SMA {ma_mid}', 0)} / {health['Leaders']}")
+            health_columns[1].metric(f"Leaders above SMA {ma_slow}", f"{health.get(f'Above SMA {ma_slow}', 0)} / {health['Leaders']}")
+            health_columns[2].metric("Avg % from 52w high", f"{health.get('Avg % from 52w high', float('nan')):.1f}%")
+            health_columns[3].metric("Avg 3-month return", f"{health.get('Avg 3m return %', float('nan')):.1f}%")
+            use_industry_gate = st.checkbox("Use the leaders as an industry filter", value=False, key="screener_industry_gate")
+            if use_industry_gate:
+                minimum_leaders = int(st.number_input(
+                    f"Minimum leaders above SMA {ma_mid}", min_value=1, max_value=health["Leaders"],
+                    value=max(1, (health["Leaders"] + 1) // 2), step=1, key="screener_industry_min",
+                ))
+                above = health.get(f"Above SMA {ma_mid}", 0)
+                industry_ok = above >= minimum_leaders
+                industry_checks = [(f"{above} of {health['Leaders']} leaders above SMA {ma_mid} (need {minimum_leaders})", industry_ok)]
+                (st.success if industry_ok else st.error)(
+                    f"**Industry filter: {'PASS' if industry_ok else 'FAIL'}** - {industry_checks[0][0]}"
+                )
+
+    # ---------------------------------------------------------- Stock
+    st.header("3. Stock")
+    st.caption(
+        "Each row is one condition on the last daily bar; a stock must meet all of them. Use **Value** on the right to "
+        "compare with a number (e.g. Close > Value 20). Cross Above / Below means the cross happened within the "
+        "cross window and still holds."
+    )
+    conditions_frame = st.data_editor(
+        DEFAULT_SCREEN_CONDITIONS,
+        num_rows="dynamic",
+        width="stretch",
+        key="screener_conditions",
+        column_config={
+            "Left": st.column_config.SelectboxColumn("Left", options=["Close", "SMA", "EMA"], required=True),
+            "Left period": st.column_config.NumberColumn("Left period", min_value=0, max_value=400, step=1,
+                                                         help="MA length (ignored for Close)."),
+            "Operator": st.column_config.SelectboxColumn("Operator", options=SCREEN_OPERATORS, required=True),
+            "Right": st.column_config.SelectboxColumn("Right", options=SCREEN_LINE_KINDS, required=True),
+            "Right period / value": st.column_config.NumberColumn("Right period / value",
+                                                                  help="MA length, or the number for Value."),
+        },
+    )
+    conditions = editor_conditions(conditions_frame)
+
+    filter_columns = st.columns(4)
+    use_high = filter_columns[0].checkbox("Within % of 52w high", value=True, key="screener_use_high")
+    max_from_high = filter_columns[0].number_input("Max % below 52w high", 0.0, 100.0, 25.0, 1.0,
+                                                   key="screener_max_from_high", disabled=not use_high)
+    min_price = filter_columns[1].number_input("Min price", 0.0, value=5.0 if market == "US" else 1.0, step=1.0, key=f"screener_min_price_{market}")
+    min_volume = filter_columns[2].number_input("Min avg daily volume (shares)", 0.0, value=0.0, step=100000.0, key="screener_min_volume")
+    cross_window = int(filter_columns[3].number_input("Cross window (bars)", 1, 60, 5, 1, key="screener_cross_window"))
+    require_gates = st.checkbox("Only list stocks when the market (and industry, if used) filter passes", value=False,
+                                key="screener_require_gates")
+
+    scan_prices = {ticker: prices[ticker] for ticker in scan_members["Ticker"] if ticker in prices}
+    results = screen_stocks(
+        scan_prices,
+        conditions,
+        max_pct_from_high=float(max_from_high) if use_high else None,
+        min_price=float(min_price) if min_price > 0 else None,
+        min_avg_volume=float(min_volume) if min_volume > 0 else None,
+        cross_window=cross_window,
+        ma_periods=ma_periods,
+        recent_days=recent_days,
+    )
+    if results.empty:
+        st.warning("No stocks to screen.")
+        return
+    passing = results[results["Pass"]]
+    gates_ok = market_ok and industry_ok
+    if require_gates and not gates_ok:
+        st.error(f"{len(passing)} stock(s) meet the stock conditions, but they are hidden because the "
+                 "market or industry filter fails.")
+        return
+    names = members.set_index("Ticker")["Name"]
+    results.insert(1, "Name", [names.get(ticker, "") for ticker in results.index])
+    st.success(f"**{len(passing)} of {len(results)} stocks pass** "
+               + ", ".join(condition_label(condition) for condition in conditions)
+               + (f", within {max_from_high:g}% of the 52w high" if use_high else ""))
+    show_all = st.checkbox("Show stocks that fail too", value=False, key="screener_show_all")
+    shown = results if show_all else results[results["Pass"]]
+    display_columns = ["Pass", "Name", "Close", "Change %"] + [f"Close vs SMA {p} %" for p in ma_periods] + [
+        "% from 52w high", f"New 52w high in last {recent_days}d", "Volume / avg", "Return 1m %", "Return 3m %"]
+    condition_columns = [column for column in results.columns if column not in display_columns and results[column].dtype == bool]
+    st.dataframe(shown[display_columns + condition_columns].style.format(precision=2), width="stretch", height=420)
+    st.download_button(
+        "Download results (CSV)",
+        shown.to_csv().encode("utf-8"),
+        file_name=f"screener_{market}_{pd.Timestamp(date.today()):%Y%m%d}.csv",
+        mime="text/csv",
+    )
+    if not passing.empty:
+        pick_columns = st.columns([2, 1])
+        picked = pick_columns[0].selectbox("Open a result in Signal Analysis", passing.index.tolist(), key="screener_pick")
+        pick_columns[1].button("Set as sidebar ticker", on_click=open_in_signal_analysis, args=(picked,))
+
+
+# ============================================================
 # Main application
 # ============================================================
 
@@ -1780,7 +2239,7 @@ if check_password():
     st.write("Welcome to the protected app!")
 
     st.sidebar.header("Strategy Settings")
-    ticker = st.sidebar.text_input("Ticker Symbol", value="AAPL")
+    ticker = st.sidebar.text_input("Ticker Symbol", value="AAPL", key="ticker_input")
     timeframe = st.sidebar.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0)
     date_range = st.sidebar.date_input(
         "Date Range",
@@ -1949,9 +2408,12 @@ if check_password():
         st.error(f"No price data was returned for {ticker} between {start_date_str} and {end_date_str}.")
         st.stop()
 
-    tab_backtest, tab_signals, tab_validate = st.tabs(
-        ["Backtest", "Signal Analysis & Trade Plan", "Validate"]
+    tab_backtest, tab_signals, tab_validate, tab_screener = st.tabs(
+        ["Backtest", "Signal Analysis & Trade Plan", "Validate", "Stock Screener"]
     )
+
+    with tab_screener:
+        render_screener()
 
     with tab_signals:
         render_signal_analysis(ticker, end_date, signal_settings, risk_settings)
