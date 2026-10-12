@@ -39,7 +39,14 @@ from analysis.screener import (
     stock_snapshot,
 )
 from analysis.scoring import COMPONENT_WEIGHTS
-from analysis.universe import MARKETS as SCREENER_MARKETS, hang_seng_members, load_us_index_members, parse_ticker_list
+from analysis.universe import (
+    MARKETS as SCREENER_MARKETS,
+    hang_seng_members,
+    load_hang_seng_members,
+    load_us_index_members,
+    normalize_symbol,
+    parse_ticker_list,
+)
 from analysis.validation import ValidationSettings, base_rates, exit_signal_stats, summarize, verdict, walk_forward
 
 
@@ -392,18 +399,33 @@ def get_sec_cik(symbol):
     return None
 
 
-def get_sec_fact_entries(company_facts, candidate_tags):
-    """Return USD fact entries for the first SEC tag containing usable data."""
+def get_sec_fact_entries(company_facts, tag):
+    """Return the USD fact entries reported under one SEC tag."""
 
     us_gaap_facts = company_facts.get("facts", {}).get("us-gaap", {})
+    return us_gaap_facts.get(tag, {}).get("units", {}).get("USD", [])
 
+
+def combine_sec_tags(company_facts, candidate_tags, extract):
+    """Quarterly series merged across tags, earlier tags taking priority.
+
+    Companies switch tags over time (NVIDIA reported revenue under
+    RevenueFromContractWithCustomerExcludingAssessedTax until 2022, then
+    Revenues), so taking only the first tag with data drops whole years.
+    """
+
+    combined = pd.Series(dtype=float)
     for tag in candidate_tags:
-        fact = us_gaap_facts.get(tag, {})
-        entries = fact.get("units", {}).get("USD", [])
-        if entries:
-            return entries
-
-    return []
+        series = extract(get_sec_fact_entries(company_facts, tag))
+        if series.empty:
+            continue
+        # Treat quarter ends a few days apart as the same quarter.
+        new_dates = [
+            timestamp for timestamp in series.index
+            if combined.empty or np.abs(combined.index - timestamp).min() > pd.Timedelta(days=14)
+        ]
+        combined = pd.concat([combined, series.loc[new_dates]]).sort_index()
+    return combined
 
 
 def prepare_sec_duration_entries(entries):
@@ -495,6 +517,12 @@ def select_latest_longest(group, minimum_days, maximum_days):
 
 
 def extract_sec_fiscal_quarters(company_facts, candidate_tags):
+    """Fiscal-quarter values from SEC duration facts, merged across ``candidate_tags``."""
+
+    return combine_sec_tags(company_facts, candidate_tags, fiscal_quarters_from_entries)
+
+
+def fiscal_quarters_from_entries(entries):
     """
     Build fiscal-quarter values from SEC duration facts.
 
@@ -503,7 +531,6 @@ def extract_sec_fiscal_quarters(company_facts, candidate_tags):
     avoids relying on CYyyyyQn frame labels, which omit many fiscal quarters.
     """
 
-    entries = get_sec_fact_entries(company_facts, candidate_tags)
     facts = prepare_sec_duration_entries(entries)
 
     if facts.empty:
@@ -576,6 +603,12 @@ def extract_sec_fiscal_quarters(company_facts, candidate_tags):
 
 
 def extract_sec_cumulative_quarters(company_facts, candidate_tags):
+    """Fiscal quarters from cumulative SEC facts, merged across ``candidate_tags``."""
+
+    return combine_sec_tags(company_facts, candidate_tags, cumulative_quarters_from_entries)
+
+
+def cumulative_quarters_from_entries(entries):
     """
     Convert cumulative SEC cash-flow facts into individual fiscal quarters.
 
@@ -583,7 +616,6 @@ def extract_sec_cumulative_quarters(company_facts, candidate_tags):
     year-to-date values rather than standalone Q2 and Q3 amounts.
     """
 
-    entries = get_sec_fact_entries(company_facts, candidate_tags)
     facts = prepare_sec_duration_entries(entries)
 
     if facts.empty:
@@ -675,6 +707,8 @@ def load_sec_quarterly_fundamentals(symbol):
             [
                 "RevenueFromContractWithCustomerExcludingAssessedTax",
                 "SalesRevenueNet",
+                # Banks report net revenue (after interest expense) here.
+                "RevenuesNetOfInterestExpense",
                 "Revenues",
             ],
         )
@@ -734,7 +768,7 @@ def load_quarterly_fundamentals(
     symbol,
     start_date_str,
     end_date_str,
-    cache_version="2026-09-29-v5",
+    cache_version="2026-10-12-v6",
 ):
     """Combine long SEC history with recent Yahoo Finance statements."""
 
@@ -1189,18 +1223,27 @@ def load_intraday_data(symbol, interval="5m", period="10d"):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_fundamental_snapshot(symbol):
-    """Current valuation fields from Yahoo (forward P/E, PEG, growth ...)."""
+def fetch_fundamental_snapshot(symbol):
+    """Yahoo valuation fields; raises when Yahoo returns nothing so failures are not cached."""
 
     keys = [
         "trailingPE", "forwardPE", "pegRatio", "trailingPegRatio", "earningsGrowth",
         "revenueGrowth", "profitMargins", "priceToBook", "debtToEquity", "sector", "industry",
     ]
+    info = yf.Ticker(symbol).info or {}
+    snapshot = {key: info.get(key) for key in keys if info.get(key) is not None}
+    if not snapshot:
+        raise ValueError(f"Yahoo returned no valuation fields for {symbol}")
+    return snapshot
+
+
+def load_fundamental_snapshot(symbol):
+    """Current valuation fields from Yahoo (forward P/E, PEG, growth ...), or {} when unavailable."""
+
     try:
-        info = yf.Ticker(symbol).info or {}
+        return fetch_fundamental_snapshot(symbol)
     except Exception:
         return {}
-    return {key: info.get(key) for key in keys if info.get(key) is not None}
 
 
 def fundamentals_by_release_date(fundamentals_df, earnings_df, fallback_lag_days=45):
@@ -1865,7 +1908,13 @@ def load_universe_members(market, universe):
     """Members of a screener universe. Cached for a day."""
 
     if market == "HK":
-        return hang_seng_members(), ""
+        try:
+            members = load_hang_seng_members()
+            if not members.empty:
+                return members, ""
+        except Exception:
+            pass
+        return hang_seng_members(), "bundled"
     try:
         return load_us_index_members(universe), ""
     except Exception as error:
@@ -1959,7 +2008,8 @@ def render_screener():
         st.error(f"Could not load the members of {universe}. {members_error} Try **Custom list** instead.")
         return
     if market == "HK" and universe != "Custom list":
-        st.caption(f"{len(members)} Hang Seng Index members (bundled list; it may lag the latest index review).")
+        source = "bundled list; it may lag the latest index review" if members_error == "bundled" else "from Wikipedia"
+        st.caption(f"{len(members)} Hang Seng Index members ({source}).")
 
     ma_columns = st.columns(3)
     ma_fast = int(ma_columns[0].number_input("Short MA", min_value=2, max_value=400, value=20, step=1, key="screener_ma_fast"))
@@ -2239,7 +2289,7 @@ if check_password():
     st.write("Welcome to the protected app!")
 
     st.sidebar.header("Strategy Settings")
-    ticker = st.sidebar.text_input("Ticker Symbol", value="AAPL", key="ticker_input")
+    ticker = normalize_symbol(st.sidebar.text_input("Ticker Symbol", value="AAPL", key="ticker_input"))
     timeframe = st.sidebar.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0)
     date_range = st.sidebar.date_input(
         "Date Range",
