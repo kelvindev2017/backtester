@@ -20,8 +20,11 @@ def fake_daily(start, end):
     n = len(index)
     closes = np.linspace(80, 140, n) + 6 * np.sin(np.arange(n) / 15) + rng.normal(0, 0.8, n)
     volumes = rng.uniform(0.8e6, 1.2e6, n)
-    closes[-1] = closes[-25:-1].max() * 1.03
-    volumes[-1] = 3.5e6
+    # Breakout on the second-to-last bar, held on the last one, so the signal
+    # survives whether or not the app drops today's in-progress bar.
+    closes[-2] = closes[-26:-2].max() * 1.03
+    closes[-1] = closes[-2] * 1.003
+    volumes[-2] = 3.5e6
     return make_bars(closes, volumes, index=index, seed=5)
 
 
@@ -74,6 +77,7 @@ def test_app_runs_both_tabs(offline):
     app.secrets["password"] = "pw"
     app.run()
     app.text_input[0].input("pw").run()
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (20-bar high/low on volume)").run()
     assert not app.exception, app.exception
     tab_labels = [tab.label for tab in app.tabs]
     assert tab_labels == ["Backtest", "Signal Analysis & Trade Plan", "Validate"]
@@ -98,3 +102,19 @@ def test_validate_tab_runs(offline):
     metrics = {metric.label: metric.value for metric in app.metric}
     assert int(metrics["Signals replayed"].replace(",", "")) > 0
     assert any("Does the confidence score mean anything?" in element.value for element in app.subheader)
+
+
+def test_one_signal_rule_drives_every_tab(offline):
+    app = AppTest.from_file(APP_PATH, default_timeout=120)
+    app.secrets["password"] = "pw"
+    app.run()
+    app.text_input[0].input("pw").run()
+    rule = next(box for box in app.selectbox if box.label == "Signal rule")
+    assert rule.value.startswith("Moving-average rule")
+    assert any(box.label == "Fast MA Type" for box in app.selectbox)
+    assert [box.label for box in app.number_input].count("Account size ($)") == 1
+
+    rule.select("Breakout (20-bar high/low on volume)").run()
+    assert not app.exception, app.exception
+    assert not any(box.label == "Fast MA Type" for box in app.selectbox)
+    assert any("Breakout (20-bar high/low on volume) signals" in element.value for element in app.info)

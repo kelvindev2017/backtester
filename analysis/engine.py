@@ -31,7 +31,9 @@ from analysis.patterns import (
     detect_signals,
     historical_edge_score,
     historical_signal_stats,
+    describe_ma_rule,
     latest_active_signal,
+    ma_rule_quality,
     pullback_quality,
     reversal_quality,
 )
@@ -54,6 +56,7 @@ class AnalysisSettings:
     opening_range_minutes: int = 30
     intraday_volume_multiple: float = 1.2
     history_horizon: int = 10
+    ma_rule: dict = None
 
 
 @dataclass
@@ -84,6 +87,7 @@ SETUP_NAMES = {
     "breakout": ("breakout above", "breakdown below"),
     "pullback": ("pullback entry above", "bounce-failure entry below"),
     "reversal": ("reversal buy after breakdown at", "-"),
+    "ma_rule": ("MA rule buy at", "MA rule sell at"),
 }
 
 
@@ -113,7 +117,9 @@ def analyze(
         return SignalReport(symbol, None, "INSUFFICIENT DATA", headline="At least ~60 daily bars are needed.")
 
     as_of = pd.Timestamp(daily.index[-1])
-    signals = detect_signals(daily, settings.setup, settings.breakout_lookback, settings.volume_multiple)
+    signals = detect_signals(
+        daily, settings.setup, settings.breakout_lookback, settings.volume_multiple, ma_rule=settings.ma_rule
+    )
     atr_value = float(atr(daily).iloc[-1])
     supports, resistances = support_resistance(
         daily,
@@ -148,7 +154,13 @@ def analyze(
 
     if signal is None:
         last = signals.iloc[-1]
-        if settings.setup == "reversal":
+        if settings.setup == "ma_rule":
+            report.headline = (
+                f"No moving-average rule signal in the last {settings.signal_window} bars. A BUY needs "
+                f"{describe_ma_rule(settings.ma_rule, 'buy')}; a {_direction_word(-1, settings.allow_short)} needs "
+                f"{describe_ma_rule(settings.ma_rule, 'sell')}."
+            )
+        elif settings.setup == "reversal":
             report.headline = (
                 f"No reversal buy in the last {settings.signal_window} bars. A BUY needs a long-term uptrend "
                 f"(close above the 200-bar MA, 50-bar MA above it) and a daily close below the prior "
@@ -187,7 +199,14 @@ def analyze(
     components = []
 
     # 1. Signal quality --------------------------------------------------
-    if settings.setup == "reversal":
+    if settings.setup == "ma_rule":
+        quality, quality_details, trigger = ma_rule_quality(signal_row, signal_close, direction, settings.ma_rule)
+        signal_text = (
+            f"Moving-average rule fired on {signal['date']:%Y-%m-%d} ({signal['bars_ago']} bar(s) ago) at "
+            f"{trigger:,.2f}, invalidated {'below' if direction > 0 else 'above'} {signal['invalidation']:,.2f}."
+        )
+        quality_metrics = {"RVOL": float(signal_row["RVOL"])}
+    elif settings.setup == "reversal":
         quality, quality_details, trigger = reversal_quality(signal_row, signal_close, direction)
         signal_text = (
             f"Daily breakdown inside an uptrend on {signal['date']:%Y-%m-%d} ({signal['bars_ago']} bar(s) ago): "
@@ -313,7 +332,7 @@ def analyze(
         entry = float(daily["Close"].iloc[-1])
         entry_basis = "last daily close (indicative - final entry comes from the intraday trigger)"
 
-    if settings.setup in ("pullback", "reversal"):
+    if settings.setup in ("pullback", "reversal", "ma_rule"):
         # The pullback / signal-bar extreme is the level that invalidates the setup.
         invalidation = signal["invalidation"]
         broken_level = PriceZone(

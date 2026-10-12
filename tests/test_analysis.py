@@ -422,3 +422,48 @@ def test_reversal_detector_buys_breakdown_only_in_uptrend():
     assert not detect_reversals(down)["Signal_Up"].iloc[-1]
     report = analyze("RV", up, to_weekly(up), settings=AnalysisSettings(setup="reversal"))
     assert report.direction == 1 and report.plan.stop < up["Low"].iloc[-1]
+
+
+def test_ma_rule_fires_once_per_cross_and_matches_backtest_rule():
+    from analysis.patterns import detect_signals, ma_rule_conditions
+
+    closes = np.concatenate([np.linspace(100, 80, 80), np.linspace(80, 120, 80), np.linspace(120, 90, 80)])
+    bars = make_bars(closes, seed=5)
+    rule = {"fast_type": "EMA", "fast_period": 10, "slow_type": "SMA", "slow_period": 30}
+    signals = detect_signals(bars, "ma_rule", ma_rule=rule)
+    _, _, buy, sell = ma_rule_conditions(bars, rule)
+    pd.testing.assert_series_equal(signals["Signal_Up"], buy, check_names=False)
+    pd.testing.assert_series_equal(signals["Signal_Down"], sell, check_names=False)
+    assert signals["Signal_Up"].sum() >= 1 and signals["Signal_Down"].sum() >= 1
+    # Long invalidation sits at or below the signal bar's low.
+    row = signals[signals["Signal_Up"]].iloc[0]
+    assert row["Invalidation_Up"] <= bars.loc[signals["Signal_Up"]].iloc[0]["Low"] + 1e-9
+
+
+def test_ma_rule_level_condition_fires_on_first_bar_only():
+    from analysis.patterns import detect_ma_rule
+
+    closes = np.concatenate([np.full(60, 100.0), np.linspace(100, 130, 40)])
+    bars = make_bars(closes, seed=6)
+    rule = {"buy": ("Close", ">", "Slow_MA"), "sell": ("Close", "<", "Slow_MA")}
+    signals = detect_ma_rule(bars, rule)
+    fired = signals.index[signals["Signal_Up"]]
+    assert len(fired) >= 1
+    # Close stays above the slow MA through the rally, so no repeated buys on consecutive bars.
+    positions = [bars.index.get_loc(ts) for ts in fired]
+    assert all(b - a > 1 for a, b in zip(positions, positions[1:]))
+
+
+def test_engine_runs_ma_rule_setup(breakout_daily):
+    rule = {"fast_type": "EMA", "fast_period": 5, "slow_type": "SMA", "slow_period": 20,
+            "buy": ("Close", "Cross Above", "Slow_MA"), "sell": ("Close", "Cross Below", "Slow_MA")}
+    report = analyze("TEST", breakout_daily, to_weekly(breakout_daily),
+                     settings=AnalysisSettings(setup="ma_rule", ma_rule=rule, signal_window=400))
+    assert report.signal is not None
+    assert report.action not in ("INSUFFICIENT DATA",)
+    text = report_to_markdown(report)
+    assert "TEST" in text
+    no_signal = analyze("TEST", breakout_daily, None,
+                        settings=AnalysisSettings(setup="ma_rule", ma_rule={"buy": ("Close", ">", "Close"), "sell": ("Close", "<", "Close")}))
+    assert no_signal.action == "NO SIGNAL"
+    assert "moving-average rule" in no_signal.headline

@@ -150,7 +150,9 @@ def walk_forward(
     if daily is None or daily.empty:
         return pd.DataFrame()
 
-    signals = detect_signals(daily, settings.setup, settings.breakout_lookback, settings.volume_multiple)
+    signals = detect_signals(
+        daily, settings.setup, settings.breakout_lookback, settings.volume_multiple, ma_rule=settings.ma_rule
+    )
     fired = (signals["Signal_Up"] | signals["Signal_Down"]).to_numpy()
     in_window = np.ones(len(daily), dtype=bool)
     if start is not None:

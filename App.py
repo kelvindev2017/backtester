@@ -15,6 +15,14 @@ from plotly.subplots import make_subplots
 from analysis.engine import AnalysisSettings, analyze, report_to_dict, report_to_markdown
 from analysis.indicators import resample_ohlcv
 from analysis.notify import send_webhook, short_summary
+from analysis.patterns import (
+    MA_RULE_OPERATORS,
+    MA_RULE_SERIES,
+    detect_signals,
+    ma_rule_conditions,
+    moving_average,
+    rule_condition,
+)
 from analysis.risk import RiskSettings
 from analysis.scoring import COMPONENT_WEIGHTS
 from analysis.validation import ValidationSettings, base_rates, exit_signal_stats, summarize, verdict, walk_forward
@@ -67,34 +75,8 @@ def check_password():
 # Indicators and signal conditions
 # ============================================================
 
-def compute_ma(series, ma_type, period):
-    """Calculate an exponential or simple moving average."""
-
-    period = int(period)
-    if ma_type == "EMA":
-        return series.ewm(span=period, adjust=False).mean()
-    return series.rolling(window=period, min_periods=period).mean()
-
-
-def build_condition(left, operator, right):
-    """Build a Boolean condition from two aligned Pandas Series."""
-
-    if operator == ">":
-        condition = left > right
-    elif operator == "<":
-        condition = left < right
-    elif operator == ">=":
-        condition = left >= right
-    elif operator == "<=":
-        condition = left <= right
-    elif operator == "Cross Above":
-        condition = (left > right) & (left.shift(1) <= right.shift(1))
-    elif operator == "Cross Below":
-        condition = (left < right) & (left.shift(1) >= right.shift(1))
-    else:
-        condition = pd.Series(False, index=left.index)
-
-    return condition.fillna(False).astype(bool)
+compute_ma = moving_average
+build_condition = rule_condition
 
 
 # ============================================================
@@ -1368,7 +1350,7 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
     st.info(
         "**Validation note:** replayed on 52 large US stocks over 2016-2026, the breakout, pullback and reversal "
         "setups did not beat random entry days with the same stops and targets, and the confidence score did not "
-        "rank trades better than chance. Treat signals as a structured checklist, and use the **Validate** tab on "
+        "rank trades better than chance. The moving-average rule was not part of that study. Treat signals as a structured checklist, and use the **Validate** tab on "
         "your own tickers before acting on them."
     )
     st.caption(
@@ -1806,70 +1788,95 @@ if check_password():
         max_value=date.today(),
         format="YYYY-MM-DD",
     )
-    initial_capital = st.sidebar.number_input(
-        "Initial Capital ($)", min_value=1.0, value=10000.0, step=1000.0
+    account_size = st.sidebar.number_input(
+        "Account size ($)",
+        min_value=1000.0,
+        value=100000.0,
+        step=5000.0,
+        help="Starting equity for the Backtest tab and the equity used for position sizing.",
     )
 
-    st.sidebar.subheader("Moving Averages")
-    fast_type = st.sidebar.selectbox("Fast MA Type", ["EMA", "SMA"], index=0)
-    fast_period = int(st.sidebar.number_input("Fast MA Period", min_value=1, value=20, step=1))
-    slow_type = st.sidebar.selectbox("Slow MA Type", ["EMA", "SMA"], index=1)
-    slow_period = int(st.sidebar.number_input("Slow MA Period", min_value=1, value=50, step=1))
+    st.sidebar.subheader("Signal")
+    setup_options = {
+        "Moving-average rule (set below)": "ma_rule",
+        "Breakout (20-bar high/low on volume)": "breakout",
+        "Pullback in trend (dip to 20 EMA, then reversal)": "pullback",
+        "Reversal (buy a 20-bar breakdown in an uptrend)": "reversal",
+    }
+    setup_label = st.sidebar.selectbox(
+        "Signal rule",
+        list(setup_options),
+        index=0,
+        help="Used by every tab: the Backtest buys and sells on it, Signal Analysis builds a trade plan from it, "
+        "and Validate replays it.",
+    )
+    setup = setup_options[setup_label]
 
-    signal_options = ["Close", "Fast_MA", "Slow_MA"]
-    operator_options = [">", "<", ">=", "<=", "Cross Above", "Cross Below"]
+    # Moving-average rule defaults (also used for the Backtest chart's MA lines).
+    fast_type, fast_period, slow_type, slow_period = "EMA", 20, "SMA", 50
+    buy_left, buy_operator, buy_right = "Fast_MA", "Cross Above", "Slow_MA"
+    sell_left, sell_operator, sell_right = "Fast_MA", "Cross Below", "Slow_MA"
+    breakout_lookback, volume_multiple = 20, 1.5
 
-    st.sidebar.subheader("Buy Signal")
-    buy_col_left, buy_col_operator, buy_col_right = st.sidebar.columns([1.25, 1.1, 1.25])
-    with buy_col_left:
-        buy_left = st.selectbox("Buy left signal", signal_options, index=1, key="buy_left", label_visibility="collapsed")
-    with buy_col_operator:
-        buy_operator = st.selectbox("Buy operator", operator_options, index=4, key="buy_operator", label_visibility="collapsed")
-    with buy_col_right:
-        buy_right = st.selectbox("Buy right signal", signal_options, index=2, key="buy_right", label_visibility="collapsed")
-    st.sidebar.caption(f"Buy when: `{buy_left} {buy_operator} {buy_right}`")
+    if setup == "ma_rule":
+        ma_columns = st.sidebar.columns(2)
+        fast_type = ma_columns[0].selectbox("Fast MA Type", ["EMA", "SMA"], index=0)
+        fast_period = int(ma_columns[1].number_input("Fast MA Period", min_value=1, value=20, step=1))
+        slow_type = ma_columns[0].selectbox("Slow MA Type", ["EMA", "SMA"], index=1)
+        slow_period = int(ma_columns[1].number_input("Slow MA Period", min_value=1, value=50, step=1))
 
-    st.sidebar.divider()
-    st.sidebar.subheader("Sell Signal")
-    sell_col_left, sell_col_operator, sell_col_right = st.sidebar.columns([1.25, 1.1, 1.25])
-    with sell_col_left:
-        sell_left = st.selectbox("Sell left signal", signal_options, index=1, key="sell_left", label_visibility="collapsed")
-    with sell_col_operator:
-        sell_operator = st.selectbox("Sell operator", operator_options, index=5, key="sell_operator", label_visibility="collapsed")
-    with sell_col_right:
-        sell_right = st.selectbox("Sell right signal", signal_options, index=2, key="sell_right", label_visibility="collapsed")
-    st.sidebar.caption(f"Sell when: `{sell_left} {sell_operator} {sell_right}`")
+        st.sidebar.markdown("**Buy when**")
+        buy_col_left, buy_col_operator, buy_col_right = st.sidebar.columns([1.25, 1.1, 1.25])
+        with buy_col_left:
+            buy_left = st.selectbox("Buy left signal", MA_RULE_SERIES, index=1, key="buy_left", label_visibility="collapsed")
+        with buy_col_operator:
+            buy_operator = st.selectbox("Buy operator", MA_RULE_OPERATORS, index=4, key="buy_operator", label_visibility="collapsed")
+        with buy_col_right:
+            buy_right = st.selectbox("Buy right signal", MA_RULE_SERIES, index=2, key="buy_right", label_visibility="collapsed")
 
-    st.sidebar.divider()
-    with st.sidebar.expander("Signal Analysis & Risk", expanded=False):
-        setup_label = st.selectbox(
-            "Signal setup",
-            [
-                "Breakout (20-bar high/low on volume)",
-                "Pullback in trend (dip to 20 EMA, then reversal)",
-                "Reversal (buy a 20-bar breakdown in an uptrend)",
-            ],
-            index=0,
-        )
-        allow_short = st.checkbox("Allow short trades (otherwise bearish signals mean exit)", value=False)
-        account_equity = st.number_input("Account equity for sizing ($)", min_value=1000.0, value=100000.0, step=5000.0)
+        st.sidebar.markdown("**Sell / exit when**")
+        sell_col_left, sell_col_operator, sell_col_right = st.sidebar.columns([1.25, 1.1, 1.25])
+        with sell_col_left:
+            sell_left = st.selectbox("Sell left signal", MA_RULE_SERIES, index=1, key="sell_left", label_visibility="collapsed")
+        with sell_col_operator:
+            sell_operator = st.selectbox("Sell operator", MA_RULE_OPERATORS, index=5, key="sell_operator", label_visibility="collapsed")
+        with sell_col_right:
+            sell_right = st.selectbox("Sell right signal", MA_RULE_SERIES, index=2, key="sell_right", label_visibility="collapsed")
+    elif setup == "breakout":
+        breakout_lookback = int(st.sidebar.number_input("Breakout lookback (daily bars)", min_value=5, max_value=120, value=20, step=1))
+        volume_multiple = st.sidebar.number_input("Breakout volume (x 50-bar average)", min_value=1.0, max_value=5.0, value=1.5, step=0.1)
+    elif setup == "pullback":
+        st.sidebar.caption("Buy: 50-bar MA above a rising 200-bar MA, a dip of at least 1.5 ATR toward the 20 EMA, then a close above the prior high. Sell / exit: the mirror image in a downtrend.")
+    else:
+        st.sidebar.caption("Buy: a close below the prior 20-bar low while the stock is above its 200-bar MA. There is no sell signal; trades exit at their stop or target.")
+
+    allow_short = st.sidebar.checkbox("Allow short trades (otherwise sell signals mean exit)", value=False)
+
+    with st.sidebar.expander("Risk & sizing", expanded=False):
         risk_pct = st.number_input("Risk per trade (% of equity)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
         max_position_pct = st.number_input("Max position (% of equity)", min_value=1.0, max_value=100.0, value=25.0, step=1.0)
-        breakout_lookback = int(st.number_input("Breakout lookback (daily bars)", min_value=5, max_value=120, value=20, step=1))
-        volume_multiple = st.number_input("Breakout volume (x 50-bar average)", min_value=1.0, max_value=5.0, value=1.5, step=0.1)
         full_size_confidence = st.slider("Full-size confidence threshold", 50, 95, 75)
         half_size_confidence = st.slider("Half-size confidence threshold", 40, 90, 60)
         opening_range_minutes = st.selectbox("Intraday opening range (minutes)", [15, 30, 60], index=1)
 
+    ma_rule = {
+        "fast_type": fast_type,
+        "fast_period": int(fast_period),
+        "slow_type": slow_type,
+        "slow_period": int(slow_period),
+        "buy": (buy_left, buy_operator, buy_right),
+        "sell": (sell_left, sell_operator, sell_right),
+    }
     signal_settings = AnalysisSettings(
-        setup=setup_label.split(" ")[0].lower(),
+        setup=setup,
         allow_short=allow_short,
         breakout_lookback=breakout_lookback,
         volume_multiple=float(volume_multiple),
         opening_range_minutes=int(opening_range_minutes),
+        ma_rule=ma_rule if setup == "ma_rule" else None,
     )
     risk_settings = RiskSettings(
-        account_equity=float(account_equity),
+        account_equity=float(account_size),
         risk_pct=float(risk_pct),
         max_position_pct=float(max_position_pct),
         full_size_confidence=float(max(full_size_confidence, half_size_confidence)),
@@ -1945,7 +1952,7 @@ if check_password():
         df["Fast_MA"] = compute_ma(df["Close"], fast_type, fast_period)
         df["Slow_MA"] = compute_ma(df["Close"], slow_type, slow_period)
 
-        if len(df) < max(fast_period, slow_period):
+        if setup == "ma_rule" and len(df) < max(fast_period, slow_period):
             st.warning(
                 f"The selected period contains only {len(df)} bars, but the longest "
                 f"moving average requires {max(fast_period, slow_period)} bars."
@@ -1978,19 +1985,31 @@ if check_password():
         if not pe_error.empty:
             st.caption(f"Maximum internal P/E calculation error: ${pe_error.max():.8f}")
 
-        signal_map = {"Close": df["Close"], "Fast_MA": df["Fast_MA"], "Slow_MA": df["Slow_MA"]}
-        buy_condition = build_condition(signal_map[buy_left], buy_operator, signal_map[buy_right])
-        sell_condition = build_condition(signal_map[sell_left], sell_operator, signal_map[sell_right])
+        if setup == "ma_rule":
+            _, _, buy_condition, sell_condition = ma_rule_conditions(df, ma_rule)
+            rule_text = (
+                f"**BUY:** `{buy_left} {buy_operator} {buy_right}`\n\n"
+                f"**SELL:** `{sell_left} {sell_operator} {sell_right}`"
+            )
+        else:
+            backtest_signals = detect_signals(df, setup, breakout_lookback, float(volume_multiple))
+            buy_condition = backtest_signals["Signal_Up"].fillna(False).astype(bool)
+            sell_condition = backtest_signals["Signal_Down"].fillna(False).astype(bool)
+            rule_text = (
+                f"**BUY / SELL:** {setup_label} signals on {timeframe.lower()} bars. The position is held until "
+                "the opposite signal. Stops and targets are not simulated here; the **Validate** tab replays the "
+                "full trade plan."
+            )
         df = run_position_engine(df, buy_condition, sell_condition)
 
         df["Returns"] = df["Close"].pct_change().fillna(0.0)
         df["Strat_Returns"] = df["Position"] * df["Returns"]
-        df["Equity"] = float(initial_capital) * (1.0 + df["Strat_Returns"]).cumprod()
+        df["Equity"] = float(account_size) * (1.0 + df["Strat_Returns"]).cumprod()
         df["Peak"] = df["Equity"].cummax()
         df["Drawdown"] = df["Equity"] / df["Peak"] - 1.0
 
         final_equity = df["Equity"].iloc[-1]
-        total_return = (final_equity / float(initial_capital) - 1.0) * 100.0
+        total_return = (final_equity / float(account_size) - 1.0) * 100.0
         max_drawdown = df["Drawdown"].min() * 100.0
         active_returns = df.loc[df["Strat_Returns"] != 0, "Strat_Returns"]
         positive_active_bars = 0.0 if active_returns.empty else active_returns.gt(0).mean() * 100.0
@@ -1999,10 +2018,7 @@ if check_password():
         metric_col1.metric("Final Equity", f"${final_equity:,.2f}", f"{total_return:.2f}%")
         metric_col2.metric("Max Drawdown", f"{max_drawdown:.2f}%")
         metric_col3.metric("Positive Active Bars", f"{positive_active_bars:.1f}%")
-        st.info(
-            f"**BUY:** `{buy_left} {buy_operator} {buy_right}`\n\n"
-            f"**SELL:** `{sell_left} {sell_operator} {sell_right}`"
-        )
+        st.info(rule_text)
 
         fig = make_subplots(
             rows=7,
@@ -2032,8 +2048,9 @@ if check_password():
 
         # Row 1: price, moving averages and signals
         fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gray", width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df["Fast_MA"], name=f"{fast_type} {fast_period}", line=dict(color="orange", width=1.5)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
+        if setup == "ma_rule":
+            fig.add_trace(go.Scatter(x=df.index, y=df["Fast_MA"], name=f"{fast_type} {fast_period}", line=dict(color="orange", width=1.5)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
 
         buy_points = df.loc[df["Buy_Signal"]]
         sell_points = df.loc[df["Sell_Signal"]]
@@ -2317,10 +2334,10 @@ if check_password():
 
         chart_state_text = "|".join(
             [
-                ticker, start_date_str, end_date_str, timeframe,
+                ticker, start_date_str, end_date_str, timeframe, setup,
                 fast_type, str(fast_period), slow_type, str(slow_period),
                 buy_left, buy_operator, buy_right,
-                sell_left, sell_operator, sell_right, str(initial_capital),
+                sell_left, sell_operator, sell_right, str(account_size),
             ]
         )
         chart_revision = hashlib.sha256(chart_state_text.encode("utf-8")).hexdigest()[:16]
