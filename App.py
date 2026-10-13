@@ -2152,7 +2152,7 @@ def render_industry_analysis():
     extra_text = pick_columns[1].text_input("Other tickers", value="", key="industry_extra",
                                             help="Any Yahoo symbols to add, e.g. ^RUT, SMH, XBI.")
     symbols = {label: INDUSTRY_INDEXES[label] for label in chosen}
-    for ticker in parse_ticker_list(extra_text, "US"):
+    for ticker in parse_ticker_list(extra_text):
         symbols.setdefault(ticker, ticker)
     control_columns = st.columns([3, 1, 1])
     period = control_columns[0].radio("Period", INDUSTRY_PERIODS, index=INDUSTRY_PERIODS.index("1Y"), horizontal=True,
@@ -2212,7 +2212,7 @@ def render_industry_leaders():
         "Industry leaders to compare (up to 5 tickers)", value="NVDA, AMD, AVGO, TSM, INTC", key="industry_leaders",
         help="Pick the top players of one industry.",
     )
-    leaders = parse_ticker_list(leaders_text, "US")
+    leaders = parse_ticker_list(leaders_text)
     if len(leaders) > 5:
         st.warning(f"Only the first 5 of {len(leaders)} tickers are compared.")
         leaders = leaders[:5]
@@ -2400,7 +2400,7 @@ def render_stock_screener(market_ok=None):
                 value="AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA",
                 key="screener_custom",
             )
-            members = pd.DataFrame({"Ticker": parse_ticker_list(custom_text, market), "Name": "", "Sector": "", "Industry": ""})
+            members = pd.DataFrame({"Ticker": parse_ticker_list(custom_text), "Name": "", "Sector": "", "Industry": ""})
             members_error = ""
         else:
             members, members_error = load_universe_members(market, universe)

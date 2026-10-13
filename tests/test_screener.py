@@ -124,8 +124,7 @@ def test_leaders_health():
 
 def test_ticker_normalisation():
     assert normalize_ticker("brk.b") == "BRK-B"
-    assert normalize_ticker("700", "HK") == "0700.HK"
-    assert normalize_ticker("9988.hk", "HK") == "9988.HK"
+    assert normalize_ticker("^gspc") == "^GSPC"
     assert parse_ticker_list("aapl, msft\nAAPL;  nvda") == ["AAPL", "MSFT", "NVDA"]
 
 
@@ -141,7 +140,7 @@ def test_members_from_wikipedia_style_table():
 
 
 def test_fundamental_trend_skips_comparisons_across_missing_quarters():
-    # Yahoo often returns HK quarters with gaps: Q2 2025, then Q2 2026 only.
+    # Yahoo sometimes returns quarters with gaps: Q2 2025, then Q2 2026 only.
     dates = pd.to_datetime(["2025-06-30", "2025-09-30", "2026-06-30"])
     frame = pd.DataFrame({"Revenue": [100.0, np.nan, 120.0], "Net_Income": [10.0, 11.0, 12.0]}, index=dates)
     trend = fundamental_trend(frame)
@@ -153,8 +152,6 @@ def test_fundamental_trend_skips_comparisons_across_missing_quarters():
 
 def test_symbol_normalisation_without_a_market():
     assert normalize_symbol(" brk.b ") == "BRK-B"
-    assert normalize_symbol("700") == "0700.HK"
-    assert normalize_symbol("0700.hk") == "0700.HK"
     assert normalize_symbol("SHOP.TO") == "SHOP.TO"
     assert normalize_symbol("^GSPC") == "^GSPC"
 

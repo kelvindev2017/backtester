@@ -281,7 +281,7 @@ def fundamental_trend(fundamentals):
     Returns latest quarter values, year-over-year growth versus the same
     quarter a year earlier, trailing-twelve-month figures and their growth,
     and the net margin. Comparisons go by date, not position, because some
-    sources (Yahoo for many HK stocks) skip quarters: a TTM sum is only
+    sources (Yahoo for some stocks) skip quarters: a TTM sum is only
     reported when the four quarters are consecutive.
     """
 

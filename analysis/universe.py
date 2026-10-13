@@ -33,41 +33,34 @@ DOW_JONES_30 = [
 ]
 
 
-def normalize_ticker(raw, market="US"):
-    """Yahoo symbol for a user-typed ticker: ``BRK.B`` -> ``BRK-B``, ``700`` -> ``0700.HK``."""
+def normalize_ticker(raw):
+    """Yahoo symbol for a user-typed US ticker: ``BRK.B`` -> ``BRK-B``."""
 
     ticker = str(raw).strip().upper()
     if not ticker:
         return ""
-    if market == "HK":
-        digits = ticker[:-3] if ticker.endswith(".HK") else ticker
-        if digits.isdigit():
-            return f"{int(digits):04d}.HK"
-        return ticker
     if ticker.startswith("^") or "=" in ticker:
         return ticker
     return ticker.replace(".", "-")
 
 
 def normalize_symbol(raw):
-    """Yahoo symbol for a ticker typed without a market: ``brk.b`` -> ``BRK-B``, ``700`` -> ``0700.HK``.
+    """Yahoo symbol for a sidebar ticker: ``brk.b`` -> ``BRK-B``.
 
-    Exchange suffixes (``0700.HK``, ``SHOP.TO``, ``VOD.L``) are kept; a
-    one-letter suffix is a US share class, which Yahoo writes with a dash.
+    Exchange suffixes (``SHOP.TO``, ``VOD.L``) are kept; a one-letter suffix
+    is a US share class, which Yahoo writes with a dash.
     """
 
     ticker = str(raw).strip().upper()
-    if ticker.isdigit() or (ticker.endswith(".HK") and ticker[:-3].isdigit()):
-        return normalize_ticker(ticker, "HK")
     if re.fullmatch(r"[A-Z]+\.[A-Z]", ticker):
         return ticker.replace(".", "-")
     return ticker
 
 
-def parse_ticker_list(text, market="US"):
+def parse_ticker_list(text):
     """Unique Yahoo symbols from comma / space / newline separated text."""
 
-    tickers = [normalize_ticker(part, market) for part in re.split(r"[\s,;]+", text or "")]
+    tickers = [normalize_ticker(part) for part in re.split(r"[\s,;]+", text or "")]
     return list(dict.fromkeys(ticker for ticker in tickers if ticker))
 
 
