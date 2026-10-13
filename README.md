@@ -36,22 +36,28 @@ Reports results in R (profit / planned risk) with a t-statistic, results per con
 and whether each score component actually ranks outcomes better than a random score would. Use it to test
 any sidebar setting across many tickers before trusting it (`analysis/validation.py`).
 
-**Stock Screener**: scans US (S&P 500, Nasdaq-100, Dow Jones 30 or a custom list) or Hong Kong (Hang Seng
-Index or a custom list) stocks in three layers (`analysis/screener.py`, `analysis/universe.py`):
+The first three tabs cover the market from the top down (`analysis/screener.py`, `analysis/signal_groups.py`,
+`analysis/universe.py`):
 
-1. **Market**: trend of the main indexes (close vs short/medium/long SMAs, % from the 52-week high, returns)
-   and breadth of the scanned universe (% of stocks above their medium/long SMA, % that set a new 52-week high
-   or low in the last N days). A market filter turns these into a PASS/FAIL verdict.
-2. **Industry**: up to 5 leading companies you pick, compared on price vs MAs, volume vs average, distance from
-   the 52-week high, relative performance and quarterly revenue / net income trend (YoY and TTM growth, net
-   margin). Optionally used as an industry filter (minimum number of leaders above their medium SMA). S&P 500 and
-   Nasdaq-100 scans can also be limited to a sector / sub-industry.
-3. **Stock**: any number of conditions such as `Close > SMA 50`, `SMA 50 > SMA 200`, `EMA 20 Cross Above SMA 50`
-   or `Close > Value 20`, plus maximum distance below the 52-week high, minimum price and minimum average volume.
-   Results can be downloaded as CSV, and a result can be sent to the sidebar ticker for Signal Analysis.
+**Stock Screener**: scans US stocks (S&P 500, Nasdaq-100, Dow Jones 30 or a custom list). Each condition row starts with a **signal group**, modelled on TradingView's
+screener filters: Moving average, Index, Price, Chg %, Mkt cap, P/E, EPS dil growth, Div yield %, Sector,
+Industry, Analyst rating, Perf %, Revenue growth, PEG, ROE, Beta, Recent / Upcoming earnings date. The inputs
+after the group follow it (e.g. `Close Cross Above SMA 50`, `P/E between 0 and 30`, `Sector is any of Energy`,
+`Earnings in the next 14 days`), and the results table adds a column for each group in use. Fundamentals come
+from Yahoo's quote summary, fetched only when a condition needs them and kept for 12 hours. The settings can be
+collapsed, and the screen can be limited to days when the Market Analysis filter passes. Results can be
+downloaded as CSV, and a result can be sent to the sidebar ticker for Signal Analysis.
 
-US index members come from Wikipedia (S&P 500 falls back to a public CSV); the Hang Seng list is bundled in
-`analysis/universe.py` and should be updated after index reviews.
+**Market Analysis** (US): trend of the main indexes (close vs short/medium/long SMAs, % from the 52-week high,
+returns) and breadth of the S&P 500, Nasdaq-100 or Dow 30 (% of stocks above their medium/long SMA, % that set
+a new 52-week high or low in the last N days). A market filter turns these into a PASS/FAIL verdict.
+
+**Industry Analysis** (US): overlays the main index of each chosen industry (e.g. ^SOX for semiconductors, sector
+SPDR ETFs such as XLK / XLF, ^NBI, ^BKX, ^DJT), optionally normalized to 100 at the start of the period (1M to
+5Y), with a table of returns, trend and distance from the 52-week high. Optionally compares up to 5 leading
+companies of one industry on price, MAs and quarterly revenue / net income trend.
+
+US index members come from Wikipedia (S&P 500 falls back to a public CSV).
 
 The tool never places orders. The report is the gate before you execute.
 

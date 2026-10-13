@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.indicators import ema, sma
+from analysis.signal_groups import MOVING_AVERAGE, evaluate_group_condition, group_condition_label
 
 TRADING_DAYS_PER_YEAR = 252
 OPERATORS = [">", "<", ">=", "<=", "Cross Above", "Cross Below"]
@@ -43,6 +44,8 @@ def line_label(kind, period=None):
 
 
 def condition_label(condition):
+    if condition.get("group", MOVING_AVERAGE) != MOVING_AVERAGE:
+        return group_condition_label(condition)
     return (
         f"{line_label(condition['left_kind'], condition.get('left_period'))} {condition['operator']} "
         f"{line_label(condition['right_kind'], condition.get('right_period'))}"
@@ -122,10 +125,12 @@ def stock_snapshot(df, ma_periods=(20, 50, 200), high_window=TRADING_DAYS_PER_YE
     }
     average_volume = snapshot[f"Avg volume {volume_period}d"]
     snapshot["Volume / avg"] = snapshot["Volume"] / average_volume if average_volume else np.nan
-    for label, bars in [("1w", 5), ("1m", 21), ("3m", 63), ("6m", 126)]:
+    for label, bars in [("1w", 5), ("1m", 21), ("3m", 63), ("6m", 126), ("1y", TRADING_DAYS_PER_YEAR)]:
         snapshot[f"Return {label} %"] = (
             (last_close / float(close.iloc[-bars - 1]) - 1) * 100 if len(close) > bars else np.nan
         )
+    prior_year = close.loc[close.index < pd.Timestamp(year=df.index[-1].year, month=1, day=1)]
+    snapshot["Return YTD %"] = (last_close / float(prior_year.iloc[-1]) - 1) * 100 if not prior_year.empty else np.nan
     for period in ma_periods:
         value = sma(close, period).iloc[-1]
         snapshot[f"SMA {period}"] = float(value) if pd.notna(value) else np.nan
@@ -276,7 +281,7 @@ def fundamental_trend(fundamentals):
     Returns latest quarter values, year-over-year growth versus the same
     quarter a year earlier, trailing-twelve-month figures and their growth,
     and the net margin. Comparisons go by date, not position, because some
-    sources (Yahoo for many HK stocks) skip quarters: a TTM sum is only
+    sources (Yahoo for some stocks) skip quarters: a TTM sum is only
     reported when the four quarters are consecutive.
     """
 
@@ -346,8 +351,15 @@ def screen_stocks(
     cross_window=5,
     ma_periods=(20, 50, 200),
     recent_days=20,
+    extra=None,
+    today=None,
 ):
     """Apply the stock filters to every ticker.
+
+    ``conditions`` mix moving-average conditions (checked on the price
+    history) and signal-group conditions (a ``group`` key, checked against a
+    column of the snapshot table joined with ``extra``: fundamentals, sector,
+    index membership ... indexed by ticker).
 
     Returns the snapshot table with one boolean column per condition and a
     ``Pass`` column (all filters met), sorted with passing stocks first and
@@ -357,12 +369,18 @@ def screen_stocks(
     table = snapshot_table(prices, ma_periods=ma_periods, recent_days=recent_days)
     if table.empty:
         return table
+    if extra is not None and not extra.empty:
+        extra = extra[[column for column in extra.columns if column not in table.columns]]
+        table = table.join(extra, how="left")
     passes = pd.Series(True, index=table.index)
     for condition in conditions:
         label = condition_label(condition)
-        table[label] = [
-            evaluate_condition(prices[ticker], condition, cross_window) for ticker in table.index
-        ]
+        if label in table.columns:
+            label = f"{label} "
+        if condition.get("group", MOVING_AVERAGE) == MOVING_AVERAGE:
+            table[label] = [evaluate_condition(prices[ticker], condition, cross_window) for ticker in table.index]
+        else:
+            table[label] = [evaluate_group_condition(table.loc[ticker], condition, today) for ticker in table.index]
         passes &= table[label]
     if max_pct_from_high is not None:
         label = f"Within {max_pct_from_high:g}% of 52w high"
