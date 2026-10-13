@@ -2,16 +2,23 @@
 
 Streamlit app for stock trend analysis, breakout identification and pre-trade reports.
 
+## Layout
+
+Each tab keeps its own settings. On a desktop they fill the sidebar and change with the open tab; on a phone
+or tablet (detected from the browser) there is no sidebar and the settings sit in collapsible menus above the
+charts. **Display > Layout** overrides the detection. The main US and industry indexes (S&P 500, Nasdaq,
+Dow, Russell 2000, ^SOX, the sector ETFs ...) load when the app starts and are cached for 6 hours.
+
 ## Tabs
 
 **Backtest**: moving-average rule backtester with EPS, quarterly fundamentals (SEC + Yahoo),
 P/E, benchmark, equity and drawdown panels.
 
-**Signal Analysis & Trade Plan**: the analysis date is the end of the sidebar date range.
+**Signal Analysis & Trade Plan**: the analysis date is the end of the date range in the settings.
 
 | Step | What it does | Module |
 |---|---|---|
-| Signal rule (sidebar, drives every tab) | **Moving-average rule**: the Backtest tab's buy/sell rule on a fast and slow MA (EMA/SMA), firing on the first bar the condition becomes true. **Breakout**: fresh close beyond the prior N-bar high/low (default 20), volume-confirmed (default 1.5x the 50-bar average). **Pullback in trend**: trend fast MA (default 50) rising and above the trend slow MA (default 200), a dip of at least N ATR (default 1.5) from the swing high to the pullback EMA (default 20) on light volume, then a close above the prior bar's high (mirror image for downtrends). **Reversal**: in a long-term uptrend (same trend MAs), buy the first close below the prior N-bar low (default 20). Every period is editable in the sidebar. | `analysis/patterns.py` |
+| Signal rule (settings, shared by Backtest, Signal Analysis and Validate) | **Moving-average rule**: the Backtest tab's buy/sell rule on a fast and slow MA (EMA/SMA), firing on the first bar the condition becomes true. **Breakout**: fresh close beyond the prior N-bar high/low (default 20), volume-confirmed (default 1.5x the 50-bar average). **Pullback in trend**: trend fast MA (default 50) rising and above the trend slow MA (default 200), a dip of at least N ATR (default 1.5) from the swing high to the pullback EMA (default 20) on light volume, then a close above the prior bar's high (mirror image for downtrends). **Reversal**: in a long-term uptrend (same trend MAs), buy the first close below the prior N-bar low (default 20). Every period is editable in the settings. | `analysis/patterns.py` |
 | Trend | Daily and weekly trend from MA position/slope, swing structure (HH/HL) and ADX. | `analysis/patterns.py` |
 | Support / resistance | Clustered swing pivots (more touches = stronger), volume-profile high-volume nodes, and the lookback high/low. | `analysis/levels.py` |
 | Volume | Up/down-day volume ratio, OBV trend and divergence, Chaikin Money Flow. | `analysis/patterns.py` |
@@ -22,7 +29,7 @@ P/E, benchmark, equity and drawdown panels.
 | Report | Action, confidence (0-100), reasoning, trade plan; download as Markdown/JSON or send to a Slack/Discord webhook. | `analysis/engine.py`, `analysis/notify.py` |
 
 **Long-only by default.** A bearish signal is reported as **EXIT** (close or reduce an existing long, no new
-short). Tick "Allow short trades" in the sidebar to get short trade plans instead.
+short). Tick "Allow short trades" in the settings to get short trade plans instead.
 
 Confidence = 50 + 50 x weighted average of component scores in [-1, 1]
 (signal quality 25%, trend alignment 20%, volume 15%, intraday 15%, fundamentals 15%,
@@ -34,7 +41,7 @@ Validate tab before relying on the score.**
 that day, and simulates the trade plan (entry at the next open, stop/target with gap handling, time exit).
 Reports results in R (profit / planned risk) with a t-statistic, results per confidence bucket and threshold,
 and whether each score component actually ranks outcomes better than a random score would. Use it to test
-any sidebar setting across many tickers before trusting it (`analysis/validation.py`).
+any signal setting across many tickers before trusting it (`analysis/validation.py`).
 
 The first three tabs cover the market from the top down (`analysis/screener.py`, `analysis/signal_groups.py`,
 `analysis/universe.py`):
@@ -46,7 +53,7 @@ after the group follow it (e.g. `Close Cross Above SMA 50`, `P/E between 0 and 3
 `Earnings in the next 14 days`), and the results table adds a column for each group in use. Fundamentals come
 from Yahoo's quote summary, fetched only when a condition needs them and kept for 12 hours. The settings can be
 collapsed, and the screen can be limited to days when the Market Analysis filter passes. Results can be
-downloaded as CSV, and a result can be sent to the sidebar ticker for Signal Analysis.
+downloaded as CSV; select a row to open that stock in Signal Analysis.
 
 **Market Analysis** (US): trend of the main indexes (close vs short/medium/long SMAs, % from the 52-week high,
 returns) and breadth of the S&P 500, Nasdaq-100 or Dow 30 (% of stocks above their medium/long SMA, % that set
