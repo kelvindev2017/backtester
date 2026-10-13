@@ -1545,7 +1545,7 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
             risks = report.reasons_against + [warning for warning in report.warnings if warning != report.headline]
             st.markdown("\n".join(f"- {reason}" for reason in risks) or "- None identified")
 
-    st.plotly_chart(build_signal_chart(daily, report), width="stretch", config={"displaylogo": False})
+    show_chart(build_signal_chart(daily, report), width="stretch", config={"displaylogo": False})
 
     if report.components:
         st.subheader("Confidence breakdown")
@@ -1572,7 +1572,7 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
     if report.intraday is not None and report.intraday.session_bars is not None and not report.intraday.session_bars.empty:
         st.subheader(f"Intraday entry - session {report.intraday.session_date}")
         st.caption(f"Status: {report.intraday.status}. 15-minute bars are resampled from the 5-minute data.")
-        st.plotly_chart(
+        show_chart(
             build_intraday_chart(report.intraday, report.signal["trigger"]),
             width="stretch",
             config={"displaylogo": False},
@@ -1804,7 +1804,7 @@ def render_validation(signal_settings, risk_settings, default_end):
         height=380, margin=dict(l=20, r=20, t=40, b=20), title="Cumulative R (each trade risks 1R)",
         yaxis_title="Cumulative R", hovermode="x unified",
     )
-    st.plotly_chart(curve, width="stretch", config={"displaylogo": False})
+    show_chart(curve, width="stretch", config={"displaylogo": False})
 
     exits = exit_signal_stats(trades, base_forward=base)
     if exits:
@@ -2073,8 +2073,20 @@ def settings_panel(title, expanded=True):
     """Where a tab's settings go: the sidebar on desktop, a collapsible menu at the top of the tab on mobile."""
 
     if MOBILE:
-        return st.expander(f"⚙️ {title}", expanded=False)
+        return st.expander(title, expanded=False)
     return st.sidebar.expander(title, expanded=expanded)
+
+
+def show_chart(fig, **kwargs):
+    """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width."""
+
+    if MOBILE:
+        fig.update_layout(
+            legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0, font=dict(size=10),
+                        entrywidth=0.5, entrywidthmode="fraction"),
+            margin=dict(l=5, r=5),
+        )
+    st.plotly_chart(fig, **kwargs)
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -2137,7 +2149,7 @@ def render_market_analysis(index_prices):
             "% from 52w high", "Return 1m %", "Return 3m %", "Return YTD %"]
         st.dataframe(index_table[index_columns].style.format(precision=2), width="stretch")
         if chart_index in index_rows:
-            st.plotly_chart(price_lines_chart(index_prices[indexes[chart_index]], chart_index, ma_periods), width="stretch")
+            show_chart(price_lines_chart(index_prices[indexes[chart_index]], chart_index, ma_periods), width="stretch")
     else:
         st.warning("No index data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
 
@@ -2179,7 +2191,7 @@ def render_market_analysis(index_prices):
                 fig.add_trace(go.Scatter(x=recent_breadth.index, y=recent_breadth[column], name=column, line=dict(color=color, width=1.4)))
             fig.update_layout(title="Market breadth (% of stocks)", height=340, margin=dict(l=10, r=10, t=40, b=10),
                               hovermode="x unified", yaxis=dict(range=[0, 100]))
-            st.plotly_chart(fig, width="stretch")
+            show_chart(fig, width="stretch")
 
     market_rules = {"index": gate_index}
     if use_index_ma:
@@ -2257,9 +2269,8 @@ def render_industry_analysis(index_prices):
                 title=f"Industry indexes, {period} ({'rebased to 100' if normalize else 'price'})", height=460,
                 margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified",
                 yaxis=dict(type="log" if log_scale else "linear"),
-                legend=dict(orientation="h", yanchor="top", y=-0.12) if MOBILE else None,
             )
-            st.plotly_chart(fig, width="stretch")
+            show_chart(fig, width="stretch")
 
             table = snapshot_table(prices, ma_periods=(50, 200))
             raw_overlay = overlay_frame(prices, start=start, normalize=True)
@@ -2303,7 +2314,7 @@ def render_industry_leaders(leaders_text, metric):
     fig = go.Figure([go.Scatter(x=rebased.index, y=rebased[column], name=column) for column in rebased.columns])
     fig.update_layout(title="Price over the last year (rebased to 100)", height=340,
                       margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
-    st.plotly_chart(fig, width="stretch")
+    show_chart(fig, width="stretch")
 
     fundamentals_start = (pd.Timestamp(date.today()) - pd.DateOffset(years=4)).strftime("%Y-%m-%d")
     today_str = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
@@ -2330,7 +2341,7 @@ def render_industry_leaders(leaders_text, metric):
                 fig.add_trace(go.Bar(x=series.index, y=series, name=ticker))
         fig.update_layout(title=f"{metric.replace('_', ' ')} by quarter (millions)", barmode="group", height=340,
                           margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig, width="stretch")
+        show_chart(fig, width="stretch")
     else:
         st.caption("No quarterly fundamentals were available for these tickers.")
 
@@ -3242,7 +3253,7 @@ def render_backtest(s):
         barmode="group",
     )
 
-    st.plotly_chart(
+    show_chart(
         fig,
         use_container_width=True,
         key=f"backtest_chart_{chart_revision}",
