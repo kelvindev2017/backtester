@@ -245,7 +245,7 @@ def market_gate(index_rows, breadth_latest, rules):
         period, threshold = rules["min_pct_above_ma"]
         value = breadth_latest.get(f"% above SMA {period}")
         checks.append((
-            f"At least {threshold:g}% of stocks above their SMA {period} (now {value:.0f}%)" if pd.notna(value) else
+            f"At least {threshold:g}% of stocks above their SMA {period} (now {value:.1f}%)" if pd.notna(value) else
             f"At least {threshold:g}% of stocks above their SMA {period}",
             None if pd.isna(value) else value >= threshold,
         ))
@@ -266,12 +266,18 @@ def market_gate(index_rows, breadth_latest, rules):
 # Industry leaders
 # ============================================================
 
+def _span_days(series):
+    return (series.index[-1] - series.index[0]).days
+
+
 def fundamental_trend(fundamentals):
     """Revenue / net income trend from a quarterly frame (Revenue, Net_Income columns).
 
     Returns latest quarter values, year-over-year growth versus the same
     quarter a year earlier, trailing-twelve-month figures and their growth,
-    and the net margin.
+    and the net margin. Comparisons go by date, not position, because some
+    sources (Yahoo for many HK stocks) skip quarters: a TTM sum is only
+    reported when the four quarters are consecutive.
     """
 
     result = {}
@@ -284,18 +290,22 @@ def fundamental_trend(fundamentals):
         series = frame[column].dropna()
         if series.empty:
             continue
-        result["Last quarter"] = max(result.get("Last quarter", series.index[-1]), series.index[-1])
+        last_date = series.index[-1]
+        result["Last quarter"] = max(result.get("Last quarter", last_date), last_date)
         result[f"{label} (last Q)"] = float(series.iloc[-1])
-        if len(series) >= 5:
-            year_ago = float(series.iloc[-5])
-            result[f"{label} YoY %"] = (series.iloc[-1] / year_ago - 1) * 100 if year_ago > 0 else np.nan
-        if len(series) >= 4:
+        year_ago = series.loc[
+            (series.index >= last_date - pd.Timedelta(days=400)) & (series.index <= last_date - pd.Timedelta(days=330))
+        ]
+        if not year_ago.empty:
+            base = float(year_ago.iloc[-1])
+            result[f"{label} YoY %"] = (series.iloc[-1] / base - 1) * 100 if base > 0 else np.nan
+        if len(series) >= 4 and _span_days(series.iloc[-4:]) <= 300:
             ttm = float(series.iloc[-4:].sum())
             result[f"{label} TTM"] = ttm
-        if len(series) >= 8:
-            previous_ttm = float(series.iloc[-8:-4].sum())
-            result[f"{label} TTM growth %"] = (ttm / previous_ttm - 1) * 100 if previous_ttm > 0 else np.nan
-        if len(series) >= 3:
+            if len(series) >= 8 and _span_days(series.iloc[-8:]) <= 670:
+                previous_ttm = float(series.iloc[-8:-4].sum())
+                result[f"{label} TTM growth %"] = (ttm / previous_ttm - 1) * 100 if previous_ttm > 0 else np.nan
+        if len(series) >= 3 and _span_days(series.iloc[-3:]) <= 210:
             last_three = series.iloc[-3:].to_numpy()
             result[f"{label} rising 2Q"] = bool(last_three[2] > last_three[1] > last_three[0])
     revenue = result.get("Revenue (last Q)")

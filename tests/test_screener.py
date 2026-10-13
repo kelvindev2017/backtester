@@ -11,7 +11,13 @@ from analysis.screener import (
     screen_stocks,
     stock_snapshot,
 )
-from analysis.universe import members_from_tables, normalize_ticker, parse_ticker_list
+from analysis.universe import (
+    hang_seng_members_from_tables,
+    members_from_tables,
+    normalize_symbol,
+    normalize_ticker,
+    parse_ticker_list,
+)
 from tests.conftest import make_bars
 
 
@@ -133,3 +139,42 @@ def test_members_from_wikipedia_style_table():
     members = members_from_tables([other, table], min_rows=2)
     assert members["Ticker"].tolist() == ["AAPL", "BRK-B"]
     assert members.loc[1, "Sector"] == "Financials"
+
+
+def test_fundamental_trend_skips_comparisons_across_missing_quarters():
+    # Yahoo often returns HK quarters with gaps: Q2 2025, then Q2 2026 only.
+    dates = pd.to_datetime(["2025-06-30", "2025-09-30", "2026-06-30"])
+    frame = pd.DataFrame({"Revenue": [100.0, np.nan, 120.0], "Net_Income": [10.0, 11.0, 12.0]}, index=dates)
+    trend = fundamental_trend(frame)
+    assert np.isclose(trend["Revenue YoY %"], 20.0)
+    assert np.isclose(trend["Net income YoY %"], 20.0)
+    assert "Net income TTM" not in trend  # only three quarters, not consecutive
+    assert "Net income rising 2Q" not in trend
+
+
+def test_symbol_normalisation_without_a_market():
+    assert normalize_symbol(" brk.b ") == "BRK-B"
+    assert normalize_symbol("700") == "0700.HK"
+    assert normalize_symbol("0700.hk") == "0700.HK"
+    assert normalize_symbol("SHOP.TO") == "SHOP.TO"
+    assert normalize_symbol("^GSPC") == "^GSPC"
+
+
+def test_members_table_with_footnoted_headers():
+    table = pd.DataFrame({
+        "Ticker": ["ADBE", "AMD"] * 3, "Company": ["Adobe", "AMD"] * 3,
+        "ICB Industry[1]": ["Technology"] * 6, "ICB Subsector[1]": ["Software", "Semiconductors"] * 3,
+    })
+    members = members_from_tables([table], min_rows=2)
+    assert members.loc[0, "Sector"] == "Technology"
+    assert members.loc[1, "Industry"] == "Semiconductors"
+
+
+def test_hang_seng_members_from_wikipedia_table():
+    table = pd.DataFrame({
+        "Ticker": ["SEHK: 5", "SEHK: 700", "SEHK: 9988"], "Name": ["HSBC", "Tencent", "Alibaba"],
+        "Sub-index": ["Finance", "Commerce & Industry", "Commerce & Industry"],
+    })
+    members = hang_seng_members_from_tables([pd.DataFrame({"Year": [1]}), table], min_rows=3)
+    assert members["Ticker"].tolist() == ["0005.HK", "0700.HK", "9988.HK"]
+    assert members.loc[0, "Sector"] == "Finance"
