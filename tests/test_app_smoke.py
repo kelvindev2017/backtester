@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import streamlit as st
 import yfinance as yf
 
 from tests.conftest import make_bars
@@ -216,3 +217,25 @@ def test_mobile_layout_has_no_sidebar(offline):
     assert len(app.sidebar.children) == 0
     expanders = [element.label for element in app.get("expander")]
     assert any("Conditions" in label for label in expanders)
+
+
+def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
+    class BlockedTicker(FakeTicker):
+        @property
+        def info(self):
+            raise RuntimeError("Too Many Requests")
+
+        @info.setter
+        def info(self, value):
+            pass
+
+    monkeypatch.setattr(yf, "Ticker", BlockedTicker)
+    st.cache_resource.clear()
+    app = start_app()
+    next(box for box in app.selectbox if box.label == "Universe").select("Custom list").run()
+    next(button for button in app.button if button.key == "screener_load_btn").click().run()
+    next(box for box in app.selectbox if box.label == "Signal group").select("Mkt cap").run()
+    next(box for box in app.number_input if box.label.startswith("Mkt cap")).set_value(10.0).run()
+    assert not app.exception, app.exception
+    assert any("only 0 of" in element.value for element in app.warning)
+    st.cache_resource.clear()

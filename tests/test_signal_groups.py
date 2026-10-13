@@ -97,3 +97,10 @@ def test_overlay_rebases_each_line_to_100():
     raw = overlay_frame(prices, start=start, normalize=False)
     assert raw["B"].iloc[0] > 500
     assert period_start(pd.Timestamp("2026-10-13"), "YTD") == pd.Timestamp("2026-01-01")
+
+
+def test_fundamental_columns_match_row():
+    from analysis.signal_groups import FUNDAMENTAL_COLUMNS, fundamental_row
+
+    row = fundamental_row({"quoteType": "EQUITY", "marketCap": 2e12, "sector": "Technology"})
+    assert list(row) == FUNDAMENTAL_COLUMNS

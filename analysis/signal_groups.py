@@ -149,6 +149,12 @@ def date_today():
     return pd.Timestamp.today().normalize()
 
 
+FUNDAMENTAL_COLUMNS = [
+    "Mkt cap ($B)", "P/E", "EPS growth YoY %", "Div yield %", "Revenue growth YoY %", "PEG", "ROE %", "Beta",
+    "Yahoo sector", "Yahoo industry", "Analyst rating", "Last earnings", "Next earnings",
+]
+
+
 def fundamental_row(info, today=None):
     """Screener columns from a ``yf.Ticker(...).info`` dict; {} when Yahoo returned nothing useful."""
 

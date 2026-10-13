@@ -47,6 +47,7 @@ from analysis.signal_groups import (
     ANALYST_RATINGS,
     CATEGORY_OPERATORS,
     DEFAULT_INDUSTRIES,
+    FUNDAMENTAL_COLUMNS,
     GICS_SECTORS,
     INDUSTRY_INDEXES,
     MOVING_AVERAGE,
@@ -1990,17 +1991,21 @@ def fetch_fundamental_row(ticker):
         return None
 
 
-def load_fundamental_table(tickers, progress=None, max_age_hours=12):
+def load_fundamental_table(tickers, progress=None, max_age_hours=12, retry_failed_minutes=15):
     """Fundamentals (market cap, P/E, growth, earnings dates ...) for many tickers, fetched 8 at a time."""
 
     store = fundamentals_store()
     now = time.time()
-    missing = [ticker for ticker in tickers if ticker not in store or now - store[ticker][0] > max_age_hours * 3600]
+    def stale(ticker):
+        fetched_at, row = store[ticker]
+        return now - fetched_at > (max_age_hours * 3600 if row is not None else retry_failed_minutes * 60)
+
+    missing = [ticker for ticker in tickers if ticker not in store or stale(ticker)]
     if missing:
         with ThreadPoolExecutor(max_workers=8) as pool:
             for done, (ticker, row) in enumerate(zip(missing, pool.map(fetch_fundamental_row, missing)), start=1):
-                if row is not None:
-                    store[ticker] = (now, row)
+                # Failed lookups are stored too (as None) so every rerun does not refetch them; they retry sooner.
+                store[ticker] = (now, row)
                 if progress is not None:
                     progress(done / len(missing))
     rows = {ticker: store[ticker][1] for ticker in tickers if ticker in store and store[ticker][1]}
@@ -2503,7 +2508,7 @@ def render_stock_screener():
     scanned = [ticker for ticker in tickers if ticker in prices] if is_loaded else tickers
     extra = members.drop_duplicates("Ticker").set_index("Ticker")[["Name", "Sector", "Industry"]].reindex(scanned)
     extra = extra.fillna("").replace("nan", "")
-    fundamentals_note = ""
+    fundamentals_note = fundamentals_warning = ""
     if is_loaded and prices:
         wants_yahoo = any(SIGNAL_GROUPS[group].get("fundamental") for group in groups_in_use) or (
             bool(groups_in_use & {"Sector", "Industry"}) and (extra["Sector"].eq("") | extra["Industry"].eq("")).any())
@@ -2511,11 +2516,18 @@ def render_stock_screener():
             progress = st.progress(0.0, text="Loading fundamentals from Yahoo...")
             fundamentals = load_fundamental_table(scanned, progress=lambda value: progress.progress(value, text="Loading fundamentals from Yahoo..."))
             progress.empty()
-            if not fundamentals.empty:
-                extra = extra.join(fundamentals, how="left")
-                extra["Sector"] = extra["Sector"].where(extra["Sector"] != "", extra["Yahoo sector"].fillna(""))
-                extra["Industry"] = extra["Industry"].where(extra["Industry"] != "", extra["Yahoo industry"].fillna(""))
-            fundamentals_note = f"Fundamentals for {len(fundamentals)} of {len(scanned)} stocks (Yahoo Finance, refreshed every 12 hours)."
+            # Yahoo can rate-limit or block quote lookups; the columns must exist anyway so the conditions
+            # simply fail for stocks without data instead of crashing the table.
+            fundamentals = fundamentals.reindex(index=scanned, columns=FUNDAMENTAL_COLUMNS)
+            extra = extra.join(fundamentals, how="left")
+            extra["Sector"] = extra["Sector"].where(extra["Sector"] != "", extra["Yahoo sector"].fillna(""))
+            extra["Industry"] = extra["Industry"].where(extra["Industry"] != "", extra["Yahoo industry"].fillna(""))
+            found = int(fundamentals.notna().any(axis=1).sum())
+            fundamentals_note = f"Fundamentals for {found} of {len(scanned)} stocks (Yahoo Finance, refreshed every 12 hours)."
+            if found < len(scanned) / 2:
+                fundamentals_warning = (f"Yahoo Finance returned fundamentals for only {found} of {len(scanned)} stocks, "
+                                        "so conditions on them fail for the rest. Yahoo may be rate-limiting; it retries "
+                                        "the missing ones after 15 minutes.")
         if "Index" in groups_in_use:
             membership = index_membership(market, scanned)
             extra["Index"] = [membership.get(ticker, []) for ticker in extra.index]
@@ -2571,7 +2583,9 @@ def render_stock_screener():
     if not prices:
         st.error("No price data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
         return
-    if fundamentals_note:
+    if fundamentals_warning:
+        st.warning(fundamentals_warning)
+    elif fundamentals_note:
         st.caption(fundamentals_note)
 
     results = screen_stocks(
@@ -2609,6 +2623,7 @@ def render_stock_screener():
     base_columns = ["Pass", "Name", "Close", "Change %"]
     display_columns = list(dict.fromkeys(base_columns + group_columns + [f"Close vs SMA {p} %" for p in ma_periods] + [
         "% from 52w high", f"New 52w high in last {recent_days}d", "Volume / avg", "Return 1m %", "Return 3m %"]))
+    display_columns = [column for column in display_columns if column in results.columns]
     condition_columns = [column for column in results.columns if column not in display_columns and results[column].dtype == bool]
     st.caption("Select a row to analyze that stock in Signal Analysis.")
     event = st.dataframe(shown[display_columns + condition_columns].style.format(precision=2), width="stretch", height=420,
