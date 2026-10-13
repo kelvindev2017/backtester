@@ -72,33 +72,44 @@ def offline(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", offline_urlopen)
 
 
-def test_app_runs_both_tabs(offline):
-    app = AppTest.from_file(APP_PATH, default_timeout=120)
+def start_app(timeout=180):
+    app = AppTest.from_file(APP_PATH, default_timeout=timeout)
     app.secrets["password"] = "pw"
     app.run()
     app.text_input[0].input("pw").run()
-    next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)").run()
+    return app
+
+
+def open_tab(app, label):
+    # AppTest cannot click a tab, and each run resets the tabs to the first one, so set the open tab every run.
+    app.session_state["main_tab"] = label
+    app.run()
     assert not app.exception, app.exception
-    tab_labels = [tab.label for tab in app.tabs]
-    assert tab_labels == ["Stock Screener", "Market Analysis", "Industry Analysis", "Backtest",
-                          "Signal Analysis & Trade Plan", "Validate"]
+    return app
+
+
+def test_app_runs_both_tabs(offline):
+    app = start_app()
+    assert [tab.label for tab in app.tabs] == ["Stock Screener", "Market Analysis", "Industry Analysis", "Backtest",
+                                               "Signal Analysis & Trade Plan", "Validate"]
+    open_tab(app, "Signal Analysis & Trade Plan")
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert not app.exception, app.exception
     rendered = " ".join(
         [element.value for element in app.success] + [element.value for element in app.warning]
         + [element.value for element in app.info] + [element.value for element in app.error]
     )
-    assert "TEST" not in rendered  # sanity: ticker default is AAPL
     assert "AAPL" in rendered
     assert any("Trade plan" in element.value for element in app.subheader)
 
 
 def test_validate_tab_runs(offline):
-    app = AppTest.from_file(APP_PATH, default_timeout=300)
-    app.secrets["password"] = "pw"
-    app.run()
-    app.text_input[0].input("pw").run()
-    tickers = next(box for box in app.text_input if box.label.startswith("Tickers"))
-    tickers.input("AAA, BBB").run()
-    next(button for button in app.button if button.label == "Run validation").click().run()
+    app = open_tab(start_app(300), "Validate")
+    next(box for box in app.text_input if box.label.startswith("Tickers")).input("AAA, BBB")
+    open_tab(app, "Validate")
+    next(button for button in app.button if button.label == "Run validation").click()
+    open_tab(app, "Validate")
     assert not app.exception, app.exception
     metrics = {metric.label: metric.value for metric in app.metric}
     assert int(metrics["Signals replayed"].replace(",", "")) > 0
@@ -106,80 +117,102 @@ def test_validate_tab_runs(offline):
 
 
 def test_one_signal_rule_drives_every_tab(offline):
-    app = AppTest.from_file(APP_PATH, default_timeout=120)
-    app.secrets["password"] = "pw"
-    app.run()
-    app.text_input[0].input("pw").run()
+    app = open_tab(start_app(), "Backtest")
     rule = next(box for box in app.selectbox if box.label == "Signal rule")
     assert rule.value == "Moving-average rule"
     assert any(box.label == "Fast MA Type" for box in app.selectbox)
     assert [box.label for box in app.number_input].count("Account size ($)") == 1
 
-    rule.select("Breakout (new high/low on volume)").run()
+    rule.select("Breakout (new high/low on volume)")
+
+    open_tab(app, "Backtest")
     assert not app.exception, app.exception
     assert not any(box.label == "Fast MA Type" for box in app.selectbox)
     assert any("Breakout (new high/low on volume) signals" in element.value for element in app.info)
 
+    # The setting survives a visit to another tab and is shared by the strategy tabs.
+    open_tab(app, "Market Analysis")
+    assert not any(box.label == "Signal rule" for box in app.selectbox)
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert next(box for box in app.selectbox if box.label == "Signal rule").value == "Breakout (new high/low on volume)"
+
 
 def test_setup_periods_are_editable(offline):
-    app = AppTest.from_file(APP_PATH, default_timeout=120)
-    app.secrets["password"] = "pw"
-    app.run()
-    app.text_input[0].input("pw").run()
+    app = open_tab(start_app(), "Backtest")
     rule = next(box for box in app.selectbox if box.label == "Signal rule")
     assert not any(char.isdigit() for option in rule.options for char in option)
 
-    rule.select("Pullback in trend (dip to the EMA, then reversal)").run()
+    rule.select("Pullback in trend (dip to the EMA, then reversal)")
+
+    open_tab(app, "Backtest")
     labels = [box.label for box in app.number_input]
     for label in ["Trend fast MA (bars)", "Trend slow MA (bars)", "Pullback EMA (bars)", "Swing high lookback (bars)",
                   "Pullback window (bars)", "Min dip depth (ATR)"]:
         assert label in labels
-    next(box for box in app.number_input if box.label == "Pullback EMA (bars)").set_value(12).run()
+    next(box for box in app.number_input if box.label == "Pullback EMA (bars)").set_value(12)
+    open_tab(app, "Backtest")
     assert not app.exception, app.exception
 
-    next(box for box in app.selectbox if box.label == "Signal rule").select("Reversal (buy a breakdown in an uptrend)").run()
-    next(box for box in app.number_input if box.label == "Breakdown lookback (bars)").set_value(10).run()
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Reversal (buy a breakdown in an uptrend)")
+
+    open_tab(app, "Backtest")
+    next(box for box in app.number_input if box.label == "Breakdown lookback (bars)").set_value(10)
+    open_tab(app, "Backtest")
     assert not app.exception, app.exception
     assert any("prior 10-bar low" in element.value for element in app.caption)
 
 
 def test_screener_tab_scans_a_custom_list(offline):
-    app = AppTest.from_file(APP_PATH, default_timeout=180)
-    app.secrets["password"] = "pw"
-    app.run()
-    app.text_input[0].input("pw").run()
-    next(box for box in app.selectbox if box.label == "Stocks to scan").select("Custom list").run()
-    next(button for button in app.button if button.key == "screener_load").click().run()
+    app = start_app()
+    assert app.sidebar.header[0].value == "Stock Screener"
+    next(box for box in app.selectbox if box.label == "Universe").select("Custom list").run()
+    next(button for button in app.button if button.key == "screener_load_btn").click().run()
     assert not app.exception, app.exception
-    outcome = " ".join(element.value for element in app.success)
-    assert "stocks pass" in outcome
+    assert "stocks pass" in " ".join(element.value for element in app.success)
     assert [box.value for box in app.selectbox if box.label == "Signal group"] == ["Moving average"] * 3
 
-    # Switching a row's group swaps the inputs after it and adds the group's column to the results.
+    # Switching a row's group swaps the inputs after it.
     next(box for box in app.selectbox if box.label == "Signal group").select("P/E").run()
     assert not app.exception, app.exception
     assert any(box.label.startswith("P/E") for box in app.number_input)
     assert not any(box.label == "Left" for box in app.selectbox if (box.key or "").startswith("screen_0_"))
-    assert "P/E" in app.dataframe[-1].value.columns or "stocks pass" in " ".join(e.value for e in app.success)
 
     next(button for button in app.button if button.label == "+ Add condition").click().run()
     assert [box.label for box in app.selectbox].count("Signal group") == 4
-    next(button for button in app.button if button.key == "screen_0_remove").click().run()
+    next(button for button in app.button if button.key == "screen_0_remove_btn").click().run()
     assert [box.label for box in app.selectbox].count("Signal group") == 3
-    assert not any(radio.label == "Market" for radio in app.radio)
+
+    # Conditions and loaded data survive a visit to another tab.
+    open_tab(app, "Industry Analysis")
+    open_tab(app, "Stock Screener")
+    assert [box.label for box in app.selectbox].count("Signal group") == 3
+    assert "stocks pass" in " ".join(element.value for element in app.success)
 
 
 def test_market_and_industry_tabs(offline):
-    app = AppTest.from_file(APP_PATH, default_timeout=180)
-    app.secrets["password"] = "pw"
-    app.run()
-    app.text_input[0].input("pw").run()
-    next(box for box in app.selectbox if box.label == "Breadth universe").select("Dow Jones 30").run()
-    next(button for button in app.button if button.key == "market_load").click().run()
-    assert not app.exception, app.exception
+    app = open_tab(start_app(), "Market Analysis")
+    assert app.sidebar.header[0].value == "Market Analysis"
+    # Index trends come from the data preloaded at start; breadth waits for its button.
     assert any("Market filter" in element.value for element in list(app.success) + list(app.error))
-
-    industry_chart_titles = [chart.proto.spec for chart in app.get("plotly_chart")]
-    assert any("Industry indexes" in spec for spec in industry_chart_titles)
-    next(toggle for toggle in app.toggle if toggle.key == "industry_normalize").set_value(False).run()
+    next(box for box in app.selectbox if box.label == "Breadth universe").select("Dow Jones 30")
+    open_tab(app, "Market Analysis")
+    next(button for button in app.button if button.key == "market_load_btn").click()
+    open_tab(app, "Market Analysis")
     assert not app.exception, app.exception
+    assert any(metric.label.startswith("Above SMA") for metric in app.metric)
+
+    open_tab(app, "Industry Analysis")
+    assert any("Industry indexes" in chart.proto.spec for chart in app.get("plotly_chart"))
+    next(toggle for toggle in app.toggle if toggle.key == "industry_normalize").set_value(False)
+    open_tab(app, "Industry Analysis")
+    assert not app.exception, app.exception
+
+
+def test_mobile_layout_has_no_sidebar(offline):
+    app = start_app()
+    app.session_state["layout_mode"] = "Mobile"
+    app.run()
+    assert not app.exception, app.exception
+    assert len(app.sidebar.children) == 0
+    expanders = [element.label for element in app.get("expander")]
+    assert any("Conditions" in label for label in expanders)

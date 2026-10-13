@@ -1,10 +1,12 @@
 import hashlib
 from datetime import date, timedelta
 import json
+import logging
 import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -71,7 +73,7 @@ from analysis.validation import ValidationSettings, base_rates, exit_signal_stat
 st.set_page_config(
     page_title="Trade Strategy Backtest",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="auto",
 )
 st.title("Trade Strategy Backtester")
 
@@ -1428,7 +1430,7 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
     st.caption(
         "Daily/weekly breakout and trend analysis with volume confirmation, a 5-min/15-min entry "
         "trigger, fundamental confirmation and risk-based sizing. The analysis date is the end of the "
-        "sidebar date range; it always uses up to 5 years of daily history."
+        "date range in the settings; it always uses up to 5 years of daily history."
     )
 
     with st.spinner(f"Running signal analysis for {ticker} as of {end_str}..."):
@@ -1678,21 +1680,24 @@ def render_validation(signal_settings, risk_settings, default_end):
         "on that day, then simulates the trade plan: entry at the next open, exit at the stop or target (stop assumed "
         "first if both are hit in one bar; gaps fill at the open) or after the maximum holding period. Results are "
         "in R - profit divided by the amount risked. Setup, volume, risk and confidence settings come from the "
-        "sidebar. The intraday trigger cannot be replayed (Yahoo keeps ~60 days of 5-minute data), so taken trades "
+        "settings. The intraday trigger cannot be replayed (Yahoo keeps ~60 days of 5-minute data), so taken trades "
         "enter at the next open."
     )
 
-    input_columns = st.columns([2.2, 1, 1])
-    tickers_text = input_columns[0].text_input("Tickers (comma-separated)", DEFAULT_VALIDATION_TICKERS)
-    test_start = input_columns[1].date_input(
-        "Test from", value=(pd.Timestamp(default_end) - pd.DateOffset(years=2)).date(), max_value=date.today(), key="validation_start"
-    )
-    test_end = input_columns[2].date_input("Test to", value=default_end, max_value=date.today(), key="validation_end")
-    option_columns = st.columns([1, 2])
-    max_hold = int(option_columns[0].number_input("Max holding period (bars)", min_value=3, max_value=120, value=20, step=1))
-    include_fundamentals = option_columns[1].checkbox(
-        "Include fundamentals (slower: loads SEC and earnings history for each ticker)", value=True
-    )
+    with settings_panel("Validation"):
+        tickers_text = st.text_input("Tickers (comma-separated)", DEFAULT_VALIDATION_TICKERS, key="validation_tickers")
+        date_columns = st.columns(2)
+        test_start = date_columns[0].date_input(
+            "Test from", value=(pd.Timestamp(default_end) - pd.DateOffset(years=2)).date(), max_value=date.today(), key="validation_start"
+        )
+        test_end = date_columns[1].date_input("Test to", value=default_end, max_value=date.today(), key="validation_end")
+        max_hold = int(st.number_input("Max holding period (bars)", min_value=3, max_value=120, value=20, step=1,
+                                       key="validation_max_hold"))
+        include_fundamentals = st.checkbox(
+            "Include fundamentals (slower: loads SEC and earnings history for each ticker)", value=True,
+            key="validation_fundamentals",
+        )
+        run_clicked = st.button("Run validation", type="primary", key="validation_run_btn")
 
     tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
     settings_dict = dict(signal_settings.__dict__)
@@ -1701,7 +1706,7 @@ def render_validation(signal_settings, risk_settings, default_end):
     end_str = pd.Timestamp(test_end).strftime("%Y-%m-%d")
     run_key = json.dumps([tickers, start_str, end_str, settings_dict, risk_dict, max_hold, include_fundamentals], default=str)
 
-    if st.button("Run validation", type="primary", disabled=not tickers or test_start >= test_end):
+    if run_clicked and tickers and test_start < test_end:
         progress = st.progress(0.0)
         frames, bases, failed = [], [], []
         for index, ticker in enumerate(tickers):
@@ -1733,7 +1738,7 @@ def render_validation(signal_settings, risk_settings, default_end):
         st.info("Choose tickers and a test period, then press **Run validation**. Expect roughly 5-15 seconds per ticker.")
         return
     if result["key"] != run_key:
-        st.warning("The inputs or sidebar settings changed since this run - press **Run validation** to refresh.")
+        st.warning("The settings changed since this run - press **Run validation** to refresh.")
     if result["failed"]:
         st.caption(f"No data for: {', '.join(result['failed'])}")
 
@@ -1956,10 +1961,6 @@ def editor_conditions(frame):
     return conditions
 
 
-def open_in_signal_analysis(ticker):
-    st.session_state["ticker_input"] = ticker
-
-
 def price_lines_chart(frame, title, ma_periods=(), bars=TRADING_DAYS_PER_YEAR, height=380):
     """Last ``bars`` closes with SMAs (computed on the full history so they start filled)."""
 
@@ -2020,54 +2021,109 @@ def index_membership(market, tickers):
 
 
 # ============================================================
+# Layout: desktop sidebar or mobile menus
+# ============================================================
+
+TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", "Backtest", "Signal Analysis & Trade Plan", "Validate"]
+SIGNAL_TAB = "Signal Analysis & Trade Plan"
+LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
+MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
+# Session keys that are actions or display state rather than settings; they are not carried across tab switches.
+TRANSIENT_KEY_SUFFIXES = ("_btn", "_table")
+TRANSIENT_KEYS = {"main_tab", "password_correct"}
+MAIN_INDEX_SYMBOLS = list(dict.fromkeys(list(SCREENER_MARKETS["US"]["indexes"].values()) + list(INDUSTRY_INDEXES.values())))
+
+# Writing a widget's own value back into Session State is how its setting survives a tab switch (see
+# keep_settings_across_tabs); Streamlit logs a warning for every such widget that also has a default.
+logging.getLogger("streamlit.elements.lib.policies").setLevel(logging.ERROR)
+
+
+def keep_settings_across_tabs():
+    """Only the open tab runs, and Streamlit forgets the value of any widget that did not run.
+
+    Re-storing every keyed setting at the start of each run keeps it, so a tab's settings are still
+    there after a visit to another tab.
+    """
+
+    for key in list(st.session_state.keys()):
+        if isinstance(key, str) and key not in TRANSIENT_KEYS and not key.endswith(TRANSIENT_KEY_SUFFIXES):
+            st.session_state[key] = st.session_state[key]
+
+
+def detect_mobile():
+    """Mobile layout when chosen in Display, else when the browser's user agent is a phone or tablet.
+
+    Streamlit has no device check of its own; the user agent is the signal the server can see.
+    """
+
+    mode = st.session_state.get("layout_mode", "Auto")
+    if mode != "Auto":
+        return mode == "Mobile"
+    try:
+        agent = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        agent = ""
+    return bool(MOBILE_AGENT.search(agent))
+
+
+MOBILE = False
+
+
+def settings_panel(title, expanded=True):
+    """Where a tab's settings go: the sidebar on desktop, a collapsible menu at the top of the tab on mobile."""
+
+    if MOBILE:
+        return st.expander(f"⚙️ {title}", expanded=False)
+    return st.sidebar.expander(title, expanded=expanded)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_main_indexes():
+    """Daily prices (about 5 years) for the main US and industry indexes, loaded when the app starts."""
+
+    return load_price_panel(MAIN_INDEX_SYMBOLS, days=1900)
+
+
+# ============================================================
 # Market Analysis tab
 # ============================================================
 
 MARKET_ANALYSIS_UNIVERSES = ["S&P 500", "Nasdaq-100", "Dow Jones 30"]
 
 
-def render_market_analysis():
-    """US index trends, market breadth and the market filter. Returns the filter verdict, or None before loading."""
+def render_market_analysis(index_prices):
+    """US index trends, market breadth and the market filter. Stores the filter verdict for the screener."""
+
+    indexes = SCREENER_MARKETS["US"]["indexes"]
+    with settings_panel("Breadth data"):
+        universe = st.selectbox("Breadth universe", MARKET_ANALYSIS_UNIVERSES, key="market_universe")
+        recent_days = int(st.number_input(
+            "New-high window (days)", min_value=1, max_value=120, value=20, step=1, key="market_recent_days",
+            help="Breadth counts stocks that made a new 52-week high (or low) at least once in this many trading days.",
+        ))
+        load_clicked = st.button("Load breadth data", type="primary", key="market_load_btn",
+                                 help="Downloads every member of the universe; about a minute the first time, then cached.")
+    with settings_panel("Moving averages"):
+        ma_columns = st.columns(3)
+        ma_fast = int(ma_columns[0].number_input("Short", min_value=2, max_value=400, value=20, step=1, key="market_ma_fast"))
+        ma_mid = int(ma_columns[1].number_input("Medium", min_value=2, max_value=400, value=50, step=1, key="market_ma_mid"))
+        ma_slow = int(ma_columns[2].number_input("Long", min_value=2, max_value=400, value=200, step=1, key="market_ma_slow"))
+        chart_index = st.selectbox("Index chart", list(indexes), key="market_index_chart")
+    ma_periods = tuple(dict.fromkeys([ma_fast, ma_mid, ma_slow]))
+    with settings_panel("Market filter", expanded=False):
+        gate_index = st.selectbox("Index", list(indexes), key="market_gate_index")
+        use_index_ma = st.checkbox(f"Index close above its SMA {ma_slow}", value=True, key="market_gate_close")
+        use_index_order = st.checkbox(f"Index SMA {ma_mid} above SMA {ma_slow}", value=False, key="market_gate_order")
+        use_breadth = st.checkbox(f"Minimum % of stocks above SMA {ma_slow}", value=True, key="market_gate_breadth")
+        breadth_threshold = st.number_input("% above", 0.0, 100.0, 50.0, 5.0, key="market_gate_breadth_pct", disabled=not use_breadth)
+        use_highs = st.checkbox(f"Minimum % of stocks with a new 52w high in the last {recent_days} days", value=False, key="market_gate_highs")
+        highs_threshold = st.number_input("% with new highs", 0.0, 100.0, 5.0, 1.0, key="market_gate_highs_pct", disabled=not use_highs)
 
     st.caption(
-        "The US market as a whole: index trends and the breadth of an index's members (share above their moving "
-        "averages, share making new 52-week highs or lows). The market filter at the bottom can gate the Stock "
-        "Screener. Data comes from Yahoo Finance and is cached for 6 hours."
+        "The US market as a whole: index trends (loaded when the app starts) and the breadth of an index's members "
+        "(share above their moving averages, share making new 52-week highs or lows). The market filter can gate "
+        "the Stock Screener."
     )
-    setup_columns = st.columns([2, 1, 1, 1, 1])
-    universe = setup_columns[0].selectbox("Breadth universe", MARKET_ANALYSIS_UNIVERSES, key="market_universe")
-    ma_fast = int(setup_columns[1].number_input("Short MA", min_value=2, max_value=400, value=20, step=1, key="market_ma_fast"))
-    ma_mid = int(setup_columns[2].number_input("Medium MA", min_value=2, max_value=400, value=50, step=1, key="market_ma_mid"))
-    ma_slow = int(setup_columns[3].number_input("Long MA", min_value=2, max_value=400, value=200, step=1, key="market_ma_slow"))
-    recent_days = int(setup_columns[4].number_input(
-        "New-high window (days)", min_value=1, max_value=120, value=20, step=1, key="market_recent_days",
-        help="Breadth counts stocks that made a new 52-week high (or low) at least once in this many trading days.",
-    ))
-    ma_periods = tuple(dict.fromkeys([ma_fast, ma_mid, ma_slow]))
-
-    members, members_error = load_universe_members("US", universe)
-    if members.empty:
-        st.error(f"Could not load the members of {universe}. {members_error}")
-        return None
-    tickers = members["Ticker"].tolist()
-    indexes = SCREENER_MARKETS["US"]["indexes"]
-    data_key = json.dumps([universe, tickers])
-    loaded = st.session_state.get("market_data")
-    if st.button(f"Load data for {len(tickers)} stocks and {len(indexes)} indexes", type="primary", key="market_load"):
-        progress = st.progress(0.0, text="Downloading prices...")
-        prices = load_price_panel(tickers, progress=lambda value: progress.progress(value, text="Downloading prices..."))
-        index_prices = load_price_panel(list(indexes.values()))
-        progress.empty()
-        loaded = {"key": data_key, "prices": prices, "index_prices": index_prices}
-        st.session_state["market_data"] = loaded
-    if loaded is None or loaded["key"] != data_key:
-        st.info("Press **Load data** to download prices. A full index takes about a minute the first time, then it is cached.")
-        return None
-    prices, index_prices = loaded["prices"], loaded["index_prices"]
-    if not prices:
-        st.error("No price data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
-        return None
-
     st.subheader("US indexes")
     index_rows = {}
     for name, symbol in indexes.items():
@@ -2080,41 +2136,51 @@ def render_market_analysis():
         index_columns = ["Trend", "Close", "Change %"] + [f"Close vs SMA {p} %" for p in ma_periods] + [
             "% from 52w high", "Return 1m %", "Return 3m %", "Return YTD %"]
         st.dataframe(index_table[index_columns].style.format(precision=2), width="stretch")
-        chart_index = st.selectbox("Index chart", list(index_rows), key="market_index_chart")
-        st.plotly_chart(price_lines_chart(index_prices[indexes[chart_index]], chart_index, ma_periods), width="stretch")
+        if chart_index in index_rows:
+            st.plotly_chart(price_lines_chart(index_prices[indexes[chart_index]], chart_index, ma_periods), width="stretch")
     else:
-        st.warning("No index data was returned.")
+        st.warning("No index data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
 
-    breadth = breadth_history(prices, ma_periods=(ma_mid, ma_slow), recent_days=recent_days)
-    breadth_latest = None
-    if not breadth.empty:
-        breadth_latest = breadth.dropna(how="all").iloc[-1]
-        st.subheader(f"Market breadth: {universe} ({int(breadth_latest['Stocks'])} stocks)")
-        tiles = st.columns(4)
-        tiles[0].metric(f"Above SMA {ma_mid}", f"{breadth_latest[f'% above SMA {ma_mid}']:.0f}%")
-        tiles[1].metric(f"Above SMA {ma_slow}", f"{breadth_latest[f'% above SMA {ma_slow}']:.0f}%")
-        tiles[2].metric(f"New 52w high, last {recent_days}d", f"{breadth_latest[f'% new 52w high in last {recent_days}d']:.1f}%")
-        tiles[3].metric(f"New 52w low, last {recent_days}d", f"{breadth_latest[f'% new 52w low in last {recent_days}d']:.1f}%")
-        recent_breadth = breadth.iloc[-TRADING_DAYS_PER_YEAR:]
-        fig = go.Figure()
-        for column, color in [
-            (f"% above SMA {ma_mid}", "royalblue"), (f"% above SMA {ma_slow}", "purple"),
-            (f"% new 52w high in last {recent_days}d", "seagreen"), (f"% new 52w low in last {recent_days}d", "indianred"),
-        ]:
-            fig.add_trace(go.Scatter(x=recent_breadth.index, y=recent_breadth[column], name=column, line=dict(color=color, width=1.4)))
-        fig.update_layout(title="Market breadth (% of stocks)", height=340, margin=dict(l=10, r=10, t=40, b=10),
-                          hovermode="x unified", yaxis=dict(range=[0, 100]))
-        st.plotly_chart(fig, width="stretch")
+    members, members_error = load_universe_members("US", universe)
+    tickers = members["Ticker"].tolist()
+    data_key = json.dumps([universe, tickers])
+    loaded = st.session_state.get("market_data")
+    if load_clicked and tickers:
+        progress = st.progress(0.0, text="Downloading prices...")
+        prices = load_price_panel(tickers, progress=lambda value: progress.progress(value, text="Downloading prices..."))
+        progress.empty()
+        loaded = {"key": data_key, "prices": prices}
+        st.session_state["market_data"] = loaded
 
-    with st.expander("Market filter", expanded=True):
-        gate_columns = st.columns(2)
-        gate_index = gate_columns[0].selectbox("Index", list(indexes), key="market_gate_index")
-        use_index_ma = gate_columns[0].checkbox(f"Index close above its SMA {ma_slow}", value=True, key="market_gate_close")
-        use_index_order = gate_columns[0].checkbox(f"Index SMA {ma_mid} above SMA {ma_slow}", value=False, key="market_gate_order")
-        use_breadth = gate_columns[1].checkbox(f"Minimum % of stocks above SMA {ma_slow}", value=True, key="market_gate_breadth")
-        breadth_threshold = gate_columns[1].number_input("% above", 0.0, 100.0, 50.0, 5.0, key="market_gate_breadth_pct", disabled=not use_breadth)
-        use_highs = gate_columns[1].checkbox(f"Minimum % of stocks with a new 52w high in the last {recent_days} days", value=False, key="market_gate_highs")
-        highs_threshold = gate_columns[1].number_input("% with new highs", 0.0, 100.0, 5.0, 1.0, key="market_gate_highs_pct", disabled=not use_highs)
+    breadth_latest = pd.Series(dtype=float)
+    st.subheader(f"Market breadth: {universe}")
+    if members.empty:
+        st.error(f"Could not load the members of {universe}. {members_error}")
+    elif loaded is None or loaded["key"] != data_key:
+        st.info(f"Press **Load breadth data** in the settings to download the {len(tickers)} members of {universe}.")
+    elif not loaded["prices"]:
+        st.error("No price data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
+    else:
+        breadth = breadth_history(loaded["prices"], ma_periods=(ma_mid, ma_slow), recent_days=recent_days)
+        if not breadth.empty:
+            breadth_latest = breadth.dropna(how="all").iloc[-1]
+            st.caption(f"{int(breadth_latest['Stocks'])} stocks with price data.")
+            tiles = st.columns(4)
+            tiles[0].metric(f"Above SMA {ma_mid}", f"{breadth_latest[f'% above SMA {ma_mid}']:.0f}%")
+            tiles[1].metric(f"Above SMA {ma_slow}", f"{breadth_latest[f'% above SMA {ma_slow}']:.0f}%")
+            tiles[2].metric(f"New 52w high, last {recent_days}d", f"{breadth_latest[f'% new 52w high in last {recent_days}d']:.1f}%")
+            tiles[3].metric(f"New 52w low, last {recent_days}d", f"{breadth_latest[f'% new 52w low in last {recent_days}d']:.1f}%")
+            recent_breadth = breadth.iloc[-TRADING_DAYS_PER_YEAR:]
+            fig = go.Figure()
+            for column, color in [
+                (f"% above SMA {ma_mid}", "royalblue"), (f"% above SMA {ma_slow}", "purple"),
+                (f"% new 52w high in last {recent_days}d", "seagreen"), (f"% new 52w low in last {recent_days}d", "indianred"),
+            ]:
+                fig.add_trace(go.Scatter(x=recent_breadth.index, y=recent_breadth[column], name=column, line=dict(color=color, width=1.4)))
+            fig.update_layout(title="Market breadth (% of stocks)", height=340, margin=dict(l=10, r=10, t=40, b=10),
+                              hovermode="x unified", yaxis=dict(range=[0, 100]))
+            st.plotly_chart(fig, width="stretch")
+
     market_rules = {"index": gate_index}
     if use_index_ma:
         market_rules["index_ma"] = ma_slow
@@ -2129,7 +2195,7 @@ def render_market_analysis():
         f"- {'✅' if ok else ('⚠️ no data:' if ok is None else '❌')} {text}" for text, ok in market_checks
     )
     (st.success if market_ok else st.error)(f"**Market filter: {'PASS' if market_ok else 'FAIL'}**\n\n{check_lines}")
-    return market_ok
+    st.session_state["market_filter_ok"] = market_ok
 
 
 # ============================================================
@@ -2139,31 +2205,39 @@ def render_market_analysis():
 INDUSTRY_PERIODS = ["1M", "3M", "6M", "YTD", "1Y", "2Y", "3Y", "5Y"]
 
 
-def render_industry_analysis():
+def render_industry_analysis(index_prices):
     """Overlay the main index of each chosen industry, plus an optional look at an industry's leading companies."""
+
+    with settings_panel("Industries"):
+        chosen = st.multiselect("Industry indexes", list(INDUSTRY_INDEXES), default=DEFAULT_INDUSTRIES, key="industry_indexes")
+        extra_text = st.text_input("Other tickers", value="", key="industry_extra",
+                                   help="Any Yahoo symbols to add, e.g. ^RUT, SMH, XBI.")
+    with settings_panel("Chart"):
+        period = st.select_slider("Period", INDUSTRY_PERIODS, value="1Y", key="industry_period")
+        normalize = st.toggle("Normalize (start = 100)", value=True, key="industry_normalize")
+        log_scale = st.checkbox("Log scale", value=False, key="industry_log")
+    with settings_panel("Leading companies", expanded=False):
+        leaders_on = st.checkbox("Compare the leading companies of one industry", value=False, key="industry_leaders_on")
+        leaders_text = st.text_input("Industry leaders (up to 5 tickers)", value="NVDA, AMD, AVGO, TSM, INTC",
+                                     key="industry_leaders", disabled=not leaders_on)
+        leaders_metric = st.radio("Quarterly chart", ["Revenue", "Net_Income"], horizontal=True, key="industry_fund_metric",
+                                  format_func=lambda value: value.replace("_", " "), disabled=not leaders_on)
 
     st.caption(
         "Compare industries through their main index (or the ETF that tracks it, where Yahoo has no index history). "
-        "Turn **Normalize** on to rebase every line to 100 at the start of the period, so moves are comparable."
+        "With **Normalize** on, every line starts at 100 so moves are comparable."
     )
-    pick_columns = st.columns([3, 1])
-    chosen = pick_columns[0].multiselect("Industry indexes", list(INDUSTRY_INDEXES), default=DEFAULT_INDUSTRIES,
-                                         key="industry_indexes")
-    extra_text = pick_columns[1].text_input("Other tickers", value="", key="industry_extra",
-                                            help="Any Yahoo symbols to add, e.g. ^RUT, SMH, XBI.")
     symbols = {label: INDUSTRY_INDEXES[label] for label in chosen}
     for ticker in parse_ticker_list(extra_text):
         symbols.setdefault(ticker, ticker)
-    control_columns = st.columns([3, 1, 1])
-    period = control_columns[0].radio("Period", INDUSTRY_PERIODS, index=INDUSTRY_PERIODS.index("1Y"), horizontal=True,
-                                      key="industry_period")
-    normalize = control_columns[1].toggle("Normalize (start = 100)", value=True, key="industry_normalize")
-    log_scale = control_columns[2].checkbox("Log scale", value=False, key="industry_log")
     if not symbols:
-        st.info("Pick at least one industry index.")
+        st.info("Pick at least one industry index in the settings.")
     else:
-        with st.spinner("Loading index prices..."):
-            raw_prices = load_price_panel(list(dict.fromkeys(symbols.values())), days=1900)
+        raw_prices = {symbol: index_prices[symbol] for symbol in symbols.values() if symbol in index_prices}
+        to_fetch = [symbol for symbol in dict.fromkeys(symbols.values()) if symbol not in raw_prices]
+        if to_fetch:
+            with st.spinner("Loading prices..."):
+                raw_prices.update(load_price_panel(to_fetch, days=1900))
         prices = {label: raw_prices[symbol] for label, symbol in symbols.items() if symbol in raw_prices}
         missing = [label for label in symbols if label not in prices]
         if missing:
@@ -2183,6 +2257,7 @@ def render_industry_analysis():
                 title=f"Industry indexes, {period} ({'rebased to 100' if normalize else 'price'})", height=460,
                 margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified",
                 yaxis=dict(type="log" if log_scale else "linear"),
+                legend=dict(orientation="h", yanchor="top", y=-0.12) if MOBILE else None,
             )
             st.plotly_chart(fig, width="stretch")
 
@@ -2201,22 +2276,18 @@ def render_industry_analysis():
             st.caption("Trend: Uptrend when the close is above its 50-day SMA and that is above the 200-day SMA; "
                        "Downtrend when both are reversed; otherwise Mixed.")
 
-    st.subheader("Leading companies")
-    if not st.checkbox("Compare the leading companies of one industry", value=False, key="industry_leaders_on"):
-        return
-    render_industry_leaders()
+    if leaders_on:
+        st.subheader("Leading companies")
+        render_industry_leaders(leaders_text, leaders_metric)
 
 
-def render_industry_leaders():
-    leaders_text = st.text_input(
-        "Industry leaders to compare (up to 5 tickers)", value="NVDA, AMD, AVGO, TSM, INTC", key="industry_leaders",
-        help="Pick the top players of one industry.",
-    )
+def render_industry_leaders(leaders_text, metric):
     leaders = parse_ticker_list(leaders_text)
     if len(leaders) > 5:
         st.warning(f"Only the first 5 of {len(leaders)} tickers are compared.")
         leaders = leaders[:5]
     if not leaders:
+        st.info("Type up to 5 tickers in the settings.")
         return
     ma_periods = (20, 50, 200)
     leader_prices = load_price_panel(leaders)
@@ -2252,8 +2323,6 @@ def render_industry_leaders():
         fundamental_table = fundamental_table.rename(columns=lambda c: f"{c} ($M)" if c.endswith("(last Q)") or c.endswith("TTM") else c)
         st.dataframe(fundamental_table.style.format(precision=1), width="stretch")
         st.caption("Amounts in millions of the reporting currency. YoY compares with the same quarter a year earlier.")
-        metric = st.radio("Quarterly chart", ["Revenue", "Net_Income"], horizontal=True, key="industry_fund_metric",
-                          format_func=lambda value: value.replace("_", " "))
         fig = go.Figure()
         for ticker, frame in quarterly.items():
             if metric in frame:
@@ -2306,183 +2375,193 @@ def row_group(row_id, seed):
 
 
 def render_condition_row(row_id, seed, category_options):
-    """One condition row: the group first, then inputs that fit the group. Returns a condition dict or None."""
+    """One condition row: the signal group first, then inputs that fit the group. Returns a condition dict or None.
+
+    Laid out for a narrow column (the sidebar, or a phone): the group and a remove button on one line, the
+    group's inputs below.
+    """
 
     groups = list(SIGNAL_GROUPS)
-    outer = st.columns([1.3, 5, 0.35], vertical_alignment="bottom")
-    group = outer[0].selectbox("Signal group", groups, index=groups.index(seed.get("group", MOVING_AVERAGE)),
-                               key=f"screen_{row_id}_group")
-    outer[2].button("✕", key=f"screen_{row_id}_remove", on_click=remove_screen_row, args=(row_id,), help="Remove this condition")
-    spec = SIGNAL_GROUPS[group]
-    key = f"screen_{row_id}_{group}"
-    kind = spec["kind"]
+    with st.container(border=True):
+        top = st.columns([3, 1], vertical_alignment="bottom")
+        group = top[0].selectbox("Signal group", groups, index=groups.index(seed.get("group", MOVING_AVERAGE)),
+                                 key=f"screen_{row_id}_group")
+        top[1].button("✕", key=f"screen_{row_id}_remove_btn", on_click=remove_screen_row, args=(row_id,),
+                      help="Remove this condition")
+        spec = SIGNAL_GROUPS[group]
+        key = f"screen_{row_id}_{group}"
+        kind = spec["kind"]
 
-    if kind == "ma":
-        cells = outer[1].columns([1, 0.8, 1.1, 1, 1])
-        left = cells[0].selectbox("Left", ["Close", "SMA", "EMA"], index=["Close", "SMA", "EMA"].index(seed.get("left", "Close")),
-                                  key=f"{key}_left")
-        left_period = cells[1].number_input("Left period", min_value=0, max_value=400, value=int(seed.get("left_period", 0)), step=1,
-                                            key=f"{key}_left_period", disabled=left == "Close", help="MA length (ignored for Close).")
-        operator = cells[2].selectbox("Operator", SCREEN_OPERATORS, index=SCREEN_OPERATORS.index(seed.get("operator", ">")),
-                                      key=f"{key}_operator")
-        right = cells[3].selectbox("Right", SCREEN_LINE_KINDS, index=SCREEN_LINE_KINDS.index(seed.get("right", "SMA")),
-                                   key=f"{key}_right")
-        right_value = cells[4].number_input("Right period / value", value=float(seed.get("right_value", 50.0)),
-                                            key=f"{key}_right_value", disabled=right == "Close",
-                                            help="MA length, or the number for Value.")
-        frame = pd.DataFrame([{"Left": left, "Left period": left_period, "Operator": operator, "Right": right,
-                               "Right period / value": right_value}])
-        conditions = editor_conditions(frame)
-        if not conditions:
-            return None
-        return {"group": MOVING_AVERAGE, **conditions[0]}
+        if kind == "ma":
+            cells = st.columns([3, 2])
+            left = cells[0].selectbox("Left", ["Close", "SMA", "EMA"], index=["Close", "SMA", "EMA"].index(seed.get("left", "Close")),
+                                      key=f"{key}_left")
+            left_period = cells[1].number_input("Period", min_value=0, max_value=400, value=int(seed.get("left_period", 0)), step=1,
+                                                key=f"{key}_left_period", disabled=left == "Close", help="MA length (ignored for Close).")
+            operator = st.selectbox("Operator", SCREEN_OPERATORS, index=SCREEN_OPERATORS.index(seed.get("operator", ">")),
+                                    key=f"{key}_operator")
+            cells = st.columns([3, 2])
+            right = cells[0].selectbox("Right", SCREEN_LINE_KINDS, index=SCREEN_LINE_KINDS.index(seed.get("right", "SMA")),
+                                       key=f"{key}_right")
+            right_value = cells[1].number_input("Period / value", value=float(seed.get("right_value", 50.0)),
+                                                key=f"{key}_right_value", disabled=right == "Close",
+                                                help="MA length, or the number for Value.")
+            frame = pd.DataFrame([{"Left": left, "Left period": left_period, "Operator": operator, "Right": right,
+                                   "Right period / value": right_value}])
+            conditions = editor_conditions(frame)
+            if not conditions:
+                return None
+            return {"group": MOVING_AVERAGE, **conditions[0]}
 
-    if kind == "number":
-        default = spec.get("default", (">", 0.0))
-        cells = outer[1].columns([1, 1, 1, 1])
-        position = 0
-        period = None
-        if spec.get("periods"):
-            period = cells[0].selectbox("Period", list(spec["periods"]), index=1, key=f"{key}_period")
-            position = 1
-        operator = cells[position].selectbox("Operator", NUMBER_OPERATORS, index=NUMBER_OPERATORS.index(default[0]),
-                                             key=f"{key}_operator")
-        label = spec["periods"][period] if period else spec["column"]
-        value = cells[position + 1].number_input(label if operator != "Between" else f"{label} from", value=float(default[1]),
-                                                 key=f"{key}_value", help=spec.get("help"))
-        condition = {"group": group, "operator": operator, "value": float(value)}
-        if period:
-            condition["period"] = period
-        if operator == "Between":
-            upper = default[2] if len(default) > 2 else float(default[1]) + 10
-            condition["value2"] = float(cells[position + 2].number_input("to", value=float(upper), key=f"{key}_value2"))
-        return condition
+        if kind == "number":
+            default = spec.get("default", (">", 0.0))
+            period = None
+            if spec.get("periods"):
+                period = st.selectbox("Period", list(spec["periods"]), index=1, key=f"{key}_period")
+            label = spec["periods"][period] if period else spec["column"]
+            operator = st.selectbox("Operator", NUMBER_OPERATORS, index=NUMBER_OPERATORS.index(default[0]), key=f"{key}_operator")
+            cells = st.columns(2)
+            value = cells[0].number_input(label if operator != "Between" else f"{label} from", value=float(default[1]),
+                                          key=f"{key}_value", help=spec.get("help"))
+            condition = {"group": group, "operator": operator, "value": float(value)}
+            if period:
+                condition["period"] = period
+            if operator == "Between":
+                upper = default[2] if len(default) > 2 else float(default[1]) + 10
+                condition["value2"] = float(cells[1].number_input("to", value=float(upper), key=f"{key}_value2"))
+            return condition
 
-    if kind == "category":
-        cells = outer[1].columns([1, 3])
-        operator = cells[0].selectbox("Operator", CATEGORY_OPERATORS, key=f"{key}_operator")
-        options = category_options.get(group, [])
-        if not options:
-            cells[1].caption(f"No {group.lower()} data for these stocks.")
-            return None
-        values = cells[1].multiselect(group, options, key=f"{key}_values")
-        if not values:
-            return None
-        return {"group": group, "operator": operator, "values": values}
+        if kind == "category":
+            operator = st.selectbox("Operator", CATEGORY_OPERATORS, key=f"{key}_operator")
+            options = category_options.get(group, [])
+            if not options:
+                st.caption(f"No {group.lower()} data yet; load the stocks first.")
+                return None
+            chosen = st.session_state.get(f"{key}_values")
+            if chosen and any(value not in options for value in chosen):
+                # Options follow the loaded stocks; drop picks that are no longer offered.
+                st.session_state[f"{key}_values"] = [value for value in chosen if value in options]
+            values = st.multiselect(group, options, key=f"{key}_values")
+            if not values:
+                return None
+            return {"group": group, "operator": operator, "values": values}
 
-    cells = outer[1].columns([1, 3])
-    days = cells[0].number_input("Within the last (days)" if kind == "past" else "Within the next (days)",
-                                 min_value=1, max_value=365, value=int(spec.get("default", 30)), step=1, key=f"{key}_days")
-    return {"group": group, "days": int(days)}
+        days = st.number_input("Within the last (days)" if kind == "past" else "Within the next (days)",
+                               min_value=1, max_value=365, value=int(spec.get("default", 30)), step=1, key=f"{key}_days")
+        return {"group": group, "days": int(days)}
 
 
-def render_stock_screener(market_ok=None):
+def open_in_signal_analysis(ticker):
+    """Send a screener result to the ticker box and switch to the Signal Analysis tab."""
+
+    st.session_state["ticker_input"] = ticker
+    st.session_state["main_tab"] = SIGNAL_TAB
+
+
+def render_stock_screener():
     """Stock screen over a US index's members, with conditions picked by signal group."""
 
-    st.caption(
-        "Scan an index's members for stocks that meet every condition. Each condition starts with a **signal group** "
-        "(moving averages, price, valuation, growth, sector, analyst rating, earnings dates ...), and the inputs after "
-        "it change to fit that group. Prices come from Yahoo Finance (cached for 6 hours); fundamentals are fetched "
-        "only when a condition needs them."
-    )
-
-    with st.expander("Screener settings", expanded=True):
-        setup_columns = st.columns(2)
-        market = "US"
-        universe = setup_columns[0].selectbox("Stocks to scan", SCREENER_MARKETS[market]["universes"], key="screener_universe")
-        recent_days = int(setup_columns[1].number_input(
-            "New-high window (days)", min_value=1, max_value=120, value=20, step=1, key="screener_recent_days",
-            help="The results show whether each stock made a new 52-week high in this many trading days.",
-        ))
+    market = "US"
+    with settings_panel("Stocks to scan"):
+        universe = st.selectbox("Universe", SCREENER_MARKETS[market]["universes"], key="screener_universe")
         if universe == "Custom list":
-            custom_text = st.text_area(
-                "Tickers (comma or space separated)",
-                value="AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA",
-                key="screener_custom",
-            )
+            custom_text = st.text_area("Tickers (comma or space separated)", value="AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA",
+                                       key="screener_custom")
             members = pd.DataFrame({"Ticker": parse_ticker_list(custom_text), "Name": "", "Sector": "", "Industry": ""})
             members_error = ""
         else:
             members, members_error = load_universe_members(market, universe)
-        ma_columns = st.columns(3)
-        ma_fast = int(ma_columns[0].number_input("Short MA", min_value=2, max_value=400, value=20, step=1, key="screener_ma_fast"))
-        ma_mid = int(ma_columns[1].number_input("Medium MA", min_value=2, max_value=400, value=50, step=1, key="screener_ma_mid"))
-        ma_slow = int(ma_columns[2].number_input("Long MA", min_value=2, max_value=400, value=200, step=1, key="screener_ma_slow"))
-    ma_periods = tuple(dict.fromkeys([ma_fast, ma_mid, ma_slow]))
-    if members.empty:
-        st.error(f"Could not load the members of {universe}. {members_error} Try **Custom list** instead.")
-        return
+        load_clicked = st.button(f"Load data for {len(members)} stocks", type="primary", key="screener_load_btn",
+                                 disabled=members.empty)
 
     tickers = members["Ticker"].tolist()
     data_key = json.dumps([market, universe, tickers])
     loaded = st.session_state.get("screener_data")
-    if st.button(f"Load data for {len(tickers)} stocks", type="primary", key="screener_load"):
+    if load_clicked:
         progress = st.progress(0.0, text="Downloading prices...")
         prices = load_price_panel(tickers, progress=lambda value: progress.progress(value, text="Downloading prices..."))
         progress.empty()
         loaded = {"key": data_key, "prices": prices}
         st.session_state["screener_data"] = loaded
-    if loaded is None or loaded["key"] != data_key:
-        st.info("Press **Load data** to download prices. A full index takes about a minute the first time, then it is cached.")
+    is_loaded = loaded is not None and loaded["key"] == data_key
+    prices = loaded["prices"] if is_loaded else {}
+
+    # Per-ticker columns the signal groups read, beyond the price snapshot.
+    rows = screen_rows()
+    groups_in_use = {row_group(row_id, seed) for row_id, seed in rows.items()}
+    scanned = [ticker for ticker in tickers if ticker in prices] if is_loaded else tickers
+    extra = members.drop_duplicates("Ticker").set_index("Ticker")[["Name", "Sector", "Industry"]].reindex(scanned)
+    extra = extra.fillna("").replace("nan", "")
+    fundamentals_note = ""
+    if is_loaded and prices:
+        wants_yahoo = any(SIGNAL_GROUPS[group].get("fundamental") for group in groups_in_use) or (
+            bool(groups_in_use & {"Sector", "Industry"}) and (extra["Sector"].eq("") | extra["Industry"].eq("")).any())
+        if wants_yahoo:
+            progress = st.progress(0.0, text="Loading fundamentals from Yahoo...")
+            fundamentals = load_fundamental_table(scanned, progress=lambda value: progress.progress(value, text="Loading fundamentals from Yahoo..."))
+            progress.empty()
+            if not fundamentals.empty:
+                extra = extra.join(fundamentals, how="left")
+                extra["Sector"] = extra["Sector"].where(extra["Sector"] != "", extra["Yahoo sector"].fillna(""))
+                extra["Industry"] = extra["Industry"].where(extra["Industry"] != "", extra["Yahoo industry"].fillna(""))
+            fundamentals_note = f"Fundamentals for {len(fundamentals)} of {len(scanned)} stocks (Yahoo Finance, refreshed every 12 hours)."
+        if "Index" in groups_in_use:
+            membership = index_membership(market, scanned)
+            extra["Index"] = [membership.get(ticker, []) for ticker in extra.index]
+    category_options = {
+        "Index": [name for name in SCREENER_MARKETS[market]["universes"] if name != "Custom list"],
+        "Sector": sorted(set(GICS_SECTORS) | {value for value in extra["Sector"] if value}),
+        "Industry": sorted({value for value in extra["Industry"] if value}),
+        "Analyst rating": ANALYST_RATINGS,
+    }
+
+    with settings_panel("Conditions"):
+        st.caption("A stock must meet every condition. Pick a signal group first; the inputs below it follow the group.")
+        conditions = []
+        for row_id, seed in list(rows.items()):
+            condition = render_condition_row(row_id, seed, category_options)
+            if condition is not None:
+                conditions.append(condition)
+        st.button("+ Add condition", on_click=add_screen_row, key="screen_add_row_btn")
+    with settings_panel("More filters", expanded=False):
+        use_high = st.checkbox("Within % of 52w high", value=True, key="screener_use_high")
+        max_from_high = st.number_input("Max % below 52w high", 0.0, 100.0, 25.0, 1.0,
+                                        key="screener_max_from_high", disabled=not use_high)
+        min_price = st.number_input("Min price", 0.0, value=5.0, step=1.0, key="screener_min_price")
+        min_volume = st.number_input("Min avg daily volume (shares)", 0.0, value=0.0, step=100000.0, key="screener_min_volume")
+        cross_window = int(st.number_input("Cross window (bars)", 1, 60, 5, 1, key="screener_cross_window",
+                                           help="Cross Above / Below counts when the cross happened within this many bars and still holds."))
+        recent_days = int(st.number_input("New-high window (days)", min_value=1, max_value=120, value=20, step=1,
+                                          key="screener_recent_days",
+                                          help="The results show whether each stock made a new 52-week high in this many trading days."))
+        ma_columns = st.columns(3)
+        ma_fast = int(ma_columns[0].number_input("Short MA", min_value=2, max_value=400, value=20, step=1, key="screener_ma_fast"))
+        ma_mid = int(ma_columns[1].number_input("Medium MA", min_value=2, max_value=400, value=50, step=1, key="screener_ma_mid"))
+        ma_slow = int(ma_columns[2].number_input("Long MA", min_value=2, max_value=400, value=200, step=1, key="screener_ma_slow"))
+        require_market = st.checkbox("Only list stocks when the Market Analysis filter passes", value=False,
+                                     key="screener_require_gates")
+    ma_periods = tuple(dict.fromkeys([ma_fast, ma_mid, ma_slow]))
+
+    st.caption(
+        "Scan an index's members for stocks that meet every condition. Each condition starts with a **signal group** "
+        "(moving averages, price, valuation, growth, sector, analyst rating, earnings dates ...). Prices come from "
+        "Yahoo Finance (cached for 6 hours); fundamentals are fetched only when a condition needs them."
+    )
+    if members.empty:
+        st.error(f"Could not load the members of {universe}. {members_error} Try **Custom list** instead.")
         return
-    prices = loaded["prices"]
+    if not is_loaded:
+        st.info(f"Press **Load data for {len(tickers)} stocks** in the settings to download prices. A full index takes "
+                "about a minute the first time, then it is cached.")
+        return
     missing = [ticker for ticker in tickers if ticker not in prices]
     if missing:
         st.caption(f"No price data for {len(missing)} ticker(s): {', '.join(missing[:20])}{' ...' if len(missing) > 20 else ''}")
     if not prices:
         st.error("No price data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
         return
-
-    # Per-ticker columns the signal groups read, beyond the price snapshot.
-    rows = screen_rows()
-    groups_in_use = {row_group(row_id, seed) for row_id, seed in rows.items()}
-    scanned = [ticker for ticker in tickers if ticker in prices]
-    extra = members.drop_duplicates("Ticker").set_index("Ticker")[["Name", "Sector", "Industry"]].reindex(scanned)
-    extra = extra.fillna("").replace("nan", "")
-    wants_yahoo = any(SIGNAL_GROUPS[group].get("fundamental") for group in groups_in_use) or (
-        bool(groups_in_use & {"Sector", "Industry"}) and (extra["Sector"].eq("") | extra["Industry"].eq("")).any())
-    if wants_yahoo:
-        progress = st.progress(0.0, text="Loading fundamentals from Yahoo...")
-        fundamentals = load_fundamental_table(scanned, progress=lambda value: progress.progress(value, text="Loading fundamentals from Yahoo..."))
-        progress.empty()
-        if not fundamentals.empty:
-            extra = extra.join(fundamentals, how="left")
-            extra["Sector"] = extra["Sector"].where(extra["Sector"] != "", extra["Yahoo sector"].fillna(""))
-            extra["Industry"] = extra["Industry"].where(extra["Industry"] != "", extra["Yahoo industry"].fillna(""))
-        st.caption(f"Fundamentals for {len(fundamentals)} of {len(scanned)} stocks (Yahoo Finance, refreshed every 12 hours).")
-    if "Index" in groups_in_use:
-        membership = index_membership(market, scanned)
-        extra["Index"] = [membership.get(ticker, []) for ticker in extra.index]
-    present_sectors = sorted({value for value in extra["Sector"] if value})
-    category_options = {
-        "Index": [name for name in SCREENER_MARKETS[market]["universes"] if name != "Custom list"],
-        "Sector": sorted(set(GICS_SECTORS) | set(present_sectors)),
-        "Industry": sorted({value for value in extra["Industry"] if value}),
-        "Analyst rating": ANALYST_RATINGS,
-    }
-
-    with st.expander("Filter settings", expanded=True):
-        st.caption(
-            "A stock must meet every condition. Pick a signal group first; the inputs after it follow the group. "
-            "Moving-average conditions are checked on the last daily bar; Cross Above / Below means the cross "
-            "happened within the cross window and still holds."
-        )
-        conditions = []
-        for row_id, seed in list(rows.items()):
-            condition = render_condition_row(row_id, seed, category_options)
-            if condition is not None:
-                conditions.append(condition)
-        st.button("+ Add condition", on_click=add_screen_row, key="screen_add_row")
-
-        filter_columns = st.columns(4)
-        use_high = filter_columns[0].checkbox("Within % of 52w high", value=True, key="screener_use_high")
-        max_from_high = filter_columns[0].number_input("Max % below 52w high", 0.0, 100.0, 25.0, 1.0,
-                                                       key="screener_max_from_high", disabled=not use_high)
-        min_price = filter_columns[1].number_input("Min price", 0.0, value=5.0, step=1.0, key="screener_min_price")
-        min_volume = filter_columns[2].number_input("Min avg daily volume (shares)", 0.0, value=0.0, step=100000.0, key="screener_min_volume")
-        cross_window = int(filter_columns[3].number_input("Cross window (bars)", 1, 60, 5, 1, key="screener_cross_window"))
-        require_market = st.checkbox("Only list stocks when the Market Analysis filter passes", value=False,
-                                     key="screener_require_gates")
+    if fundamentals_note:
+        st.caption(fundamentals_note)
 
     results = screen_stocks(
         prices,
@@ -2500,8 +2579,9 @@ def render_stock_screener(market_ok=None):
         return
     passing = results[results["Pass"]]
     if require_market:
+        market_ok = st.session_state.get("market_filter_ok")
         if market_ok is None:
-            st.info("Load data in the **Market Analysis** tab to apply the market filter; it is ignored for now.")
+            st.info("Open the **Market Analysis** tab once to evaluate the market filter; it is ignored for now.")
         elif not market_ok:
             st.error(f"{len(passing)} stock(s) meet the conditions, but they are hidden because the market filter fails "
                      "(see Market Analysis).")
@@ -2510,71 +2590,68 @@ def render_stock_screener(market_ok=None):
                + ", ".join(condition_label(condition) for condition in conditions)
                + (f", within {max_from_high:g}% of the 52w high" if use_high else ""))
     show_all = st.checkbox("Show stocks that fail too", value=False, key="screener_show_all")
-    shown = results if show_all else passing
-    shown = shown.copy()
+    shown = (results if show_all else passing).copy()
     if "Index" in shown:
         shown["Index"] = shown["Index"].apply(lambda value: ", ".join(value) if isinstance(value, list) else "")
     # The columns after Close / Change % follow the signal groups in use.
-    group_columns = []
-    for condition in conditions:
-        if condition["group"] != MOVING_AVERAGE:
-            group_columns.append(condition_column(condition))
+    group_columns = [condition_column(condition) for condition in conditions if condition["group"] != MOVING_AVERAGE]
     base_columns = ["Pass", "Name", "Close", "Change %"]
     display_columns = list(dict.fromkeys(base_columns + group_columns + [f"Close vs SMA {p} %" for p in ma_periods] + [
         "% from 52w high", f"New 52w high in last {recent_days}d", "Volume / avg", "Return 1m %", "Return 3m %"]))
     condition_columns = [column for column in results.columns if column not in display_columns and results[column].dtype == bool]
-    st.dataframe(shown[display_columns + condition_columns].style.format(precision=2), width="stretch", height=420)
-    st.download_button(
+    st.caption("Select a row to analyze that stock in Signal Analysis.")
+    event = st.dataframe(shown[display_columns + condition_columns].style.format(precision=2), width="stretch", height=420,
+                         on_select="rerun", selection_mode="single-row", key="screener_results_table")
+    selected = event.selection.rows if event is not None and hasattr(event, "selection") else []
+    action_columns = st.columns([2, 1])
+    if selected and selected[0] < len(shown):
+        picked = shown.index[selected[0]]
+        action_columns[0].button(f"Analyze {picked} in Signal Analysis", type="primary", key="screener_open_btn",
+                                 on_click=open_in_signal_analysis, args=(picked,))
+    action_columns[1].download_button(
         "Download results (CSV)",
         shown.to_csv().encode("utf-8"),
         file_name=f"screener_{market}_{pd.Timestamp(date.today()):%Y%m%d}.csv",
         mime="text/csv",
     )
-    if not passing.empty:
-        pick_columns = st.columns([2, 1])
-        picked = pick_columns[0].selectbox("Open a result in Signal Analysis", passing.index.tolist(), key="screener_pick")
-        pick_columns[1].button("Set as sidebar ticker", on_click=open_in_signal_analysis, args=(picked,))
 
 
 # ============================================================
-# Main application
+# Backtest / Signal Analysis / Validate: strategy settings
 # ============================================================
 
-if check_password():
-    st.write("Welcome to the protected app!")
+SETUP_OPTIONS = {
+    "Moving-average rule": "ma_rule",
+    "Breakout (new high/low on volume)": "breakout",
+    "Pullback in trend (dip to the EMA, then reversal)": "pullback",
+    "Reversal (buy a breakdown in an uptrend)": "reversal",
+}
 
-    st.sidebar.header("Strategy Settings")
-    ticker = normalize_symbol(st.sidebar.text_input("Ticker Symbol", value="AAPL", key="ticker_input"))
-    timeframe = st.sidebar.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0)
-    date_range = st.sidebar.date_input(
-        "Date Range",
-        value=(date(2022, 1, 1), date.today()),
-        max_value=date.today(),
-        format="YYYY-MM-DD",
-    )
-    account_size = st.sidebar.number_input(
-        "Account size ($)",
-        min_value=1000.0,
-        value=100000.0,
-        step=5000.0,
-        help="Starting equity for the Backtest tab and the equity used for position sizing.",
-    )
 
-    st.sidebar.subheader("Signal")
-    setup_options = {
-        "Moving-average rule": "ma_rule",
-        "Breakout (new high/low on volume)": "breakout",
-        "Pullback in trend (dip to the EMA, then reversal)": "pullback",
-        "Reversal (buy a breakdown in an uptrend)": "reversal",
-    }
-    setup_label = st.sidebar.selectbox(
-        "Signal rule",
-        list(setup_options),
-        index=0,
-        help="Used by every tab: the Backtest buys and sells on it, Signal Analysis builds a trade plan from it, "
-        "and Validate replays it.",
-    )
-    setup = setup_options[setup_label]
+def strategy_settings():
+    """Ticker, dates, signal rule and risk settings shared by Backtest, Signal Analysis and Validate.
+
+    Returns a namespace of the settings, or None (after saying why) when the ticker or dates are not usable.
+    """
+
+    with settings_panel("Ticker & dates"):
+        ticker = normalize_symbol(st.text_input("Ticker Symbol", value="AAPL", key="ticker_input"))
+        timeframe = st.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0, key="timeframe")
+        date_range = st.date_input(
+            "Date Range",
+            value=(date(2022, 1, 1), date.today()),
+            max_value=date.today(),
+            format="YYYY-MM-DD",
+            key="date_range",
+        )
+        account_size = st.number_input(
+            "Account size ($)",
+            min_value=1000.0,
+            value=100000.0,
+            step=5000.0,
+            key="account_size",
+            help="Starting equity for the Backtest tab and the equity used for position sizing.",
+        )
 
     # Moving-average rule defaults (also used for the Backtest chart's MA lines).
     fast_type, fast_period, slow_type, slow_period = "EMA", 20, "SMA", 50
@@ -2584,70 +2661,77 @@ if check_password():
     pullback_ema, trend_mid, trend_slow = 20, 50, 200
     swing_bars, pullback_bars, min_depth_atr = 20, 5, 1.5
 
-    if setup == "ma_rule":
-        ma_columns = st.sidebar.columns(2)
-        fast_type = ma_columns[0].selectbox("Fast MA Type", ["EMA", "SMA"], index=0)
-        fast_period = int(ma_columns[1].number_input("Fast MA Period", min_value=1, value=20, step=1))
-        slow_type = ma_columns[0].selectbox("Slow MA Type", ["EMA", "SMA"], index=1)
-        slow_period = int(ma_columns[1].number_input("Slow MA Period", min_value=1, value=50, step=1))
+    with settings_panel("Signal"):
+        setup_label = st.selectbox(
+            "Signal rule",
+            list(SETUP_OPTIONS),
+            index=0,
+            key="signal_rule",
+            help="Used by every tab: the Backtest buys and sells on it, Signal Analysis builds a trade plan from it, "
+            "and Validate replays it.",
+        )
+        setup = SETUP_OPTIONS[setup_label]
 
-        st.sidebar.markdown("**Buy when**")
-        buy_col_left, buy_col_operator, buy_col_right = st.sidebar.columns([1.25, 1.1, 1.25])
-        with buy_col_left:
+        if setup == "ma_rule":
+            ma_columns = st.columns(2)
+            fast_type = ma_columns[0].selectbox("Fast MA Type", ["EMA", "SMA"], index=0, key="fast_type")
+            fast_period = int(ma_columns[1].number_input("Fast MA Period", min_value=1, value=20, step=1, key="fast_period"))
+            slow_type = ma_columns[0].selectbox("Slow MA Type", ["EMA", "SMA"], index=1, key="slow_type")
+            slow_period = int(ma_columns[1].number_input("Slow MA Period", min_value=1, value=50, step=1, key="slow_period"))
+
+            st.markdown("**Buy when**")
             buy_left = st.selectbox("Buy left signal", MA_RULE_SERIES, index=1, key="buy_left", label_visibility="collapsed")
-        with buy_col_operator:
             buy_operator = st.selectbox("Buy operator", MA_RULE_OPERATORS, index=4, key="buy_operator", label_visibility="collapsed")
-        with buy_col_right:
             buy_right = st.selectbox("Buy right signal", MA_RULE_SERIES, index=2, key="buy_right", label_visibility="collapsed")
 
-        st.sidebar.markdown("**Sell / exit when**")
-        sell_col_left, sell_col_operator, sell_col_right = st.sidebar.columns([1.25, 1.1, 1.25])
-        with sell_col_left:
+            st.markdown("**Sell / exit when**")
             sell_left = st.selectbox("Sell left signal", MA_RULE_SERIES, index=1, key="sell_left", label_visibility="collapsed")
-        with sell_col_operator:
             sell_operator = st.selectbox("Sell operator", MA_RULE_OPERATORS, index=5, key="sell_operator", label_visibility="collapsed")
-        with sell_col_right:
             sell_right = st.selectbox("Sell right signal", MA_RULE_SERIES, index=2, key="sell_right", label_visibility="collapsed")
-    elif setup == "breakout":
-        breakout_lookback = int(st.sidebar.number_input("Breakout lookback (bars)", min_value=2, max_value=250, value=20, step=1))
-        volume_multiple = st.sidebar.number_input("Breakout volume (x 50-bar average)", min_value=1.0, max_value=5.0, value=1.5, step=0.1)
-        st.sidebar.caption(
-            f"Buy: the first close above the prior {breakout_lookback}-bar high on at least {volume_multiple:g}x "
-            f"average volume. Sell / exit: the first close below the prior {breakout_lookback}-bar low."
-        )
-    elif setup == "pullback":
-        trend_columns = st.sidebar.columns(2)
-        trend_mid = int(trend_columns[0].number_input("Trend fast MA (bars)", min_value=5, max_value=250, value=50, step=1))
-        trend_slow = int(trend_columns[1].number_input("Trend slow MA (bars)", min_value=10, max_value=400, value=200, step=1))
-        pullback_columns = st.sidebar.columns(2)
-        pullback_ema = int(pullback_columns[0].number_input("Pullback EMA (bars)", min_value=2, max_value=100, value=20, step=1))
-        swing_bars = int(pullback_columns[1].number_input("Swing high lookback (bars)", min_value=2, max_value=120, value=20, step=1))
-        pullback_bars = int(pullback_columns[0].number_input("Pullback window (bars)", min_value=2, max_value=30, value=5, step=1))
-        min_depth_atr = float(pullback_columns[1].number_input("Min dip depth (ATR)", min_value=0.0, max_value=10.0, value=1.5, step=0.1))
-        st.sidebar.caption(
-            f"Buy: {trend_mid}-bar MA rising and above the {trend_slow}-bar MA, a dip of at least {min_depth_atr:g} ATR "
-            f"from the {swing_bars}-bar high reaching the {pullback_ema} EMA within the last {pullback_bars} bars, then a "
-            "close above the prior high. Sell / exit: the mirror image in a downtrend."
-        )
-    else:
-        breakout_lookback = int(st.sidebar.number_input("Breakdown lookback (bars)", min_value=2, max_value=250, value=20, step=1))
-        trend_columns = st.sidebar.columns(2)
-        trend_mid = int(trend_columns[0].number_input("Trend fast MA (bars)", min_value=5, max_value=250, value=50, step=1))
-        trend_slow = int(trend_columns[1].number_input("Trend slow MA (bars)", min_value=10, max_value=400, value=200, step=1))
-        st.sidebar.caption(
-            f"Buy: the first close below the prior {breakout_lookback}-bar low while the close is above the "
-            f"{trend_slow}-bar MA and the {trend_mid}-bar MA is above it. There is no sell signal; trades exit at "
-            "their stop or target."
-        )
+        elif setup == "breakout":
+            breakout_lookback = int(st.number_input("Breakout lookback (bars)", min_value=2, max_value=250, value=20, step=1,
+                                                    key="breakout_lookback"))
+            volume_multiple = st.number_input("Breakout volume (x 50-bar average)", min_value=1.0, max_value=5.0, value=1.5, step=0.1,
+                                              key="volume_multiple")
+            st.caption(
+                f"Buy: the first close above the prior {breakout_lookback}-bar high on at least {volume_multiple:g}x "
+                f"average volume. Sell / exit: the first close below the prior {breakout_lookback}-bar low."
+            )
+        elif setup == "pullback":
+            trend_columns = st.columns(2)
+            trend_mid = int(trend_columns[0].number_input("Trend fast MA (bars)", min_value=5, max_value=250, value=50, step=1, key="trend_mid"))
+            trend_slow = int(trend_columns[1].number_input("Trend slow MA (bars)", min_value=10, max_value=400, value=200, step=1, key="trend_slow"))
+            pullback_columns = st.columns(2)
+            pullback_ema = int(pullback_columns[0].number_input("Pullback EMA (bars)", min_value=2, max_value=100, value=20, step=1, key="pullback_ema"))
+            swing_bars = int(pullback_columns[1].number_input("Swing high lookback (bars)", min_value=2, max_value=120, value=20, step=1, key="swing_bars"))
+            pullback_bars = int(pullback_columns[0].number_input("Pullback window (bars)", min_value=2, max_value=30, value=5, step=1, key="pullback_bars"))
+            min_depth_atr = float(pullback_columns[1].number_input("Min dip depth (ATR)", min_value=0.0, max_value=10.0, value=1.5, step=0.1, key="min_depth_atr"))
+            st.caption(
+                f"Buy: {trend_mid}-bar MA rising and above the {trend_slow}-bar MA, a dip of at least {min_depth_atr:g} ATR "
+                f"from the {swing_bars}-bar high reaching the {pullback_ema} EMA within the last {pullback_bars} bars, then a "
+                "close above the prior high. Sell / exit: the mirror image in a downtrend."
+            )
+        else:
+            breakout_lookback = int(st.number_input("Breakdown lookback (bars)", min_value=2, max_value=250, value=20, step=1,
+                                                    key="breakdown_lookback"))
+            trend_columns = st.columns(2)
+            trend_mid = int(trend_columns[0].number_input("Trend fast MA (bars)", min_value=5, max_value=250, value=50, step=1, key="trend_mid"))
+            trend_slow = int(trend_columns[1].number_input("Trend slow MA (bars)", min_value=10, max_value=400, value=200, step=1, key="trend_slow"))
+            st.caption(
+                f"Buy: the first close below the prior {breakout_lookback}-bar low while the close is above the "
+                f"{trend_slow}-bar MA and the {trend_mid}-bar MA is above it. There is no sell signal; trades exit at "
+                "their stop or target."
+            )
 
-    allow_short = st.sidebar.checkbox("Allow short trades (otherwise sell signals mean exit)", value=False)
+        allow_short = st.checkbox("Allow short trades (otherwise sell signals mean exit)", value=False, key="allow_short")
 
-    with st.sidebar.expander("Risk & sizing", expanded=False):
-        risk_pct = st.number_input("Risk per trade (% of equity)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-        max_position_pct = st.number_input("Max position (% of equity)", min_value=1.0, max_value=100.0, value=25.0, step=1.0)
-        full_size_confidence = st.slider("Full-size confidence threshold", 50, 95, 75)
-        half_size_confidence = st.slider("Half-size confidence threshold", 40, 90, 60)
-        opening_range_minutes = st.selectbox("Intraday opening range (minutes)", [15, 30, 60], index=1)
+    with settings_panel("Risk & sizing", expanded=False):
+        risk_pct = st.number_input("Risk per trade (% of equity)", min_value=0.1, max_value=5.0, value=1.0, step=0.1, key="risk_pct")
+        max_position_pct = st.number_input("Max position (% of equity)", min_value=1.0, max_value=100.0, value=25.0, step=1.0,
+                                           key="max_position_pct")
+        full_size_confidence = st.slider("Full-size confidence threshold", 50, 95, 75, key="full_size_confidence")
+        half_size_confidence = st.slider("Half-size confidence threshold", 40, 90, 60, key="half_size_confidence")
+        opening_range_minutes = st.selectbox("Intraday opening range (minutes)", [15, 30, 60], index=1, key="opening_range_minutes")
 
     ma_rule = {
         "fast_type": fast_type,
@@ -2681,17 +2765,38 @@ if check_password():
 
     if not isinstance(date_range, (tuple, list)) or len(date_range) != 2:
         st.info("Please select both a start date and an end date.")
-        st.stop()
-
+        return None
     start_date, end_date = date_range
     if start_date > end_date:
         st.error("The start date must be earlier than the end date.")
-        st.stop()
-
+        return None
     ticker = ticker.strip().upper()
     if not ticker:
         st.error("Please enter a ticker symbol.")
-        st.stop()
+        return None
+
+    return SimpleNamespace(
+        ticker=ticker, timeframe=timeframe, start_date=start_date, end_date=end_date, account_size=account_size,
+        setup=setup, setup_label=setup_label, fast_type=fast_type, fast_period=fast_period, slow_type=slow_type,
+        slow_period=slow_period, buy_left=buy_left, buy_operator=buy_operator, buy_right=buy_right,
+        sell_left=sell_left, sell_operator=sell_operator, sell_right=sell_right, breakout_lookback=breakout_lookback,
+        volume_multiple=volume_multiple, ma_rule=ma_rule, signal_settings=signal_settings, risk_settings=risk_settings,
+    )
+
+
+# ============================================================
+# Backtest tab
+# ============================================================
+
+def render_backtest(s):
+    """Moving-average / signal-rule backtest of the chosen ticker with EPS, fundamentals, P/E and benchmark panels."""
+
+    ticker, timeframe, start_date, end_date = s.ticker, s.timeframe, s.start_date, s.end_date
+    account_size, setup, setup_label, ma_rule = s.account_size, s.setup, s.setup_label, s.ma_rule
+    fast_type, fast_period, slow_type, slow_period = s.fast_type, s.fast_period, s.slow_type, s.slow_period
+    buy_left, buy_operator, buy_right = s.buy_left, s.buy_operator, s.buy_right
+    sell_left, sell_operator, sell_right = s.sell_left, s.sell_operator, s.sell_right
+    breakout_lookback, volume_multiple, signal_settings = s.breakout_lookback, s.volume_multiple, s.signal_settings
 
     start_date_str = pd.Timestamp(start_date).strftime("%Y-%m-%d")
     end_date_str = pd.Timestamp(end_date).strftime("%Y-%m-%d")
@@ -2711,456 +2816,485 @@ if check_password():
 
     if df.empty:
         st.error(f"No price data was returned for {ticker} between {start_date_str} and {end_date_str}.")
-        st.stop()
+        return
 
-    tab_screener, tab_market, tab_industry, tab_backtest, tab_signals, tab_validate = st.tabs(
-        ["Stock Screener", "Market Analysis", "Industry Analysis", "Backtest", "Signal Analysis & Trade Plan", "Validate"]
+    st.caption(
+        f"Loaded {len(df):,} {timeframe.lower()} bars: "
+        f"{df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d}"
     )
 
-    # Market Analysis runs first so the screener can use its market filter.
-    with tab_market:
-        market_ok = render_market_analysis()
 
-    with tab_industry:
-        render_industry_analysis()
-
-    with tab_screener:
-        render_stock_screener(market_ok)
-
-    with tab_signals:
-        render_signal_analysis(ticker, end_date, signal_settings, risk_settings)
-
-    with tab_validate:
-        render_validation(signal_settings, risk_settings, end_date)
-
-    with tab_backtest:
+    if fundamentals_df.empty:
+        st.warning(
+            "No quarterly fundamentals were available for the selected period. "
+            f"SEC diagnostic: {fundamentals_sec_error or 'No SEC error reported.'}"
+        )
+    else:
         st.caption(
-            f"Loaded {len(df):,} {timeframe.lower()} bars: "
-            f"{df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d}"
+            f"Quarterly fundamentals source: {fundamentals_source}. "
+            f"Loaded {len(fundamentals_df)} quarter-end records from "
+            f"{fundamentals_df.index.min():%Y-%m-%d} to "
+            f"{fundamentals_df.index.max():%Y-%m-%d}."
+        )
+        if fundamentals_sec_error:
+            st.caption(f"SEC fallback diagnostic: {fundamentals_sec_error}")
+
+    df["Fast_MA"] = compute_ma(df["Close"], fast_type, fast_period)
+    df["Slow_MA"] = compute_ma(df["Close"], slow_type, slow_period)
+
+    if setup == "ma_rule" and len(df) < max(fast_period, slow_period):
+        st.warning(
+            f"The selected period contains only {len(df)} bars, but the longest "
+            f"moving average requires {max(fast_period, slow_period)} bars."
         )
 
+    valuation_df, earnings_calculated_df = build_valuation_data(df, earnings_history_df)
 
-        if fundamentals_df.empty:
-            st.warning(
-                "No quarterly fundamentals were available for the selected period. "
-                f"SEC diagnostic: {fundamentals_sec_error or 'No SEC error reported.'}"
-            )
-        else:
-            st.caption(
-                f"Quarterly fundamentals source: {fundamentals_source}. "
-                f"Loaded {len(fundamentals_df)} quarter-end records from "
-                f"{fundamentals_df.index.min():%Y-%m-%d} to "
-                f"{fundamentals_df.index.max():%Y-%m-%d}."
-            )
-            if fundamentals_sec_error:
-                st.caption(f"SEC fallback diagnostic: {fundamentals_sec_error}")
+    if earnings_calculated_df.empty:
+        earnings_display_df = pd.DataFrame()
+    else:
+        display_start = pd.Timestamp(start_date).normalize()
+        display_end = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
+        earnings_display_df = earnings_calculated_df.loc[
+            (earnings_calculated_df.index >= display_start)
+            & (earnings_calculated_df.index < display_end)
+        ].copy()
 
-        df["Fast_MA"] = compute_ma(df["Close"], fast_type, fast_period)
-        df["Slow_MA"] = compute_ma(df["Close"], slow_type, slow_period)
-
-        if setup == "ma_rule" and len(df) < max(fast_period, slow_period):
-            st.warning(
-                f"The selected period contains only {len(df)} bars, but the longest "
-                f"moving average requires {max(fast_period, slow_period)} bars."
-            )
-
-        valuation_df, earnings_calculated_df = build_valuation_data(df, earnings_history_df)
-
-        if earnings_calculated_df.empty:
-            earnings_display_df = pd.DataFrame()
-        else:
-            display_start = pd.Timestamp(start_date).normalize()
-            display_end = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
-            earnings_display_df = earnings_calculated_df.loc[
-                (earnings_calculated_df.index >= display_start)
-                & (earnings_calculated_df.index < display_end)
-            ].copy()
-
-        # --------------------------------------------------------
-        # Align quarterly fundamentals with EPS announcement dates
-        # --------------------------------------------------------
-        fundamentals_plot_df = (
-            align_fundamentals_to_earnings_dates(
-                fundamentals_df=fundamentals_df,
-                earnings_df=earnings_calculated_df,
-                maximum_days=120,
-            )
+    # --------------------------------------------------------
+    # Align quarterly fundamentals with EPS announcement dates
+    # --------------------------------------------------------
+    fundamentals_plot_df = (
+        align_fundamentals_to_earnings_dates(
+            fundamentals_df=fundamentals_df,
+            earnings_df=earnings_calculated_df,
+            maximum_days=120,
         )
+    )
 
-        pe_error = valuation_df["PE_Reconstruction_Error"].dropna()
-        if not pe_error.empty:
-            st.caption(f"Maximum internal P/E calculation error: ${pe_error.max():.8f}")
+    pe_error = valuation_df["PE_Reconstruction_Error"].dropna()
+    if not pe_error.empty:
+        st.caption(f"Maximum internal P/E calculation error: ${pe_error.max():.8f}")
 
-        if setup == "ma_rule":
-            _, _, buy_condition, sell_condition = ma_rule_conditions(df, ma_rule)
-            rule_text = (
-                f"**BUY:** `{buy_left} {buy_operator} {buy_right}`\n\n"
-                f"**SELL:** `{sell_left} {sell_operator} {sell_right}`"
-            )
-        else:
-            backtest_signals = detect_signals(
-                df, setup, breakout_lookback, float(volume_multiple), **signal_settings.detector_kwargs()
-            )
-            buy_condition = backtest_signals["Signal_Up"].fillna(False).astype(bool)
-            sell_condition = backtest_signals["Signal_Down"].fillna(False).astype(bool)
-            rule_text = (
-                f"**BUY / SELL:** {setup_label} signals on {timeframe.lower()} bars. The position is held until "
-                "the opposite signal. Stops and targets are not simulated here; the **Validate** tab replays the "
-                "full trade plan."
-            )
-        df = run_position_engine(df, buy_condition, sell_condition)
-
-        df["Returns"] = df["Close"].pct_change().fillna(0.0)
-        df["Strat_Returns"] = df["Position"] * df["Returns"]
-        df["Equity"] = float(account_size) * (1.0 + df["Strat_Returns"]).cumprod()
-        df["Peak"] = df["Equity"].cummax()
-        df["Drawdown"] = df["Equity"] / df["Peak"] - 1.0
-
-        final_equity = df["Equity"].iloc[-1]
-        total_return = (final_equity / float(account_size) - 1.0) * 100.0
-        max_drawdown = df["Drawdown"].min() * 100.0
-        active_returns = df.loc[df["Strat_Returns"] != 0, "Strat_Returns"]
-        positive_active_bars = 0.0 if active_returns.empty else active_returns.gt(0).mean() * 100.0
-
-        metric_col1, metric_col2, metric_col3 = st.columns(3)
-        metric_col1.metric("Final Equity", f"${final_equity:,.2f}", f"{total_return:.2f}%")
-        metric_col2.metric("Max Drawdown", f"{max_drawdown:.2f}%")
-        metric_col3.metric("Positive Active Bars", f"{positive_active_bars:.1f}%")
-        st.info(rule_text)
-
-        fig = make_subplots(
-            rows=7,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.025,
-            subplot_titles=(
-                f"{ticker} Price, Indicators and Trade Signals",
-                f"{ticker} Quarterly and TTM EPS",
-                f"{ticker} Quarterly Revenue, OpEx, Total Expense, CapEx and Net Income",
-                f"{ticker} Trailing P/E and Estimate-Based P/E Proxy",
-                "Market Benchmark Performance, Normalized to 100",
-                "Portfolio Equity Curve ($)",
-                "Drawdown Profile (%)",
-            ),
-            row_heights=[0.27, 0.14, 0.16, 0.13, 0.12, 0.11, 0.07],
-            specs=[
-                [{"secondary_y": False}],
-                [{"secondary_y": True}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-            ],
+    if setup == "ma_rule":
+        _, _, buy_condition, sell_condition = ma_rule_conditions(df, ma_rule)
+        rule_text = (
+            f"**BUY:** `{buy_left} {buy_operator} {buy_right}`\n\n"
+            f"**SELL:** `{sell_left} {sell_operator} {sell_right}`"
         )
-
-        # Row 1: price, moving averages and signals
-        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gray", width=1)), row=1, col=1)
-        if setup == "ma_rule":
-            fig.add_trace(go.Scatter(x=df.index, y=df["Fast_MA"], name=f"{fast_type} {fast_period}", line=dict(color="orange", width=1.5)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
-
-        buy_points = df.loc[df["Buy_Signal"]]
-        sell_points = df.loc[df["Sell_Signal"]]
-        fig.add_trace(
-            go.Scatter(
-                x=buy_points.index, y=buy_points["Close"], mode="markers", name="BUY signal",
-                marker=dict(symbol="triangle-up", size=12, color="lime", line=dict(color="darkgreen", width=1)),
-                hovertemplate="BUY signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
-            ), row=1, col=1
+    else:
+        backtest_signals = detect_signals(
+            df, setup, breakout_lookback, float(volume_multiple), **signal_settings.detector_kwargs()
         )
-        fig.add_trace(
-            go.Scatter(
-                x=sell_points.index, y=sell_points["Close"], mode="markers", name="SELL signal",
-                marker=dict(symbol="triangle-down", size=12, color="red", line=dict(color="darkred", width=1)),
-                hovertemplate="SELL signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
-            ), row=1, col=1
+        buy_condition = backtest_signals["Signal_Up"].fillna(False).astype(bool)
+        sell_condition = backtest_signals["Signal_Down"].fillna(False).astype(bool)
+        rule_text = (
+            f"**BUY / SELL:** {setup_label} signals on {timeframe.lower()} bars. The position is held until "
+            "the opposite signal. Stops and targets are not simulated here; the **Validate** tab replays the "
+            "full trade plan."
         )
+    df = run_position_engine(df, buy_condition, sell_condition)
 
-        # Row 2: quarterly and TTM EPS
-        eps_trace_added = False
-        eps_trace_definitions = [
-            ("Reported EPS", "Quarterly Reported EPS", "bar", "royalblue", False),
-            ("EPS Estimate", "Quarterly EPS Estimate", "scatter", "orange", False),
-            ("TTM_Reported_EPS", "TTM Reported EPS", "scatter", "limegreen", True),
-            ("TTM_Estimated_EPS", "TTM EPS Estimate Proxy", "scatter", "cyan", True),
-        ]
+    df["Returns"] = df["Close"].pct_change().fillna(0.0)
+    df["Strat_Returns"] = df["Position"] * df["Returns"]
+    df["Equity"] = float(account_size) * (1.0 + df["Strat_Returns"]).cumprod()
+    df["Peak"] = df["Equity"].cummax()
+    df["Drawdown"] = df["Equity"] / df["Peak"] - 1.0
 
-        for column, trace_name, trace_type, color, use_secondary in eps_trace_definitions:
-            if not earnings_display_df.empty and column in earnings_display_df.columns:
-                series = earnings_display_df[column].dropna()
-                if series.empty:
-                    continue
-                eps_trace_added = True
-                if trace_type == "bar":
-                    trace = go.Bar(x=series.index, y=series, name=trace_name, marker_color=color, opacity=0.75)
-                else:
-                    trace = go.Scatter(
-                        x=series.index,
-                        y=series,
-                        mode="lines+markers",
-                        name=trace_name,
-                        line=dict(color=color, width=2, dash="dot" if "Estimate" in trace_name else "solid"),
-                        marker=dict(size=7, color=color),
-                    )
-                fig.add_trace(trace, row=2, col=1, secondary_y=use_secondary)
+    final_equity = df["Equity"].iloc[-1]
+    total_return = (final_equity / float(account_size) - 1.0) * 100.0
+    max_drawdown = df["Drawdown"].min() * 100.0
+    active_returns = df.loc[df["Strat_Returns"] != 0, "Strat_Returns"]
+    positive_active_bars = 0.0 if active_returns.empty else active_returns.gt(0).mean() * 100.0
 
-        if not eps_trace_added:
-            fig.add_annotation(
-                x=0.5, y=0.5, xref="x2 domain", yref="y2 domain",
-                text="No quarterly EPS event falls within the selected display period",
-                showarrow=False, font=dict(color="gray", size=12)
-            )
-        fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray", row=2, col=1, secondary_y=False)
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    metric_col1.metric("Final Equity", f"${final_equity:,.2f}", f"{total_return:.2f}%")
+    metric_col2.metric("Max Drawdown", f"{max_drawdown:.2f}%")
+    metric_col3.metric("Positive Active Bars", f"{positive_active_bars:.1f}%")
+    st.info(rule_text)
 
-        # Row 3: quarterly fundamentals   
-        fundamentals_trace_added = False
-    
-        scale_divisor, fundamentals_axis_title = (
-            choose_fundamental_scale(
-                fundamentals_plot_df
-            )
-        )
-    
-        fundamental_definitions = [
-            (
-                "Revenue",
-                "Revenue",
-                "royalblue",
-            ),
-            (
-                "Total_Expense",
-                "Total expenses",
-                "crimson",
-            ),
-            (
-                "Net_Income",
-                "Net income",
-                "limegreen",
-            ),
-            (
-                "Operating_Expense",
-                "Operating expenses",
-                "orange",
-            ),
-            (
-                "CapEx",
-                "CapEx spending",
-                "purple",
-            ),
-        ]
-    
-    
-        for (
-            column,
-            trace_name,
-            color,
-        ) in fundamental_definitions:
-    
-            if (
-                fundamentals_plot_df.empty
-                or column not in fundamentals_plot_df.columns
-            ):
+    fig = make_subplots(
+        rows=7,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.025,
+        subplot_titles=(
+            f"{ticker} Price, Indicators and Trade Signals",
+            f"{ticker} Quarterly and TTM EPS",
+            f"{ticker} Quarterly Revenue, OpEx, Total Expense, CapEx and Net Income",
+            f"{ticker} Trailing P/E and Estimate-Based P/E Proxy",
+            "Market Benchmark Performance, Normalized to 100",
+            "Portfolio Equity Curve ($)",
+            "Drawdown Profile (%)",
+        ),
+        row_heights=[0.27, 0.14, 0.16, 0.13, 0.12, 0.11, 0.07],
+        specs=[
+            [{"secondary_y": False}],
+            [{"secondary_y": True}],
+            [{"secondary_y": False}],
+            [{"secondary_y": False}],
+            [{"secondary_y": False}],
+            [{"secondary_y": False}],
+            [{"secondary_y": False}],
+        ],
+    )
+
+    # Row 1: price, moving averages and signals
+    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gray", width=1)), row=1, col=1)
+    if setup == "ma_rule":
+        fig.add_trace(go.Scatter(x=df.index, y=df["Fast_MA"], name=f"{fast_type} {fast_period}", line=dict(color="orange", width=1.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
+
+    buy_points = df.loc[df["Buy_Signal"]]
+    sell_points = df.loc[df["Sell_Signal"]]
+    fig.add_trace(
+        go.Scatter(
+            x=buy_points.index, y=buy_points["Close"], mode="markers", name="BUY signal",
+            marker=dict(symbol="triangle-up", size=12, color="lime", line=dict(color="darkgreen", width=1)),
+            hovertemplate="BUY signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
+        ), row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=sell_points.index, y=sell_points["Close"], mode="markers", name="SELL signal",
+            marker=dict(symbol="triangle-down", size=12, color="red", line=dict(color="darkred", width=1)),
+            hovertemplate="SELL signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
+        ), row=1, col=1
+    )
+
+    # Row 2: quarterly and TTM EPS
+    eps_trace_added = False
+    eps_trace_definitions = [
+        ("Reported EPS", "Quarterly Reported EPS", "bar", "royalblue", False),
+        ("EPS Estimate", "Quarterly EPS Estimate", "scatter", "orange", False),
+        ("TTM_Reported_EPS", "TTM Reported EPS", "scatter", "limegreen", True),
+        ("TTM_Estimated_EPS", "TTM EPS Estimate Proxy", "scatter", "cyan", True),
+    ]
+
+    for column, trace_name, trace_type, color, use_secondary in eps_trace_definitions:
+        if not earnings_display_df.empty and column in earnings_display_df.columns:
+            series = earnings_display_df[column].dropna()
+            if series.empty:
                 continue
-    
-            trace_data = fundamentals_plot_df[
-                [
-                    column,
-                    "Fiscal_Quarter_End",
-                ]
-            ].dropna(
-                subset=[column]
-            )
-    
-            if trace_data.empty:
-                continue
-    
-            fundamentals_trace_added = True
-    
-            scaled_values = (
-                trace_data[column]
-                / scale_divisor
-            )
-    
-            fiscal_quarter_end_text = (
-                trace_data["Fiscal_Quarter_End"]
-                .dt.strftime("%Y-%m-%d")
-            )
-    
-            fig.add_trace(
-                go.Bar(
-                    x=trace_data.index,
-                    y=scaled_values,
+            eps_trace_added = True
+            if trace_type == "bar":
+                trace = go.Bar(x=series.index, y=series, name=trace_name, marker_color=color, opacity=0.75)
+            else:
+                trace = go.Scatter(
+                    x=series.index,
+                    y=series,
+                    mode="lines+markers",
                     name=trace_name,
-                    marker_color=color,
-                    opacity=0.78,
-                    customdata=np.column_stack(
-                        [
-                            fiscal_quarter_end_text,
-                        ]
-                    ),
-                    hovertemplate=(
-                        f"{trace_name}<br>"
-                        "Earnings date: "
-                        "%{x|%Y-%m-%d}<br>"
-                        "Fiscal quarter end: "
-                        "%{customdata[0]}<br>"
-                        "Value: "
-                        f"%{{y:,.2f}} "
-                        f"{fundamentals_axis_title}"
-                        "<extra></extra>"
-                    ),
+                    line=dict(color=color, width=2, dash="dot" if "Estimate" in trace_name else "solid"),
+                    marker=dict(size=7, color=color),
+                )
+            fig.add_trace(trace, row=2, col=1, secondary_y=use_secondary)
+
+    if not eps_trace_added:
+        fig.add_annotation(
+            x=0.5, y=0.5, xref="x2 domain", yref="y2 domain",
+            text="No quarterly EPS event falls within the selected display period",
+            showarrow=False, font=dict(color="gray", size=12)
+        )
+    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray", row=2, col=1, secondary_y=False)
+
+    # Row 3: quarterly fundamentals   
+    fundamentals_trace_added = False
+
+    scale_divisor, fundamentals_axis_title = (
+        choose_fundamental_scale(
+            fundamentals_plot_df
+        )
+    )
+
+    fundamental_definitions = [
+        (
+            "Revenue",
+            "Revenue",
+            "royalblue",
+        ),
+        (
+            "Total_Expense",
+            "Total expenses",
+            "crimson",
+        ),
+        (
+            "Net_Income",
+            "Net income",
+            "limegreen",
+        ),
+        (
+            "Operating_Expense",
+            "Operating expenses",
+            "orange",
+        ),
+        (
+            "CapEx",
+            "CapEx spending",
+            "purple",
+        ),
+    ]
+
+
+    for (
+        column,
+        trace_name,
+        color,
+    ) in fundamental_definitions:
+
+        if (
+            fundamentals_plot_df.empty
+            or column not in fundamentals_plot_df.columns
+        ):
+            continue
+
+        trace_data = fundamentals_plot_df[
+            [
+                column,
+                "Fiscal_Quarter_End",
+            ]
+        ].dropna(
+            subset=[column]
+        )
+
+        if trace_data.empty:
+            continue
+
+        fundamentals_trace_added = True
+
+        scaled_values = (
+            trace_data[column]
+            / scale_divisor
+        )
+
+        fiscal_quarter_end_text = (
+            trace_data["Fiscal_Quarter_End"]
+            .dt.strftime("%Y-%m-%d")
+        )
+
+        fig.add_trace(
+            go.Bar(
+                x=trace_data.index,
+                y=scaled_values,
+                name=trace_name,
+                marker_color=color,
+                opacity=0.78,
+                customdata=np.column_stack(
+                    [
+                        fiscal_quarter_end_text,
+                    ]
                 ),
-                row=3,
-                col=1,
-            )
-    
-    
-        if not fundamentals_trace_added:
-            fig.add_annotation(
-                x=0.5,
-                y=0.5,
-                xref="x3 domain",
-                yref="y3 domain",
-                text=(
-                    "Quarterly revenue, total expenses, "
-                    "net income, operating expenses and "
-                    "CapEx data are unavailable"
+                hovertemplate=(
+                    f"{trace_name}<br>"
+                    "Earnings date: "
+                    "%{x|%Y-%m-%d}<br>"
+                    "Fiscal quarter end: "
+                    "%{customdata[0]}<br>"
+                    "Value: "
+                    f"%{{y:,.2f}} "
+                    f"{fundamentals_axis_title}"
+                    "<extra></extra>"
                 ),
-                showarrow=False,
-                font=dict(
-                    color="gray",
-                    size=12,
-                ),
-            )
-    
-    
-        fig.add_hline(
-            y=0,
-            line_width=1,
-            line_dash="dot",
-            line_color="gray",
+            ),
             row=3,
             col=1,
         )
 
-        # Row 4: P/E
-        trailing_pe = valuation_df["Trailing_PE"].dropna()
-        estimate_based_pe = valuation_df["Estimate_Based_PE_Proxy"].dropna()
 
-        if not trailing_pe.empty:
-            fig.add_trace(
-                go.Scatter(x=trailing_pe.index, y=trailing_pe, mode="lines", name="Trailing P/E", line=dict(color="gold", width=2)),
-                row=4, col=1
-            )
-            median_value = trailing_pe.median()
-            fig.add_hline(
-                y=median_value, line_width=1, line_dash="dash", line_color="goldenrod",
-                annotation_text=f"Median trailing P/E: {median_value:.1f}x",
-                annotation_position="top left", row=4, col=1
-            )
+    if not fundamentals_trace_added:
+        fig.add_annotation(
+            x=0.5,
+            y=0.5,
+            xref="x3 domain",
+            yref="y3 domain",
+            text=(
+                "Quarterly revenue, total expenses, "
+                "net income, operating expenses and "
+                "CapEx data are unavailable"
+            ),
+            showarrow=False,
+            font=dict(
+                color="gray",
+                size=12,
+            ),
+        )
 
-        if not estimate_based_pe.empty:
-            fig.add_trace(
-                go.Scatter(x=estimate_based_pe.index, y=estimate_based_pe, mode="lines", name="Estimate-Based P/E Proxy", line=dict(color="cyan", width=2, dash="dot")),
-                row=4, col=1
-            )
-            median_value = estimate_based_pe.median()
-            fig.add_hline(
-                y=median_value, line_width=1, line_dash="dash", line_color="darkcyan",
-                annotation_text=f"Median estimate-based P/E: {median_value:.1f}x",
-                annotation_position="bottom left", row=4, col=1
-            )
 
-        if trailing_pe.empty and estimate_based_pe.empty:
-            fig.add_annotation(
-                x=0.5, y=0.5, xref="x4 domain", yref="y4 domain",
-                text="Insufficient historical EPS data to calculate P/E",
-                showarrow=False, font=dict(color="gray", size=12)
-            )
+    fig.add_hline(
+        y=0,
+        line_width=1,
+        line_dash="dot",
+        line_color="gray",
+        row=3,
+        col=1,
+    )
 
-        # Row 5: benchmarks
-        benchmark_trace_added = False
-        for column, color in [("S&P 500", "deepskyblue"), ("Nasdaq-100", "magenta")]:
-            if not benchmark_df.empty and column in benchmark_df.columns:
-                series = benchmark_df[column].dropna()
-                if not series.empty:
-                    benchmark_trace_added = True
-                    fig.add_trace(
-                        go.Scatter(x=series.index, y=series, name=column, line=dict(color=color, width=2)),
-                        row=5, col=1
-                    )
+    # Row 4: P/E
+    trailing_pe = valuation_df["Trailing_PE"].dropna()
+    estimate_based_pe = valuation_df["Estimate_Based_PE_Proxy"].dropna()
 
-        if not benchmark_trace_added:
-            fig.add_annotation(
-                x=0.5, y=0.5, xref="x5 domain", yref="y5 domain",
-                text="Benchmark data is unavailable", showarrow=False,
-                font=dict(color="gray", size=12)
-            )
-        fig.add_hline(y=100, line_width=1, line_dash="dot", line_color="gray", row=5, col=1)
-
-        # Row 6: equity
+    if not trailing_pe.empty:
         fig.add_trace(
-            go.Scatter(
-                x=df.index, y=df["Equity"], name="Strategy Equity", line=dict(color="green", width=2),
-                hovertemplate="Strategy Equity<br>Date: %{x|%Y-%m-%d}<br>Equity: $%{y:,.2f}<extra></extra>",
-            ), row=6, col=1
+            go.Scatter(x=trailing_pe.index, y=trailing_pe, mode="lines", name="Trailing P/E", line=dict(color="gold", width=2)),
+            row=4, col=1
+        )
+        median_value = trailing_pe.median()
+        fig.add_hline(
+            y=median_value, line_width=1, line_dash="dash", line_color="goldenrod",
+            annotation_text=f"Median trailing P/E: {median_value:.1f}x",
+            annotation_position="top left", row=4, col=1
         )
 
-        # Row 7: drawdown
+    if not estimate_based_pe.empty:
         fig.add_trace(
-            go.Scatter(
-                x=df.index, y=df["Drawdown"] * 100, name="Drawdown %", fill="tozeroy",
-                line=dict(color="red", width=1),
-                hovertemplate="Drawdown<br>Date: %{x|%Y-%m-%d}<br>Drawdown: %{y:.2f}%<extra></extra>",
-            ), row=7, col=1
+            go.Scatter(x=estimate_based_pe.index, y=estimate_based_pe, mode="lines", name="Estimate-Based P/E Proxy", line=dict(color="cyan", width=2, dash="dot")),
+            row=4, col=1
+        )
+        median_value = estimate_based_pe.median()
+        fig.add_hline(
+            y=median_value, line_width=1, line_dash="dash", line_color="darkcyan",
+            annotation_text=f"Median estimate-based P/E: {median_value:.1f}x",
+            annotation_position="bottom left", row=4, col=1
         )
 
-        fig.update_yaxes(title_text="Price", row=1, col=1)
-        fig.update_yaxes(title_text="Quarterly EPS", row=2, col=1, secondary_y=False)
-        fig.update_yaxes(title_text="TTM EPS", row=2, col=1, secondary_y=True)
-        fig.update_yaxes(title_text=fundamentals_axis_title, row=3, col=1)
-        fig.update_yaxes(title_text="P/E (x)", row=4, col=1)
-        fig.update_yaxes(title_text="Indexed", row=5, col=1)
-        fig.update_yaxes(title_text="Equity ($)", row=6, col=1)
-        fig.update_yaxes(title_text="DD (%)", row=7, col=1)
-
-        # Apply the exact same time range to every subplot.
-        common_x_start = pd.Timestamp(df.index.min())
-        common_x_end = pd.Timestamp(df.index.max())
-        for subplot_row in range(1, 8):
-            fig.update_xaxes(
-                range=[
-                    common_x_start,
-                    common_x_end,
-                ],
-                autorange=False,
-                rangeslider_visible=False,
-                row=subplot_row,
-                col=1,
-            )
-
-        chart_state_text = "|".join(
-            [
-                ticker, start_date_str, end_date_str, timeframe, setup,
-                fast_type, str(fast_period), slow_type, str(slow_period),
-                buy_left, buy_operator, buy_right,
-                sell_left, sell_operator, sell_right, str(account_size),
-            ]
-        )
-        chart_revision = hashlib.sha256(chart_state_text.encode("utf-8")).hexdigest()[:16]
-
-        fig.update_layout(
-            height=1725,
-            margin=dict(l=20, r=70, t=50, b=20),
-            showlegend=True,
-            hovermode="x unified",
-            barmode="group",
+    if trailing_pe.empty and estimate_based_pe.empty:
+        fig.add_annotation(
+            x=0.5, y=0.5, xref="x4 domain", yref="y4 domain",
+            text="Insufficient historical EPS data to calculate P/E",
+            showarrow=False, font=dict(color="gray", size=12)
         )
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            key=f"backtest_chart_{chart_revision}",
-            config={"responsive": True, "displaylogo": False},
+    # Row 5: benchmarks
+    benchmark_trace_added = False
+    for column, color in [("S&P 500", "deepskyblue"), ("Nasdaq-100", "magenta")]:
+        if not benchmark_df.empty and column in benchmark_df.columns:
+            series = benchmark_df[column].dropna()
+            if not series.empty:
+                benchmark_trace_added = True
+                fig.add_trace(
+                    go.Scatter(x=series.index, y=series, name=column, line=dict(color=color, width=2)),
+                    row=5, col=1
+                )
+
+    if not benchmark_trace_added:
+        fig.add_annotation(
+            x=0.5, y=0.5, xref="x5 domain", yref="y5 domain",
+            text="Benchmark data is unavailable", showarrow=False,
+            font=dict(color="gray", size=12)
+        )
+    fig.add_hline(y=100, line_width=1, line_dash="dot", line_color="gray", row=5, col=1)
+
+    # Row 6: equity
+    fig.add_trace(
+        go.Scatter(
+            x=df.index, y=df["Equity"], name="Strategy Equity", line=dict(color="green", width=2),
+            hovertemplate="Strategy Equity<br>Date: %{x|%Y-%m-%d}<br>Equity: $%{y:,.2f}<extra></extra>",
+        ), row=6, col=1
+    )
+
+    # Row 7: drawdown
+    fig.add_trace(
+        go.Scatter(
+            x=df.index, y=df["Drawdown"] * 100, name="Drawdown %", fill="tozeroy",
+            line=dict(color="red", width=1),
+            hovertemplate="Drawdown<br>Date: %{x|%Y-%m-%d}<br>Drawdown: %{y:.2f}%<extra></extra>",
+        ), row=7, col=1
+    )
+
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Quarterly EPS", row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="TTM EPS", row=2, col=1, secondary_y=True)
+    fig.update_yaxes(title_text=fundamentals_axis_title, row=3, col=1)
+    fig.update_yaxes(title_text="P/E (x)", row=4, col=1)
+    fig.update_yaxes(title_text="Indexed", row=5, col=1)
+    fig.update_yaxes(title_text="Equity ($)", row=6, col=1)
+    fig.update_yaxes(title_text="DD (%)", row=7, col=1)
+
+    # Apply the exact same time range to every subplot.
+    common_x_start = pd.Timestamp(df.index.min())
+    common_x_end = pd.Timestamp(df.index.max())
+    for subplot_row in range(1, 8):
+        fig.update_xaxes(
+            range=[
+                common_x_start,
+                common_x_end,
+            ],
+            autorange=False,
+            rangeslider_visible=False,
+            row=subplot_row,
+            col=1,
+        )
+
+    chart_state_text = "|".join(
+        [
+            ticker, start_date_str, end_date_str, timeframe, setup,
+            fast_type, str(fast_period), slow_type, str(slow_period),
+            buy_left, buy_operator, buy_right,
+            sell_left, sell_operator, sell_right, str(account_size),
+        ]
+    )
+    chart_revision = hashlib.sha256(chart_state_text.encode("utf-8")).hexdigest()[:16]
+
+    fig.update_layout(
+        height=1725,
+        margin=dict(l=20, r=70, t=50, b=20),
+        showlegend=True,
+        hovermode="x unified",
+        barmode="group",
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=f"backtest_chart_{chart_revision}",
+        config={"responsive": True, "displaylogo": False},
+    )
+
+
+# ============================================================
+# Main application
+# ============================================================
+
+if check_password():
+    st.write("Welcome to the protected app!")
+    keep_settings_across_tabs()
+    MOBILE = detect_mobile()
+
+    with st.spinner("Loading the main indexes..."):
+        main_index_prices = load_main_indexes()
+
+    # on_change="rerun" makes the tabs lazy: only the open tab runs, and its settings fill the sidebar.
+    tabs = st.tabs(TAB_NAMES, key="main_tab", on_change="rerun")
+    active_tab = st.session_state.get("main_tab") or TAB_NAMES[0]
+
+    def tab_is_open(tab, label):
+        return tab.open if tab.open is not None else label == active_tab
+
+    if not MOBILE:
+        st.sidebar.header(active_tab)
+    for tab, label in zip(tabs, TAB_NAMES):
+        with tab:
+            if not tab_is_open(tab, label):
+                continue
+            if label == "Stock Screener":
+                render_stock_screener()
+            elif label == "Market Analysis":
+                render_market_analysis(main_index_prices)
+            elif label == "Industry Analysis":
+                render_industry_analysis(main_index_prices)
+            else:
+                strategy = strategy_settings()
+                if strategy is None:
+                    continue
+                if label == "Backtest":
+                    render_backtest(strategy)
+                elif label == SIGNAL_TAB:
+                    render_signal_analysis(strategy.ticker, strategy.end_date, strategy.signal_settings, strategy.risk_settings)
+                else:
+                    render_validation(strategy.signal_settings, strategy.risk_settings, strategy.end_date)
+
+    with settings_panel("Display", expanded=False):
+        st.selectbox(
+            "Layout", LAYOUT_MODES, key="layout_mode",
+            help="Auto picks the mobile layout on phones and tablets. Desktop puts each tab's settings in the "
+            "sidebar; Mobile puts them in collapsible menus above the charts.",
         )
