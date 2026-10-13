@@ -80,7 +80,8 @@ def test_app_runs_both_tabs(offline):
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)").run()
     assert not app.exception, app.exception
     tab_labels = [tab.label for tab in app.tabs]
-    assert tab_labels == ["Backtest", "Signal Analysis & Trade Plan", "Validate", "Stock Screener"]
+    assert tab_labels == ["Stock Screener", "Market Analysis", "Industry Analysis", "Backtest",
+                          "Signal Analysis & Trade Plan", "Validate"]
     rendered = " ".join(
         [element.value for element in app.success] + [element.value for element in app.warning]
         + [element.value for element in app.info] + [element.value for element in app.error]
@@ -148,14 +149,40 @@ def test_screener_tab_scans_a_custom_list(offline):
     app.run()
     app.text_input[0].input("pw").run()
     next(box for box in app.selectbox if box.label == "Stocks to scan").select("Custom list").run()
-    load = next(button for button in app.button if button.label.startswith("Load data for"))
-    load.click().run()
+    next(button for button in app.button if button.key == "screener_load").click().run()
     assert not app.exception, app.exception
-    headers = [element.value for element in app.header]
-    assert [h for h in headers if h[0].isdigit()] == ["1. Market", "2. Industry", "3. Stock"]
-    outcome = " ".join([element.value for element in app.success] + [element.value for element in app.error])
-    assert "Market filter" in outcome
+    outcome = " ".join(element.value for element in app.success)
     assert "stocks pass" in outcome
+    assert [box.value for box in app.selectbox if box.label == "Signal group"] == ["Moving average"] * 3
+
+    # Switching a row's group swaps the inputs after it and adds the group's column to the results.
+    next(box for box in app.selectbox if box.label == "Signal group").select("P/E").run()
+    assert not app.exception, app.exception
+    assert any(box.label.startswith("P/E") for box in app.number_input)
+    assert not any(box.label == "Left" for box in app.selectbox if (box.key or "").startswith("screen_0_"))
+    assert "P/E" in app.dataframe[-1].value.columns or "stocks pass" in " ".join(e.value for e in app.success)
+
+    next(button for button in app.button if button.label == "+ Add condition").click().run()
+    assert [box.label for box in app.selectbox].count("Signal group") == 4
+    next(button for button in app.button if button.key == "screen_0_remove").click().run()
+    assert [box.label for box in app.selectbox].count("Signal group") == 3
 
     next(radio for radio in app.radio if radio.label == "Market").set_value("HK").run()
+    assert not app.exception, app.exception
+
+
+def test_market_and_industry_tabs(offline):
+    app = AppTest.from_file(APP_PATH, default_timeout=180)
+    app.secrets["password"] = "pw"
+    app.run()
+    app.text_input[0].input("pw").run()
+    assert not any(radio.label == "Market" and "HK" in radio.options for radio in app.radio if (radio.key or "").startswith("market_"))
+    next(box for box in app.selectbox if box.label == "Breadth universe").select("Dow Jones 30").run()
+    next(button for button in app.button if button.key == "market_load").click().run()
+    assert not app.exception, app.exception
+    assert any("Market filter" in element.value for element in list(app.success) + list(app.error))
+
+    industry_chart_titles = [chart.proto.spec for chart in app.get("plotly_chart")]
+    assert any("Industry indexes" in spec for spec in industry_chart_titles)
+    next(toggle for toggle in app.toggle if toggle.key == "industry_normalize").set_value(False).run()
     assert not app.exception, app.exception
