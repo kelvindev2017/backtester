@@ -1,9 +1,7 @@
-"""Stock universes for the screener (US and Hong Kong).
+"""US stock universes for the screener.
 
 Index members are read from Wikipedia at run time (cached by the app), with
-a public CSV as a fallback for the S&P 500 and a bundled list as a fallback
-for the Hang Seng Index; edit ``HANG_SENG_MEMBERS`` when the index is
-rebalanced.
+a public CSV as a fallback for the S&P 500.
 """
 
 import io
@@ -26,16 +24,6 @@ MARKETS = {
         },
         "universes": ["S&P 500", "Nasdaq-100", "Dow Jones 30", "Custom list"],
     },
-    "HK": {
-        "indexes": {
-            "Hang Seng Index": "^HSI",
-            "Hang Seng China Enterprises": "^HSCE",
-            # Yahoo has no usable history for the index itself (HSTECH.HK
-            # returns one bar), so track it through the CSOP tracker ETF.
-            "Hang Seng TECH (3033 ETF)": "3033.HK",
-        },
-        "universes": ["Hang Seng Index", "Custom list"],
-    },
 }
 
 DOW_JONES_30 = [
@@ -43,40 +31,6 @@ DOW_JONES_30 = [
     "GS", "HD", "HON", "IBM", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
     "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT",
 ]
-
-# Hang Seng Index members (Yahoo symbols), matching Wikipedia in October 2026.
-# Only used when the Wikipedia table cannot be read; may lag index rebalances.
-HANG_SENG_MEMBERS = {
-    "0001.HK": "CK Hutchison", "0002.HK": "CLP Holdings", "0003.HK": "HK & China Gas",
-    "0005.HK": "HSBC Holdings", "0006.HK": "Power Assets", "0012.HK": "Henderson Land",
-    "0016.HK": "SHK Properties", "0027.HK": "Galaxy Entertainment", "0066.HK": "MTR Corporation",
-    "0101.HK": "Hang Lung Properties", "0175.HK": "Geely Automobile", "0241.HK": "Alibaba Health",
-    "0267.HK": "CITIC", "0285.HK": "BYD Electronic", "0288.HK": "WH Group",
-    "0291.HK": "China Resources Beer", "0300.HK": "Midea Group", "0316.HK": "Orient Overseas",
-    "0322.HK": "Tingyi", "0386.HK": "Sinopec", "0388.HK": "HKEX",
-    "0669.HK": "Techtronic Industries", "0688.HK": "China Overseas Land", "0700.HK": "Tencent",
-    "0762.HK": "China Unicom", "0823.HK": "Link REIT", "0836.HK": "China Resources Power",
-    "0857.HK": "PetroChina", "0868.HK": "Xinyi Glass", "0881.HK": "Zhongsheng Group",
-    "0883.HK": "CNOOC", "0939.HK": "China Construction Bank", "0941.HK": "China Mobile",
-    "0960.HK": "Longfor Group", "0968.HK": "Xinyi Solar", "0981.HK": "SMIC",
-    "0992.HK": "Lenovo Group", "1024.HK": "Kuaishou", "1038.HK": "CK Infrastructure",
-    "1044.HK": "Hengan International", "1088.HK": "China Shenhua", "1093.HK": "CSPC Pharmaceutical",
-    "1099.HK": "Sinopharm Group", "1109.HK": "China Resources Land", "1113.HK": "CK Asset",
-    "1177.HK": "Sino Biopharmaceutical", "1209.HK": "China Resources Mixc", "1211.HK": "BYD Company",
-    "1299.HK": "AIA Group", "1378.HK": "China Hongqiao", "1398.HK": "ICBC",
-    "1810.HK": "Xiaomi", "1876.HK": "Budweiser APAC", "1928.HK": "Sands China",
-    "1929.HK": "Chow Tai Fook", "1997.HK": "Wharf REIC", "2015.HK": "Li Auto",
-    "2020.HK": "ANTA Sports", "2057.HK": "ZTO Express", "2269.HK": "WuXi Biologics",
-    "2313.HK": "Shenzhou International", "2318.HK": "Ping An Insurance", "2319.HK": "Mengniu Dairy",
-    "2331.HK": "Li Ning", "2359.HK": "WuXi AppTec", "2382.HK": "Sunny Optical",
-    "2388.HK": "BOC Hong Kong", "2618.HK": "JD Logistics", "2628.HK": "China Life",
-    "2688.HK": "ENN Energy", "2899.HK": "Zijin Mining", "3690.HK": "Meituan",
-    "3692.HK": "Hansoh Pharmaceutical", "3968.HK": "China Merchants Bank", "3988.HK": "Bank of China",
-    "6618.HK": "JD Health", "6690.HK": "Haier Smart Home", "6862.HK": "Haidilao",
-    "9618.HK": "JD.com", "9633.HK": "Nongfu Spring", "9888.HK": "Baidu",
-    "9961.HK": "Trip.com", "9988.HK": "Alibaba", "9992.HK": "Pop Mart",
-    "9999.HK": "NetEase",
-}
 
 
 def normalize_ticker(raw, market="US"):
@@ -174,39 +128,3 @@ def load_us_index_members(name):
                 return members
         return members
     raise ValueError(f"Unknown universe: {name}")
-
-
-def hang_seng_members_from_tables(tables, min_rows=60):
-    """Hang Seng Index members from Wikipedia's constituents table ("SEHK: 5", Name, Sub-index)."""
-
-    for table in tables:
-        columns = {re.sub(r"\[[^\]]*\]", "", str(column)).strip(): column for column in table.columns}
-        if "Ticker" not in columns or "Name" not in columns or len(table) < min_rows:
-            continue
-        codes = table[columns["Ticker"]].astype(str).str.extract(r"(\d+)\s*$")[0]
-        frame = pd.DataFrame({
-            "Ticker": [normalize_ticker(code, "HK") if isinstance(code, str) else "" for code in codes],
-            "Name": table[columns["Name"]].astype(str),
-            "Sector": table[columns["Sub-index"]].astype(str) if "Sub-index" in columns else "",
-            "Industry": "",
-        })
-        frame = frame[frame["Ticker"] != ""]
-        return frame.drop_duplicates("Ticker").reset_index(drop=True)
-    return pd.DataFrame(columns=["Ticker", "Name", "Sector", "Industry"])
-
-
-def load_hang_seng_members():
-    """Hang Seng Index members from Wikipedia. Needs network."""
-
-    return hang_seng_members_from_tables(_read_html_tables("https://en.wikipedia.org/wiki/Hang_Seng_Index"))
-
-
-def hang_seng_members():
-    """The bundled Hang Seng Index list (offline fallback)."""
-
-    return pd.DataFrame({
-        "Ticker": list(HANG_SENG_MEMBERS),
-        "Name": list(HANG_SENG_MEMBERS.values()),
-        "Sector": "",
-        "Industry": "",
-    })

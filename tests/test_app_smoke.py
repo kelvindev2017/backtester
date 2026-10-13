@@ -166,9 +166,7 @@ def test_screener_tab_scans_a_custom_list(offline):
     assert [box.label for box in app.selectbox].count("Signal group") == 4
     next(button for button in app.button if button.key == "screen_0_remove").click().run()
     assert [box.label for box in app.selectbox].count("Signal group") == 3
-
-    next(radio for radio in app.radio if radio.label == "Market").set_value("HK").run()
-    assert not app.exception, app.exception
+    assert not any(radio.label == "Market" for radio in app.radio)
 
 
 def test_market_and_industry_tabs(offline):
@@ -176,7 +174,6 @@ def test_market_and_industry_tabs(offline):
     app.secrets["password"] = "pw"
     app.run()
     app.text_input[0].input("pw").run()
-    assert not any(radio.label == "Market" and "HK" in radio.options for radio in app.radio if (radio.key or "").startswith("market_"))
     next(box for box in app.selectbox if box.label == "Breadth universe").select("Dow Jones 30").run()
     next(button for button in app.button if button.key == "market_load").click().run()
     assert not app.exception, app.exception

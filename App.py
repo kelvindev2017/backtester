@@ -57,8 +57,6 @@ from analysis.signal_groups import (
 )
 from analysis.universe import (
     MARKETS as SCREENER_MARKETS,
-    hang_seng_members,
-    load_hang_seng_members,
     load_us_index_members,
     normalize_symbol,
     parse_ticker_list,
@@ -1923,14 +1921,6 @@ def load_price_panel(tickers, chunk_size=50, progress=None, days=1100):
 def load_universe_members(market, universe):
     """Members of a screener universe. Cached for a day."""
 
-    if market == "HK":
-        try:
-            members = load_hang_seng_members()
-            if not members.empty:
-                return members, ""
-        except Exception:
-            pass
-        return hang_seng_members(), "bundled"
     try:
         return load_us_index_members(universe), ""
     except Exception as error:
@@ -2387,7 +2377,7 @@ def render_condition_row(row_id, seed, category_options):
 
 
 def render_stock_screener(market_ok=None):
-    """Stock screen over an index's members (US or Hong Kong), with conditions picked by signal group."""
+    """Stock screen over a US index's members, with conditions picked by signal group."""
 
     st.caption(
         "Scan an index's members for stocks that meet every condition. Each condition starts with a **signal group** "
@@ -2397,27 +2387,23 @@ def render_stock_screener(market_ok=None):
     )
 
     with st.expander("Screener settings", expanded=True):
-        setup_columns = st.columns([1, 2, 2])
-        market = setup_columns[0].radio("Market", list(SCREENER_MARKETS), horizontal=True, key="screener_market")
-        universe = setup_columns[1].selectbox("Stocks to scan", SCREENER_MARKETS[market]["universes"], key=f"screener_universe_{market}")
-        recent_days = int(setup_columns[2].number_input(
+        setup_columns = st.columns(2)
+        market = "US"
+        universe = setup_columns[0].selectbox("Stocks to scan", SCREENER_MARKETS[market]["universes"], key="screener_universe")
+        recent_days = int(setup_columns[1].number_input(
             "New-high window (days)", min_value=1, max_value=120, value=20, step=1, key="screener_recent_days",
             help="The results show whether each stock made a new 52-week high in this many trading days.",
         ))
         if universe == "Custom list":
             custom_text = st.text_area(
                 "Tickers (comma or space separated)",
-                value="AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA" if market == "US" else "700, 9988, 3690, 1810, 1211, 5, 1299",
-                key=f"screener_custom_{market}",
-                help="HK codes can be typed as numbers, e.g. 700 for 0700.HK.",
+                value="AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA",
+                key="screener_custom",
             )
             members = pd.DataFrame({"Ticker": parse_ticker_list(custom_text, market), "Name": "", "Sector": "", "Industry": ""})
             members_error = ""
         else:
             members, members_error = load_universe_members(market, universe)
-        if market == "HK" and universe != "Custom list" and not members.empty:
-            source = "bundled list; it may lag the latest index review" if members_error == "bundled" else "from Wikipedia"
-            st.caption(f"{len(members)} Hang Seng Index members ({source}).")
         ma_columns = st.columns(3)
         ma_fast = int(ma_columns[0].number_input("Short MA", min_value=2, max_value=400, value=20, step=1, key="screener_ma_fast"))
         ma_mid = int(ma_columns[1].number_input("Medium MA", min_value=2, max_value=400, value=50, step=1, key="screener_ma_mid"))
@@ -2470,7 +2456,7 @@ def render_stock_screener(market_ok=None):
     present_sectors = sorted({value for value in extra["Sector"] if value})
     category_options = {
         "Index": [name for name in SCREENER_MARKETS[market]["universes"] if name != "Custom list"],
-        "Sector": sorted(set(GICS_SECTORS) | set(present_sectors)) if market == "US" else present_sectors,
+        "Sector": sorted(set(GICS_SECTORS) | set(present_sectors)),
         "Industry": sorted({value for value in extra["Industry"] if value}),
         "Analyst rating": ANALYST_RATINGS,
     }
@@ -2492,7 +2478,7 @@ def render_stock_screener(market_ok=None):
         use_high = filter_columns[0].checkbox("Within % of 52w high", value=True, key="screener_use_high")
         max_from_high = filter_columns[0].number_input("Max % below 52w high", 0.0, 100.0, 25.0, 1.0,
                                                        key="screener_max_from_high", disabled=not use_high)
-        min_price = filter_columns[1].number_input("Min price", 0.0, value=5.0 if market == "US" else 1.0, step=1.0, key=f"screener_min_price_{market}")
+        min_price = filter_columns[1].number_input("Min price", 0.0, value=5.0, step=1.0, key="screener_min_price")
         min_volume = filter_columns[2].number_input("Min avg daily volume (shares)", 0.0, value=0.0, step=100000.0, key="screener_min_volume")
         cross_window = int(filter_columns[3].number_input("Cross window (bars)", 1, 60, 5, 1, key="screener_cross_window"))
         require_market = st.checkbox("Only list stocks when the Market Analysis filter passes", value=False,

@@ -39,8 +39,7 @@ any sidebar setting across many tickers before trusting it (`analysis/validation
 The first three tabs cover the market from the top down (`analysis/screener.py`, `analysis/signal_groups.py`,
 `analysis/universe.py`):
 
-**Stock Screener**: scans US (S&P 500, Nasdaq-100, Dow Jones 30 or a custom list) or Hong Kong (Hang Seng
-Index or a custom list) stocks. Each condition row starts with a **signal group**, modelled on TradingView's
+**Stock Screener**: scans US stocks (S&P 500, Nasdaq-100, Dow Jones 30 or a custom list). Each condition row starts with a **signal group**, modelled on TradingView's
 screener filters: Moving average, Index, Price, Chg %, Mkt cap, P/E, EPS dil growth, Div yield %, Sector,
 Industry, Analyst rating, Perf %, Revenue growth, PEG, ROE, Beta, Recent / Upcoming earnings date. The inputs
 after the group follow it (e.g. `Close Cross Above SMA 50`, `P/E between 0 and 30`, `Sector is any of Energy`,
@@ -58,8 +57,7 @@ SPDR ETFs such as XLK / XLF, ^NBI, ^BKX, ^DJT), optionally normalized to 100 at 
 5Y), with a table of returns, trend and distance from the 52-week high. Optionally compares up to 5 leading
 companies of one industry on price, MAs and quarterly revenue / net income trend.
 
-US index members come from Wikipedia (S&P 500 falls back to a public CSV); the Hang Seng list is bundled in
-`analysis/universe.py` and should be updated after index reviews.
+US index members come from Wikipedia (S&P 500 falls back to a public CSV).
 
 The tool never places orders. The report is the gate before you execute.
 
