@@ -9,6 +9,10 @@ or tablet (detected from the browser) there is no sidebar and the settings sit i
 charts. **Display > Layout** overrides the detection. The main US and industry indexes (S&P 500, Nasdaq,
 Dow, Russell 2000, ^SOX, the sector ETFs ...) load when the app starts and are cached for 6 hours.
 
+Settings are saved in the browser's cookies whenever they change and come back when the app is reopened, even
+after the deployed app restarts. They are per browser, so a phone and a desktop keep their own settings.
+**Display > Reset all settings to defaults** starts over.
+
 ## Tabs
 
 **Backtest**: moving-average rule backtester with EPS, quarterly fundamentals (SEC + Yahoo),

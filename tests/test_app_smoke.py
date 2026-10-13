@@ -239,3 +239,26 @@ def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
     assert not app.exception, app.exception
     assert any("only 0 of" in element.value for element in app.warning)
     st.cache_resource.clear()
+
+
+def test_settings_survive_an_app_restart(offline, monkeypatch):
+    from streamlit.runtime.context import ContextProxy
+
+    from analysis.settings_store import COOKIE_PREFIX
+
+    app = start_app()
+    next(box for box in app.selectbox if box.label == "Universe").select("Dow Jones 30").run()
+    next(box for box in app.selectbox if box.label == "Signal group").select("P/E").run()
+    chunks = app.session_state["_settings_saved"]
+    assert any(COOKIE_PREFIX in element.proto.body for element in app.get("html"))
+
+    cookies = {f"{COOKIE_PREFIX}{index}": chunk for index, chunk in enumerate(chunks)}
+    cookies[f"{COOKIE_PREFIX}n"] = str(len(chunks))
+    monkeypatch.setattr(ContextProxy, "cookies", property(lambda self: cookies))
+    restarted = start_app()
+    assert not restarted.exception, restarted.exception
+    assert next(box for box in restarted.selectbox if box.label == "Universe").value == "Dow Jones 30"
+    assert next(box for box in restarted.selectbox if box.label == "Signal group").value == "P/E"
+
+    next(button for button in restarted.button if button.key == "settings_reset_btn").click().run()
+    assert next(box for box in restarted.selectbox if box.label == "Universe").value != "Dow Jones 30"

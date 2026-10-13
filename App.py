@@ -43,6 +43,7 @@ from analysis.screener import (
     stock_snapshot,
 )
 from analysis.scoring import COMPONENT_WEIGHTS
+from analysis.settings_store import cookie_script, pack, settings_snapshot, unpack
 from analysis.signal_groups import (
     ANALYST_RATINGS,
     CATEGORY_OPERATORS,
@@ -2055,6 +2056,47 @@ def keep_settings_across_tabs():
             st.session_state[key] = st.session_state[key]
 
 
+# Results and loaded data are rebuilt from the settings, so only the settings themselves are saved.
+UNSAVED_KEYS = {"market_filter_ok", "validation_result", "market_data", "screener_data"}
+
+
+def unsaved_key(key):
+    return key in TRANSIENT_KEYS or key in UNSAVED_KEYS or key.endswith(TRANSIENT_KEY_SUFFIXES)
+
+
+def restore_saved_settings():
+    """Once per browser session, load the settings this browser saved last time (see ``save_settings``)."""
+
+    if st.session_state.get("_settings_restored"):
+        return
+    st.session_state["_settings_restored"] = True
+    try:
+        saved = unpack(dict(st.context.cookies))
+    except Exception:
+        saved = {}
+    for key, value in saved.items():
+        if not unsaved_key(key) and key not in st.session_state:
+            st.session_state[key] = value
+
+
+def save_settings():
+    """Write the current settings to this browser's cookies when they changed, so an app restart keeps them."""
+
+    chunks = pack(settings_snapshot(st.session_state, skip=unsaved_key))
+    if not chunks or st.session_state.get("_settings_saved") == chunks:
+        return
+    st.session_state["_settings_saved"] = chunks
+    st.html(cookie_script(chunks), width="content", unsafe_allow_javascript=True)
+
+
+def forget_settings():
+    """Back to the default settings; the next save overwrites what this browser stored."""
+
+    for key in list(st.session_state.keys()):
+        if isinstance(key, str) and not key.startswith("_") and not unsaved_key(key):
+            del st.session_state[key]
+
+
 def detect_mobile():
     """Mobile layout when chosen in Display, else when the browser's user agent is a phone or tablet.
 
@@ -3282,6 +3324,7 @@ def render_backtest(s):
 
 if check_password():
     st.write("Welcome to the protected app!")
+    restore_saved_settings()
     keep_settings_across_tabs()
     MOBILE = detect_mobile()
 
@@ -3324,3 +3367,6 @@ if check_password():
             help="Auto picks the mobile layout on phones and tablets. Desktop puts each tab's settings in the "
             "sidebar; Mobile puts them in collapsible menus above the charts.",
         )
+        st.caption("Your settings are saved in this browser and come back when you reopen the app.")
+        st.button("Reset all settings to defaults", key="settings_reset_btn", on_click=forget_settings)
+    save_settings()
