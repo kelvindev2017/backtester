@@ -227,6 +227,12 @@ def test_supply_chain_tab(offline):
     open_tab(app, "Semicon Supply Chain")
     assert not app.exception, app.exception
 
+    for chain in ["AI / data center", "Automotive", "All end markets"]:
+        next(box for box in app.selectbox if box.key == "supply_chain").select(chain)
+        open_tab(app, "Semicon Supply Chain")
+        assert not app.exception, app.exception
+        assert any('"NVDA"' in chart.proto.spec for chart in app.get("plotly_chart"))
+
 
 def test_mobile_layout_has_no_sidebar(offline):
     app = start_app()

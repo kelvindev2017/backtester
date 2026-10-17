@@ -1,6 +1,7 @@
 import numpy as np
 
 from analysis.supply_chain import (
+    ALL_CHAINS,
     CHAINS,
     COMPANIES,
     LEVELS,
@@ -30,6 +31,24 @@ def test_chains_are_consistent():
             pairs.add((source, target))
         linked = {ticker for edge in chain["edges"] for ticker in edge[:2]}
         assert linked == set(tickers), "every company has at least one link"
+
+
+def test_a_company_sits_on_the_same_level_in_every_chain():
+    level_of = {}
+    for chain in CHAINS.values():
+        for index, level in enumerate(chain["levels"]):
+            for ticker in level:
+                assert level_of.setdefault(ticker, index) == index, ticker
+
+
+def test_all_end_markets_merges_the_chains():
+    merged = CHAINS[ALL_CHAINS]
+    others = [chain for name, chain in CHAINS.items() if name != ALL_CHAINS]
+    assert set(chain_tickers(ALL_CHAINS)) == {t for chain in others for level in chain["levels"] for t in level}
+    notes = {(source, target): note for source, target, note in merged["edges"]}
+    # TSM makes chips for NVIDIA in both the AI and the automotive chain; the merged link keeps both notes.
+    assert "CoWoS" in notes[("TSM", "NVDA")] and "Drive" in notes[("TSM", "NVDA")]
+    assert len(notes) == len(merged["edges"])
 
 
 def test_positions_spread_each_level():

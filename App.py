@@ -2480,7 +2480,8 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
                            font=dict(size=11 if MOBILE else 12))
     hidden = dict(visible=False, fixedrange=True)
     fig.update_layout(
-        height=640, margin=dict(l=5, r=5, t=30, b=10), dragmode=False, clickmode="event+select",
+        height=max(640, 44 * max(len(level) for level in SUPPLY_CHAINS[chain]["levels"]) + 100),
+        margin=dict(l=5, r=5, t=30, b=10), dragmode=False, clickmode="event+select",
         xaxis=dict(range=[-0.15, len(SUPPLY_LEVELS) - 0.35], **hidden), yaxis=dict(range=[-0.06, 1.14], **hidden),
         hoverlabel=dict(align="left"),
     )
@@ -2558,7 +2559,7 @@ def render_supply_chain(index_prices):
     focus = None if focus == NO_FOCUS else focus
 
     st.caption(
-        f"The {chain.lower()} chain traced back from the end market, US-listed companies only. A line means the "
+        f"**{chain}**: traced back from the end market, US-listed companies only. A line means the "
         "left company buys from the right one. Hover a company or a line for details, or tap a company to focus it. "
         "Links are curated from public reporting and show the main relationships, not every one."
     )

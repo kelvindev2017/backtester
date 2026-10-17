@@ -15,20 +15,43 @@ import pandas as pd
 
 from analysis.screener import index_trend, stock_snapshot
 
-LEVELS = ["End market", "Chips & components", "Fabs & packaging", "Tools, software & materials"]
-LEVEL_SHORT_NAMES = ["End market", "Chips", "Fabs", "Tools & IP"]
+LEVELS = ["End market & systems", "Chips & components", "Memory, fabs & packaging", "Tools, software & materials"]
+LEVEL_SHORT_NAMES = ["End market", "Chips", "Fabs & memory", "Tools & IP"]
+ALL_CHAINS = "All end markets"
 
 COMPANIES = {
     "AAPL": ("Apple", "iPhone maker; designs its own A-series processors, C1 modem and N1 wireless chip."),
-    "GOOGL": ("Alphabet", "Pixel phones; designs its own Tensor processor."),
+    "GOOGL": ("Alphabet", "Pixel phones and Google Cloud; designs its own Tensor phone chip, TPU AI chips and Axion CPU."),
+    "MSFT": ("Microsoft", "Azure cloud; one of the largest buyers of AI accelerators. Designs its own Maia and Cobalt chips."),
+    "AMZN": ("Amazon", "AWS cloud; designs its own Trainium AI chips and Graviton CPUs."),
+    "META": ("Meta Platforms", "AI data centers for its apps and models; designs its own MTIA accelerators."),
+    "ORCL": ("Oracle", "Oracle Cloud; fast-growing buyer of AI accelerators."),
+    "DELL": ("Dell Technologies", "AI servers built on NVIDIA and AMD accelerators."),
+    "SMCI": ("Super Micro Computer", "AI servers and racks built on NVIDIA accelerators."),
+    "ANET": ("Arista Networks", "Data center Ethernet switches; Microsoft and Meta are its largest customers."),
+    "TSLA": ("Tesla", "EVs; designs its own self-driving computer chips and trains on NVIDIA GPUs."),
+    "GM": ("General Motors", "Car maker; working with NVIDIA on driver assistance and self-driving."),
+    "F": ("Ford Motor", "Car maker; BlueCruise driver assistance."),
+    "RIVN": ("Rivian Automotive", "EV maker; Gen 2 vehicles run on NVIDIA Drive."),
+    "NVDA": ("NVIDIA", "AI data center GPUs and systems; Drive computers for cars."),
+    "AMD": ("Advanced Micro Devices", "Instinct AI accelerators and EPYC server CPUs."),
+    "MRVL": ("Marvell Technology", "Custom AI chips for cloud providers and optical interconnect chips."),
+    "INTC": ("Intel", "Xeon server CPUs; also runs its own fabs."),
+    "ALAB": ("Astera Labs", "PCIe and CXL connectivity chips that link GPUs, CPUs and memory in AI servers."),
+    "CRDO": ("Credo Technology", "Active electrical cables and connectivity chips for AI clusters."),
+    "MBLY": ("Mobileye Global", "EyeQ chips for driver assistance, sold mostly through tier-1 suppliers."),
+    "NXPI": ("NXP Semiconductors", "Automotive processors, microcontrollers, radar and networking chips."),
+    "ADI": ("Analog Devices", "Analog and battery management chips, including GM's wireless battery management system."),
+    "STM": ("STMicroelectronics", "Silicon carbide power chips and microcontrollers; a key Tesla supplier."),
+    "ON": ("onsemi", "Silicon carbide power chips and image sensors for cars."),
     "QCOM": ("Qualcomm", "Modems and Snapdragon processors; iPhone modem supplier while Apple moves to its own."),
     "AVGO": ("Broadcom", "RF filters (FBAR) and wireless chips."),
     "SWKS": ("Skyworks Solutions", "RF front-end modules; Apple is its largest customer. Took over Qorvo in Oct 2026."),
     "CRUS": ("Cirrus Logic", "Audio codecs, amplifiers and haptic drivers; most revenue comes from Apple."),
     "TXN": ("Texas Instruments", "Power management and analog chips; runs its own fabs."),
-    "MU": ("Micron Technology", "Mobile DRAM (LPDDR) and NAND flash; runs its own fabs."),
+    "MU": ("Micron Technology", "DRAM, high-bandwidth memory (HBM) for AI accelerators, and NAND flash; runs its own fabs."),
     "SONY": ("Sony Group (ADR)", "Camera image sensors; the main iPhone camera sensor supplier."),
-    "TSM": ("TSMC (ADR)", "Foundry that makes Apple's A-series, Qualcomm's Snapdragon and Google's Tensor G5."),
+    "TSM": ("TSMC (ADR)", "Leading-edge foundry and CoWoS advanced packaging; makes most of the world's AI accelerators and phone processors."),
     "GFS": ("GlobalFoundries", "Foundry for RF, mixed-signal and mature-node chips."),
     "AMKR": ("Amkor Technology", "Chip packaging and test; Apple and Qualcomm are its largest customers."),
     "ASX": ("ASE Technology (ADR)", "Packaging, test and system-in-package modules."),
@@ -47,8 +70,8 @@ CHAINS = {
     "Mobile devices": {
         "levels": [
             ["AAPL", "GOOGL"],
-            ["QCOM", "AVGO", "SWKS", "CRUS", "TXN", "MU", "SONY"],
-            ["TSM", "GFS", "AMKR", "ASX"],
+            ["QCOM", "AVGO", "SWKS", "CRUS", "TXN", "SONY"],
+            ["TSM", "MU", "GFS", "AMKR", "ASX"],
             ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "TER", "ENTG"],
         ],
         "edges": [
@@ -91,7 +114,118 @@ CHAINS = {
             ("ENTG", "MU", "Specialty materials and filtration"),
         ],
     },
+    "AI / data center": {
+        "levels": [
+            ["MSFT", "AMZN", "GOOGL", "META", "ORCL", "DELL", "SMCI", "ANET"],
+            ["NVDA", "AMD", "AVGO", "MRVL", "INTC", "ALAB", "CRDO"],
+            ["TSM", "MU", "AMKR"],
+            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "ENTG"],
+        ],
+        "edges": [
+            ("NVDA", "MSFT", "GPUs for Azure"),
+            ("NVDA", "AMZN", "GPUs for AWS"),
+            ("NVDA", "GOOGL", "GPUs for Google Cloud"),
+            ("NVDA", "META", "GPUs for its AI clusters"),
+            ("NVDA", "ORCL", "GPUs for Oracle Cloud"),
+            ("NVDA", "DELL", "GPUs and HGX boards for AI servers"),
+            ("NVDA", "SMCI", "GPUs and HGX boards for AI servers"),
+            ("AMD", "MSFT", "Instinct accelerators for Azure"),
+            ("AMD", "META", "Instinct accelerators"),
+            ("AMD", "ORCL", "Instinct accelerators for Oracle Cloud"),
+            ("AMD", "DELL", "EPYC CPUs and Instinct accelerators"),
+            ("AVGO", "GOOGL", "Co-designs Google's TPU AI chips"),
+            ("AVGO", "META", "Custom AI chips and networking"),
+            ("AVGO", "ANET", "Tomahawk and Jericho switch chips"),
+            ("MRVL", "AMZN", "Custom AI chips and optical interconnect chips"),
+            ("MRVL", "MSFT", "Custom AI accelerator work"),
+            ("INTC", "DELL", "Xeon server CPUs"),
+            ("INTC", "SMCI", "Xeon server CPUs"),
+            ("ALAB", "AMZN", "PCIe and CXL connectivity chips"),
+            ("CRDO", "AMZN", "Active electrical cables"),
+            ("CRDO", "MSFT", "Active electrical cables"),
+            ("TSM", "NVDA", "Makes the GPUs and packages them with CoWoS"),
+            ("TSM", "AMD", "Makes Instinct and EPYC chips"),
+            ("TSM", "AVGO", "Makes custom AI and switch chips"),
+            ("TSM", "MRVL", "Makes Marvell's custom chips"),
+            ("MU", "NVDA", "HBM memory stacked next to the GPU"),
+            ("MU", "AMD", "HBM memory for Instinct accelerators"),
+            ("AMKR", "NVDA", "Advanced packaging and test"),
+            ("ARM", "NVDA", "Arm cores in the Grace CPU"),
+            ("ARM", "AMZN", "Arm Neoverse cores in Graviton"),
+            ("ARM", "MSFT", "Arm Neoverse cores in Cobalt"),
+            ("ARM", "GOOGL", "Arm Neoverse cores in Axion"),
+            ("SNPS", "NVDA", "Design software and IP"),
+            ("SNPS", "AMD", "Design software and IP"),
+            ("CDNS", "NVDA", "Design software and IP"),
+            ("CDNS", "AMD", "Design software and IP"),
+            ("ASML", "TSM", "EUV and DUV lithography"),
+            ("ASML", "MU", "EUV and DUV lithography for DRAM"),
+            ("ASML", "INTC", "EUV lithography, including High-NA"),
+            ("AMAT", "TSM", "Wafer fab equipment"),
+            ("AMAT", "MU", "Wafer fab equipment"),
+            ("AMAT", "INTC", "Wafer fab equipment"),
+            ("LRCX", "TSM", "Etch and deposition"),
+            ("LRCX", "MU", "Etch and deposition for DRAM and HBM"),
+            ("KLAC", "TSM", "Inspection and process control"),
+            ("KLAC", "MU", "Inspection and process control"),
+            ("ENTG", "TSM", "Specialty materials and filtration"),
+            ("ENTG", "MU", "Specialty materials and filtration"),
+        ],
+    },
+    "Automotive": {
+        "levels": [
+            ["TSLA", "GM", "F", "RIVN"],
+            ["NVDA", "MBLY", "QCOM", "NXPI", "ADI", "STM", "ON"],
+            ["TSM", "GFS"],
+            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "ENTG"],
+        ],
+        "edges": [
+            ("NVDA", "TSLA", "GPUs for training its self-driving models"),
+            ("NVDA", "GM", "Drive computers and AI training for self-driving"),
+            ("NVDA", "RIVN", "Drive Orin computers in Gen 2 vehicles"),
+            ("MBLY", "F", "EyeQ driver-assistance chips"),
+            ("QCOM", "GM", "Snapdragon cockpit chips"),
+            ("NXPI", "F", "Processors for the SYNC infotainment system"),
+            ("ADI", "GM", "Wireless battery management system"),
+            ("STM", "TSLA", "Silicon carbide power chips for the inverter"),
+            ("ON", "TSLA", "Silicon carbide power chips"),
+            ("TSM", "TSLA", "Makes Tesla's AI5 self-driving chip"),
+            ("TSM", "NVDA", "Makes the Drive Orin and Thor chips"),
+            ("TSM", "MBLY", "Makes EyeQ chips"),
+            ("TSM", "QCOM", "Makes Snapdragon automotive chips"),
+            ("TSM", "NXPI", "Makes NXP's advanced-node processors"),
+            ("GFS", "GM", "Long-term supply agreement for GM's chips"),
+            ("ARM", "NVDA", "Arm cores in Drive Thor"),
+            ("ARM", "NXPI", "Arm cores in S32 processors"),
+            ("SNPS", "NVDA", "Design software and IP"),
+            ("CDNS", "NVDA", "Design software and IP"),
+            ("ASML", "TSM", "EUV and DUV lithography"),
+            ("AMAT", "TSM", "Wafer fab equipment"),
+            ("AMAT", "GFS", "Wafer fab equipment"),
+            ("LRCX", "TSM", "Etch and deposition"),
+            ("KLAC", "TSM", "Inspection and process control"),
+            ("ENTG", "TSM", "Specialty materials and filtration"),
+        ],
+    },
 }
+
+
+def _merge_chains(chains):
+    """One graph of every chain: companies keep their level, a link in several chains keeps every note."""
+
+    levels = [[] for _ in LEVELS]
+    notes = {}
+    for chain in chains.values():
+        for index, level in enumerate(chain["levels"]):
+            levels[index] += [ticker for ticker in level if ticker not in levels[index]]
+        for source, target, note in chain["edges"]:
+            notes.setdefault((source, target), [])
+            if note not in notes[(source, target)]:
+                notes[(source, target)].append(note)
+    return {"levels": levels, "edges": [(source, target, "; ".join(parts)) for (source, target), parts in notes.items()]}
+
+
+CHAINS[ALL_CHAINS] = _merge_chains(CHAINS)
 
 NODE_METRICS = ["Return 1m %", "Return 3m %", "Return 6m %", "Return YTD %", "Return 1y %", "% from 52w high"]
 
