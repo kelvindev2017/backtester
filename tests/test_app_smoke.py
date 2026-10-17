@@ -91,7 +91,8 @@ def open_tab(app, label):
 
 def test_app_runs_both_tabs(offline):
     app = start_app()
-    assert [tab.label for tab in app.tabs] == ["Stock Screener", "Market Analysis", "Industry Analysis", "Backtest",
+    assert [tab.label for tab in app.tabs] == ["Stock Screener", "Market Analysis", "Industry Analysis",
+                                               "Semicon Supply Chain", "Backtest",
                                                "Signal Analysis & Trade Plan", "Validate"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
@@ -206,6 +207,24 @@ def test_market_and_industry_tabs(offline):
     assert any("Industry indexes" in chart.proto.spec for chart in app.get("plotly_chart"))
     next(toggle for toggle in app.toggle if toggle.key == "industry_normalize").set_value(False)
     open_tab(app, "Industry Analysis")
+    assert not app.exception, app.exception
+
+
+def test_supply_chain_tab(offline):
+    app = open_tab(start_app(), "Semicon Supply Chain")
+    assert app.sidebar.header[0].value == "Semicon Supply Chain"
+    assert any("End market" in box.label for box in app.selectbox)
+    assert any('"AAPL"' in chart.proto.spec for chart in app.get("plotly_chart"))
+
+    # Focusing a company opens its detail panel with the companies it buys from and sells to.
+    next(box for box in app.selectbox if box.key == "supply_focus").select("TSM")
+    open_tab(app, "Semicon Supply Chain")
+    assert any(element.value.startswith("TSM") for element in app.subheader)
+    rendered = " ".join(element.value for element in app.markdown)
+    assert "Buys from" in rendered and "ASML" in rendered and "Sells to" in rendered
+
+    next(box for box in app.selectbox if box.key == "supply_metric").select("% from 52w high")
+    open_tab(app, "Semicon Supply Chain")
     assert not app.exception, app.exception
 
 

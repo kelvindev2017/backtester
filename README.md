@@ -64,6 +64,15 @@ SPDR ETFs such as XLK / XLF, ^NBI, ^BKX, ^DJT), optionally normalized to 100 at 
 5Y), with a table of returns, trend and distance from the 52-week high. Optionally compares up to 5 leading
 companies of one industry on price, MAs and quarterly revenue / net income trend.
 
+**Semicon Supply Chain** (US-listed companies only): a bottom-up graph of one end market's semiconductor supply
+chain, starting with **Mobile devices**. Columns run from the end market (Apple, Alphabet) through chips and
+components, fabs and packaging, to tools, software and materials; a line means the left company buys from the right
+one. Each company shows a node metric (3-month return by default, also 1m/6m/YTD/1y return or % from the 52-week
+high) as its label and color. Hover a company or a line for details; tap or click a company (or pick it under the
+graph) to highlight everything upstream and downstream of it and open its detail panel: who it buys from and sells
+to, its price over the last year against ^SOX, and quarterly revenue. The chain and its links are curated by hand in
+`analysis/supply_chain.py`; add AI / data center or automotive as another entry in `CHAINS`.
+
 US index members come from Wikipedia (S&P 500 falls back to a public CSV).
 
 The tool never places orders. The report is the gate before you execute.

@@ -43,6 +43,18 @@ from analysis.screener import (
     stock_snapshot,
 )
 from analysis.scoring import COMPONENT_WEIGHTS
+from analysis.supply_chain import (
+    CHAINS as SUPPLY_CHAINS,
+    COMPANIES as SUPPLY_COMPANIES,
+    LEVEL_SHORT_NAMES as SUPPLY_LEVEL_SHORT_NAMES,
+    LEVELS as SUPPLY_LEVELS,
+    NODE_METRICS as SUPPLY_NODE_METRICS,
+    chain_tickers,
+    linked_tickers,
+    neighbors,
+    node_positions,
+    node_table,
+)
 from analysis.signal_groups import (
     ANALYST_RATINGS,
     CATEGORY_OPERATORS,
@@ -2029,12 +2041,13 @@ def index_membership(market, tickers):
 # Layout: desktop sidebar or mobile menus
 # ============================================================
 
-TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", "Backtest", "Signal Analysis & Trade Plan", "Validate"]
+SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
+TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", SUPPLY_CHAIN_TAB, "Backtest", "Signal Analysis & Trade Plan", "Validate"]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
-TRANSIENT_KEY_SUFFIXES = ("_btn", "_table")
+TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart")
 TRANSIENT_KEYS = {"main_tab", "password_correct"}
 MAIN_INDEX_SYMBOLS = list(dict.fromkeys(list(SCREENER_MARKETS["US"]["indexes"].values()) + list(INDUSTRY_INDEXES.values())))
 
@@ -2356,6 +2369,216 @@ def render_industry_leaders(leaders_text, metric):
     health_columns[1].metric("Leaders above SMA 200", f"{health.get('Above SMA 200', 0)} / {health['Leaders']}")
     health_columns[2].metric("Avg % from 52w high", f"{health.get('Avg % from 52w high', float('nan')):.1f}%")
     health_columns[3].metric("Avg 3-month return", f"{health.get('Avg 3m return %', float('nan')):.1f}%")
+
+
+# ============================================================
+# Semicon Supply Chain tab
+# ============================================================
+
+NO_FOCUS = "(none)"
+
+
+def supply_graph_key():
+    return f"supply_graph_{st.session_state.get('supply_graph_round', 0)}_chart"
+
+
+def focus_from_graph():
+    """A tap or click on a company node in the supply-chain graph makes it the focused company.
+
+    Every click also gives the chart a new key, so the next run draws it fresh instead of keeping Plotly's own
+    selection, which would grey out every other point and hide the highlighted chain.
+    """
+
+    event = st.session_state.get(supply_graph_key())
+    st.session_state["supply_graph_round"] = st.session_state.get("supply_graph_round", 0) + 1
+    points = event.selection.points if event and event.selection else []
+    for point in points:
+        customdata = point.get("customdata")
+        if customdata and customdata[0] in SUPPLY_COMPANIES:
+            st.session_state["supply_focus"] = customdata[0]
+            return
+
+
+def wrap_text(text, width=48):
+    words, lines, line = text.split(), [], ""
+    for word in words:
+        if line and len(line) + len(word) + 1 > width:
+            lines.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    return "<br>".join(lines + [line])
+
+
+def node_colors(values, metric):
+    """Color range for the node metric: symmetric around 0 for returns, from the lowest value to 0 for % from the high."""
+
+    finite = values[np.isfinite(values)]
+    if metric == "% from 52w high":
+        return dict(cmin=min(-1.0, float(finite.min())) if finite.size else -30.0, cmax=0.0)
+    bound = max(1.0, float(np.nanpercentile(np.abs(finite), 90))) if finite.size else 20.0
+    return dict(cmin=-bound, cmax=bound)
+
+
+def supply_chain_figure(chain, table, metric, focus, highlight):
+    positions = node_positions(chain)
+    linked = linked_tickers(chain, focus) if focus and highlight else set(positions)
+    fig = go.Figure()
+
+    for active in (False, True):
+        xs, ys = [], []
+        for source, target, _ in SUPPLY_CHAINS[chain]["edges"]:
+            if (source in linked and target in linked) == active:
+                xs += [positions[source][0], positions[target][0], None]
+                ys += [positions[source][1], positions[target][1], None]
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", hoverinfo="skip", showlegend=False,
+            line=dict(width=1.6 if active and focus else 1.0,
+                      color="rgba(65,105,225,0.75)" if active and focus else "rgba(128,128,128,0.35)"),
+        ))
+
+    # Invisible markers along each edge carry the edge's hover text. They sit 30% of the way from the customer,
+    # which never lands on a company (companies sit on whole-number columns, edges span 1 to 3 columns).
+    edges = SUPPLY_CHAINS[chain]["edges"]
+    fig.add_trace(go.Scatter(
+        x=[positions[t][0] + 0.3 * (positions[s][0] - positions[t][0]) for s, t, _ in edges],
+        y=[positions[t][1] + 0.3 * (positions[s][1] - positions[t][1]) for s, t, _ in edges],
+        mode="markers", marker=dict(size=10, color="rgba(0,0,0,0)"), showlegend=False,
+        hovertext=[f"<b>{s} → {t}</b><br>{wrap_text(note)}" for s, t, note in edges], hoverinfo="text",
+    ))
+
+    tickers = list(positions)
+    values = table.loc[tickers, metric].astype(float).to_numpy()
+    labels = [f"<b>{t}</b><br>{v:+.1f}%" if np.isfinite(v) else f"<b>{t}</b><br>n/a" for t, v in zip(tickers, values)]
+    customdata = [
+        [t, SUPPLY_COMPANIES[t][0], table.at[t, "Level"], wrap_text(SUPPLY_COMPANIES[t][1]), table.at[t, "Trend"],
+         *[f"{table.at[t, column]:+.1f}%" if pd.notna(table.at[t, column]) else "n/a"
+           for column in ["Return 1m %", "Return 3m %", "Return YTD %", "% from 52w high"]],
+         f"{table.at[t, 'Close']:.2f}" if pd.notna(table.at[t, "Close"]) else "n/a"]
+        for t in tickers
+    ]
+    fig.add_trace(go.Scatter(
+        x=[positions[t][0] for t in tickers], y=[positions[t][1] for t in tickers],
+        mode="markers+text", text=labels, textposition="middle right",
+        textfont=dict(size=10 if MOBILE else 12), customdata=customdata, showlegend=False,
+        marker=dict(
+            size=[26 if t == focus else 18 for t in tickers],
+            color=np.where(np.isfinite(values), values, np.nan), colorscale="RdYlGn", **node_colors(values, metric),
+            opacity=[1.0 if t in linked else 0.25 for t in tickers],
+            line=dict(width=[3 if t == focus else 1 for t in tickers], color="gray"),
+            showscale=not MOBILE, colorbar=dict(title=dict(text=metric, side="right"), thickness=10, len=0.6),
+        ),
+        hovertemplate=(
+            "<b>%{customdata[0]}</b> · %{customdata[1]}<br><i>%{customdata[2]}</i><br>%{customdata[3]}<br><br>"
+            "Close %{customdata[9]} · %{customdata[4]}<br>1m %{customdata[5]} · 3m %{customdata[6]} · "
+            "YTD %{customdata[7]}<br>From 52w high %{customdata[8]}<extra></extra>"
+        ),
+    ))
+
+    for x, level in enumerate(SUPPLY_LEVEL_SHORT_NAMES if MOBILE else SUPPLY_LEVELS):
+        fig.add_annotation(x=x, y=1.09, text=f"<b>{level}</b>", showarrow=False, xanchor="left",
+                           font=dict(size=11 if MOBILE else 12))
+    hidden = dict(visible=False, fixedrange=True)
+    fig.update_layout(
+        height=640, margin=dict(l=5, r=5, t=30, b=10), dragmode=False, clickmode="event+select",
+        xaxis=dict(range=[-0.15, len(SUPPLY_LEVELS) - 0.35], **hidden), yaxis=dict(range=[-0.06, 1.14], **hidden),
+        hoverlabel=dict(align="left"),
+    )
+    return fig
+
+
+def render_company_detail(chain, ticker, table, prices, index_prices):
+    name, role = SUPPLY_COMPANIES[ticker]
+    st.subheader(f"{ticker} · {name}")
+    st.caption(f"{table.at[ticker, 'Level']}. {role}")
+    tiles = st.columns(4)
+    close = table.at[ticker, "Close"]
+    tiles[0].metric("Close", f"{close:.2f}" if pd.notna(close) else "n/a")
+    for tile, column in zip(tiles[1:3], ["Return 3m %", "% from 52w high"]):
+        value = table.at[ticker, column]
+        tile.metric(column.replace(" %", ""), f"{value:+.1f}%" if pd.notna(value) else "n/a")
+    tiles[3].metric("Trend", table.at[ticker, "Trend"])
+
+    suppliers, customers = neighbors(chain, ticker)
+    columns = st.columns(2)
+    for column, title, links in [(columns[0], "Buys from", suppliers), (columns[1], "Sells to", customers)]:
+        with column:
+            st.markdown(f"**{title}**")
+            st.markdown("\n".join(f"- **{other}** ({SUPPLY_COMPANIES[other][0]}): {note}" for other, note in links)
+                        if links else "_None in this chain._")
+
+    if ticker in prices:
+        lines = {ticker: prices[ticker]}
+        if "^SOX" in index_prices:
+            lines["^SOX"] = index_prices["^SOX"]
+        rebased = overlay_frame(lines, start=period_start(prices[ticker].index[-1], "1Y"))
+        fig = go.Figure([go.Scatter(x=rebased.index, y=rebased[column], name=column,
+                                    line=dict(width=1.2, dash="dot") if column == "^SOX" else dict(width=1.8))
+                         for column in rebased.columns])
+        fig.add_hline(y=100, line=dict(color="gray", width=1, dash="dot"))
+        fig.update_layout(title=f"{ticker} vs the semiconductor index, last year (rebased to 100)", height=320,
+                          margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
+        show_chart(fig, width="stretch")
+
+    fundamentals_start = (pd.Timestamp(date.today()) - pd.DateOffset(years=3)).strftime("%Y-%m-%d")
+    with st.spinner("Loading quarterly revenue..."):
+        fundamentals, _, _ = load_quarterly_fundamentals(ticker, fundamentals_start, pd.Timestamp(date.today()).strftime("%Y-%m-%d"))
+    trend = fundamental_trend(fundamentals)
+    if trend and "Revenue" in fundamentals:
+        revenue = fundamentals["Revenue"].dropna().iloc[-8:] / 1e6
+        yoy = trend.get("Revenue YoY %")
+        margin = trend.get("Net margin %")
+        st.caption(
+            f"Revenue last quarter: {revenue.iloc[-1]:,.0f}M in its reporting currency"
+            + (f", {yoy:+.1f}% year on year" if yoy is not None and pd.notna(yoy) else "")
+            + (f". Net margin {margin:.1f}%." if margin is not None and pd.notna(margin) else ".")
+        )
+        fig = go.Figure(go.Bar(x=revenue.index, y=revenue, marker_color="royalblue", name="Revenue"))
+        fig.update_layout(title="Revenue by quarter (millions, reporting currency)", height=280,
+                          margin=dict(l=10, r=10, t=40, b=10), yaxis=dict(tickformat=",.0f"))
+        show_chart(fig, width="stretch")
+    else:
+        st.caption("No quarterly revenue was available for this company.")
+
+
+def render_supply_chain(index_prices):
+    """Bottom-up supply chain of one end market as a graph: hover a company for details, tap or click it to focus."""
+
+    with settings_panel("Supply chain"):
+        chain = st.selectbox("End market", list(SUPPLY_CHAINS), key="supply_chain")
+        metric = st.selectbox("Node metric", SUPPLY_NODE_METRICS, index=1, key="supply_metric",
+                              help="Shown on each company and used for its color.")
+        highlight = st.checkbox("Highlight the focused company's chain", value=True, key="supply_highlight",
+                                help="Dims everything that is not upstream or downstream of the focused company.")
+
+    tickers = chain_tickers(chain)
+    if st.session_state.get("supply_focus") not in [NO_FOCUS] + tickers:
+        st.session_state["supply_focus"] = NO_FOCUS
+    focus = st.session_state.get("supply_focus", NO_FOCUS)
+    focus = None if focus == NO_FOCUS else focus
+
+    st.caption(
+        f"The {chain.lower()} chain traced back from the end market, US-listed companies only. A line means the "
+        "left company buys from the right one. Hover a company or a line for details, or tap a company to focus it. "
+        "Links are curated from public reporting and show the main relationships, not every one."
+    )
+    with st.spinner("Loading prices..."):
+        prices = load_price_panel(tickers)
+    if not prices:
+        st.warning("No price data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
+    table = node_table(chain, prices)
+
+    show_chart(supply_chain_figure(chain, table, metric, focus, highlight), width="stretch", key=supply_graph_key(),
+               on_select=focus_from_graph, selection_mode="points", config={"displayModeBar": False})
+    st.selectbox("Focused company", [NO_FOCUS] + tickers, key="supply_focus",
+                 format_func=lambda t: t if t == NO_FOCUS else f"{t} · {SUPPLY_COMPANIES[t][0]}")
+
+    if focus:
+        render_company_detail(chain, focus, table, prices, index_prices)
+
+    with st.expander("All companies", expanded=not focus):
+        columns = ["Company", "Level", "Trend", "Close"] + SUPPLY_NODE_METRICS
+        st.dataframe(table[columns].style.format(precision=2), width="stretch")
 
 
 # ============================================================
@@ -3307,6 +3530,8 @@ if check_password():
                 render_market_analysis(main_index_prices)
             elif label == "Industry Analysis":
                 render_industry_analysis(main_index_prices)
+            elif label == SUPPLY_CHAIN_TAB:
+                render_supply_chain(main_index_prices)
             else:
                 strategy = strategy_settings()
                 if strategy is None:
