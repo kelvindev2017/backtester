@@ -8,7 +8,10 @@ from analysis.supply_chain import (
     COMPANY_GROUPS,
     LEVELS,
     chain_tickers,
+    column_groups,
     group_boxes,
+    group_index,
+    group_table,
     linked_tickers,
     neighbors,
     node_positions,
@@ -95,3 +98,40 @@ def test_node_table_handles_missing_prices():
     assert table.loc[tickers[0], "Return 3m %"] > 0
     assert np.isnan(table.loc[tickers[-1], "Return 3m %"])
     assert table.loc[tickers[-1], "Trend"] == "No data"
+
+
+def test_custom_groups_replace_the_defaults():
+    groups = {"ASML": "Lithography & bonding", "BESIY": "Lithography & bonding", "AMAT": "Deposition"}
+    column = column_groups("Mobile devices", 3, groups)
+    assert ("Lithography & bonding", ["ASML", "BESIY"]) in column
+    assert ("Deposition", ["AMAT"]) in column
+    # Companies without a name end up ungrouped, drawn last.
+    assert column[-1][0] is None and "SNPS" in column[-1][1]
+    boxes = {group: tickers for x, group, tickers, _, _ in group_boxes("Mobile devices", groups)}
+    assert boxes == {"Lithography & bonding": ["ASML", "BESIY"], "Deposition": ["AMAT"]}
+    assert set(chain_tickers("Mobile devices", groups)) == set(chain_tickers("Mobile devices"))
+    table = node_table("Mobile devices", {}, groups)
+    assert table.at["ASML", "Group"] == "Lithography & bonding" and table.at["SNPS", "Group"] == ""
+
+
+def test_group_index_is_an_equal_weight_average():
+    up = make_bars(np.linspace(100, 200, 300), seed=1)
+    flat = make_bars(np.full(300, 50.0), seed=2)
+    index = group_index({"A": up, "B": flat}, ["A", "B", "MISSING"])
+    expected = (up["Close"] / up["Close"].iloc[0] * 100 + flat["Close"] / flat["Close"].iloc[0] * 100) / 2
+    assert np.allclose(index["Close"], expected.loc[index.index])
+    assert index["Close"].iloc[0] == pytest.approx(100)
+    assert group_index({}, ["A"]).empty
+
+
+def test_group_table_has_one_row_per_group():
+    tickers = chain_tickers("Mobile devices")
+    prices = {ticker: make_bars(np.linspace(100, 130, 300), seed=1) for ticker in tickers}
+    groups = {"ASML": "Picks", "AMAT": "Picks", "AAPL": "Picks", "TSM": "Fabs"}
+    table = group_table("Mobile devices", prices, groups)
+    # "Picks" is used in two layers, so each layer's group gets its own row.
+    assert set(table.index) == {"Picks (Tools & IP)", "Picks (End market)", "Fabs"}
+    assert table.at["Picks (Tools & IP)", "Members"] == "ASML, AMAT"
+    assert table.at["Fabs", "Return 3m %"] > 0
+    assert table.at["Fabs", "Group"] == "Fabs" and table.at["Fabs", "Level"] == LEVELS[2]
+    assert group_table("Mobile devices", {}, groups).at["Fabs", "Trend"] == "No data"

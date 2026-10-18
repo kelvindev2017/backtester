@@ -11,6 +11,8 @@ disclosures, teardowns, supply agreements). They show the main relationships,
 not every one. An edge points from supplier to customer.
 """
 
+from functools import lru_cache
+
 import numpy as np
 import pandas as pd
 
@@ -245,7 +247,9 @@ def _merge_chains(chains):
 
 CHAINS[ALL_CHAINS] = _merge_chains(CHAINS)
 
-# Supplier groups shown as labelled boxes inside each column, in display order. End-market companies are not grouped.
+# Default supplier groups, shown as labelled boxes inside each column in this order. End-market companies are not
+# grouped by default. The app lets the user regroup and rename; a grouping is a {ticker: group name} dict, and a
+# company with no group sits below the groups of its column.
 GROUPS = [
     {},
     {
@@ -271,51 +275,114 @@ GROUP_GAP = 1.0  # empty rows between two groups in a column
 NODE_METRICS = ["Return 1m %", "Return 3m %", "Return 6m %", "Return YTD %", "Return 1y %", "% from 52w high"]
 
 
-def column_groups(chain, level):
-    """[(group, tickers)] for one column of a chain, in display order. End-market companies form one unnamed group."""
+def company_levels():
+    """{ticker: level} over every chain, end market (0) to tools (3)."""
 
+    return {t: index for chain in CHAINS.values() for index, level in enumerate(chain["levels"]) for t in level}
+
+
+@lru_cache(maxsize=1)
+def default_order():
+    """Every company in its default display order: level by level, by default group, then as the chains list it."""
+
+    order = []
+    for index in range(len(LEVELS)):
+        for members in GROUPS[index].values():
+            order += [t for t in members if t not in order]
+        for chain in CHAINS.values():
+            order += [t for t in chain["levels"][index] if t not in order]
+    return order
+
+
+def column_groups(chain, level, groups=None):
+    """[(group, tickers)] for one column of a chain, in display order; group is None for ungrouped companies.
+
+    Groups keep the order of their first company in the default order, so the defaults draw as listed in GROUPS
+    and a group the user creates appears where its first member used to be.
+    """
+
+    groups = COMPANY_GROUPS if groups is None else groups
     tickers = CHAINS[chain]["levels"][level]
-    if not GROUPS[level]:
-        return [(None, list(tickers))]
-    return [(group, [t for t in members if t in tickers]) for group, members in GROUPS[level].items()
-            if any(t in tickers for t in members)]
+    named, loose = {}, []
+    for ticker in sorted(tickers, key=default_order().index):
+        name = (groups.get(ticker) or "").strip()
+        if name:
+            named.setdefault(name, []).append(ticker)
+        else:
+            loose.append(ticker)
+    return list(named.items()) + ([(None, loose)] if loose else [])
 
 
-def chain_tickers(chain):
+def chain_tickers(chain, groups=None):
     """Every ticker in a chain, level by level, grouped as drawn."""
 
-    return [t for level in range(len(LEVELS)) for _, tickers in column_groups(chain, level) for t in tickers]
+    return [t for level in range(len(LEVELS)) for _, tickers in column_groups(chain, level, groups) for t in tickers]
 
 
-def column_rows(chain, level):
+def column_rows(chain, level, groups=None):
     """Rows a column takes: one per company plus the gaps between groups."""
 
-    groups = column_groups(chain, level)
-    return sum(len(tickers) for _, tickers in groups) + GROUP_GAP * (len(groups) - 1)
+    column = column_groups(chain, level, groups)
+    return sum(len(tickers) for _, tickers in column) + GROUP_GAP * (len(column) - 1)
 
 
-def node_positions(chain):
+def node_positions(chain, groups=None):
     """(x, y) per ticker: x is the level (0 = end market), y spreads each column over [0, 1], top first,
-    with a gap between supplier groups."""
+    with a gap between groups."""
 
     positions = {}
     for x in range(len(LEVELS)):
-        span = max(column_rows(chain, x) - 1, 1)
+        rows = column_rows(chain, x, groups)
+        span = max(rows - 1, 1)
         row = 0.0
-        for _, tickers in column_groups(chain, x):
+        for _, tickers in column_groups(chain, x, groups):
             for ticker in tickers:
-                positions[ticker] = (x, 0.5 if column_rows(chain, x) == 1 else 1 - row / span)
+                positions[ticker] = (x, 0.5 if rows == 1 else 1 - row / span)
                 row += 1
             row += GROUP_GAP
     return positions
 
 
-def group_boxes(chain):
-    """(level, group, top y, bottom y) for every named group, using the node positions."""
+def group_boxes(chain, groups=None):
+    """(level, group, members, top y, bottom y) for every named group, using the node positions."""
 
-    positions = node_positions(chain)
-    return [(x, group, positions[tickers[0]][1], positions[tickers[-1]][1])
-            for x in range(len(LEVELS)) for group, tickers in column_groups(chain, x) if group]
+    positions = node_positions(chain, groups)
+    return [(x, group, tickers, positions[tickers[0]][1], positions[tickers[-1]][1])
+            for x in range(len(LEVELS)) for group, tickers in column_groups(chain, x, groups) if group]
+
+
+def group_index(prices, tickers):
+    """Equal-weight index of a group's closes: each member rebased to 100 on the first day all of them trade,
+    then averaged. Returned as a price frame (Close = High = Low) so the usual snapshot and trend code applies."""
+
+    closes = pd.DataFrame({t: prices[t]["Close"] for t in tickers if t in prices and not prices[t].empty})
+    closes = closes.sort_index().ffill().dropna()
+    if closes.empty:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    level = (closes / closes.iloc[0] * 100).mean(axis=1)
+    return pd.DataFrame({"Open": level, "High": level, "Low": level, "Close": level, "Volume": 1.0})
+
+
+def group_table(chain, prices, groups=None):
+    """Snapshot of every named group's index in the chain: members, returns, distance from the high, trend."""
+
+    boxes = group_boxes(chain, groups)
+    names = [group for _, group, _, _, _ in boxes]
+    rows = {}
+    for x, group, tickers, _, _ in boxes:
+        index = group_index(prices, tickers)
+        row = stock_snapshot(index) if not index.empty else {}
+        row["Trend"] = index_trend(index) if row else "No data"
+        row["Level"] = LEVELS[x]
+        row["Group"] = group
+        row["Members"] = ", ".join(tickers)
+        # The same name in two layers is two groups; tell them apart by layer.
+        rows[group if names.count(group) == 1 else f"{group} ({LEVEL_SHORT_NAMES[x]})"] = row
+    table = pd.DataFrame.from_dict(rows, orient="index")
+    for column in ["Level", "Group", "Members", "Trend", "Close"] + NODE_METRICS:
+        if column not in table:
+            table[column] = np.nan
+    return table
 
 
 def neighbors(chain, ticker):
@@ -343,11 +410,12 @@ def linked_tickers(chain, ticker):
     return linked
 
 
-def node_table(chain, prices):
+def node_table(chain, prices, groups=None):
     """Price snapshot per company in the chain (one row per ticker, NaN where Yahoo returned nothing)."""
 
+    groups = COMPANY_GROUPS if groups is None else groups
     rows = {}
-    for ticker in chain_tickers(chain):
+    for ticker in chain_tickers(chain, groups):
         frame = prices.get(ticker)
         row = stock_snapshot(frame) if frame is not None and not frame.empty else {}
         row["Trend"] = index_trend(frame) if row else "No data"
@@ -358,7 +426,7 @@ def node_table(chain, prices):
             table[column] = np.nan
     names = {ticker: COMPANIES[ticker][0] for ticker in table.index}
     table.insert(0, "Company", pd.Series(names))
-    positions = node_positions(chain)
-    table.insert(1, "Level", [LEVELS[positions[ticker][0]] for ticker in table.index])
-    table.insert(2, "Group", [COMPANY_GROUPS.get(ticker, "") for ticker in table.index])
+    levels = company_levels()
+    table.insert(1, "Level", [LEVELS[levels[ticker]] for ticker in table.index])
+    table.insert(2, "Group", [(groups.get(ticker) or "").strip() for ticker in table.index])
     return table
