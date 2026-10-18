@@ -1,11 +1,14 @@
 import numpy as np
+import pytest
 
 from analysis.supply_chain import (
     ALL_CHAINS,
     CHAINS,
     COMPANIES,
+    COMPANY_GROUPS,
     LEVELS,
     chain_tickers,
+    group_boxes,
     linked_tickers,
     neighbors,
     node_positions,
@@ -49,6 +52,21 @@ def test_all_end_markets_merges_the_chains():
     # TSM makes chips for NVIDIA in both the AI and the automotive chain; the merged link keeps both notes.
     assert "CoWoS" in notes[("TSM", "NVDA")] and "Drive" in notes[("TSM", "NVDA")]
     assert len(notes) == len(merged["edges"])
+
+
+def test_every_supplier_has_a_group_and_groups_stay_apart():
+    for chain in CHAINS:
+        for level in range(1, len(LEVELS)):
+            for ticker in CHAINS[chain]["levels"][level]:
+                assert ticker in COMPANY_GROUPS, (chain, ticker)
+    positions = node_positions("Mobile devices")
+    equipment = [positions[t][1] for t in ["ASML", "AMAT", "LRCX", "KLAC", "TER", "ASMVY", "BESIY", "KLIC"]]
+    software = [positions[t][1] for t in ["ARM", "SNPS", "CDNS"]]
+    step = equipment[0] - equipment[1]
+    # Software sits above equipment with an empty row between the two groups.
+    assert min(software) - max(equipment) == pytest.approx(2 * step)
+    assert [box[1] for box in group_boxes("Mobile devices") if box[0] == 3] == [
+        "Design software & IP", "Equipment", "Materials"]
 
 
 def test_positions_spread_each_level():

@@ -245,24 +245,77 @@ def _merge_chains(chains):
 
 CHAINS[ALL_CHAINS] = _merge_chains(CHAINS)
 
+# Supplier groups shown as labelled boxes inside each column, in display order. End-market companies are not grouped.
+GROUPS = [
+    {},
+    {
+        "Processors & accelerators": ["QCOM", "NVDA", "AMD", "AVGO", "MRVL", "INTC", "MBLY"],
+        "Connectivity & RF": ["SWKS", "ALAB", "CRDO"],
+        "Analog, power & microcontrollers": ["CRUS", "TXN", "ADI", "NXPI", "STM", "ON"],
+        "Sensors": ["SONY"],
+    },
+    {
+        "Foundry": ["TSM", "GFS"],
+        "Memory": ["MU"],
+        "Packaging & test": ["AMKR", "ASX"],
+    },
+    {
+        "Design software & IP": ["ARM", "SNPS", "CDNS"],
+        "Equipment": ["ASML", "AMAT", "LRCX", "KLAC", "TER", "ASMVY", "BESIY", "KLIC"],
+        "Materials": ["ENTG"],
+    },
+]
+COMPANY_GROUPS = {ticker: group for level in GROUPS for group, tickers in level.items() for ticker in tickers}
+GROUP_GAP = 1.0  # empty rows between two groups in a column
+
 NODE_METRICS = ["Return 1m %", "Return 3m %", "Return 6m %", "Return YTD %", "Return 1y %", "% from 52w high"]
 
 
-def chain_tickers(chain):
-    """Every ticker in a chain, level by level."""
+def column_groups(chain, level):
+    """[(group, tickers)] for one column of a chain, in display order. End-market companies form one unnamed group."""
 
-    return [ticker for level in CHAINS[chain]["levels"] for ticker in level]
+    tickers = CHAINS[chain]["levels"][level]
+    if not GROUPS[level]:
+        return [(None, list(tickers))]
+    return [(group, [t for t in members if t in tickers]) for group, members in GROUPS[level].items()
+            if any(t in tickers for t in members)]
+
+
+def chain_tickers(chain):
+    """Every ticker in a chain, level by level, grouped as drawn."""
+
+    return [t for level in range(len(LEVELS)) for _, tickers in column_groups(chain, level) for t in tickers]
+
+
+def column_rows(chain, level):
+    """Rows a column takes: one per company plus the gaps between groups."""
+
+    groups = column_groups(chain, level)
+    return sum(len(tickers) for _, tickers in groups) + GROUP_GAP * (len(groups) - 1)
 
 
 def node_positions(chain):
-    """(x, y) per ticker: x is the level (0 = end market), y spreads each level evenly over [0, 1], top first."""
+    """(x, y) per ticker: x is the level (0 = end market), y spreads each column over [0, 1], top first,
+    with a gap between supplier groups."""
 
     positions = {}
-    for x, level in enumerate(CHAINS[chain]["levels"]):
-        count = len(level)
-        for row, ticker in enumerate(level):
-            positions[ticker] = (x, 0.5 if count == 1 else 1 - row / (count - 1))
+    for x in range(len(LEVELS)):
+        span = max(column_rows(chain, x) - 1, 1)
+        row = 0.0
+        for _, tickers in column_groups(chain, x):
+            for ticker in tickers:
+                positions[ticker] = (x, 0.5 if column_rows(chain, x) == 1 else 1 - row / span)
+                row += 1
+            row += GROUP_GAP
     return positions
+
+
+def group_boxes(chain):
+    """(level, group, top y, bottom y) for every named group, using the node positions."""
+
+    positions = node_positions(chain)
+    return [(x, group, positions[tickers[0]][1], positions[tickers[-1]][1])
+            for x in range(len(LEVELS)) for group, tickers in column_groups(chain, x) if group]
 
 
 def neighbors(chain, ticker):
@@ -307,4 +360,5 @@ def node_table(chain, prices):
     table.insert(0, "Company", pd.Series(names))
     positions = node_positions(chain)
     table.insert(1, "Level", [LEVELS[positions[ticker][0]] for ticker in table.index])
+    table.insert(2, "Group", [COMPANY_GROUPS.get(ticker, "") for ticker in table.index])
     return table

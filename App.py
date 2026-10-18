@@ -46,11 +46,14 @@ from analysis.scoring import COMPONENT_WEIGHTS
 from analysis.supply_chain import (
     CHAINS as SUPPLY_CHAINS,
     COMPANIES as SUPPLY_COMPANIES,
+    COMPANY_GROUPS as SUPPLY_COMPANY_GROUPS,
     LEVEL_SHORT_NAMES as SUPPLY_LEVEL_SHORT_NAMES,
     LEVELS as SUPPLY_LEVELS,
     NODE_METRICS as SUPPLY_NODE_METRICS,
     chain_tickers,
     linked_tickers,
+    column_rows,
+    group_boxes,
     neighbors,
     node_positions,
     node_table,
@@ -2376,6 +2379,11 @@ def render_industry_leaders(leaders_text, metric):
 # ============================================================
 
 NO_FOCUS = "(none)"
+SUPPLY_GROUP_SHORT_NAMES = {
+    "Processors & accelerators": "Processors", "Connectivity & RF": "Connectivity", "Sensors": "Sensors",
+    "Analog, power & microcontrollers": "Analog & power", "Packaging & test": "Packaging",
+    "Design software & IP": "Software & IP",
+}
 
 
 def supply_graph_key():
@@ -2451,7 +2459,7 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
     values = table.loc[tickers, metric].astype(float).to_numpy()
     labels = [f"<b>{t}</b><br>{v:+.1f}%" if np.isfinite(v) else f"<b>{t}</b><br>n/a" for t, v in zip(tickers, values)]
     customdata = [
-        [t, SUPPLY_COMPANIES[t][0], table.at[t, "Level"], wrap_text(SUPPLY_COMPANIES[t][1]), table.at[t, "Trend"],
+        [t, SUPPLY_COMPANIES[t][0], " · ".join(filter(None, [table.at[t, "Level"], table.at[t, "Group"]])), wrap_text(SUPPLY_COMPANIES[t][1]), table.at[t, "Trend"],
          *[f"{table.at[t, column]:+.1f}%" if pd.notna(table.at[t, column]) else "n/a"
            for column in ["Return 1m %", "Return 3m %", "Return YTD %", "% from 52w high"]],
          f"{table.at[t, 'Close']:.2f}" if pd.notna(table.at[t, "Close"]) else "n/a"]
@@ -2475,14 +2483,23 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
         ),
     ))
 
+    # A shaded, labelled box around each supplier group (equipment, design software, foundry ...). Padding is in
+    # plot units, not rows, so a sparse column's top box does not run into the column titles.
+    for x, group, top, bottom in group_boxes(chain):
+        fig.add_shape(type="rect", x0=x - 0.08, x1=x + 0.62, y0=bottom - 0.025, y1=top + 0.07,
+                      line=dict(color="rgba(128,128,128,0.35)", width=1), fillcolor="rgba(128,128,128,0.07)",
+                      layer="below")
+        label = SUPPLY_GROUP_SHORT_NAMES.get(group, group) if MOBILE else group
+        fig.add_annotation(x=x - 0.06, y=top + 0.048, text=f"<i>{label}</i>", showarrow=False, xanchor="left",
+                           yanchor="middle", font=dict(size=9 if MOBILE else 11, color="gray"))
     for x, level in enumerate(SUPPLY_LEVEL_SHORT_NAMES if MOBILE else SUPPLY_LEVELS):
-        fig.add_annotation(x=x, y=1.09, text=f"<b>{level}</b>", showarrow=False, xanchor="left",
+        fig.add_annotation(x=x, y=1.11, text=f"<b>{level}</b>", showarrow=False, xanchor="left",
                            font=dict(size=11 if MOBILE else 12))
     hidden = dict(visible=False, fixedrange=True)
     fig.update_layout(
-        height=max(640, 44 * max(len(level) for level in SUPPLY_CHAINS[chain]["levels"]) + 100),
+        height=max(640, 44 * max(column_rows(chain, x) for x in range(len(SUPPLY_LEVELS))) + 100),
         margin=dict(l=5, r=5, t=30, b=10), dragmode=False, clickmode="event+select",
-        xaxis=dict(range=[-0.15, len(SUPPLY_LEVELS) - 0.35], **hidden), yaxis=dict(range=[-0.06, 1.14], **hidden),
+        xaxis=dict(range=[-0.15, len(SUPPLY_LEVELS) - 0.35], **hidden), yaxis=dict(range=[-0.06, 1.15], **hidden),
         hoverlabel=dict(align="left"),
     )
     return fig
@@ -2491,7 +2508,7 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
 def render_company_detail(chain, ticker, table, prices, index_prices):
     name, role = SUPPLY_COMPANIES[ticker]
     st.subheader(f"{ticker} · {name}")
-    st.caption(f"{table.at[ticker, 'Level']}. {role}")
+    st.caption(f"{' · '.join(filter(None, [table.at[ticker, 'Level'], SUPPLY_COMPANY_GROUPS.get(ticker)]))}. {role}")
     tiles = st.columns(4)
     close = table.at[ticker, "Close"]
     tiles[0].metric("Close", f"{close:.2f}" if pd.notna(close) else "n/a")
@@ -2578,7 +2595,7 @@ def render_supply_chain(index_prices):
         render_company_detail(chain, focus, table, prices, index_prices)
 
     with st.expander("All companies", expanded=not focus):
-        columns = ["Company", "Level", "Trend", "Close"] + SUPPLY_NODE_METRICS
+        columns = ["Company", "Level", "Group", "Trend", "Close"] + SUPPLY_NODE_METRICS
         st.dataframe(table[columns].style.format(precision=2), width="stretch")
 
 
