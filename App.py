@@ -46,11 +46,18 @@ from analysis.scoring import COMPONENT_WEIGHTS
 from analysis.supply_chain import (
     CHAINS as SUPPLY_CHAINS,
     COMPANIES as SUPPLY_COMPANIES,
+    COMPANY_GROUPS as SUPPLY_COMPANY_GROUPS,
     LEVEL_SHORT_NAMES as SUPPLY_LEVEL_SHORT_NAMES,
     LEVELS as SUPPLY_LEVELS,
     NODE_METRICS as SUPPLY_NODE_METRICS,
     chain_tickers,
     linked_tickers,
+    column_rows,
+    company_levels,
+    default_order,
+    group_boxes,
+    group_index,
+    group_table,
     neighbors,
     node_positions,
     node_table,
@@ -2376,6 +2383,11 @@ def render_industry_leaders(leaders_text, metric):
 # ============================================================
 
 NO_FOCUS = "(none)"
+SUPPLY_GROUP_SHORT_NAMES = {
+    "Processors & accelerators": "Processors", "Connectivity & RF": "Connectivity", "Sensors": "Sensors",
+    "Analog, power & microcontrollers": "Analog & power", "Packaging & test": "Packaging",
+    "Design software & IP": "Software & IP",
+}
 
 
 def supply_graph_key():
@@ -2420,8 +2432,8 @@ def node_colors(values, metric):
     return dict(cmin=-bound, cmax=bound)
 
 
-def supply_chain_figure(chain, table, metric, focus, highlight):
-    positions = node_positions(chain)
+def supply_chain_figure(chain, table, metric, focus, highlight, groups, groups_table):
+    positions = node_positions(chain, groups)
     linked = linked_tickers(chain, focus) if focus and highlight else set(positions)
     fig = go.Figure()
 
@@ -2451,7 +2463,7 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
     values = table.loc[tickers, metric].astype(float).to_numpy()
     labels = [f"<b>{t}</b><br>{v:+.1f}%" if np.isfinite(v) else f"<b>{t}</b><br>n/a" for t, v in zip(tickers, values)]
     customdata = [
-        [t, SUPPLY_COMPANIES[t][0], table.at[t, "Level"], wrap_text(SUPPLY_COMPANIES[t][1]), table.at[t, "Trend"],
+        [t, SUPPLY_COMPANIES[t][0], " · ".join(filter(None, [table.at[t, "Level"], table.at[t, "Group"]])), wrap_text(SUPPLY_COMPANIES[t][1]), table.at[t, "Trend"],
          *[f"{table.at[t, column]:+.1f}%" if pd.notna(table.at[t, column]) else "n/a"
            for column in ["Return 1m %", "Return 3m %", "Return YTD %", "% from 52w high"]],
          f"{table.at[t, 'Close']:.2f}" if pd.notna(table.at[t, "Close"]) else "n/a"]
@@ -2475,14 +2487,29 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
         ),
     ))
 
+    # A shaded, labelled box around each supplier group (equipment, design software, foundry ...). Padding is in
+    # plot units, not rows, so a sparse column's top box does not run into the column titles.
+    # The label carries the group index's value for the node metric.
+    group_values = {(row["Level"], row["Group"]): row[metric] for _, row in groups_table.iterrows()}
+    for x, group, _, top, bottom in group_boxes(chain, groups):
+        fig.add_shape(type="rect", x0=x - 0.08, x1=x + 0.62, y0=bottom - 0.025, y1=top + 0.07,
+                      line=dict(color="rgba(128,128,128,0.35)", width=1), fillcolor="rgba(128,128,128,0.07)",
+                      layer="below")
+        label = SUPPLY_GROUP_SHORT_NAMES.get(group, group) if MOBILE else group
+        value = group_values.get((SUPPLY_LEVELS[x], group))
+        if value is not None and pd.notna(value):
+            label = f"{label} · {value:+.1f}%"
+        fig.add_annotation(x=x - 0.06, y=top + 0.048, text=f"<i>{label}</i>", showarrow=False, xanchor="left",
+                           yanchor="middle", font=dict(size=9 if MOBILE else 11, color="gray"))
     for x, level in enumerate(SUPPLY_LEVEL_SHORT_NAMES if MOBILE else SUPPLY_LEVELS):
-        fig.add_annotation(x=x, y=1.09, text=f"<b>{level}</b>", showarrow=False, xanchor="left",
+        fig.add_annotation(x=x, y=1.11, text=f"<b>{level}</b>", showarrow=False, xanchor="left",
                            font=dict(size=11 if MOBILE else 12))
     hidden = dict(visible=False, fixedrange=True)
     fig.update_layout(
-        height=max(640, 44 * max(len(level) for level in SUPPLY_CHAINS[chain]["levels"]) + 100),
+        height=max(640, 44 * max(column_rows(chain, x, groups) for x in range(len(SUPPLY_LEVELS))) + 100),
         margin=dict(l=5, r=5, t=30, b=10), dragmode=False, clickmode="event+select",
-        xaxis=dict(range=[-0.15, len(SUPPLY_LEVELS) - 0.35], **hidden), yaxis=dict(range=[-0.06, 1.14], **hidden),
+        # On a phone the group labels run wider than their boxes, so the right edge gets a little more room.
+        xaxis=dict(range=[-0.15, len(SUPPLY_LEVELS) - (0.22 if MOBILE else 0.35)], **hidden), yaxis=dict(range=[-0.06, 1.15], **hidden),
         hoverlabel=dict(align="left"),
     )
     return fig
@@ -2490,8 +2517,9 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
 
 def render_company_detail(chain, ticker, table, prices, index_prices):
     name, role = SUPPLY_COMPANIES[ticker]
+    group = table.at[ticker, "Group"]
     st.subheader(f"{ticker} · {name}")
-    st.caption(f"{table.at[ticker, 'Level']}. {role}")
+    st.caption(f"{' · '.join(filter(None, [table.at[ticker, 'Level'], group]))}. {role}")
     tiles = st.columns(4)
     close = table.at[ticker, "Close"]
     tiles[0].metric("Close", f"{close:.2f}" if pd.notna(close) else "n/a")
@@ -2510,14 +2538,19 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
 
     if ticker in prices:
         lines = {ticker: prices[ticker]}
+        same_box = (table["Group"] == group) & (table["Level"] == table.at[ticker, "Level"])
+        members = list(table.index[same_box]) if group else []
+        if len(members) > 1:
+            lines[f"{group} index"] = group_index(prices, members)
         if "^SOX" in index_prices:
             lines["^SOX"] = index_prices["^SOX"]
         rebased = overlay_frame(lines, start=period_start(prices[ticker].index[-1], "1Y"))
         fig = go.Figure([go.Scatter(x=rebased.index, y=rebased[column], name=column,
-                                    line=dict(width=1.2, dash="dot") if column == "^SOX" else dict(width=1.8))
+                                    line=dict(width=1.8) if column == ticker else dict(width=1.2, dash="dot"))
                          for column in rebased.columns])
         fig.add_hline(y=100, line=dict(color="gray", width=1, dash="dot"))
-        fig.update_layout(title=f"{ticker} vs the semiconductor index, last year (rebased to 100)", height=320,
+        fig.update_layout(title=f"{ticker} vs {'its group and ' if len(lines) > 2 else ''}the semiconductor index, "
+                                f"last year (rebased to 100)", height=320,
                           margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
         show_chart(fig, width="stretch")
 
@@ -2542,17 +2575,117 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
         st.caption("No quarterly revenue was available for this company.")
 
 
+def supply_group_base():
+    """Every company with its layer and group, as the groups editor shows it. Starts from the default groups."""
+
+    if "supply_group_base" not in st.session_state:
+        levels = company_levels()
+        st.session_state["supply_group_base"] = pd.DataFrame(
+            {"Layer": [SUPPLY_LEVEL_SHORT_NAMES[levels[t]] for t in default_order()],
+             "Company": [SUPPLY_COMPANIES[t][0] for t in default_order()],
+             "Group": [SUPPLY_COMPANY_GROUPS.get(t, "") for t in default_order()]},
+            index=pd.Index(default_order(), name="Ticker"),
+        )
+    return st.session_state["supply_group_base"]
+
+
+def set_supply_group_base(base):
+    """Replace the groups and drop the editor's pending edits, which would otherwise be laid over the new table."""
+
+    st.session_state["supply_group_base"] = base
+    st.session_state.pop("supply_groups_table", None)
+
+
+def rename_supply_group():
+    old, new = st.session_state.get("supply_rename_from"), (st.session_state.get("supply_rename_to") or "").strip()
+    if old and new:
+        base = supply_group_base().copy()
+        base.loc[base["Group"] == old, "Group"] = new
+        set_supply_group_base(base)
+        st.session_state["supply_rename_from"] = new
+        st.session_state["supply_rename_to"] = ""
+
+
+def reset_supply_groups():
+    st.session_state.pop("supply_group_base", None)
+    st.session_state.pop("supply_groups_table", None)
+
+
+def render_group_editor():
+    """Table where the user sets each company's group: typing a new name creates a group, an existing name joins it,
+    an empty cell leaves the company ungrouped. Returns {ticker: group}."""
+
+    base = supply_group_base()
+    st.caption(
+        "Type a group name next to each company. Companies in the same layer with the same name form a group, "
+        "drawn as one box with its own index. Clear the name to leave a company out of every group."
+    )
+    edited = st.data_editor(
+        base, key="supply_groups_table", disabled=["Layer", "Company"], num_rows="fixed", width="stretch",
+        column_order=["Group", "Layer", "Company"],
+        height=320, column_config={"Group": st.column_config.TextColumn("Group", help="Type a name to create or join a group.")},
+    )
+    edited["Group"] = edited["Group"].fillna("").astype(str).str.strip()
+    st.session_state["supply_group_base"] = edited
+    names = sorted(set(edited["Group"]) - {""})
+    if names:
+        columns = st.columns([2, 2, 1, 1], vertical_alignment="bottom")
+        columns[0].selectbox("Rename group", names, key="supply_rename_from")
+        columns[1].text_input("New name", key="supply_rename_to", placeholder="e.g. Hybrid bonding")
+        columns[2].button("Rename", key="supply_rename_btn", on_click=rename_supply_group, width="stretch")
+        columns[3].button("Reset groups", key="supply_reset_btn", on_click=reset_supply_groups, width="stretch",
+                          help="Back to the default groups.")
+    else:
+        st.button("Reset groups", key="supply_reset_btn", on_click=reset_supply_groups, help="Back to the default groups.")
+    return dict(edited["Group"])
+
+
+def render_group_indexes(chain, prices, groups_table, metric):
+    """Each group's equal-weight index over the last year, with its returns and trend."""
+
+    st.subheader("Group indexes")
+    if groups_table.empty:
+        st.info("No groups in this chain yet. Give companies a group name in Edit groups.")
+        return
+    layers = ["All layers"] + [level for level in SUPPLY_LEVELS if level in set(groups_table["Level"])]
+    layer = st.selectbox("Layer", layers, key="supply_index_level")
+    shown = groups_table if layer == "All layers" else groups_table[groups_table["Level"] == layer]
+    lines = {}
+    for name, row in shown.iterrows():
+        index = group_index(prices, row["Members"].split(", "))
+        if not index.empty:
+            lines[name] = index
+    if lines:
+        rebased = overlay_frame(lines, start=period_start(max(frame.index[-1] for frame in lines.values()), "1Y"))
+        fig = go.Figure([go.Scatter(x=rebased.index, y=rebased[column], name=column, line=dict(width=1.6))
+                         for column in rebased.columns])
+        fig.add_hline(y=100, line=dict(color="gray", width=1, dash="dot"))
+        fig.update_layout(title="Group indexes, last year (rebased to 100)", height=380,
+                          margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
+        show_chart(fig, width="stretch")
+    columns = ["Level", "Members", "Trend", "Close"] + SUPPLY_NODE_METRICS
+    st.dataframe(shown[columns].sort_values(metric, ascending=False).style.format(precision=2), width="stretch")
+    st.caption(
+        "Each index weights its members equally: every member's close is rebased to 100 on the first day all "
+        f"of them trade, then averaged. In **{chain}** a group has only the members in that chain. "
+        "Trend uses the same moving-average rules as a single stock."
+    )
+
+
 def render_supply_chain(index_prices):
     """Bottom-up supply chain of one end market as a graph: hover a company for details, tap or click it to focus."""
 
     with settings_panel("Supply chain"):
         chain = st.selectbox("End market", list(SUPPLY_CHAINS), key="supply_chain")
         metric = st.selectbox("Node metric", SUPPLY_NODE_METRICS, index=1, key="supply_metric",
-                              help="Shown on each company and used for its color.")
+                              help="Shown on each company and group and used for the node color.")
         highlight = st.checkbox("Highlight the focused company's chain", value=True, key="supply_highlight",
                                 help="Dims everything that is not upstream or downstream of the focused company.")
 
-    tickers = chain_tickers(chain)
+    with st.expander("Edit groups", expanded=False):
+        groups = render_group_editor()
+
+    tickers = chain_tickers(chain, groups)
     if st.session_state.get("supply_focus") not in [NO_FOCUS] + tickers:
         st.session_state["supply_focus"] = NO_FOCUS
     focus = st.session_state.get("supply_focus", NO_FOCUS)
@@ -2561,24 +2694,29 @@ def render_supply_chain(index_prices):
     st.caption(
         f"**{chain}**: traced back from the end market, US-listed companies only. A line means the "
         "left company buys from the right one. Hover a company or a line for details, or tap a company to focus it. "
+        "Each box is a group, with its index's value for the node metric. "
         "Links are curated from public reporting and show the main relationships, not every one."
     )
     with st.spinner("Loading prices..."):
         prices = load_price_panel(tickers)
     if not prices:
         st.warning("No price data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
-    table = node_table(chain, prices)
+    table = node_table(chain, prices, groups)
+    groups_table = group_table(chain, prices, groups)
 
-    show_chart(supply_chain_figure(chain, table, metric, focus, highlight), width="stretch", key=supply_graph_key(),
-               on_select=focus_from_graph, selection_mode="points", config={"displayModeBar": False})
+    show_chart(supply_chain_figure(chain, table, metric, focus, highlight, groups, groups_table), width="stretch",
+               key=supply_graph_key(), on_select=focus_from_graph, selection_mode="points",
+               config={"displayModeBar": False})
     st.selectbox("Focused company", [NO_FOCUS] + tickers, key="supply_focus",
                  format_func=lambda t: t if t == NO_FOCUS else f"{t} · {SUPPLY_COMPANIES[t][0]}")
 
     if focus:
         render_company_detail(chain, focus, table, prices, index_prices)
 
-    with st.expander("All companies", expanded=not focus):
-        columns = ["Company", "Level", "Trend", "Close"] + SUPPLY_NODE_METRICS
+    render_group_indexes(chain, prices, groups_table, metric)
+
+    with st.expander("All companies", expanded=False):
+        columns = ["Company", "Level", "Group", "Trend", "Close"] + SUPPLY_NODE_METRICS
         st.dataframe(table[columns].style.format(precision=2), width="stretch")
 
 

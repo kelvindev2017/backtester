@@ -227,6 +227,19 @@ def test_supply_chain_tab(offline):
     open_tab(app, "Semicon Supply Chain")
     assert not app.exception, app.exception
 
+    # Renaming a group relabels its box and its index row.
+    assert any(element.value == "Group indexes" for element in app.subheader)
+    next(box for box in app.selectbox if box.key == "supply_rename_from").select("Equipment")
+    next(box for box in app.text_input if box.key == "supply_rename_to").input("Tool makers")
+    next(button for button in app.button if button.key == "supply_rename_btn").click()
+    open_tab(app, "Semicon Supply Chain")
+    assert not app.exception, app.exception
+    assert "Tool makers" in set(app.session_state["supply_group_base"]["Group"])
+    assert any("Tool makers" in chart.proto.spec for chart in app.get("plotly_chart"))
+    next(button for button in app.button if button.key == "supply_reset_btn").click()
+    open_tab(app, "Semicon Supply Chain")
+    assert "Equipment" in set(app.session_state["supply_group_base"]["Group"])
+
     for chain in ["AI / data center", "Automotive", "All end markets"]:
         next(box for box in app.selectbox if box.key == "supply_chain").select(chain)
         open_tab(app, "Semicon Supply Chain")
