@@ -3,7 +3,8 @@
 Each chain starts at the companies that sell to the end market (level 0) and
 goes back through the chips they buy, the fabs and packaging houses that make
 those chips, and the tools, software and materials the fabs need. Only
-US-listed companies are included (ADRs such as TSM, ASML and SONY count).
+US-listed companies are included (ADRs such as TSM, ASML and SONY count, and so do the
+OTC ADRs ASMVY and BESIY).
 
 Links are curated by hand from public reporting (annual-report customer
 disclosures, teardowns, supply agreements). They show the main relationships,
@@ -61,6 +62,9 @@ COMPANIES = {
     "KLAC": ("KLA", "Inspection and process control equipment."),
     "TER": ("Teradyne", "Automated test equipment for processors and RF chips."),
     "ENTG": ("Entegris", "Specialty materials, filtration and wafer handling for fabs."),
+    "ASMVY": ("ASMPT (OTC ADR)", "Back-end equipment: thermocompression and hybrid bonders, die and wire bonders."),
+    "BESIY": ("BE Semiconductor (OTC ADR)", "Back-end equipment: hybrid bonders for 3D chip stacking and die attach."),
+    "KLIC": ("Kulicke & Soffa", "Back-end equipment: wire bonders and thermocompression bonders for advanced packaging."),
     "SNPS": ("Synopsys", "Chip design software (EDA) and design IP."),
     "CDNS": ("Cadence Design Systems", "Chip design software (EDA) and design IP."),
     "ARM": ("Arm Holdings", "CPU architecture and core designs licensed to chip designers."),
@@ -72,7 +76,7 @@ CHAINS = {
             ["AAPL", "GOOGL"],
             ["QCOM", "AVGO", "SWKS", "CRUS", "TXN", "SONY"],
             ["TSM", "MU", "GFS", "AMKR", "ASX"],
-            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "TER", "ENTG"],
+            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "TER", "ASMVY", "BESIY", "KLIC", "ENTG"],
         ],
         "edges": [
             ("QCOM", "AAPL", "Cellular modems (Apple is shifting to its own C1 modem)"),
@@ -110,6 +114,15 @@ CHAINS = {
             ("KLAC", "MU", "Inspection and process control"),
             ("TER", "TSM", "Test systems for mobile processors"),
             ("TER", "AMKR", "Test systems for packaged chips"),
+            ("ASMVY", "TSM", "Bonders for advanced packaging"),
+            ("ASMVY", "AMKR", "Die bonders, wire bonders and thermocompression bonders"),
+            ("ASMVY", "ASX", "Die bonders, wire bonders and thermocompression bonders"),
+            ("BESIY", "TSM", "Hybrid bonders for 3D chip stacking (SoIC)"),
+            ("BESIY", "AMKR", "Die attach equipment"),
+            ("BESIY", "ASX", "Die attach equipment"),
+            ("KLIC", "TSM", "Thermocompression bonders for advanced packaging"),
+            ("KLIC", "AMKR", "Wire bonders and advanced packaging bonders"),
+            ("KLIC", "ASX", "Wire bonders and advanced packaging bonders"),
             ("ENTG", "TSM", "Specialty materials and filtration"),
             ("ENTG", "MU", "Specialty materials and filtration"),
         ],
@@ -119,7 +132,7 @@ CHAINS = {
             ["MSFT", "AMZN", "GOOGL", "META", "ORCL", "DELL", "SMCI", "ANET"],
             ["NVDA", "AMD", "AVGO", "MRVL", "INTC", "ALAB", "CRDO"],
             ["TSM", "MU", "AMKR"],
-            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "ENTG"],
+            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "ASMVY", "BESIY", "KLIC", "ENTG"],
         ],
         "edges": [
             ("NVDA", "MSFT", "GPUs for Azure"),
@@ -168,6 +181,11 @@ CHAINS = {
             ("LRCX", "MU", "Etch and deposition for DRAM and HBM"),
             ("KLAC", "TSM", "Inspection and process control"),
             ("KLAC", "MU", "Inspection and process control"),
+            ("ASMVY", "TSM", "Thermocompression and hybrid bonders for advanced packaging"),
+            ("ASMVY", "AMKR", "Bonders for advanced packaging"),
+            ("BESIY", "TSM", "Hybrid bonders for 3D chip stacking (SoIC)"),
+            ("KLIC", "TSM", "Thermocompression bonders for advanced packaging"),
+            ("KLIC", "AMKR", "Advanced packaging bonders"),
             ("ENTG", "TSM", "Specialty materials and filtration"),
             ("ENTG", "MU", "Specialty materials and filtration"),
         ],
