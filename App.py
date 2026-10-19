@@ -2096,7 +2096,11 @@ def settings_panel(title, expanded=True):
 
 
 def show_chart(fig, **kwargs):
-    """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width."""
+    """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width.
+
+    On a phone the chart toolbar runs across most of the top edge, so the title moves down to sit just above the
+    plot, under the toolbar, instead of behind it.
+    """
 
     if MOBILE:
         fig.update_layout(
@@ -2104,6 +2108,9 @@ def show_chart(fig, **kwargs):
                         entrywidth=0.5, entrywidthmode="fraction"),
             margin=dict(l=5, r=5),
         )
+        if fig.layout.title.text:
+            fig.update_layout(title=dict(yref="paper", y=1, yanchor="bottom", pad=dict(b=8)),
+                              margin=dict(t=max(fig.layout.margin.t or 0, 75)))
     st.plotly_chart(fig, **kwargs)
 
 
