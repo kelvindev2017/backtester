@@ -259,11 +259,13 @@ def test_stock_fundamentals_tab(offline, monkeypatch):
     app = open_tab(start_app(), "Stock Fundamentals")
     assert app.sidebar.header[0].value == "Stock Fundamentals"
     assert app.subheader[0].value == "NVDA"
-    assert any("Price YoY" in chart.proto.spec and "Trailing P" in chart.proto.spec for chart in app.get("plotly_chart"))
+    assert any("Price YoY" in chart.proto.spec and "Daily close" in chart.proto.spec and "Trailing P" in chart.proto.spec
+               for chart in app.get("plotly_chart"))
 
     # Any ticker and history length.
     next(box for box in app.text_input if box.key == "fundamentals_ticker").input(" msft ")
     next(slider for slider in app.select_slider if slider.key == "fundamentals_years").set_value(3)
+    next(box for box in app.checkbox if box.key == "fundamentals_log_price").check()
     open_tab(app, "Stock Fundamentals")
     assert app.subheader[0].value == "MSFT"
     assert any("last 3 years" in element.value for element in app.markdown)

@@ -2553,7 +2553,7 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
     return fig
 
 
-def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS):
+def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
     """Growth vs price, revenue, EPS, trailing P/E and PEG for one ticker, with their captions."""
 
     today = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
@@ -2588,13 +2588,16 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS):
         st.caption(correlation_text({name: growth_price_correlation(series.loc[history_start:], price_change)
                                      for name, series in growth.items()}))
         show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates,
-                                     price_change=price_change, growth=growth), width="stretch")
+                                     price_change=price_change, growth=growth,
+                                     close=valuation["Close"].loc[history_start:], log_price=log_price),
+                   width="stretch")
         st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
         st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
         st.caption(
             "YoY change: the price daily, revenue and EPS by quarter, left empty when the year-ago value is zero or "
             "negative. Revenue is in billions of the reporting currency. EPS is Yahoo's reported (adjusted) EPS per "
-            "share, on the quarter it reports rather than the announcement date. Trailing P/E is price / last 4 "
+            "share, on the quarter it reports rather than the announcement date. The daily close is split-adjusted "
+            "(not dividend-adjusted), the same price the P/E uses. Trailing P/E is price / last 4 "
             "quarters' EPS, so it can differ from GAAP P/E; a spike usually means earnings fell, not that the price "
             "ran. PEG is that P/E / EPS growth %, blank while growth is zero or negative. Hatched bars are analyst "
             "estimates, not results."
@@ -2612,6 +2615,8 @@ def render_stock_fundamentals():
                                help="Any Yahoo symbol with quarterly results, e.g. NVDA, TSM, BESIY.").strip().upper()
         years = st.select_slider("History (years)", FUNDAMENTALS_YEARS, value=VALUATION_HISTORY_YEARS,
                                  key="fundamentals_years")
+        log_price = st.checkbox("Log scale for the price", value=False, key="fundamentals_log_price",
+                                help="Equal % moves look the same size, so early years aren't flattened.")
     st.caption(
         "Is the price following the business? The top panel compares the year-over-year change in revenue and EPS "
         "with the price's own change; below it are revenue, EPS and the valuation those results imply."
@@ -2621,7 +2626,7 @@ def render_stock_fundamentals():
         return
     name = load_fundamental_snapshot(ticker).get("shortName")
     st.subheader(f"{ticker} · {name}" if name else ticker)
-    render_fundamentals(ticker, years)
+    render_fundamentals(ticker, years, log_price)
 
 
 def render_company_detail(chain, ticker, table, prices, index_prices):
