@@ -56,7 +56,8 @@ class FakeTicker:
         self.earnings_estimate = pd.DataFrame({"avg": [2.1, 9.0], "growth": [0.2, 0.25]}, index=["0q", "+1y"])
 
     def get_earnings_dates(self, limit=100):
-        dates = pd.date_range(end=pd.Timestamp.today(), periods=28, freq="QS-FEB", tz="America/New_York")
+        # Midnight dates: a time of day between 1 and 2 am lands in the ambiguous hour when DST ends on Nov 1.
+        dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=28, freq="QS-FEB", tz="America/New_York")
         eps = np.linspace(0.8, 2.0, len(dates))
         return pd.DataFrame(
             {"EPS Estimate": eps * 0.97, "Reported EPS": eps, "Surprise(%)": 3.0},
@@ -239,6 +240,7 @@ def test_supply_chain_tab(offline, monkeypatch):
                for chart in app.get("plotly_chart"))
     assert any("percentile" in element.value for element in app.caption)
     assert any("Forward PEG 1.00" in element.value for element in app.caption)
+    assert any("EPS (reported)" in chart.proto.spec for chart in app.get("plotly_chart"))
 
     next(box for box in app.selectbox if box.key == "supply_metric").select("% from 52w high")
     open_tab(app, "Semicon Supply Chain")

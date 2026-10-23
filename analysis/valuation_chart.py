@@ -19,6 +19,8 @@ ESTIMATE_COLOR = "rgba(65, 105, 225, 0.35)"
 PE_COLOR = "goldenrod"
 PEG_COLOR = "seagreen"
 PEG_AXIS_CAP = 4
+EPS_COLOR = "darkorange"
+EPS_ESTIMATE_COLOR = "rgba(255, 140, 0, 0.35)"
 
 
 def revenue_estimate_quarters(estimates, last_quarter_end):
@@ -119,8 +121,46 @@ def peg_summary_text(peg, forward_pe=None, forward_growth=None):
     return " ".join(parts)
 
 
-def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, height=None):
-    """Trailing P/E (and PEG, when given) above quarterly revenue bars, sharing one date axis.
+def quarterly_eps(earnings, quarter_ends, max_lag_days=95, fallback_lag_days=30):
+    """Reported EPS per quarter, moved from its announcement date to the fiscal quarter end it reports.
+
+    ``earnings`` is indexed by announcement date with a ``Reported EPS`` column.
+    Each announcement is matched to the latest of ``quarter_ends`` (the revenue
+    quarters) within ``max_lag_days`` before it, so EPS and revenue bars line up.
+    An announcement with no matching revenue quarter (the revenue source skipped
+    it) is placed ``fallback_lag_days`` before its date. ``max_lag_days`` stays
+    near one quarter so a skipped quarter's EPS doesn't land on the one before it.
+    """
+
+    if earnings is None or earnings.empty or "Reported EPS" not in earnings.columns:
+        return pd.Series(dtype=float)
+    ends = pd.DatetimeIndex(sorted(quarter_ends))
+    values = {}
+    for announced, eps in pd.to_numeric(earnings["Reported EPS"], errors="coerce").dropna().items():
+        candidates = ends[(ends < announced) & (ends >= announced - pd.Timedelta(days=max_lag_days))]
+        quarter = candidates[-1] if len(candidates) else announced.normalize() - pd.Timedelta(days=fallback_lag_days)
+        values[quarter] = float(eps)
+    return pd.Series(values, dtype=float).sort_index()
+
+
+def eps_estimate_quarters(estimates, last_quarter_end):
+    """Analyst average EPS for the current and next fiscal quarter, placed like :func:`revenue_estimate_quarters`."""
+
+    if estimates is None or getattr(estimates, "empty", True) or "avg" not in estimates.columns:
+        return pd.Series(dtype=float)
+    if last_quarter_end is None or pd.isna(last_quarter_end):
+        return pd.Series(dtype=float)
+    values = {}
+    for step, period in [(1, "0q"), (2, "+1q")]:
+        if period in estimates.index:
+            value = pd.to_numeric(estimates.at[period, "avg"], errors="coerce")
+            if pd.notna(value):
+                values[pd.Timestamp(last_quarter_end) + pd.DateOffset(months=3 * step)] = float(value)
+    return pd.Series(values, dtype=float)
+
+
+def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None, height=None):
+    """Trailing P/E (and PEG, when given) above quarterly revenue (and EPS) bars, sharing one date axis.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -135,10 +175,15 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, he
         titles.append("Trailing PEG (P/E / EPS growth %, blank when growth <= 0"
                       + (f", axis capped at {PEG_AXIS_CAP})" if capped else ")"))
     titles.append("Revenue by quarter (billions, reporting currency)")
+    revenue_row = len(titles)
+    eps = eps.dropna() if eps is not None else pd.Series(dtype=float)
+    if not eps.empty:
+        titles.append("EPS by quarter (Yahoo reported, adjusted, per share)")
     rows = len(titles)
-    revenue_row = rows
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                        row_heights=[0.45, 0.55] if rows == 2 else [0.3, 0.25, 0.45], subplot_titles=titles)
+    weights = {"Trailing P/E": 0.3, "Trailing PEG": 0.22, "Revenue": 0.3, "EPS": 0.22}
+    heights = [next(w for key, w in weights.items() if title.startswith(key)) for title in titles]
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                        row_heights=[h / sum(heights) for h in heights], subplot_titles=titles)
     pe = trailing_pe.dropna() if trailing_pe is not None else pd.Series(dtype=float)
     if not pe.empty:
         fig.add_trace(go.Scatter(x=pe.index, y=pe, mode="lines", name="Trailing P/E",
@@ -172,11 +217,26 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, he
                                          pattern=dict(shape="/", fgcolor=ACTUAL_COLOR, size=6)),
                              hovertemplate="Quarter to %{x|%Y-%m-%d} (estimate): %{y:,.2f}B<extra></extra>"),
                       row=revenue_row, col=1)
-        if not actual.empty:
-            fig.add_vline(x=actual.index[-1] + pd.Timedelta(days=45), line=dict(color="gray", width=1, dash="dot"))
+
+    if not eps.empty:
+        eps_row = revenue_row + 1
+        fig.add_trace(go.Bar(x=eps.index, y=eps, name="EPS (reported)", marker_color=EPS_COLOR,
+                             hovertemplate="Quarter to %{x|%Y-%m-%d}: %{y:.2f}<extra></extra>"), row=eps_row, col=1)
+        eps_ahead = eps_estimates.dropna() if eps_estimates is not None else pd.Series(dtype=float)
+        if not eps_ahead.empty:
+            fig.add_trace(go.Bar(x=eps_ahead.index, y=eps_ahead, name="EPS (analyst estimate)",
+                                 marker=dict(color=EPS_ESTIMATE_COLOR, line=dict(color=EPS_COLOR, width=1),
+                                             pattern=dict(shape="/", fgcolor=EPS_COLOR, size=6)),
+                                 hovertemplate="Quarter to %{x|%Y-%m-%d} (estimate): %{y:.2f}<extra></extra>"),
+                          row=eps_row, col=1)
+        fig.update_yaxes(tickformat=".2f", row=eps_row, col=1)
+
+    if not estimated.empty and not actual.empty:
+        # Added last: add_vline only reaches the panels that already hold traces.
+        fig.add_vline(x=actual.index[-1] + pd.Timedelta(days=45), line=dict(color="gray", width=1, dash="dot"))
 
     fig.update_yaxes(ticksuffix="x", rangemode="tozero", row=1, col=1)
     fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=revenue_row, col=1)
-    fig.update_layout(height=height or (480 if rows == 2 else 620), margin=dict(l=10, r=10, t=60, b=10),
+    fig.update_layout(height=height or {2: 480, 3: 620}.get(rows, 760), margin=dict(l=10, r=10, t=60, b=10),
                       bargap=0.15, legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0))
     return fig

@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 
 from analysis.valuation_chart import (
+    eps_estimate_quarters,
+    quarterly_eps,
     peg_summary_text,
     pe_summary,
     pe_summary_text,
@@ -84,3 +86,31 @@ def test_peg_axis_is_capped_when_growth_restarts_from_near_zero():
     fig = revenue_pe_figure(revenue, pd.Series(dtype=float), peg=peg)
     assert tuple(fig.layout.yaxis2.range) == (0, 4)
     assert "capped at 4" in fig.layout.annotations[1].text
+
+
+def test_eps_moves_to_the_quarter_it_reports():
+    quarter_ends = pd.to_datetime(["2026-01-25", "2026-04-26", "2026-07-26"])
+    earnings = pd.DataFrame({"Reported EPS": [1.62, 1.87, 2.22, np.nan]},
+                            index=pd.to_datetime(["2026-02-25", "2026-05-20", "2026-08-26", "2026-11-17"]))
+    eps = quarterly_eps(earnings, quarter_ends)
+    assert list(eps.index) == list(quarter_ends) and list(eps) == [1.62, 1.87, 2.22]
+    assert quarterly_eps(pd.DataFrame(), quarter_ends).empty
+    # A quarter the revenue source skipped still gets its EPS bar, a month before the announcement.
+    gap = quarterly_eps(earnings, quarter_ends[[0, 2]])
+    assert gap.index[1] == pd.Timestamp("2026-04-20") and gap.iloc[1] == 1.87
+    estimates = pd.DataFrame({"avg": [2.47, 2.75, 9.3]}, index=["0q", "+1q", "0y"])
+    ahead = eps_estimate_quarters(estimates, quarter_ends[-1])
+    assert list(ahead.index) == [pd.Timestamp("2026-10-26"), pd.Timestamp("2027-01-26")]
+
+
+def test_eps_panel_sits_under_revenue():
+    quarters = pd.to_datetime(["2026-04-26", "2026-07-26"])
+    revenue = pd.Series([80e9, 96e9], index=quarters)
+    peg = pd.Series([0.4], index=[pd.Timestamp("2026-07-01")])
+    eps = pd.Series([1.87, 2.22], index=quarters)
+    eps_ahead = pd.Series([2.47], index=[pd.Timestamp("2026-10-26")])
+    fig = revenue_pe_figure(revenue, pd.Series(dtype=float), peg=peg, eps=eps, eps_estimates=eps_ahead)
+    assert [trace.name for trace in fig.data] == ["Trailing PEG", "Revenue (reported)", "EPS (reported)",
+                                                  "EPS (analyst estimate)"]
+    assert fig.data[2].yaxis == "y4" and fig.data[3].yaxis == "y4"
+    assert fig.layout.annotations[3].text.startswith("EPS by quarter")

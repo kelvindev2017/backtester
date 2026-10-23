@@ -72,9 +72,11 @@ from analysis.signal_groups import (
 )
 from analysis.valuation_chart import (
     VALUATION_HISTORY_YEARS,
+    eps_estimate_quarters,
     pe_summary,
     pe_summary_text,
     peg_summary_text,
+    quarterly_eps,
     revenue_estimate_quarters,
     revenue_pe_figure,
     trailing_peg,
@@ -1293,6 +1295,15 @@ def fetch_earnings_estimates(symbol):
     if estimates is None or estimates.empty:
         raise ValueError(f"Yahoo returned no earnings estimates for {symbol}")
     return estimates
+
+
+def load_earnings_estimates(symbol):
+    """Analyst EPS estimates from Yahoo, or an empty frame when unavailable."""
+
+    try:
+        return fetch_earnings_estimates(symbol)
+    except Exception:
+        return pd.DataFrame()
 
 
 def next_year_eps_growth(symbol):
@@ -2575,8 +2586,8 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
         fundamentals, _, _ = load_quarterly_fundamentals(ticker, history_start, today)
         # Load two extra years so TTM EPS, and its year-on-year growth for PEG, exist from the first day shown.
         earnings_start = (pd.Timestamp(history_start) - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
-        valuation, _ = build_valuation_data(load_data(ticker, earnings_start, today, "Daily"),
-                                            load_earnings_data(ticker, earnings_start, today))
+        earnings = load_earnings_data(ticker, earnings_start, today)
+        valuation, _ = build_valuation_data(load_data(ticker, earnings_start, today, "Daily"), earnings)
     trend = fundamental_trend(fundamentals)
     if trend and "Revenue" in fundamentals:
         revenue = fundamentals["Revenue"].dropna()
@@ -2594,10 +2605,14 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
         st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
         st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
         estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])
-        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg), width="stretch")
+        eps = quarterly_eps(earnings, revenue.index).loc[history_start:]
+        eps_estimates = eps_estimate_quarters(load_earnings_estimates(ticker), revenue.index[-1])
+        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates),
+                   width="stretch")
         st.caption(
             "P/E uses Yahoo's reported (adjusted) EPS, so it can differ from GAAP P/E. A P/E spike usually means "
-            "earnings fell, not that the price ran. Hatched bars are analyst estimates, not results."
+            "earnings fell, not that the price ran. EPS bars sit on the quarter they report, not the announcement "
+            "date. Hatched bars are analyst estimates, not results."
         )
     else:
         st.caption("No quarterly revenue was available for this company.")
