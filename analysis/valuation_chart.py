@@ -249,18 +249,18 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
               for name, series in growth.items()}
 
     # Panels top to bottom: growth vs price, revenue, EPS, trailing P/E, PEG. Optional ones drop out.
+    # Titles stay short enough for a phone; the page caption defines each one.
     panels = {}
     if not price_change.empty:
         values = pd.concat([price_change] + list(growth.values())).dropna()
-        panels["growth"] = ("Year-over-year change, % (price daily, revenue and EPS by quarter"
-                            + (f", axis capped at {GROWTH_AXIS_CAP}%)" if values.max() > GROWTH_AXIS_CAP else ")"), 0.3)
-    panels["revenue"] = ("Revenue by quarter (billions, reporting currency)", 0.3)
+        panels["growth"] = ("YoY change, %" + (f" (capped at {GROWTH_AXIS_CAP}%)" if values.max() > GROWTH_AXIS_CAP else ""),
+                            0.3)
+    panels["revenue"] = ("Revenue by quarter, billions", 0.3)
     if not eps.empty:
-        panels["eps"] = ("EPS by quarter (Yahoo reported, adjusted, per share)", 0.22)
-    panels["pe"] = ("Trailing P/E (price / last 4 quarters' reported EPS)", 0.3)
+        panels["eps"] = ("EPS by quarter (adjusted)", 0.22)
+    panels["pe"] = ("Trailing P/E", 0.3)
     if not peg.empty:
-        panels["peg"] = ("Trailing PEG (P/E / EPS growth %, blank when growth <= 0"
-                         + (f", axis capped at {PEG_AXIS_CAP})" if peg.max() > PEG_AXIS_CAP else ")"), 0.22)
+        panels["peg"] = ("Trailing PEG" + (f" (capped at {PEG_AXIS_CAP})" if peg.max() > PEG_AXIS_CAP else ""), 0.22)
     row = {key: number for number, key in enumerate(panels, start=1)}
     rows = len(panels)
     heights = [weight for _, weight in panels.values()]
@@ -330,7 +330,8 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
         fig.update_yaxes(ticksuffix="%", range=[min(low, -10.0), min(GROWTH_AXIS_CAP, float(values.max()) * 1.1)],
                          row=row["growth"], col=1)
 
-    if not estimated.empty and not actual.empty:
+    has_eps_estimates = not eps.empty and eps_estimates is not None and not eps_estimates.dropna().empty
+    if (not estimated.empty or has_eps_estimates) and not actual.empty:
         # Added last: add_vline only reaches the panels that already hold traces.
         fig.add_vline(x=actual.index[-1] + pd.Timedelta(days=45), line=dict(color="gray", width=1, dash="dot"))
 

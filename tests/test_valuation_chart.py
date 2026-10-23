@@ -164,7 +164,7 @@ def test_growth_panel_is_the_first_row():
     assert names[-3:] == ["Price YoY %", "Revenue YoY %", "EPS YoY %"]
     assert fig.data[-1].yaxis == "y" and tuple(fig.layout.yaxis.range)[1] == 300
     assert [annotation.text.split(" ")[0] for annotation in fig.layout.annotations[:4]] == [
-        "Year-over-year", "Revenue", "EPS", "Trailing"]
+        "YoY", "Revenue", "EPS", "Trailing"]
     assert any("capped at 300%" in annotation.text for annotation in fig.layout.annotations)
 
 

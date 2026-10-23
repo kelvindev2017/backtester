@@ -1272,7 +1272,7 @@ def fetch_fundamental_snapshot(symbol):
 
     keys = [
         "trailingPE", "forwardPE", "pegRatio", "trailingPegRatio", "earningsGrowth",
-        "revenueGrowth", "profitMargins", "priceToBook", "debtToEquity", "sector", "industry",
+        "revenueGrowth", "profitMargins", "priceToBook", "debtToEquity", "sector", "industry", "shortName",
     ]
     info = yf.Ticker(symbol).info or {}
     snapshot = {key: info.get(key) for key in keys if info.get(key) is not None}
@@ -2105,7 +2105,9 @@ def index_membership(market, tickers):
 # ============================================================
 
 SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
-TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", SUPPLY_CHAIN_TAB, "Backtest", "Signal Analysis & Trade Plan", "Validate"]
+FUNDAMENTALS_TAB = "Stock Fundamentals"
+FUNDAMENTALS_YEARS = [3, 5, 8, 10]
+TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Backtest", "Signal Analysis & Trade Plan", "Validate"]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
@@ -2551,6 +2553,77 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
     return fig
 
 
+def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS):
+    """Growth vs price, revenue, EPS, trailing P/E and PEG for one ticker, with their captions."""
+
+    today = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
+    history_start = (pd.Timestamp(date.today()) - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
+    with st.spinner("Loading quarterly revenue and P/E history..."):
+        fundamentals, _, _ = load_quarterly_fundamentals(ticker, history_start, today)
+        # Load two extra years so TTM EPS, and its year-on-year growth for PEG, exist from the first day shown.
+        earnings_start = (pd.Timestamp(history_start) - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
+        earnings = load_earnings_data(ticker, earnings_start, today)
+        valuation, _ = build_valuation_data(load_data(ticker, earnings_start, today, "Daily"), earnings)
+    trend = fundamental_trend(fundamentals)
+    if trend and "Revenue" in fundamentals:
+        revenue = fundamentals["Revenue"].dropna()
+        yoy = trend.get("Revenue YoY %")
+        margin = trend.get("Net margin %")
+        st.caption(
+            f"Revenue last quarter: {revenue.iloc[-1] / 1e6:,.0f}M in its reporting currency"
+            + (f", {yoy:+.1f}% year on year" if yoy is not None and pd.notna(yoy) else "")
+            + (f". Net margin {margin:.1f}%." if margin is not None and pd.notna(margin) else ".")
+        )
+        st.markdown(f"**{ticker} fundamentals: growth, revenue, EPS and valuation, last {years} years**")
+        peg = trailing_peg(valuation).loc[history_start:]
+        trailing_pe = valuation["Trailing_PE"].loc[history_start:]
+        forward_pe = load_fundamental_snapshot(ticker).get("forwardPE")
+        estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])
+        all_eps = quarterly_eps(earnings, revenue.index)
+        eps = all_eps.loc[history_start:]
+        eps_estimates = eps_estimate_quarters(load_earnings_estimates(ticker), revenue.index[-1])
+        price_change = price_yoy(valuation["Close"]).loc[history_start:]
+        growth = {"Revenue": yoy_change(revenue), "EPS": yoy_change(all_eps)}
+        # Captions follow the panel order: growth vs price above the chart, valuation below it.
+        st.caption(correlation_text({name: growth_price_correlation(series.loc[history_start:], price_change)
+                                     for name, series in growth.items()}))
+        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates,
+                                     price_change=price_change, growth=growth), width="stretch")
+        st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
+        st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
+        st.caption(
+            "YoY change: the price daily, revenue and EPS by quarter, left empty when the year-ago value is zero or "
+            "negative. Revenue is in billions of the reporting currency. EPS is Yahoo's reported (adjusted) EPS per "
+            "share, on the quarter it reports rather than the announcement date. Trailing P/E is price / last 4 "
+            "quarters' EPS, so it can differ from GAAP P/E; a spike usually means earnings fell, not that the price "
+            "ran. PEG is that P/E / EPS growth %, blank while growth is zero or negative. Hatched bars are analyst "
+            "estimates, not results."
+        )
+    else:
+        st.caption("No quarterly revenue was available for this company.")
+
+
+
+def render_stock_fundamentals():
+    """Fundamentals of any ticker: growth vs price, revenue, EPS, trailing P/E and PEG."""
+
+    with settings_panel("Stock"):
+        ticker = st.text_input("Ticker", value="NVDA", key="fundamentals_ticker",
+                               help="Any Yahoo symbol with quarterly results, e.g. NVDA, TSM, BESIY.").strip().upper()
+        years = st.select_slider("History (years)", FUNDAMENTALS_YEARS, value=VALUATION_HISTORY_YEARS,
+                                 key="fundamentals_years")
+    st.caption(
+        "Is the price following the business? The top panel compares the year-over-year change in revenue and EPS "
+        "with the price's own change; below it are revenue, EPS and the valuation those results imply."
+    )
+    if not ticker:
+        st.info("Enter a ticker in the settings.")
+        return
+    name = load_fundamental_snapshot(ticker).get("shortName")
+    st.subheader(f"{ticker} · {name}" if name else ticker)
+    render_fundamentals(ticker, years)
+
+
 def render_company_detail(chain, ticker, table, prices, index_prices):
     name, role = SUPPLY_COMPANIES[ticker]
     st.subheader(f"{ticker} · {name}")
@@ -2584,48 +2657,7 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
                           margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
         show_chart(fig, width="stretch")
 
-    today = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
-    history_start = (pd.Timestamp(date.today()) - pd.DateOffset(years=VALUATION_HISTORY_YEARS)).strftime("%Y-%m-%d")
-    with st.spinner("Loading quarterly revenue and P/E history..."):
-        fundamentals, _, _ = load_quarterly_fundamentals(ticker, history_start, today)
-        # Load two extra years so TTM EPS, and its year-on-year growth for PEG, exist from the first day shown.
-        earnings_start = (pd.Timestamp(history_start) - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
-        earnings = load_earnings_data(ticker, earnings_start, today)
-        valuation, _ = build_valuation_data(load_data(ticker, earnings_start, today, "Daily"), earnings)
-    trend = fundamental_trend(fundamentals)
-    if trend and "Revenue" in fundamentals:
-        revenue = fundamentals["Revenue"].dropna()
-        yoy = trend.get("Revenue YoY %")
-        margin = trend.get("Net margin %")
-        st.caption(
-            f"Revenue last quarter: {revenue.iloc[-1] / 1e6:,.0f}M in its reporting currency"
-            + (f", {yoy:+.1f}% year on year" if yoy is not None and pd.notna(yoy) else "")
-            + (f". Net margin {margin:.1f}%." if margin is not None and pd.notna(margin) else ".")
-        )
-        st.markdown(f"**{ticker} fundamentals: growth, revenue, EPS and valuation, last {VALUATION_HISTORY_YEARS} years**")
-        peg = trailing_peg(valuation).loc[history_start:]
-        trailing_pe = valuation["Trailing_PE"].loc[history_start:]
-        forward_pe = load_fundamental_snapshot(ticker).get("forwardPE")
-        estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])
-        all_eps = quarterly_eps(earnings, revenue.index)
-        eps = all_eps.loc[history_start:]
-        eps_estimates = eps_estimate_quarters(load_earnings_estimates(ticker), revenue.index[-1])
-        price_change = price_yoy(valuation["Close"]).loc[history_start:]
-        growth = {"Revenue": yoy_change(revenue), "EPS": yoy_change(all_eps)}
-        # Captions follow the panel order: growth vs price above the chart, valuation below it.
-        st.caption(correlation_text({name: growth_price_correlation(series.loc[history_start:], price_change)
-                                     for name, series in growth.items()}))
-        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates,
-                                     price_change=price_change, growth=growth), width="stretch")
-        st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
-        st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
-        st.caption(
-            "P/E uses Yahoo's reported (adjusted) EPS, so it can differ from GAAP P/E. A P/E spike usually means "
-            "earnings fell, not that the price ran. EPS bars sit on the quarter they report, not the announcement "
-            "date. Hatched bars are analyst estimates, not results."
-        )
-    else:
-        st.caption("No quarterly revenue was available for this company.")
+    render_fundamentals(ticker)
 
 
 def render_supply_chain(index_prices):
@@ -3617,6 +3649,8 @@ if check_password():
                 render_market_analysis(main_index_prices)
             elif label == "Industry Analysis":
                 render_industry_analysis(main_index_prices)
+            elif label == FUNDAMENTALS_TAB:
+                render_stock_fundamentals()
             elif label == SUPPLY_CHAIN_TAB:
                 render_supply_chain(main_index_prices)
             else:
