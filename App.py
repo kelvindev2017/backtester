@@ -74,8 +74,10 @@ from analysis.valuation_chart import (
     VALUATION_HISTORY_YEARS,
     pe_summary,
     pe_summary_text,
+    peg_summary_text,
     revenue_estimate_quarters,
     revenue_pe_figure,
+    trailing_peg,
 )
 from analysis.universe import (
     MARKETS as SCREENER_MARKETS,
@@ -1281,6 +1283,26 @@ def fetch_revenue_estimates(symbol):
     if estimates is None or estimates.empty:
         raise ValueError(f"Yahoo returned no revenue estimates for {symbol}")
     return estimates
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_earnings_estimates(symbol):
+    """Yahoo's analyst EPS estimates (rows 0q, +1q, 0y, +1y; columns avg, growth ...); raises when empty."""
+
+    estimates = yf.Ticker(symbol).earnings_estimate
+    if estimates is None or estimates.empty:
+        raise ValueError(f"Yahoo returned no earnings estimates for {symbol}")
+    return estimates
+
+
+def next_year_eps_growth(symbol):
+    """Analysts' expected EPS growth for next fiscal year (0.70 = +70%), or None when unavailable."""
+
+    try:
+        value = float(fetch_earnings_estimates(symbol).at["+1y", "growth"])
+    except Exception:
+        return None
+    return value if np.isfinite(value) else None
 
 
 def load_revenue_estimates(symbol):
@@ -2551,9 +2573,9 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
     history_start = (pd.Timestamp(date.today()) - pd.DateOffset(years=VALUATION_HISTORY_YEARS)).strftime("%Y-%m-%d")
     with st.spinner("Loading quarterly revenue and P/E history..."):
         fundamentals, _, _ = load_quarterly_fundamentals(ticker, history_start, today)
-        # Earnings start a year early so the trailing four quarters exist from the first day shown.
-        earnings_start = (pd.Timestamp(history_start) - pd.DateOffset(years=1)).strftime("%Y-%m-%d")
-        valuation, _ = build_valuation_data(load_data(ticker, history_start, today, "Daily"),
+        # Load two extra years so TTM EPS, and its year-on-year growth for PEG, exist from the first day shown.
+        earnings_start = (pd.Timestamp(history_start) - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
+        valuation, _ = build_valuation_data(load_data(ticker, earnings_start, today, "Daily"),
                                             load_earnings_data(ticker, earnings_start, today))
     trend = fundamental_trend(fundamentals)
     if trend and "Revenue" in fundamentals:
@@ -2566,10 +2588,13 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
             + (f". Net margin {margin:.1f}%." if margin is not None and pd.notna(margin) else ".")
         )
         st.markdown(f"**{ticker} revenue and valuation, last {VALUATION_HISTORY_YEARS} years**")
-        trailing_pe = valuation["Trailing_PE"]
-        st.caption(pe_summary_text(pe_summary(trailing_pe), load_fundamental_snapshot(ticker).get("forwardPE")))
+        peg = trailing_peg(valuation).loc[history_start:]
+        trailing_pe = valuation["Trailing_PE"].loc[history_start:]
+        forward_pe = load_fundamental_snapshot(ticker).get("forwardPE")
+        st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
+        st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
         estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])
-        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates), width="stretch")
+        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg), width="stretch")
         st.caption(
             "P/E uses Yahoo's reported (adjusted) EPS, so it can differ from GAAP P/E. A P/E spike usually means "
             "earnings fell, not that the price ran. Hatched bars are analyst estimates, not results."

@@ -1,4 +1,4 @@
-"""Revenue and valuation (P/E) history for one company, drawn as two stacked
+"""Revenue and valuation (P/E, PEG) history for one company, drawn as two stacked
 panels on a shared date axis.
 
 The panels are stacked rather than overlaid on twin y-axes on purpose: with
@@ -17,6 +17,8 @@ VALUATION_HISTORY_YEARS = 8
 ACTUAL_COLOR = "royalblue"
 ESTIMATE_COLOR = "rgba(65, 105, 225, 0.35)"
 PE_COLOR = "goldenrod"
+PEG_COLOR = "seagreen"
+PEG_AXIS_CAP = 4
 
 
 def revenue_estimate_quarters(estimates, last_quarter_end):
@@ -75,8 +77,50 @@ def pe_summary_text(summary, forward_pe=None):
     return text
 
 
-def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, height=480):
-    """Trailing P/E line above quarterly revenue bars, sharing one date axis.
+def trailing_peg(valuation):
+    """Daily trailing PEG: trailing P/E divided by TTM EPS growth (%) versus a year earlier.
+
+    ``valuation`` holds ``Trailing_PE`` and ``TTM_Reported_EPS`` by day. PEG is left
+    empty while EPS growth is zero or negative, where the ratio has no meaning.
+    """
+
+    if valuation is None or valuation.empty or not {"Trailing_PE", "TTM_Reported_EPS"}.issubset(valuation.columns):
+        return pd.Series(dtype=float)
+    eps = valuation["TTM_Reported_EPS"]
+    clean = eps.dropna()
+    if clean.empty:
+        return pd.Series(np.nan, index=valuation.index)
+    year_ago = clean.reindex(valuation.index - pd.Timedelta(days=365), method="ffill")
+    year_ago.index = valuation.index
+    growth = (eps / year_ago.where(year_ago > 0) - 1) * 100
+    return (valuation["Trailing_PE"] / growth.where(growth > 0)).replace([np.inf, -np.inf], np.nan)
+
+
+def peg_summary_text(peg, forward_pe=None, forward_growth=None):
+    """One caption line: today's trailing PEG against its own history, plus a forward PEG when estimates exist."""
+
+    series = peg.dropna() if peg is not None else pd.Series(dtype=float)
+    parts = []
+    if not series.empty:
+        current = float(series.iloc[-1])
+        parts.append(
+            f"Trailing PEG {current:.2f} (P/E / last year's EPS growth %), {ordinal(round((series < current).mean() * 100))} "
+            f"percentile since {series.index.min():%Y} (median {series.median():.2f}, low {series.min():.2f} in "
+            f"{series.idxmin():%b %Y})."
+        )
+    else:
+        parts.append("No trailing PEG (EPS growth was zero or negative).")
+    if all(value is not None and np.isfinite(value) and value > 0 for value in [forward_pe, forward_growth]):
+        parts.append(
+            f"Forward PEG {forward_pe / (forward_growth * 100):.2f} (forward P/E {forward_pe:.1f}x / next fiscal year's "
+            f"expected EPS growth {forward_growth * 100:.0f}%)."
+        )
+    parts.append("Below 1 reads as cheap for the growth, but only if that growth lasts.")
+    return " ".join(parts)
+
+
+def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, height=None):
+    """Trailing P/E (and PEG, when given) above quarterly revenue bars, sharing one date axis.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -84,9 +128,17 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, height=480):
     reported revenue.
     """
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.45, 0.55],
-                        subplot_titles=("Trailing P/E (price / last 4 quarters' reported EPS)",
-                                        "Revenue by quarter (billions, reporting currency)"))
+    peg = peg.dropna() if peg is not None else pd.Series(dtype=float)
+    titles = ["Trailing P/E (price / last 4 quarters' reported EPS)"]
+    if not peg.empty:
+        capped = peg.max() > PEG_AXIS_CAP
+        titles.append("Trailing PEG (P/E / EPS growth %, blank when growth <= 0"
+                      + (f", axis capped at {PEG_AXIS_CAP})" if capped else ")"))
+    titles.append("Revenue by quarter (billions, reporting currency)")
+    rows = len(titles)
+    revenue_row = rows
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        row_heights=[0.45, 0.55] if rows == 2 else [0.3, 0.25, 0.45], subplot_titles=titles)
     pe = trailing_pe.dropna() if trailing_pe is not None else pd.Series(dtype=float)
     if not pe.empty:
         fig.add_trace(go.Scatter(x=pe.index, y=pe, mode="lines", name="Trailing P/E",
@@ -99,21 +151,32 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, height=480):
         fig.add_annotation(x=0.5, y=0.5, xref="x domain", yref="y domain", showarrow=False,
                            text="No trailing P/E (no reported EPS, or EPS was negative)", font=dict(color="gray"))
 
+    if not peg.empty:
+        # Gaps (growth <= 0) stay gaps: connecting them would invent PEG values.
+        full = peg.reindex(pd.date_range(peg.index.min(), peg.index.max(), freq="B"))
+        fig.add_trace(go.Scatter(x=full.index, y=full, mode="lines", name="Trailing PEG", connectgaps=False,
+                                 line=dict(color=PEG_COLOR, width=2),
+                                 hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}<extra></extra>"), row=2, col=1)
+        fig.add_hline(y=1, line=dict(color="gray", width=1, dash="dash"), row=2, col=1,
+                      annotation_text="PEG 1", annotation_position="top left")
+        # Right after earnings turn up, growth is tiny and PEG spikes; capping keeps the usual range readable.
+        fig.update_yaxes(range=[0, min(PEG_AXIS_CAP, float(peg.max()) * 1.1)], row=2, col=1)
+
     actual = revenue.dropna() / 1e9 if revenue is not None else pd.Series(dtype=float)
     fig.add_trace(go.Bar(x=actual.index, y=actual, name="Revenue (reported)", marker_color=ACTUAL_COLOR,
-                         hovertemplate="Quarter to %{x|%Y-%m-%d}: %{y:,.2f}B<extra></extra>"), row=2, col=1)
+                         hovertemplate="Quarter to %{x|%Y-%m-%d}: %{y:,.2f}B<extra></extra>"), row=revenue_row, col=1)
     estimated = revenue_estimates.dropna() / 1e9 if revenue_estimates is not None else pd.Series(dtype=float)
     if not estimated.empty:
         fig.add_trace(go.Bar(x=estimated.index, y=estimated, name="Revenue (analyst estimate)",
                              marker=dict(color=ESTIMATE_COLOR, line=dict(color=ACTUAL_COLOR, width=1),
                                          pattern=dict(shape="/", fgcolor=ACTUAL_COLOR, size=6)),
                              hovertemplate="Quarter to %{x|%Y-%m-%d} (estimate): %{y:,.2f}B<extra></extra>"),
-                      row=2, col=1)
+                      row=revenue_row, col=1)
         if not actual.empty:
             fig.add_vline(x=actual.index[-1] + pd.Timedelta(days=45), line=dict(color="gray", width=1, dash="dot"))
 
     fig.update_yaxes(ticksuffix="x", rangemode="tozero", row=1, col=1)
-    fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=2, col=1)
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=60, b=10), bargap=0.15,
-                      legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0))
+    fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=revenue_row, col=1)
+    fig.update_layout(height=height or (480 if rows == 2 else 620), margin=dict(l=10, r=10, t=60, b=10),
+                      bargap=0.15, legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0))
     return fig

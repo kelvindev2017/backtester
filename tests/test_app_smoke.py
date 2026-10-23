@@ -53,6 +53,7 @@ class FakeTicker:
         self.quarterly_income_stmt = pd.DataFrame()
         self.quarterly_cashflow = pd.DataFrame()
         self.revenue_estimate = pd.DataFrame({"avg": [12e9, 13e9]}, index=pd.Index(["0q", "+1q"], name="period"))
+        self.earnings_estimate = pd.DataFrame({"avg": [2.1, 9.0], "growth": [0.2, 0.25]}, index=["0q", "+1y"])
 
     def get_earnings_dates(self, limit=100):
         dates = pd.date_range(end=pd.Timestamp.today(), periods=28, freq="QS-FEB", tz="America/New_York")
@@ -237,6 +238,7 @@ def test_supply_chain_tab(offline, monkeypatch):
     assert any("Revenue (reported)" in chart.proto.spec and "analyst estimate" in chart.proto.spec
                for chart in app.get("plotly_chart"))
     assert any("percentile" in element.value for element in app.caption)
+    assert any("Forward PEG 1.00" in element.value for element in app.caption)
 
     next(box for box in app.selectbox if box.key == "supply_metric").select("% from 52w high")
     open_tab(app, "Semicon Supply Chain")
