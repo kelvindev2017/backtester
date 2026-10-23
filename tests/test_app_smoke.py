@@ -1,5 +1,6 @@
 """Run App.py headlessly with Yahoo Finance and SEC calls replaced by synthetic data."""
 
+import json
 import urllib.request
 from pathlib import Path
 
@@ -281,6 +282,26 @@ def test_mobile_layout_has_no_sidebar(offline):
     assert len(app.sidebar.children) == 0
     expanders = [element.label for element in app.get("expander")]
     assert any("Conditions" in label for label in expanders)
+
+
+def test_mobile_charts_let_a_swipe_scroll_the_page(offline):
+    app = start_app()
+    app.session_state["layout_mode"] = "Mobile"
+    app = open_tab(app, "Industry Analysis")
+    spec = json.loads(app.get("plotly_chart")[0].proto.spec)
+    assert spec["layout"]["dragmode"] is False and spec["layout"]["xaxis"]["fixedrange"] is True
+
+    # Display setting: swipes zoom and pan the chart again.
+    next(radio for radio in app.radio if radio.key == "chart_touch").set_value("Zoom and pan the chart")
+    app = open_tab(app, "Industry Analysis")
+    spec = json.loads(app.get("plotly_chart")[0].proto.spec)
+    assert "dragmode" not in spec["layout"] and not spec["layout"].get("xaxis", {}).get("fixedrange")
+
+    # Desktop is unchanged.
+    app.session_state["layout_mode"] = "Desktop"
+    next(radio for radio in app.radio if radio.key == "chart_touch").set_value("Scroll the page")
+    app = open_tab(app, "Industry Analysis")
+    assert "dragmode" not in json.loads(app.get("plotly_chart")[0].proto.spec)["layout"]
 
 
 def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
