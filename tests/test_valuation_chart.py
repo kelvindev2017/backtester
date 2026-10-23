@@ -42,7 +42,7 @@ def test_pe_summary_ranks_the_current_value_against_history():
     assert "No trailing P/E" in pe_summary_text(pe_summary(pd.Series(dtype=float)))
 
 
-def test_figure_stacks_pe_above_revenue_and_marks_estimates():
+def test_figure_stacks_revenue_above_pe_and_marks_estimates():
     quarters = pd.date_range("2024-01-31", periods=8, freq="QE-JAN")
     revenue = pd.Series(np.linspace(20e9, 60e9, 8), index=quarters)
     pe = pd.Series(np.linspace(60, 30, 400), index=pd.bdate_range("2024-01-01", periods=400))
@@ -51,7 +51,7 @@ def test_figure_stacks_pe_above_revenue_and_marks_estimates():
     names = [trace.name for trace in fig.data]
     assert names == ["Trailing P/E", "Revenue (reported)", "Revenue (analyst estimate)"]
     # Two separate y-axes in stacked rows, never an overlaid secondary axis.
-    assert fig.data[0].yaxis == "y" and fig.data[1].yaxis == "y2"
+    assert fig.data[0].yaxis == "y2" and fig.data[1].yaxis == "y"
     assert fig.layout.yaxis2.overlaying is None
     assert fig.data[1].y[-1] == 60.0  # billions
 
@@ -81,15 +81,15 @@ def test_peg_caption_and_panel():
     revenue = pd.Series([1e9, 2e9], index=pd.to_datetime(["2023-12-31", "2024-03-31"]))
     fig = revenue_pe_figure(revenue, pd.Series(dtype=float), peg=peg)
     assert [trace.name for trace in fig.data] == ["Trailing PEG", "Revenue (reported)"]
-    assert fig.data[0].yaxis == "y2" and fig.data[1].yaxis == "y3"
+    assert fig.data[0].yaxis == "y3" and fig.data[1].yaxis == "y"  # revenue, P/E, then PEG at the bottom
 
 
 def test_peg_axis_is_capped_when_growth_restarts_from_near_zero():
     peg = pd.Series([0.5, 12.0, 0.8], index=pd.to_datetime(["2022-01-03", "2023-06-01", "2024-01-01"]))
     revenue = pd.Series([1e9], index=pd.to_datetime(["2024-03-31"]))
     fig = revenue_pe_figure(revenue, pd.Series(dtype=float), peg=peg)
-    assert tuple(fig.layout.yaxis2.range) == (0, 4)
-    assert "capped at 4" in fig.layout.annotations[1].text
+    assert tuple(fig.layout.yaxis3.range) == (0, 4)
+    assert "capped at 4" in fig.layout.annotations[2].text
 
 
 def test_eps_moves_to_the_quarter_it_reports():
@@ -107,7 +107,7 @@ def test_eps_moves_to_the_quarter_it_reports():
     assert list(ahead.index) == [pd.Timestamp("2026-10-26"), pd.Timestamp("2027-01-26")]
 
 
-def test_eps_panel_sits_under_revenue():
+def test_eps_panel_sits_between_revenue_and_pe():
     quarters = pd.to_datetime(["2026-04-26", "2026-07-26"])
     revenue = pd.Series([80e9, 96e9], index=quarters)
     peg = pd.Series([0.4], index=[pd.Timestamp("2026-07-01")])
@@ -116,8 +116,9 @@ def test_eps_panel_sits_under_revenue():
     fig = revenue_pe_figure(revenue, pd.Series(dtype=float), peg=peg, eps=eps, eps_estimates=eps_ahead)
     assert [trace.name for trace in fig.data] == ["Trailing PEG", "Revenue (reported)", "EPS (reported)",
                                                   "EPS (analyst estimate)"]
-    assert fig.data[2].yaxis == "y4" and fig.data[3].yaxis == "y4"
-    assert fig.layout.annotations[3].text.startswith("EPS by quarter")
+    assert fig.data[1].yaxis == "y" and fig.data[2].yaxis == "y2" and fig.data[3].yaxis == "y2"
+    assert fig.data[0].yaxis == "y4"  # PEG last
+    assert fig.layout.annotations[1].text.startswith("EPS by quarter")
 
 
 def test_yoy_change_matches_by_date_and_skips_losses():
@@ -153,7 +154,7 @@ def test_growth_price_correlation_finds_the_lag():
     assert "EPS YoY vs price YoY (23 quarters)" in correlation_text({"EPS": result})
 
 
-def test_growth_panel_is_the_last_row():
+def test_growth_panel_is_the_first_row():
     quarters = pd.date_range("2023-03-31", periods=12, freq="QE")
     revenue = pd.Series(np.linspace(10e9, 40e9, 12), index=quarters)
     eps = pd.Series(np.linspace(0.5, 2.0, 12), index=quarters)
@@ -161,5 +162,17 @@ def test_growth_panel_is_the_last_row():
     fig = revenue_pe_figure(revenue, pd.Series(dtype=float), eps=eps, price_change=price_change)
     names = [trace.name for trace in fig.data]
     assert names[-3:] == ["Price YoY %", "Revenue YoY %", "EPS YoY %"]
-    assert fig.data[-1].yaxis == "y4" and tuple(fig.layout.yaxis4.range)[1] == 300
+    assert fig.data[-1].yaxis == "y" and tuple(fig.layout.yaxis.range)[1] == 300
+    assert [annotation.text.split(" ")[0] for annotation in fig.layout.annotations[:4]] == [
+        "Year-over-year", "Revenue", "EPS", "Trailing"]
     assert any("capped at 300%" in annotation.text for annotation in fig.layout.annotations)
+
+
+def test_legend_follows_panel_order():
+    quarters = pd.date_range("2023-03-31", periods=12, freq="QE")
+    revenue = pd.Series(np.linspace(10e9, 40e9, 12), index=quarters)
+    pe = pd.Series(np.linspace(60, 30, 400), index=pd.bdate_range("2024-01-01", periods=400))
+    price_change = pd.Series(np.linspace(-20, 80, 400), index=pe.index)
+    fig = revenue_pe_figure(revenue, pe, price_change=price_change)
+    by_rank = [trace.name for trace in sorted(fig.data, key=lambda trace: trace.legendrank)]
+    assert by_rank == ["Price YoY %", "Revenue YoY %", "Revenue (reported)", "Trailing P/E"]

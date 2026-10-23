@@ -2602,22 +2602,23 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
             + (f", {yoy:+.1f}% year on year" if yoy is not None and pd.notna(yoy) else "")
             + (f". Net margin {margin:.1f}%." if margin is not None and pd.notna(margin) else ".")
         )
-        st.markdown(f"**{ticker} revenue and valuation, last {VALUATION_HISTORY_YEARS} years**")
+        st.markdown(f"**{ticker} fundamentals: growth, revenue, EPS and valuation, last {VALUATION_HISTORY_YEARS} years**")
         peg = trailing_peg(valuation).loc[history_start:]
         trailing_pe = valuation["Trailing_PE"].loc[history_start:]
         forward_pe = load_fundamental_snapshot(ticker).get("forwardPE")
-        st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
-        st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
         estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])
         all_eps = quarterly_eps(earnings, revenue.index)
         eps = all_eps.loc[history_start:]
         eps_estimates = eps_estimate_quarters(load_earnings_estimates(ticker), revenue.index[-1])
         price_change = price_yoy(valuation["Close"]).loc[history_start:]
         growth = {"Revenue": yoy_change(revenue), "EPS": yoy_change(all_eps)}
-        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates,
-                                     price_change=price_change, growth=growth), width="stretch")
+        # Captions follow the panel order: growth vs price above the chart, valuation below it.
         st.caption(correlation_text({name: growth_price_correlation(series.loc[history_start:], price_change)
                                      for name, series in growth.items()}))
+        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates,
+                                     price_change=price_change, growth=growth), width="stretch")
+        st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
+        st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
         st.caption(
             "P/E uses Yahoo's reported (adjusted) EPS, so it can differ from GAAP P/E. A P/E spike usually means "
             "earnings fell, not that the price ran. EPS bars sit on the quarter they report, not the announcement "
