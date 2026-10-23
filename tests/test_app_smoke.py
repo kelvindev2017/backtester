@@ -95,7 +95,7 @@ def open_tab(app, label):
 def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["Stock Screener", "Market Analysis", "Industry Analysis",
-                                               "Semicon Supply Chain", "Backtest",
+                                               "Stock Fundamentals", "Semicon Supply Chain", "Backtest",
                                                "Signal Analysis & Trade Plan", "Validate"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
@@ -252,6 +252,25 @@ def test_supply_chain_tab(offline, monkeypatch):
         open_tab(app, "Semicon Supply Chain")
         assert not app.exception, app.exception
         assert any('"NVDA"' in chart.proto.spec for chart in app.get("plotly_chart"))
+
+
+def test_stock_fundamentals_tab(offline, monkeypatch):
+    monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
+    app = open_tab(start_app(), "Stock Fundamentals")
+    assert app.sidebar.header[0].value == "Stock Fundamentals"
+    assert app.subheader[0].value == "NVDA"
+    assert any("Price YoY" in chart.proto.spec and "Trailing P" in chart.proto.spec for chart in app.get("plotly_chart"))
+
+    # Any ticker and history length.
+    next(box for box in app.text_input if box.key == "fundamentals_ticker").input(" msft ")
+    next(slider for slider in app.select_slider if slider.key == "fundamentals_years").set_value(3)
+    open_tab(app, "Stock Fundamentals")
+    assert app.subheader[0].value == "MSFT"
+    assert any("last 3 years" in element.value for element in app.markdown)
+
+    next(box for box in app.text_input if box.key == "fundamentals_ticker").input("")
+    open_tab(app, "Stock Fundamentals")
+    assert any("Enter a ticker" in element.value for element in app.info)
 
 
 def test_mobile_layout_has_no_sidebar(offline):

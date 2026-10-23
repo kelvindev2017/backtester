@@ -64,6 +64,13 @@ SPDR ETFs such as XLK / XLF, ^NBI, ^BKX, ^DJT), optionally normalized to 100 at 
 5Y), with a table of returns, trend and distance from the 52-week high. Optionally compares up to 5 leading
 companies of one industry on price, MAs and quarterly revenue / net income trend.
 
+**Stock Fundamentals** (any Yahoo ticker): five stacked panels on one date axis over 3 to 10 years. 1) Year-over-year
+% change of quarterly revenue and EPS next to the daily price YoY %, with the rank correlation between growth and price
+at several lags (price a quarter earlier, same quarter, a quarter later, a year later). 2) Quarterly revenue (SEC,
+falling back to Yahoo) and 3) quarterly reported EPS, each with the next two quarters of analyst estimates as hatched
+bars. 4) Trailing P/E with its median and 5) trailing PEG, with captions placing today's values in their own history
+plus Yahoo's forward P/E and a forward PEG. Code in `analysis/valuation_chart.py`.
+
 **Semicon Supply Chain** (US-listed companies only): a bottom-up graph of the semiconductor supply chain behind
 an end market: **Mobile devices**, **AI / data center**, **Automotive**, or **All end markets** merged into one graph
 (which shows where the chains meet, e.g. TSM and ASML). Columns run from the end market (and system makers such as
