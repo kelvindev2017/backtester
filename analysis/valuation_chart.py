@@ -1,5 +1,5 @@
-"""Revenue and valuation (P/E, PEG) history for one company, drawn as two stacked
-panels on a shared date axis.
+"""Revenue, EPS and valuation (P/E, PEG) history for one company, drawn as
+stacked panels on a shared date axis.
 
 The panels are stacked rather than overlaid on twin y-axes on purpose: with
 two y-scales the visual crossing of the P/E line and the revenue bars depends
@@ -21,6 +21,9 @@ PEG_COLOR = "seagreen"
 PEG_AXIS_CAP = 4
 EPS_COLOR = "darkorange"
 EPS_ESTIMATE_COLOR = "rgba(255, 140, 0, 0.35)"
+PRICE_COLOR = "dimgray"
+GROWTH_AXIS_CAP = 300
+LAGS = {"price 1 quarter earlier": 1, "same quarter": 0, "1 quarter later": -1, "1 year later": -4}
 
 
 def revenue_estimate_quarters(estimates, last_quarter_end):
@@ -159,7 +162,76 @@ def eps_estimate_quarters(estimates, last_quarter_end):
     return pd.Series(values, dtype=float)
 
 
-def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None, height=None):
+def yoy_change(series, min_days=330, max_days=400):
+    """Percent change of each quarterly value versus the value about a year earlier.
+
+    Matched by date, not position, because some sources skip quarters. Empty
+    (NaN) when there is no year-ago value or it is zero or negative, where a
+    percent change has no meaning (EPS turning from a loss to a profit).
+    """
+
+    clean = series.dropna().sort_index() if series is not None else pd.Series(dtype=float)
+    values = {}
+    for when, value in clean.items():
+        base = clean.loc[(clean.index >= when - pd.Timedelta(days=max_days))
+                         & (clean.index <= when - pd.Timedelta(days=min_days))]
+        values[when] = (value / base.iloc[-1] - 1) * 100 if not base.empty and base.iloc[-1] > 0 else np.nan
+    return pd.Series(values, dtype=float)
+
+
+def price_yoy(close):
+    """Daily percent change of the close versus the close 365 days earlier (or the last trading day before)."""
+
+    clean = close.dropna().sort_index() if close is not None else pd.Series(dtype=float)
+    if clean.empty:
+        return pd.Series(dtype=float)
+    year_ago = clean.reindex(clean.index - pd.Timedelta(days=365), method="ffill")
+    year_ago.index = clean.index
+    return (clean / year_ago.where(year_ago > 0) - 1) * 100
+
+
+def growth_price_correlation(growth, price_change, lags=None):
+    """Correlation between quarterly YoY growth and the price's YoY change, at several lags.
+
+    ``price_change`` (daily) is sampled at each quarter end in ``growth``. A lag of
+    -4 compares each quarter's growth with the price change a year later (does
+    growth predict the price?), +1 with the price change a quarter earlier (does
+    the price run ahead?). Rank (Spearman) correlation, so a few 400% growth
+    quarters don't dominate. Returns ``{label: (r, n)}``; r is NaN with fewer
+    than 8 quarters.
+    """
+
+    lags = LAGS if lags is None else lags
+    clean = growth.dropna() if growth is not None else pd.Series(dtype=float)
+    prices = price_change.dropna() if price_change is not None else pd.Series(dtype=float)
+    result = {}
+    if clean.empty or prices.empty:
+        return {label: (np.nan, 0) for label in lags}
+    sampled = prices.reindex(clean.index, method="ffill", tolerance=pd.Timedelta(days=7))
+    for label, lag in lags.items():
+        pair = pd.DataFrame({"growth": clean.values, "price": sampled.shift(lag).values}).dropna()
+        ranked = pair.rank()
+        result[label] = (float(ranked["growth"].corr(ranked["price"])) if len(pair) >= 8 else np.nan, len(pair))
+    return result
+
+
+def correlation_text(correlations):
+    """One caption line for :func:`growth_price_correlation` results by series name."""
+
+    parts = []
+    for name, by_lag in correlations.items():
+        cells = [f"{label} r = {r:+.2f}" for label, (r, _) in by_lag.items() if np.isfinite(r)]
+        if cells:
+            n = max(count for _, count in by_lag.values())
+            parts.append(f"{name} YoY vs price YoY ({n} quarters): " + ", ".join(cells) + ".")
+    if not parts:
+        return "Not enough quarters to compare growth with the price."
+    return (" ".join(parts) + " r is a rank correlation from -1 to +1. YoY windows overlap, so neighbouring "
+            "quarters are not independent and r looks stronger than it is.")
+
+
+def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
+                      price_change=None, growth=None, height=None):
     """Trailing P/E (and PEG, when given) above quarterly revenue (and EPS) bars, sharing one date axis.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
@@ -179,8 +251,20 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     eps = eps.dropna() if eps is not None else pd.Series(dtype=float)
     if not eps.empty:
         titles.append("EPS by quarter (Yahoo reported, adjusted, per share)")
+    price_change = price_change.dropna() if price_change is not None else pd.Series(dtype=float)
+    # Pass ``growth`` when revenue or EPS is trimmed to the window shown, so the first year still has growth.
+    growth = growth or {"Revenue": yoy_change(revenue), "EPS": yoy_change(eps)}
+    growth = {name: series.loc[series.index >= price_change.index.min()] if not price_change.empty else series
+              for name, series in growth.items()}
+    growth_row = None
+    if not price_change.empty:
+        values = pd.concat([price_change] + list(growth.values())).dropna()
+        capped = values.max() > GROWTH_AXIS_CAP
+        titles.append("Year-over-year change, % (price daily, revenue and EPS by quarter"
+                      + (f", axis capped at {GROWTH_AXIS_CAP}%)" if capped else ")"))
+        growth_row = len(titles)
     rows = len(titles)
-    weights = {"Trailing P/E": 0.3, "Trailing PEG": 0.22, "Revenue": 0.3, "EPS": 0.22}
+    weights = {"Trailing P/E": 0.3, "Trailing PEG": 0.22, "Revenue": 0.3, "EPS": 0.22, "Year-over-year": 0.3}
     heights = [next(w for key, w in weights.items() if title.startswith(key)) for title in titles]
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.05,
                         row_heights=[h / sum(heights) for h in heights], subplot_titles=titles)
@@ -231,12 +315,28 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
                           row=eps_row, col=1)
         fig.update_yaxes(tickformat=".2f", row=eps_row, col=1)
 
+    if growth_row:
+        fig.add_trace(go.Scatter(x=price_change.index, y=price_change, mode="lines", name="Price YoY %",
+                                 line=dict(color=PRICE_COLOR, width=1.2),
+                                 hovertemplate="%{x|%Y-%m-%d}: %{y:+.0f}%<extra></extra>"), row=growth_row, col=1)
+        for name, color in [("Revenue", ACTUAL_COLOR), ("EPS", EPS_COLOR)]:
+            series = growth[name].dropna()
+            if not series.empty:
+                fig.add_trace(go.Scatter(x=series.index, y=series, mode="lines+markers", name=f"{name} YoY %",
+                                         line=dict(color=color, width=2), marker=dict(size=8),
+                                         hovertemplate=f"{name}, quarter to %{{x|%Y-%m-%d}}: %{{y:+.0f}}%<extra></extra>"),
+                              row=growth_row, col=1)
+        fig.add_hline(y=0, line=dict(color="gray", width=1), row=growth_row, col=1)
+        low = max(-100.0, float(values.min()) * 1.1)
+        fig.update_yaxes(ticksuffix="%", range=[min(low, -10.0), min(GROWTH_AXIS_CAP, float(values.max()) * 1.1)],
+                         row=growth_row, col=1)
+
     if not estimated.empty and not actual.empty:
         # Added last: add_vline only reaches the panels that already hold traces.
         fig.add_vline(x=actual.index[-1] + pd.Timedelta(days=45), line=dict(color="gray", width=1, dash="dot"))
 
     fig.update_yaxes(ticksuffix="x", rangemode="tozero", row=1, col=1)
     fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=revenue_row, col=1)
-    fig.update_layout(height=height or {2: 480, 3: 620}.get(rows, 760), margin=dict(l=10, r=10, t=60, b=10),
+    fig.update_layout(height=height or {2: 480, 3: 620, 4: 760}.get(rows, 940), margin=dict(l=10, r=10, t=60, b=10),
                       bargap=0.15, legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0))
     return fig

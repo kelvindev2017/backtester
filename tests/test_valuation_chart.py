@@ -2,6 +2,10 @@ import numpy as np
 import pandas as pd
 
 from analysis.valuation_chart import (
+    correlation_text,
+    growth_price_correlation,
+    price_yoy,
+    yoy_change,
     eps_estimate_quarters,
     quarterly_eps,
     peg_summary_text,
@@ -114,3 +118,48 @@ def test_eps_panel_sits_under_revenue():
                                                   "EPS (analyst estimate)"]
     assert fig.data[2].yaxis == "y4" and fig.data[3].yaxis == "y4"
     assert fig.layout.annotations[3].text.startswith("EPS by quarter")
+
+
+def test_yoy_change_matches_by_date_and_skips_losses():
+    quarters = pd.to_datetime(["2024-03-31", "2024-06-30", "2025-03-31", "2025-06-30", "2025-09-30"])
+    series = pd.Series([2.0, -1.0, 3.0, 0.5, 1.0], index=quarters)
+    change = yoy_change(series)
+    assert change.loc["2025-03-31"] == 50.0
+    assert np.isnan(change.loc["2025-06-30"])  # year-ago loss: no meaningful % change
+    assert np.isnan(change.loc["2025-09-30"])  # no quarter a year earlier
+
+
+def test_price_yoy_uses_the_last_close_a_year_back():
+    index = pd.bdate_range("2024-01-01", "2025-06-30")
+    close = pd.Series(np.linspace(100, 250, len(index)), index=index)
+    change = price_yoy(close)
+    assert np.isnan(change.iloc[0])
+    when = pd.Timestamp("2025-06-30")
+    assert change.loc[when] == (close.loc[when] / close.loc[:when - pd.Timedelta(days=365)].iloc[-1] - 1) * 100
+
+
+def test_growth_price_correlation_finds_the_lag():
+    quarters = pd.date_range("2018-03-31", periods=24, freq="QE")
+    rng = np.random.default_rng(1)
+    growth = pd.Series(rng.normal(30, 40, len(quarters)), index=quarters)
+    # The price moves a quarter after growth: its YoY change at each quarter end is last quarter's growth.
+    daily = pd.date_range(quarters[0], quarters[-1] + pd.Timedelta(days=5))
+    price_change = growth.shift(1).reindex(daily, method="ffill")
+    result = growth_price_correlation(growth, price_change)
+    assert result["1 quarter later"][0] > 0.99
+    assert abs(result["same quarter"][0]) < 0.6
+    assert result["same quarter"][1] == 23  # the first quarter has no price change yet
+    assert "Not enough quarters" in correlation_text({"EPS": growth_price_correlation(growth.iloc[:5], price_change)})
+    assert "EPS YoY vs price YoY (23 quarters)" in correlation_text({"EPS": result})
+
+
+def test_growth_panel_is_the_last_row():
+    quarters = pd.date_range("2023-03-31", periods=12, freq="QE")
+    revenue = pd.Series(np.linspace(10e9, 40e9, 12), index=quarters)
+    eps = pd.Series(np.linspace(0.5, 2.0, 12), index=quarters)
+    price_change = pd.Series(np.linspace(-20, 500, 400), index=pd.bdate_range("2024-01-01", periods=400))
+    fig = revenue_pe_figure(revenue, pd.Series(dtype=float), eps=eps, price_change=price_change)
+    names = [trace.name for trace in fig.data]
+    assert names[-3:] == ["Price YoY %", "Revenue YoY %", "EPS YoY %"]
+    assert fig.data[-1].yaxis == "y4" and tuple(fig.layout.yaxis4.range)[1] == 300
+    assert any("capped at 300%" in annotation.text for annotation in fig.layout.annotations)

@@ -72,14 +72,18 @@ from analysis.signal_groups import (
 )
 from analysis.valuation_chart import (
     VALUATION_HISTORY_YEARS,
+    correlation_text,
     eps_estimate_quarters,
+    growth_price_correlation,
     pe_summary,
     pe_summary_text,
     peg_summary_text,
+    price_yoy,
     quarterly_eps,
     revenue_estimate_quarters,
     revenue_pe_figure,
     trailing_peg,
+    yoy_change,
 )
 from analysis.universe import (
     MARKETS as SCREENER_MARKETS,
@@ -2605,10 +2609,15 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
         st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
         st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
         estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])
-        eps = quarterly_eps(earnings, revenue.index).loc[history_start:]
+        all_eps = quarterly_eps(earnings, revenue.index)
+        eps = all_eps.loc[history_start:]
         eps_estimates = eps_estimate_quarters(load_earnings_estimates(ticker), revenue.index[-1])
-        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates),
-                   width="stretch")
+        price_change = price_yoy(valuation["Close"]).loc[history_start:]
+        growth = {"Revenue": yoy_change(revenue), "EPS": yoy_change(all_eps)}
+        show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates,
+                                     price_change=price_change, growth=growth), width="stretch")
+        st.caption(correlation_text({name: growth_price_correlation(series.loc[history_start:], price_change)
+                                     for name, series in growth.items()}))
         st.caption(
             "P/E uses Yahoo's reported (adjusted) EPS, so it can differ from GAAP P/E. A P/E spike usually means "
             "earnings fell, not that the price ran. EPS bars sit on the quarter they report, not the announcement "

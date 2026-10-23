@@ -240,7 +240,8 @@ def test_supply_chain_tab(offline, monkeypatch):
                for chart in app.get("plotly_chart"))
     assert any("percentile" in element.value for element in app.caption)
     assert any("Forward PEG 1.00" in element.value for element in app.caption)
-    assert any("EPS (reported)" in chart.proto.spec for chart in app.get("plotly_chart"))
+    assert any("EPS (reported)" in chart.proto.spec and "Price YoY" in chart.proto.spec
+               for chart in app.get("plotly_chart"))
 
     next(box for box in app.selectbox if box.key == "supply_metric").select("% from 52w high")
     open_tab(app, "Semicon Supply Chain")
