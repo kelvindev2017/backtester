@@ -52,9 +52,12 @@ class FakeTicker:
         self.info = {"forwardPE": 25.0, "trailingPegRatio": 1.4, "sector": "Technology"}
         self.quarterly_income_stmt = pd.DataFrame()
         self.quarterly_cashflow = pd.DataFrame()
+        self.revenue_estimate = pd.DataFrame({"avg": [12e9, 13e9]}, index=pd.Index(["0q", "+1q"], name="period"))
+        self.earnings_estimate = pd.DataFrame({"avg": [2.1, 9.0], "growth": [0.2, 0.25]}, index=["0q", "+1y"])
 
     def get_earnings_dates(self, limit=100):
-        dates = pd.date_range(end=pd.Timestamp.today(), periods=28, freq="QS-FEB", tz="America/New_York")
+        # Midnight dates: a time of day between 1 and 2 am lands in the ambiguous hour when DST ends on Nov 1.
+        dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=28, freq="QS-FEB", tz="America/New_York")
         eps = np.linspace(0.8, 2.0, len(dates))
         return pd.DataFrame(
             {"EPS Estimate": eps * 0.97, "Reported EPS": eps, "Surprise(%)": 3.0},
@@ -210,7 +213,17 @@ def test_market_and_industry_tabs(offline):
     assert not app.exception, app.exception
 
 
-def test_supply_chain_tab(offline):
+class FakeTickerWithRevenue(FakeTicker):
+    def __init__(self, symbol):
+        super().__init__(symbol)
+        quarters = pd.date_range(end=pd.Timestamp.today(), periods=8, freq="QE")
+        self.quarterly_income_stmt = pd.DataFrame(
+            [np.linspace(8e9, 11e9, 8), np.linspace(2e9, 3e9, 8)], index=["Total Revenue", "Net Income"], columns=quarters
+        )
+
+
+def test_supply_chain_tab(offline, monkeypatch):
+    monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
     app = open_tab(start_app(), "Semicon Supply Chain")
     assert app.sidebar.header[0].value == "Semicon Supply Chain"
     assert any("End market" in box.label for box in app.selectbox)
@@ -222,6 +235,13 @@ def test_supply_chain_tab(offline):
     assert any(element.value.startswith("TSM") for element in app.subheader)
     rendered = " ".join(element.value for element in app.markdown)
     assert "Buys from" in rendered and "ASML" in rendered and "Sells to" in rendered
+    # Revenue and trailing P/E share a date axis; analyst estimates are drawn as their own, labelled bars.
+    assert any("Revenue (reported)" in chart.proto.spec and "analyst estimate" in chart.proto.spec
+               for chart in app.get("plotly_chart"))
+    assert any("percentile" in element.value for element in app.caption)
+    assert any("Forward PEG 1.00" in element.value for element in app.caption)
+    assert any("EPS (reported)" in chart.proto.spec and "Price YoY" in chart.proto.spec
+               for chart in app.get("plotly_chart"))
 
     next(box for box in app.selectbox if box.key == "supply_metric").select("% from 52w high")
     open_tab(app, "Semicon Supply Chain")
