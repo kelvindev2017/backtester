@@ -7,7 +7,7 @@ This is the rule that came out of reviewing Kelvin's 2026 IBKR trades (fit on Ma
 * at every close, including the entry day, keep the position only if the close is in the top part of the
   day's range (default the top third: (close - low) / (high - low) >= 2/3); otherwise sell at the close;
 * or, instead of the range test, hold while the close stays above a moving average (SMA or EMA, default
-  SMA 60), or never hold overnight;
+  SMA 20), or never hold overnight;
 * a fixed dollar amount per trade (default $10,000), so no single trade dominates the result.
 
 Daily bars stand in for the intraday fill: the entry assumes a stop order resting at the breakout level, and
@@ -36,12 +36,12 @@ class DayBreakoutSettings:
     lookback: int = 10
     exit_mode: str = "top_range"
     keep_fraction: float = 2 / 3
-    max_hold: int = 10
+    max_hold: int = 60
     position_size: float = 10_000.0
     fee_per_trade: float = 1.5
     trend_sma: int = 0
     exit_ma_type: str = "SMA"
-    exit_ma_period: int = 60
+    exit_ma_period: int = 20
 
 
 def close_location(daily):
