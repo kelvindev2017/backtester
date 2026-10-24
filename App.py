@@ -16,6 +16,14 @@ import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+from analysis.day_breakout import (
+    EXIT_MODES,
+    DayBreakoutSettings,
+    monthly_pnl,
+    run_day_breakout,
+    split_summary,
+    ticker_summary,
+)
 from analysis.engine import AnalysisSettings, analyze, report_to_dict, report_to_markdown
 from analysis.indicators import resample_ohlcv
 from analysis.notify import send_webhook, short_summary
@@ -1500,7 +1508,7 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
     st.info(
         "**Validation note:** replayed on 52 large US stocks over 2016-2026, the breakout, pullback and reversal "
         "setups did not beat random entry days with the same stops and targets, and the confidence score did not "
-        "rank trades better than chance. The moving-average rule was not part of that study. Treat signals as a structured checklist, and use the **Validate** tab on "
+        "rank trades better than chance. The moving-average and day-breakout rules were not part of that study. Treat signals as a structured checklist, and use the **Validate** tab on "
         "your own tickers before acting on them."
     )
     st.caption(
@@ -2106,8 +2114,10 @@ def index_membership(market, tickers):
 
 SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
 FUNDAMENTALS_TAB = "Stock Fundamentals"
+DAY_BREAKOUT_TAB = "Day Breakout Rule"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
-TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Backtest", "Signal Analysis & Trade Plan", "Validate"]
+TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Backtest", "Signal Analysis & Trade Plan", "Validate",
+             DAY_BREAKOUT_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
@@ -2993,6 +3003,7 @@ SETUP_OPTIONS = {
     "Breakout (new high/low on volume)": "breakout",
     "Pullback in trend (dip to the EMA, then reversal)": "pullback",
     "Reversal (buy a breakdown in an uptrend)": "reversal",
+    "Day breakout (above the N-day high, hold on a top-third close)": "day_breakout",
 }
 
 
@@ -3028,6 +3039,7 @@ def strategy_settings():
     breakout_lookback, volume_multiple = 20, 1.5
     pullback_ema, trend_mid, trend_slow = 20, 50, 200
     swing_bars, pullback_bars, min_depth_atr = 20, 5, 1.5
+    keep_fraction = 2 / 3
 
     with settings_panel("Signal"):
         setup_label = st.selectbox(
@@ -3064,6 +3076,16 @@ def strategy_settings():
             st.caption(
                 f"Buy: the first close above the prior {breakout_lookback}-bar high on at least {volume_multiple:g}x "
                 f"average volume. Sell / exit: the first close below the prior {breakout_lookback}-bar low."
+            )
+        elif setup == "day_breakout":
+            breakout_lookback = int(st.number_input("Breakout above the prior N-day high", min_value=1, max_value=250,
+                                                    value=10, step=1, key="signal_day_breakout_lookback"))
+            keep_fraction = float(st.slider("Hold when the close is at least this far up the day's range", 0.0, 1.0,
+                                            2 / 3, 0.05, key="signal_day_breakout_keep"))
+            st.caption(
+                f"Buy: price trades above the prior {breakout_lookback}-day high (buy-stop at that level) and closes at "
+                f"least {keep_fraction * 100:.0f}% of the way up the day's range. Sell / exit: the first close below "
+                "that. Long only. The Day Breakout Rule tab runs it on many tickers with fixed $ size."
             )
         elif setup == "pullback":
             trend_columns = st.columns(2)
@@ -3122,6 +3144,7 @@ def strategy_settings():
         swing_bars=swing_bars,
         pullback_bars=pullback_bars,
         min_depth_atr=min_depth_atr,
+        keep_fraction=keep_fraction,
     )
     risk_settings = RiskSettings(
         account_equity=float(account_size),
@@ -3254,7 +3277,8 @@ def render_backtest(s):
             df, setup, breakout_lookback, float(volume_multiple), **signal_settings.detector_kwargs()
         )
         buy_condition = backtest_signals["Signal_Up"].fillna(False).astype(bool)
-        sell_condition = backtest_signals["Signal_Down"].fillna(False).astype(bool)
+        sell_column = "Exit_Long" if "Exit_Long" in backtest_signals else "Signal_Down"
+        sell_condition = backtest_signals[sell_column].fillna(False).astype(bool)
         rule_text = (
             f"**BUY / SELL:** {setup_label} signals on {timeframe.lower()} bars. The position is held until "
             "the opposite signal. Stops and targets are not simulated here; the **Validate** tab replays the "
@@ -3619,6 +3643,124 @@ def render_backtest(s):
 
 
 # ============================================================
+# Day Breakout Rule tab
+# ============================================================
+
+DEFAULT_DAY_BREAKOUT_TICKERS = "MU, ASML, TSM, QCOM, GOOG, INTC, SNDK, AAPL, TER, NVDA"
+
+
+def render_day_breakout():
+    """Day-breakout rule from the IBKR trade review, run mechanically on a list of tickers with a fit/check split."""
+
+    st.caption(
+        "Buys the first day a stock trades above its prior N-day high (filled at that level, or at the open on a gap "
+        "up), then decides at each close: hold overnight only when the close is in the top part of the day's range, "
+        "otherwise sell at the close. Each trade is a fixed dollar amount. This is the rule that turned the review of "
+        "your 2026 IBKR trades positive; here it takes every breakout, not only the ones you picked. Results before "
+        "the split date are where the rule was fitted, results after it are the check."
+    )
+    with settings_panel("Day breakout rule"):
+        tickers_text = st.text_input("Tickers (comma-separated)", DEFAULT_DAY_BREAKOUT_TICKERS, key="day_breakout_tickers")
+        date_columns = st.columns(2)
+        start = date_columns[0].date_input("Trades from", value=date(2026, 3, 1), max_value=date.today(),
+                                           key="day_breakout_start")
+        split = date_columns[1].date_input("Check period from", value=date(2026, 8, 1), max_value=date.today(),
+                                           key="day_breakout_split",
+                                           help="Trades entered from this date are reported separately, as the "
+                                           "out-of-sample check.")
+        lookback = int(st.number_input("Breakout above the prior N-day high", min_value=1, max_value=250, value=10,
+                                       step=1, key="day_breakout_lookback"))
+        exit_label = st.selectbox("Overnight rule", list(EXIT_MODES), key="day_breakout_exit")
+        keep_fraction = st.slider(
+            "Hold when the close is at least this far up the day's range", 0.0, 1.0, 2 / 3, 0.05,
+            key="day_breakout_keep", disabled=EXIT_MODES[exit_label] != "top_range",
+            help="0.67 is the top third: (close - low) / (high - low) >= 0.67.",
+        )
+        max_hold = int(st.number_input("Sell after at most this many days (0 = no limit)", min_value=0,
+                                       max_value=120, value=10, step=1, key="day_breakout_max_hold"))
+        trend_sma = int(st.number_input("Only when the prior close is above its SMA (0 = off)", min_value=0,
+                                        max_value=250, value=0, step=10, key="day_breakout_sma"))
+        money_columns = st.columns(2)
+        position_size = float(money_columns[0].number_input("Size per trade ($)", min_value=100.0, value=10_000.0,
+                                                            step=1_000.0, key="day_breakout_size"))
+        fee = float(money_columns[1].number_input("Fees per round trip ($)", min_value=0.0, value=1.5, step=0.5,
+                                                  key="day_breakout_fee"))
+
+    tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
+    if not tickers:
+        st.info("Enter at least one ticker in the settings.")
+        return
+    settings = DayBreakoutSettings(lookback=lookback, exit_mode=EXIT_MODES[exit_label], keep_fraction=keep_fraction,
+                                   max_hold=max_hold, position_size=position_size, fee_per_trade=fee,
+                                   trend_sma=trend_sma)
+    # Enough history before the first trade for the N-day high and the SMA filter.
+    days = (date.today() - start).days + 2 * max(lookback, trend_sma) + 30
+    with st.spinner("Loading daily prices..."):
+        prices = load_price_panel(tickers, days=days)
+    missing = [t for t in tickers if t not in prices]
+    if missing:
+        st.warning(f"No prices for {', '.join(missing)}.")
+    trades = run_day_breakout(prices, settings, start=start)
+    if trades.empty:
+        st.info("No breakouts in this period.")
+        return
+
+    split_table = split_summary(trades, split)
+    overall = split_table.loc["All"]
+    tiles = st.columns(2 if MOBILE else 4)
+    tiles[0].metric("Net P&L", f"${overall['Net P&L']:+,.0f}", f"{int(overall['Trades'])} closed trades",
+                    delta_color="off")
+    tiles[1].metric("Win rate", f"{overall['Win rate %']:.0f}%",
+                    f"avg win ${overall['Avg win']:,.0f} / loss ${-overall['Avg loss']:,.0f}", delta_color="off")
+    tiles[2 % len(tiles)].metric("Profit factor", f"{overall['Profit factor']:.2f}")
+    tiles[3 % len(tiles)].metric("Max drawdown", f"-${abs(overall['Max drawdown']):,.0f}")
+
+    st.markdown("**Fit period vs check period**")
+    st.dataframe(
+        split_table.style.format({"Trades": "{:.0f}", "Win rate %": "{:.0f}", "Net P&L": "${:+,.0f}",
+                                  "Avg / trade": "${:+,.0f}", "Avg win": "${:,.0f}", "Avg loss": "${:,.0f}",
+                                  "Profit factor": "{:.2f}", "Max drawdown": "${:,.0f}",
+                                  "Held overnight %": "{:.0f}"}, na_rep="-"),
+        width="stretch",
+    )
+
+    closed = trades[trades["Status"] == "Closed"]
+    equity = go.Figure()
+    equity.add_trace(go.Scatter(x=closed["Exit date"], y=closed["P&L"].cumsum(), mode="lines", name="Rule",
+                                line=dict(color="seagreen", width=2)))
+    equity.add_vline(x=pd.Timestamp(split), line_dash="dot", line_color="gray")
+    equity.add_hline(y=0, line_color="lightgray")
+    equity.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20), title="Cumulative P&L ($)",
+                         hovermode="x unified", showlegend=False)
+    show_chart(equity, width="stretch", config={"displaylogo": False})
+
+    months = monthly_pnl(trades)
+    if not months.empty:
+        bars = go.Figure(go.Bar(x=months.index.astype(str), y=months.values,
+                                marker_color=["seagreen" if v >= 0 else "indianred" for v in months.values]))
+        bars.update_layout(height=260, margin=dict(l=20, r=20, t=40, b=20), title="P&L by month ($)")
+        show_chart(bars, width="stretch", config={"displaylogo": False})
+
+    with st.expander("By ticker", expanded=not MOBILE):
+        st.dataframe(ticker_summary(trades).style.format({"Win rate %": "{:.0f}", "Net P&L": "${:+,.0f}"}),
+                     width="stretch")
+    with st.expander(f"All {len(trades):,} trades"):
+        st.dataframe(
+            trades.sort_values("Entry date", ascending=False).style.format(
+                {"Entry": "{:.2f}", "Exit": "{:.2f}", "P&L": "${:+,.0f}", "Return %": "{:+.2f}",
+                 "Entry date": "{:%Y-%m-%d}", "Exit date": "{:%Y-%m-%d}"}),
+            hide_index=True, width="stretch",
+        )
+    st.download_button("Download trades (CSV)", trades.to_csv(index=False),
+                       file_name=f"day_breakout_{start:%Y%m%d}.csv", mime="text/csv")
+    st.caption(
+        "Daily bars stand in for intraday fills: the entry assumes a buy-stop at the breakout level and every exit "
+        "is at a close. Tickers are traded side by side, so several positions can be open at once. A trade still "
+        "open on the last bar is listed but left out of the statistics."
+    )
+
+
+# ============================================================
 # Main application
 # ============================================================
 
@@ -3653,6 +3795,8 @@ if check_password():
                 render_stock_fundamentals()
             elif label == SUPPLY_CHAIN_TAB:
                 render_supply_chain(main_index_prices)
+            elif label == DAY_BREAKOUT_TAB:
+                render_day_breakout()
             else:
                 strategy = strategy_settings()
                 if strategy is None:
