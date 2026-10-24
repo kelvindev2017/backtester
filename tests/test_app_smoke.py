@@ -318,7 +318,7 @@ def test_day_breakout_tab(offline):
     next(box for box in app.selectbox if box.key == "day_breakout_exit").select(
         "Hold while the close is above a moving average")
     open_tab(app, "Day Breakout Rule")
-    assert next(box for box in app.number_input if box.key == "day_breakout_ma_period").value == 60
+    assert next(box for box in app.number_input if box.key == "day_breakout_ma_period").value == 20
     assert app.metric
 
     next(box for box in app.text_input if box.key == "day_breakout_tickers").input("")

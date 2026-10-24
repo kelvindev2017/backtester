@@ -3680,11 +3680,11 @@ def render_day_breakout():
         exit_ma_type = ma_columns[0].selectbox("Exit MA type", ["SMA", "EMA"], key="day_breakout_ma_type",
                                                disabled=EXIT_MODES[exit_label] != "above_ma")
         exit_ma_period = int(ma_columns[1].number_input(
-            "Exit MA period (days)", min_value=2, max_value=250, value=60, step=1, key="day_breakout_ma_period",
+            "Exit MA period (days)", min_value=2, max_value=250, value=20, step=1, key="day_breakout_ma_period",
             disabled=EXIT_MODES[exit_label] != "above_ma",
             help="Hold while the close stays above this average; sell at the first close below it."))
         max_hold = int(st.number_input("Sell after at most this many days (0 = no limit)", min_value=0,
-                                       max_value=120, value=10, step=1, key="day_breakout_max_hold"))
+                                       max_value=250, value=60, step=1, key="day_breakout_max_hold"))
         trend_sma = int(st.number_input("Only when the prior close is above its SMA (0 = off)", min_value=0,
                                         max_value=250, value=0, step=10, key="day_breakout_sma"))
         money_columns = st.columns(2)
