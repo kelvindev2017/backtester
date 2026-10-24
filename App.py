@@ -3007,7 +3007,7 @@ SETUP_OPTIONS = {
 }
 
 
-def strategy_settings():
+def strategy_settings(tab="Backtest"):
     """Ticker, dates, signal rule and risk settings shared by Backtest, Signal Analysis and Validate.
 
     Returns a namespace of the settings, or None (after saying why) when the ticker or dates are not usable.
@@ -3023,14 +3023,16 @@ def strategy_settings():
             format="YYYY-MM-DD",
             key="date_range",
         )
-        account_size = st.number_input(
-            "Account size ($)",
-            min_value=1000.0,
-            value=100000.0,
-            step=5000.0,
-            key="account_size",
-            help="Starting equity for the Backtest tab and the equity used for position sizing.",
-        )
+        account_size = st.session_state.get("account_size", 100000.0)
+        if tab != "Validate":  # Validate reports results in R, so the account size does not change them.
+            account_size = st.number_input(
+                "Account size ($)",
+                min_value=1000.0,
+                value=100000.0,
+                step=5000.0,
+                key="account_size",
+                help="Starting equity for the Backtest tab and the equity used for position sizing.",
+            )
 
     # Moving-average rule defaults (also used for the Backtest chart's MA lines).
     fast_type, fast_period, slow_type, slow_period = "EMA", 20, "SMA", 50
@@ -3113,15 +3115,40 @@ def strategy_settings():
                 "their stop or target."
             )
 
-        allow_short = st.checkbox("Allow short trades (otherwise sell signals mean exit)", value=False, key="allow_short")
+        if setup == "day_breakout":
+            show_day_breakout_concept(breakout_lookback, "top_range", keep_fraction)
 
-    with settings_panel("Risk & sizing", expanded=False):
-        risk_pct = st.number_input("Risk per trade (% of equity)", min_value=0.1, max_value=5.0, value=1.0, step=0.1, key="risk_pct")
-        max_position_pct = st.number_input("Max position (% of equity)", min_value=1.0, max_value=100.0, value=25.0, step=1.0,
-                                           key="max_position_pct")
-        full_size_confidence = st.slider("Full-size confidence threshold", 50, 95, 75, key="full_size_confidence")
-        half_size_confidence = st.slider("Half-size confidence threshold", 40, 90, 60, key="half_size_confidence")
-        opening_range_minutes = st.selectbox("Intraday opening range (minutes)", [15, 30, 60], index=1, key="opening_range_minutes")
+        # The Backtest is long only and the reversal and day-breakout rules have no short side.
+        allow_short = bool(st.session_state.get("allow_short", False))
+        if tab != "Backtest" and setup not in ("reversal", "day_breakout"):
+            allow_short = st.checkbox("Allow short trades (otherwise sell signals mean exit)", value=False,
+                                      key="allow_short")
+        elif setup in ("reversal", "day_breakout"):
+            allow_short = False
+
+    # Sizing and confidence only shape the trade plan (Signal Analysis) and which replayed trades are taken
+    # (Validate); the Backtest holds a full position on every signal. The intraday trigger cannot be replayed.
+    risk_pct = float(st.session_state.get("risk_pct", 1.0))
+    max_position_pct = float(st.session_state.get("max_position_pct", 25.0))
+    full_size_confidence = st.session_state.get("full_size_confidence", 75)
+    half_size_confidence = st.session_state.get("half_size_confidence", 60)
+    opening_range_minutes = st.session_state.get("opening_range_minutes", 30)
+    if tab != "Backtest":
+        with settings_panel("Risk & sizing", expanded=False):
+            if tab == SIGNAL_TAB:
+                risk_pct = st.number_input("Risk per trade (% of equity)", min_value=0.1, max_value=5.0, value=1.0,
+                                           step=0.1, key="risk_pct")
+                max_position_pct = st.number_input("Max position (% of equity)", min_value=1.0, max_value=100.0,
+                                                   value=25.0, step=1.0, key="max_position_pct")
+            full_size_confidence = st.slider("Full-size confidence threshold", 50, 95, 75, key="full_size_confidence",
+                                             help="Confidence = 50 + 50 x the weighted score of signal quality, "
+                                             "trend, volume, intraday, fundamentals and historical edge.")
+            half_size_confidence = st.slider("Half-size confidence threshold", 40, 90, 60, key="half_size_confidence")
+            if tab == SIGNAL_TAB:
+                opening_range_minutes = st.selectbox(
+                    "Intraday opening range (minutes)", [15, 30, 60], index=1, key="opening_range_minutes",
+                    help="On the session after the daily signal, the entry is the first 5-minute close above this "
+                    "opening range, the daily trigger and VWAP.")
 
     ma_rule = {
         "fast_type": fast_type,
@@ -3646,6 +3673,76 @@ def render_backtest(s):
 # Day Breakout Rule tab
 # ============================================================
 
+def day_breakout_concept_figure(lookback=10, exit_mode="top_range", keep_fraction=2 / 3, ma_label="SMA 20"):
+    """Illustration (made-up prices) of the day-breakout entry and the chosen overnight exit."""
+
+    # (open, high, low, close): a base under 104, the breakout day, two strong closes, then a pullback.
+    bars = [(100, 102, 98.5, 101), (101, 103, 99.5, 99.8), (99.8, 101.5, 98, 100.6), (100.6, 104, 100, 103.2),
+            (103.2, 103.6, 100.5, 101.4), (101.4, 102.4, 99.8, 100.2), (100.2, 102.8, 99.6, 102.2),
+            (102.2, 103.4, 101, 101.8), (101.8, 102.6, 100.4, 102.1), (102.1, 103.5, 101.2, 102.9),
+            (103.4, 108, 102.8, 107.6), (107.6, 110.5, 106.8, 110.1), (110.1, 112.4, 109.4, 112.0),
+            (112.0, 113.0, 108.6, 109.4), (109.4, 110.2, 106.5, 107.0), (107.0, 108.0, 104.2, 104.6)]
+    frame = pd.DataFrame(bars, columns=["Open", "High", "Low", "Close"])
+    days = list(range(1, len(frame) + 1))
+    breakout = 10
+    level = frame["High"].iloc[:breakout].max()
+    ma = frame["Close"].rolling(6, min_periods=1).mean()
+    location = (frame["Close"] - frame["Low"]) / (frame["High"] - frame["Low"])
+    if exit_mode == "same_day":
+        exit_index, exit_text = breakout, "Sell at the close<br>(never held overnight)"
+    elif exit_mode == "above_ma":
+        exit_index = next((i for i in range(breakout, len(frame)) if frame["Close"].iloc[i] < ma.iloc[i]), len(frame) - 1)
+        exit_text = f"First close below<br>the {ma_label}: sell"
+    else:
+        exit_index = next((i for i in range(breakout, len(frame)) if location.iloc[i] < keep_fraction), len(frame) - 1)
+        exit_text = f"Close not in the top<br>{(1 - keep_fraction) * 100:.0f}%: sell at the close"
+
+    fig = go.Figure(go.Candlestick(
+        x=days, open=frame["Open"], high=frame["High"], low=frame["Low"], close=frame["Close"], showlegend=False,
+        increasing_line_color="seagreen", decreasing_line_color="indianred", hoverinfo="skip",
+    ))
+    fig.add_shape(type="line", x0=0.5, x1=breakout + 1.5, y0=level, y1=level, line=dict(color="royalblue", dash="dash"))
+    fig.add_annotation(x=3, y=level, text=f"Prior {lookback}-day high", showarrow=False, yshift=9,
+                       font=dict(size=10, color="royalblue"))
+    if exit_mode == "above_ma":
+        fig.add_trace(go.Scatter(x=days, y=ma, mode="lines", line=dict(color="darkorange", width=1.5),
+                                 showlegend=False, hoverinfo="skip"))
+        fig.add_annotation(x=days[2], y=ma.iloc[2], text=ma_label, showarrow=False, yshift=-14,
+                           bgcolor="rgba(255,255,255,0.85)",
+                           font=dict(size=10, color="darkorange"))
+    elif exit_mode == "top_range":
+        # Shade the hold zone of the breakout bar: the top part of its range.
+        high, low = frame["High"].iloc[breakout], frame["Low"].iloc[breakout]
+        fig.add_shape(type="rect", x0=breakout + 0.6, x1=breakout + 1.4, y0=low + keep_fraction * (high - low), y1=high,
+                      fillcolor="seagreen", opacity=0.35, line_width=0)
+    fig.add_annotation(x=breakout + 1, y=level, text="Buy-stop fills<br>at the high", ax=-50, ay=55,
+                       font=dict(size=10, color="#333"), arrowhead=2, bgcolor="rgba(255,255,255,0.85)")
+    hold_text = (f"Close in the top {(1 - keep_fraction) * 100:.0f}%: hold" if exit_mode == "top_range"
+                 else f"Close above the {ma_label}: hold")
+    if exit_index > breakout:
+        fig.add_annotation(x=breakout + 1, y=frame["High"].iloc[breakout], text=hold_text, ax=-45, ay=-28,
+                           font=dict(size=10, color="seagreen"), arrowhead=2,
+                           bgcolor="rgba(255,255,255,0.85)")
+    same_day = exit_index == breakout
+    fig.add_annotation(x=exit_index + 1, y=frame["Close"].iloc[exit_index], text=exit_text,
+                       ax=-50 if same_day else 0, ay=-45 if same_day else 60,
+                       font=dict(size=10, color="indianred"), arrowhead=2,
+                       bgcolor="rgba(255,255,255,0.85)")
+    fig.update_layout(height=290, margin=dict(l=5, r=5, t=30, b=5), xaxis_rangeslider_visible=False,
+                      title=dict(text="How the rule trades (illustration)", font=dict(size=13)),
+                      xaxis=dict(showticklabels=False, showgrid=False),
+                      yaxis=dict(showticklabels=False, showgrid=False, range=[93, 115]),
+                      plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+
+def show_day_breakout_concept(lookback, exit_mode, keep_fraction, ma_label="SMA 20"):
+    """The concept figure under a tab's settings, static so it reads like a picture on a phone."""
+
+    st.plotly_chart(day_breakout_concept_figure(lookback, exit_mode, keep_fraction, ma_label), width="stretch",
+                    config={"displayModeBar": False, "staticPlot": True})
+
+
 DEFAULT_DAY_BREAKOUT_TICKERS = "MU, ASML, TSM, QCOM, GOOG, INTC, SNDK, AAPL, TER, NVDA"
 
 
@@ -3671,18 +3768,22 @@ def render_day_breakout():
         lookback = int(st.number_input("Breakout above the prior N-day high", min_value=1, max_value=250, value=10,
                                        step=1, key="day_breakout_lookback"))
         exit_label = st.selectbox("Overnight rule", list(EXIT_MODES), key="day_breakout_exit")
-        keep_fraction = st.slider(
-            "Hold when the close is at least this far up the day's range", 0.0, 1.0, 2 / 3, 0.05,
-            key="day_breakout_keep", disabled=EXIT_MODES[exit_label] != "top_range",
-            help="0.67 is the top third: (close - low) / (high - low) >= 0.67.",
-        )
-        ma_columns = st.columns(2)
-        exit_ma_type = ma_columns[0].selectbox("Exit MA type", ["SMA", "EMA"], key="day_breakout_ma_type",
-                                               disabled=EXIT_MODES[exit_label] != "above_ma")
-        exit_ma_period = int(ma_columns[1].number_input(
-            "Exit MA period (days)", min_value=2, max_value=250, value=20, step=1, key="day_breakout_ma_period",
-            disabled=EXIT_MODES[exit_label] != "above_ma",
-            help="Hold while the close stays above this average; sell at the first close below it."))
+        exit_mode = EXIT_MODES[exit_label]
+        # Only the chosen overnight rule's own settings are shown; the others keep their last value.
+        keep_fraction = st.session_state.get("day_breakout_keep", 2 / 3)
+        exit_ma_type = st.session_state.get("day_breakout_ma_type", "SMA")
+        exit_ma_period = int(st.session_state.get("day_breakout_ma_period", 20))
+        if exit_mode == "top_range":
+            keep_fraction = st.slider(
+                "Hold when the close is at least this far up the day's range", 0.0, 1.0, 2 / 3, 0.05,
+                key="day_breakout_keep", help="0.67 is the top third: (close - low) / (high - low) >= 0.67.",
+            )
+        elif exit_mode == "above_ma":
+            ma_columns = st.columns(2)
+            exit_ma_type = ma_columns[0].selectbox("Exit MA type", ["SMA", "EMA"], key="day_breakout_ma_type")
+            exit_ma_period = int(ma_columns[1].number_input(
+                "Exit MA period (days)", min_value=2, max_value=250, value=20, step=1, key="day_breakout_ma_period",
+                help="Hold while the close stays above this average; sell at the first close below it."))
         max_hold = int(st.number_input("Sell after at most this many days (0 = no limit)", min_value=0,
                                        max_value=250, value=60, step=1, key="day_breakout_max_hold"))
         trend_sma = int(st.number_input("Only when the prior close is above its SMA (0 = off)", min_value=0,
@@ -3692,6 +3793,7 @@ def render_day_breakout():
                                                             step=1_000.0, key="day_breakout_size"))
         fee = float(money_columns[1].number_input("Fees per round trip ($)", min_value=0.0, value=1.5, step=0.5,
                                                   key="day_breakout_fee"))
+        show_day_breakout_concept(lookback, exit_mode, keep_fraction, f"{exit_ma_type} {exit_ma_period}")
 
     tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
     if not tickers:
@@ -3805,7 +3907,7 @@ if check_password():
             elif label == DAY_BREAKOUT_TAB:
                 render_day_breakout()
             else:
-                strategy = strategy_settings()
+                strategy = strategy_settings(label)
                 if strategy is None:
                     continue
                 if label == "Backtest":
