@@ -266,6 +266,53 @@ def reversal_quality(row, close, direction, lookback=20, slow=200):
     return 0.0, details, float(row["Trigger_Up"])
 
 
+def detect_day_breakouts(df, lookback=10, keep_fraction=2 / 3, volume_period=50, atr_period=14):
+    """Day breakout (from the IBKR trade review, see ``analysis/day_breakout.py``), long only.
+
+    Entry: price trades above the prior ``lookback``-day high, filled at that level or at the open on a gap.
+    The position is carried overnight only when the close is in the top part of the day's range
+    (``keep_fraction``, default the top third), so the signal is a breakout bar that closes there. The
+    signal day's low is the invalidation level. ``Exit_Long`` marks every close below ``keep_fraction``
+    of the range: the rule sells a held position at that close. There is no short signal.
+    """
+
+    close, high, low = df["Close"], df["High"], df["Low"]
+    prior_high = high.shift(1).rolling(lookback, min_periods=lookback).max()
+    bar_range = (high - low).replace(0, np.nan)
+    location = ((close - low) / bar_range).fillna(0.5)
+    traded_above = (high > prior_high).fillna(False)
+    strong = location >= keep_fraction
+
+    result = pd.DataFrame(index=df.index)
+    result["Signal_Up"] = traded_above & strong
+    result["Signal_Down"] = False
+    result["Exit_Long"] = ~strong
+    result["Trigger_Up"] = np.fmax(df["Open"], prior_high)
+    result["Trigger_Down"] = np.nan
+    result["Invalidation_Up"] = low
+    result["Invalidation_Down"] = np.nan
+    result["Prior_High"] = prior_high
+    result["RVOL"] = relative_volume(df["Volume"], volume_period)
+    result["ATR"] = atr(df, atr_period)
+    result["Close_Location"] = location
+    result["Volume_Confirmed"] = True
+    return result
+
+
+def day_breakout_quality(row, close, direction, lookback=10, keep_fraction=2 / 3):
+    """Describe a day-breakout entry. Scored neutrally: the rule takes every qualifying day."""
+
+    details = [
+        f"Traded above the prior {lookback}-day high {row['Prior_High']:,.2f} (fill {row['Trigger_Up']:,.2f}) and "
+        f"closed {row['Close_Location'] * 100:.0f}% of the way up its range (hold needs {keep_fraction * 100:.0f}%).",
+        f"Rule: keep holding only while each close stays in the top {(1 - keep_fraction) * 100:.0f}% of the day's "
+        "range; sell at the first close below it.",
+    ]
+    if np.isfinite(row["RVOL"]):
+        details.append(f"Volume was {row['RVOL']:.1f}x its 50-bar average.")
+    return 0.0, details, float(row["Trigger_Up"])
+
+
 # ============================================================
 # Moving-average rule (the Backtest tab's buy/sell rule)
 # ============================================================
@@ -394,8 +441,9 @@ def detect_signals(
     swing_bars=20,
     pullback_bars=5,
     min_depth_atr=1.5,
+    keep_fraction=2 / 3,
 ):
-    """Dispatch to the detector for ``setup`` ("breakout", "pullback", "reversal" or "ma_rule").
+    """Dispatch to the detector for ``setup`` ("breakout", "pullback", "reversal", "day_breakout" or "ma_rule").
 
     ``lookback`` is the breakout range and the reversal breakdown range;
     ``trend_mid`` / ``trend_slow`` are the trend-filter moving averages of the
@@ -415,6 +463,8 @@ def detect_signals(
             min_depth_atr=min_depth_atr,
             volume_period=volume_period,
         )
+    if setup == "day_breakout":
+        return detect_day_breakouts(df, lookback, keep_fraction=keep_fraction, volume_period=volume_period)
     if setup == "reversal":
         return detect_reversals(df, lookback, mid=trend_mid, slow=trend_slow, volume_period=volume_period)
     return detect_breakouts(df, lookback, volume_period=volume_period, volume_multiple=volume_multiple)

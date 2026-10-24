@@ -1508,7 +1508,7 @@ def render_signal_analysis(ticker, end_date, signal_settings, risk_settings):
     st.info(
         "**Validation note:** replayed on 52 large US stocks over 2016-2026, the breakout, pullback and reversal "
         "setups did not beat random entry days with the same stops and targets, and the confidence score did not "
-        "rank trades better than chance. The moving-average rule was not part of that study. Treat signals as a structured checklist, and use the **Validate** tab on "
+        "rank trades better than chance. The moving-average and day-breakout rules were not part of that study. Treat signals as a structured checklist, and use the **Validate** tab on "
         "your own tickers before acting on them."
     )
     st.caption(
@@ -3003,6 +3003,7 @@ SETUP_OPTIONS = {
     "Breakout (new high/low on volume)": "breakout",
     "Pullback in trend (dip to the EMA, then reversal)": "pullback",
     "Reversal (buy a breakdown in an uptrend)": "reversal",
+    "Day breakout (above the N-day high, hold on a top-third close)": "day_breakout",
 }
 
 
@@ -3038,6 +3039,7 @@ def strategy_settings():
     breakout_lookback, volume_multiple = 20, 1.5
     pullback_ema, trend_mid, trend_slow = 20, 50, 200
     swing_bars, pullback_bars, min_depth_atr = 20, 5, 1.5
+    keep_fraction = 2 / 3
 
     with settings_panel("Signal"):
         setup_label = st.selectbox(
@@ -3074,6 +3076,16 @@ def strategy_settings():
             st.caption(
                 f"Buy: the first close above the prior {breakout_lookback}-bar high on at least {volume_multiple:g}x "
                 f"average volume. Sell / exit: the first close below the prior {breakout_lookback}-bar low."
+            )
+        elif setup == "day_breakout":
+            breakout_lookback = int(st.number_input("Breakout above the prior N-day high", min_value=1, max_value=250,
+                                                    value=10, step=1, key="signal_day_breakout_lookback"))
+            keep_fraction = float(st.slider("Hold when the close is at least this far up the day's range", 0.0, 1.0,
+                                            2 / 3, 0.05, key="signal_day_breakout_keep"))
+            st.caption(
+                f"Buy: price trades above the prior {breakout_lookback}-day high (buy-stop at that level) and closes at "
+                f"least {keep_fraction * 100:.0f}% of the way up the day's range. Sell / exit: the first close below "
+                "that. Long only. The Day Breakout Rule tab runs it on many tickers with fixed $ size."
             )
         elif setup == "pullback":
             trend_columns = st.columns(2)
@@ -3132,6 +3144,7 @@ def strategy_settings():
         swing_bars=swing_bars,
         pullback_bars=pullback_bars,
         min_depth_atr=min_depth_atr,
+        keep_fraction=keep_fraction,
     )
     risk_settings = RiskSettings(
         account_equity=float(account_size),
@@ -3264,7 +3277,8 @@ def render_backtest(s):
             df, setup, breakout_lookback, float(volume_multiple), **signal_settings.detector_kwargs()
         )
         buy_condition = backtest_signals["Signal_Up"].fillna(False).astype(bool)
-        sell_condition = backtest_signals["Signal_Down"].fillna(False).astype(bool)
+        sell_column = "Exit_Long" if "Exit_Long" in backtest_signals else "Signal_Down"
+        sell_condition = backtest_signals[sell_column].fillna(False).astype(bool)
         rule_text = (
             f"**BUY / SELL:** {setup_label} signals on {timeframe.lower()} bars. The position is held until "
             "the opposite signal. Stops and targets are not simulated here; the **Validate** tab replays the "

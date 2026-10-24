@@ -318,3 +318,14 @@ def test_day_breakout_tab(offline):
     next(box for box in app.text_input if box.key == "day_breakout_tickers").input("")
     open_tab(app, "Day Breakout Rule")
     assert any("at least one ticker" in element.value for element in app.info)
+
+
+def test_day_breakout_signal_rule(offline):
+    app = open_tab(start_app(), "Backtest")
+    next(box for box in app.selectbox if box.label == "Signal rule").select(
+        "Day breakout (above the N-day high, hold on a top-third close)")
+    open_tab(app, "Backtest")
+    assert any(box.key == "signal_day_breakout_lookback" for box in app.number_input)
+    assert any("Day breakout" in element.value for element in app.info)
+    open_tab(app, "Signal Analysis & Trade Plan")
+    open_tab(app, "Validate")

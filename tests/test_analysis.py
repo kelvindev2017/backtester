@@ -424,6 +424,31 @@ def test_reversal_detector_buys_breakdown_only_in_uptrend():
     assert report.direction == 1 and report.plan.stop < up["Low"].iloc[-1]
 
 
+def test_day_breakout_signal_needs_a_strong_close_and_marks_weak_closes_as_exits():
+    from analysis.patterns import detect_day_breakouts, detect_signals
+    rng = np.random.default_rng(2)
+    up = make_bars(np.linspace(50, 120, 300) + rng.normal(0, 0.6, 300), seed=5)
+    last = up.index[-1]
+    up.loc[last, ["Open", "High", "Low"]] = [up["High"].iloc[-11:-1].max() - 1, up["High"].iloc[-11:-1].max() + 3,
+                                              up["High"].iloc[-11:-1].max() - 2]
+    up.loc[last, "Close"] = up.loc[last, "High"] - 0.5
+    signals = detect_day_breakouts(up, 10)
+    assert bool(signals["Signal_Up"].iloc[-1]) and not signals["Signal_Down"].any()
+    assert signals["Trigger_Up"].iloc[-1] == pytest.approx(up["High"].iloc[-11:-1].max())
+    assert signals["Invalidation_Up"].iloc[-1] == up["Low"].iloc[-1]
+    assert (signals["Exit_Long"] == (signals["Close_Location"] < 2 / 3)).all()
+    pd.testing.assert_frame_equal(detect_signals(up, "day_breakout", 10, 1.5), signals)
+
+    weak = up.copy()
+    weak.loc[last, "Close"] = weak.loc[last, "Low"] + 0.5
+    assert not detect_day_breakouts(weak, 10)["Signal_Up"].iloc[-1]
+
+    report = analyze("DB", up, to_weekly(up), settings=AnalysisSettings(setup="day_breakout", breakout_lookback=10))
+    assert report.direction == 1 and report.plan.stop < up["Low"].iloc[-1]
+    quiet = analyze("DB", weak, to_weekly(weak), settings=AnalysisSettings(setup="day_breakout", breakout_lookback=10))
+    assert quiet.direction != 1 or "day breakout" in quiet.headline.lower()
+
+
 def test_ma_rule_fires_once_per_cross_and_matches_backtest_rule():
     from analysis.patterns import detect_signals, ma_rule_conditions
 
