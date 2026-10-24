@@ -335,3 +335,34 @@ def test_day_breakout_signal_rule(offline):
     assert any("Day breakout" in element.value for element in app.info)
     open_tab(app, "Signal Analysis & Trade Plan")
     open_tab(app, "Validate")
+
+
+def test_settings_show_only_what_the_tab_and_rule_use(offline):
+    app = open_tab(start_app(), "Backtest")
+    labels = lambda: [w.label for w in list(app.number_input) + list(app.slider) + list(app.selectbox) + list(app.checkbox)]
+    assert "Risk per trade (% of equity)" not in labels()
+    assert "Allow short trades (otherwise sell signals mean exit)" not in labels()
+
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert {"Risk per trade (% of equity)", "Full-size confidence threshold", "Intraday opening range (minutes)",
+            "Allow short trades (otherwise sell signals mean exit)"} <= set(labels())
+
+    open_tab(app, "Validate")
+    assert "Full-size confidence threshold" in labels()
+    assert "Intraday opening range (minutes)" not in labels() and "Account size ($)" not in labels()
+
+    next(box for box in app.selectbox if box.label == "Signal rule").select(
+        "Day breakout (above the N-day high, hold on a top-third close)")
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert "Allow short trades (otherwise sell signals mean exit)" not in labels()
+    assert any("How the rule trades" in chart.proto.spec for chart in app.get("plotly_chart"))
+
+    open_tab(app, "Day Breakout Rule")
+    assert "Exit MA period (days)" not in labels() and any("this far up" in label for label in labels())
+    next(box for box in app.selectbox if box.key == "day_breakout_exit").select(
+        "Hold while the close is above a moving average")
+    open_tab(app, "Day Breakout Rule")
+    assert "Exit MA period (days)" in labels() and not any("this far up" in label for label in labels())
+    next(box for box in app.selectbox if box.key == "day_breakout_exit").select("Always sell at the close")
+    open_tab(app, "Day Breakout Rule")
+    assert "Exit MA period (days)" not in labels() and not any("this far up" in label for label in labels())
