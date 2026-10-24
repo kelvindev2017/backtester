@@ -98,3 +98,17 @@ def test_multi_ticker_summaries():
     assert table.loc["All", "Max drawdown"] <= 0
     assert monthly_pnl(trades).sum() == pytest.approx(closed["P&L"].sum())
     assert ticker_summary(trades)["Trades"].sum() == len(closed)
+
+
+def test_moving_average_exit_holds_until_a_close_below_the_average():
+    rising = [(100 + i, 101 + i, 99 + i, 100 + i) for i in range(10)]
+    frame = bars(rising + [(110, 113, 109.5, 112.5), (112.5, 114, 111, 111.5), (111, 112, 104, 104.5)])
+    settings = DayBreakoutSettings(exit_mode="above_ma", exit_ma_type="SMA", exit_ma_period=5, max_hold=0)
+    trade = day_breakout_trades(frame, settings, "X").iloc[0]
+    # SMA 5 is about 108-109 on the last bars; the close at 104.5 is the first one below it.
+    assert trade["Exit date"] == frame.index[-1] and trade["Exit"] == 104.5
+    ema = DayBreakoutSettings(exit_mode="above_ma", exit_ma_type="EMA", exit_ma_period=5, max_hold=0)
+    assert day_breakout_trades(frame, ema, "X").iloc[0]["Exit date"] == frame.index[-1]
+    # Until the average has enough history, it cannot hold a position.
+    long_ma = DayBreakoutSettings(exit_mode="above_ma", exit_ma_period=60, max_hold=0)
+    assert day_breakout_trades(frame, long_ma, "X").iloc[0]["Days held"] == 0

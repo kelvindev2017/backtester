@@ -315,6 +315,12 @@ def test_day_breakout_tab(offline):
     open_tab(app, "Day Breakout Rule")
     assert app.metric
 
+    next(box for box in app.selectbox if box.key == "day_breakout_exit").select(
+        "Hold while the close is above a moving average")
+    open_tab(app, "Day Breakout Rule")
+    assert next(box for box in app.number_input if box.key == "day_breakout_ma_period").value == 60
+    assert app.metric
+
     next(box for box in app.text_input if box.key == "day_breakout_tickers").input("")
     open_tab(app, "Day Breakout Rule")
     assert any("at least one ticker" in element.value for element in app.info)
