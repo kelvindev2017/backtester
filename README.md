@@ -71,6 +71,12 @@ falling back to Yahoo) and 3) quarterly reported EPS, each with the next two qua
 bars. 4) Trailing P/E with its median and 5) trailing PEG, with captions placing today's values in their own history
 plus Yahoo's forward P/E and a forward PEG. Code in `analysis/valuation_chart.py`.
 
+Below it, **What happened next**: at each check date (every day, week or month) it ranks the trailing P/E against every
+trading day in the prior 3, 5 or 10 years (only EPS reported by then), and measures the total return over the next week
+to 12 months minus SPY's. A scatter shows every check, with those near today's P/E percentile highlighted; a table
+summarises them, counting how many checks do not overlap; and a walkthrough draws the close, trailing EPS, P/E window
+and look-ahead return behind any one dot. Code in `analysis/what_happened_next.py`.
+
 **Semicon Supply Chain** (US-listed companies only): a bottom-up graph of the semiconductor supply chain behind
 an end market: **Mobile devices**, **AI / data center**, **Automotive**, or **All end markets** merged into one graph
 (which shows where the chains meet, e.g. TSM and ASML). Columns run from the end market (and system makers such as
