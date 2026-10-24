@@ -43,6 +43,14 @@ Reports results in R (profit / planned risk) with a t-statistic, results per con
 and whether each score component actually ranks outcomes better than a random score would. Use it to test
 any signal setting across many tickers before trusting it (`analysis/validation.py`).
 
+**Day Breakout Rule**: the rule from the review of the 2026 IBKR trades, run mechanically on a list of tickers.
+Long only: buy the first day a stock trades above its prior N-day high (default 10), filled at that level or at the
+open on a gap up; at each close hold overnight only if the close is in the top third of the day's range (other
+overnight rules: always sell at the close, or hold while above the 9-day EMA), with an optional time limit and SMA
+trend filter. Fixed dollars per trade and flat fees per round trip. Results are split at a date into the period the
+rule was fitted on and the check after it, with equity, monthly P&L, per-ticker results and the trade list
+(`analysis/day_breakout.py`).
+
 The first three tabs cover the market from the top down (`analysis/screener.py`, `analysis/signal_groups.py`,
 `analysis/universe.py`):
 

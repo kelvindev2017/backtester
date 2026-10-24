@@ -96,7 +96,7 @@ def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["Stock Screener", "Market Analysis", "Industry Analysis",
                                                "Stock Fundamentals", "Semicon Supply Chain", "Backtest",
-                                               "Signal Analysis & Trade Plan", "Validate"]
+                                               "Signal Analysis & Trade Plan", "Validate", "Day Breakout Rule"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
     open_tab(app, "Signal Analysis & Trade Plan")
@@ -303,3 +303,18 @@ def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
     assert not app.exception, app.exception
     assert any("only 0 of" in element.value for element in app.warning)
     st.cache_resource.clear()
+
+
+def test_day_breakout_tab(offline):
+    app = open_tab(start_app(), "Day Breakout Rule")
+    assert app.sidebar.header[0].value == "Day Breakout Rule"
+    assert [metric.label for metric in app.metric] == ["Net P&L", "Win rate", "Profit factor", "Max drawdown"]
+    assert any("Cumulative P&L" in chart.proto.spec for chart in app.get("plotly_chart"))
+
+    next(box for box in app.selectbox if box.key == "day_breakout_exit").select("Always sell at the close")
+    open_tab(app, "Day Breakout Rule")
+    assert app.metric
+
+    next(box for box in app.text_input if box.key == "day_breakout_tickers").input("")
+    open_tab(app, "Day Breakout Rule")
+    assert any("at least one ticker" in element.value for element in app.info)
