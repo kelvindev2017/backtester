@@ -85,6 +85,19 @@ from analysis.valuation_chart import (
     trailing_peg,
     yoy_change,
 )
+from analysis.what_happened_next import (
+    CHECK_FREQUENCIES,
+    DEFAULT_BAND,
+    DEFAULT_LOOKBACK_YEARS,
+    LOOK_AHEADS,
+    LOOKBACK_CHOICES,
+    observations,
+    scatter_figure,
+    similar_mask,
+    summary_table,
+    today_text,
+    walkthrough_figure,
+)
 from analysis.universe import (
     MARKETS as SCREENER_MARKETS,
     load_us_index_members,
@@ -1320,6 +1333,26 @@ def next_year_eps_growth(symbol):
     return value if np.isfinite(value) else None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_total_return(symbol, start_date_str, end_date_str):
+    """Daily close adjusted for splits and dividends (a total-return series), or an empty Series."""
+
+    try:
+        data = yf.download(symbol, start=start_date_str,
+                           end=(pd.Timestamp(end_date_str) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                           auto_adjust=True, progress=False, threads=False)
+        close = data["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = pd.to_numeric(close, errors="coerce").dropna().sort_index()
+        close.index = pd.to_datetime(close.index)
+        if getattr(close.index, "tz", None) is not None:
+            close.index = close.index.tz_localize(None)
+        return close.loc[~close.index.duplicated(keep="last")]
+    except Exception:
+        return pd.Series(dtype=float)
+
+
 def load_revenue_estimates(symbol):
     """Analyst revenue estimates from Yahoo, or an empty frame when unavailable."""
 
@@ -2107,6 +2140,7 @@ def index_membership(market, tickers):
 SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
 FUNDAMENTALS_TAB = "Stock Fundamentals"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
+NEXT_BENCHMARK = "SPY"
 TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Backtest", "Signal Analysis & Trade Plan", "Validate"]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
@@ -2604,6 +2638,50 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS):
 
 
 
+def render_what_happened_next(ticker, years, frequency, look_ahead, lookback_years, band):
+    """After past dates with a P/E percentile like today's, how did the stock do against SPY?"""
+
+    st.markdown(f"**What happened next: {ticker} after past dates with a P/E like today's**")
+    today = pd.Timestamp(date.today())
+    start = today - pd.DateOffset(years=years)
+    # The first check needs its full look-back window, plus a year of EPS for the growth figure.
+    load_start = (start - pd.DateOffset(years=lookback_years + 1)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+    with st.spinner("Loading prices and earnings for the look-back..."):
+        valuation, _ = build_valuation_data(load_data(ticker, load_start, end, "Daily"),
+                                            load_earnings_data(ticker, load_start, end))
+        total_return = load_total_return(ticker, load_start, end)
+        benchmark = load_total_return(NEXT_BENCHMARK, load_start, end)
+    obs = observations(valuation, total_return, benchmark, frequency, look_ahead, lookback_years, start=start)
+    if obs.empty or not np.isfinite(obs["percentile"].iloc[-1]):
+        st.caption(f"Not enough trailing P/E history for a {lookback_years}-year comparison of {ticker}.")
+        return
+    st.caption(today_text(obs, lookback_years))
+    table = summary_table(obs, look_ahead, band).rename(columns=lambda c: c.replace("benchmark", NEXT_BENCHMARK))
+    st.dataframe(table, hide_index=True, width="stretch", column_config={
+        column: st.column_config.NumberColumn(format="%+.1f") for column in table.columns if column.endswith(("%", "pts"))
+    } | {f"Beat {NEXT_BENCHMARK} %": st.column_config.NumberColumn(format="%.0f")})
+
+    past = obs.iloc[:-1].dropna(subset=["excess", "percentile"])
+    similar = past[similar_mask(past, obs.iloc[-1], band)]
+    choices = list(reversed(past.index))
+    default = similar.index[-1] if len(similar) else choices[0]
+    example = st.selectbox("Explain the dot from", choices, index=choices.index(default),
+                           format_func=lambda when: f"{when:%d %b %Y}" + (" (similar to today)" if when in similar.index else ""),
+                           key=f"next_example_{ticker}_{frequency}_{look_ahead}_{lookback_years}", help="Defaults to the latest check with a P/E percentile like today's.")
+    show_chart(scatter_figure(obs, ticker, look_ahead, NEXT_BENCHMARK, band, lookback_years, example,
+                              height=420 if MOBILE else None), width="stretch")
+    show_chart(walkthrough_figure(valuation, total_return, benchmark, obs, example, ticker, look_ahead, NEXT_BENCHMARK,
+                                  lookback_years, height=900 if MOBILE else None), width="stretch")
+    st.caption(
+        f"Each dot is one check date. x: the share of trading days in the {lookback_years} years before it with a lower "
+        "trailing P/E, using only EPS reported by then. y: the return with dividends over the next "
+        f"{look_ahead}, minus {NEXT_BENCHMARK}'s, in percentage points. Checks close together share most of their "
+        "look-ahead, so they are not independent; 'Non-overlapping' counts how many do not overlap, a better guide to "
+        "how much evidence there is. Past results describe this stock's history only; they are not a forecast."
+    )
+
+
 def render_stock_fundamentals():
     """Fundamentals of any ticker: growth vs price, revenue, EPS, trailing P/E and PEG."""
 
@@ -2612,6 +2690,14 @@ def render_stock_fundamentals():
                                help="Any Yahoo symbol with quarterly results, e.g. NVDA, TSM, BESIY.").strip().upper()
         years = st.select_slider("History (years)", FUNDAMENTALS_YEARS, value=VALUATION_HISTORY_YEARS,
                                  key="fundamentals_years")
+    with settings_panel("What happened next"):
+        frequency = st.radio("Check every", list(CHECK_FREQUENCIES), index=2, horizontal=True, key="next_frequency",
+                             help="How often a dot is taken. Daily gives more dots, not more independent evidence.")
+        look_ahead = st.select_slider("Look ahead", list(LOOK_AHEADS), value="12 months", key="next_look_ahead",
+                                      help="The return measured after each check.")
+        lookback_years = st.select_slider("Compare P/E with the past (years)", LOOKBACK_CHOICES,
+                                          value=DEFAULT_LOOKBACK_YEARS, key="next_lookback")
+        band = st.slider("Similar to today = P/E percentile within", 5, 25, DEFAULT_BAND, step=5, key="next_band")
     st.caption(
         "Is the price following the business? The top panel compares the year-over-year change in revenue and EPS "
         "with the price's own change; below it are revenue, EPS and the valuation those results imply."
@@ -2622,6 +2708,7 @@ def render_stock_fundamentals():
     name = load_fundamental_snapshot(ticker).get("shortName")
     st.subheader(f"{ticker} · {name}" if name else ticker)
     render_fundamentals(ticker, years)
+    render_what_happened_next(ticker, years, frequency, look_ahead, lookback_years, band)
 
 
 def render_company_detail(chain, ticker, table, prices, index_prices):
