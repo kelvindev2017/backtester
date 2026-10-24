@@ -3654,8 +3654,8 @@ def render_day_breakout():
 
     st.caption(
         "Buys the first day a stock trades above its prior N-day high (filled at that level, or at the open on a gap "
-        "up), then decides at each close: hold overnight only when the close is in the top part of the day's range, "
-        "otherwise sell at the close. Each trade is a fixed dollar amount. This is the rule that turned the review of "
+        "up), then decides at each close: hold overnight only when the close is in the top part of the day's range "
+        "(or, with the moving-average exit, above the chosen SMA/EMA), otherwise sell at the close. Each trade is a fixed dollar amount. This is the rule that turned the review of "
         "your 2026 IBKR trades positive; here it takes every breakout, not only the ones you picked. Results before "
         "the split date are where the rule was fitted, results after it are the check."
     )
@@ -3676,6 +3676,13 @@ def render_day_breakout():
             key="day_breakout_keep", disabled=EXIT_MODES[exit_label] != "top_range",
             help="0.67 is the top third: (close - low) / (high - low) >= 0.67.",
         )
+        ma_columns = st.columns(2)
+        exit_ma_type = ma_columns[0].selectbox("Exit MA type", ["SMA", "EMA"], key="day_breakout_ma_type",
+                                               disabled=EXIT_MODES[exit_label] != "above_ma")
+        exit_ma_period = int(ma_columns[1].number_input(
+            "Exit MA period (days)", min_value=2, max_value=250, value=60, step=1, key="day_breakout_ma_period",
+            disabled=EXIT_MODES[exit_label] != "above_ma",
+            help="Hold while the close stays above this average; sell at the first close below it."))
         max_hold = int(st.number_input("Sell after at most this many days (0 = no limit)", min_value=0,
                                        max_value=120, value=10, step=1, key="day_breakout_max_hold"))
         trend_sma = int(st.number_input("Only when the prior close is above its SMA (0 = off)", min_value=0,
@@ -3692,9 +3699,9 @@ def render_day_breakout():
         return
     settings = DayBreakoutSettings(lookback=lookback, exit_mode=EXIT_MODES[exit_label], keep_fraction=keep_fraction,
                                    max_hold=max_hold, position_size=position_size, fee_per_trade=fee,
-                                   trend_sma=trend_sma)
+                                   trend_sma=trend_sma, exit_ma_type=exit_ma_type, exit_ma_period=exit_ma_period)
     # Enough history before the first trade for the N-day high and the SMA filter.
-    days = (date.today() - start).days + 2 * max(lookback, trend_sma) + 30
+    days = (date.today() - start).days + 2 * max(lookback, trend_sma, exit_ma_period) + 30
     with st.spinner("Loading daily prices..."):
         prices = load_price_panel(tickers, days=days)
     missing = [t for t in tickers if t not in prices]
