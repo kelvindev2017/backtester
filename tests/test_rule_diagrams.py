@@ -25,3 +25,9 @@ def test_labels_follow_the_settings():
 def test_tuned_exits_are_labelled():
     assert "SMA" in texts(breakout_figure(20, 1.5, 150)) and "150-bar SMA" in texts(breakout_figure(20, 1.5, 150))
     assert "after 7 bars" in texts(reversal_figure(20, 50, 200, 7))
+
+
+def test_pullback_shows_every_setting():
+    text = texts(pullback_figure(21, 40, 150, 2.0, 30, 7))
+    for label in ["Fast MA 40", "Slow MA 150", "Pullback EMA 21", "lookback: 30 bars", "last 7 bars", "2 ATR"]:
+        assert label in text, label

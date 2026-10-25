@@ -231,8 +231,8 @@ def correlation_text(correlations):
 
 
 def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
-                      price_change=None, growth=None, height=None):
-    """Growth vs price, revenue, EPS, trailing P/E and PEG panels, top to bottom, sharing one date axis.
+                      price_change=None, growth=None, close=None, log_price=False, height=None):
+    """Growth vs price, revenue, EPS, daily price, trailing P/E and PEG panels, top to bottom, on one date axis.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -248,7 +248,7 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     growth = {name: series.loc[series.index >= price_change.index.min()] if not price_change.empty else series
               for name, series in growth.items()}
 
-    # Panels top to bottom: growth vs price, revenue, EPS, trailing P/E, PEG. Optional ones drop out.
+    # Panels top to bottom: growth vs price, revenue, EPS, price, trailing P/E, PEG. Optional ones drop out.
     # Titles stay short enough for a phone; the page caption defines each one.
     panels = {}
     if not price_change.empty:
@@ -258,6 +258,10 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     panels["revenue"] = ("Revenue by quarter, billions", 0.3)
     if not eps.empty:
         panels["eps"] = ("EPS by quarter (adjusted)", 0.22)
+    close = close.dropna() if close is not None else pd.Series(dtype=float)
+    if not close.empty:
+        # Right above P/E and PEG: price = P/E x TTM EPS, so a price move reads as a re-rating or an earnings move.
+        panels["price"] = ("Daily close (split-adjusted)", 0.26)
     panels["pe"] = ("Trailing P/E", 0.3)
     if not peg.empty:
         panels["peg"] = ("Trailing PEG" + (f" (capped at {PEG_AXIS_CAP})" if peg.max() > PEG_AXIS_CAP else ""), 0.22)
@@ -267,6 +271,11 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.05,
                         row_heights=[h / sum(heights) for h in heights],
                         subplot_titles=[title for title, _ in panels.values()])
+    if not close.empty:
+        fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close", line=dict(color=PRICE_COLOR, width=1.5),
+                                 hovertemplate="%{x|%Y-%m-%d}: %{y:,.2f}<extra></extra>"), row=row["price"], col=1)
+        fig.update_yaxes(tickformat=",.0f", type="log" if log_price else "linear", row=row["price"], col=1)
+
     pe = trailing_pe.dropna() if trailing_pe is not None else pd.Series(dtype=float)
     if not pe.empty:
         fig.add_trace(go.Scatter(x=pe.index, y=pe, mode="lines", name="Trailing P/E",
@@ -341,6 +350,6 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
 
     fig.update_yaxes(ticksuffix="x", rangemode="tozero", row=row["pe"], col=1)
     fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=row["revenue"], col=1)
-    fig.update_layout(height=height or {2: 480, 3: 620, 4: 760}.get(rows, 940), margin=dict(l=10, r=10, t=60, b=10),
+    fig.update_layout(height=height or {2: 480, 3: 620, 4: 760, 5: 940}.get(rows, 1100), margin=dict(l=10, r=10, t=60, b=10),
                       bargap=0.15, legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0))
     return fig

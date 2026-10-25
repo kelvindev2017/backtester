@@ -1,5 +1,6 @@
 """Run App.py headlessly with Yahoo Finance and SEC calls replaced by synthetic data."""
 
+import json
 import urllib.request
 from pathlib import Path
 
@@ -259,11 +260,13 @@ def test_stock_fundamentals_tab(offline, monkeypatch):
     app = open_tab(start_app(), "Stock Fundamentals")
     assert app.sidebar.header[0].value == "Stock Fundamentals"
     assert app.subheader[0].value == "NVDA"
-    assert any("Price YoY" in chart.proto.spec and "Trailing P" in chart.proto.spec for chart in app.get("plotly_chart"))
+    assert any("Price YoY" in chart.proto.spec and "Daily close" in chart.proto.spec and "Trailing P" in chart.proto.spec
+               for chart in app.get("plotly_chart"))
 
     # Any ticker and history length.
     next(box for box in app.text_input if box.key == "fundamentals_ticker").input(" msft ")
     next(slider for slider in app.select_slider if slider.key == "fundamentals_years").set_value(3)
+    next(box for box in app.checkbox if box.key == "fundamentals_log_price").check()
     open_tab(app, "Stock Fundamentals")
     assert app.subheader[0].value == "MSFT"
     assert any("last 3 years" in element.value for element in app.markdown)
@@ -281,6 +284,26 @@ def test_mobile_layout_has_no_sidebar(offline):
     assert len(app.sidebar.children) == 0
     expanders = [element.label for element in app.get("expander")]
     assert any("Conditions" in label for label in expanders)
+
+
+def test_mobile_charts_let_a_swipe_scroll_the_page(offline):
+    app = start_app()
+    app.session_state["layout_mode"] = "Mobile"
+    app = open_tab(app, "Industry Analysis")
+    spec = json.loads(app.get("plotly_chart")[0].proto.spec)
+    assert spec["layout"]["dragmode"] is False and spec["layout"]["xaxis"]["fixedrange"] is True
+
+    # Display setting: swipes zoom and pan the chart again.
+    next(radio for radio in app.radio if radio.key == "chart_touch").set_value("Zoom and pan the chart")
+    app = open_tab(app, "Industry Analysis")
+    spec = json.loads(app.get("plotly_chart")[0].proto.spec)
+    assert "dragmode" not in spec["layout"] and not spec["layout"].get("xaxis", {}).get("fixedrange")
+
+    # Desktop is unchanged.
+    app.session_state["layout_mode"] = "Desktop"
+    next(radio for radio in app.radio if radio.key == "chart_touch").set_value("Scroll the page")
+    app = open_tab(app, "Industry Analysis")
+    assert "dragmode" not in json.loads(app.get("plotly_chart")[0].proto.spec)["layout"]
 
 
 def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
@@ -386,3 +409,24 @@ def test_settings_show_only_what_the_tab_and_rule_use(offline):
     next(box for box in app.selectbox if box.key == "day_breakout_exit").select("Always sell at the close")
     open_tab(app, "Day Breakout Rule")
     assert "Exit MA period (days)" not in labels() and not any("far below the day's high" in label for label in labels())
+
+
+def test_sliders_have_a_number_box_in_sync(offline):
+    app = open_tab(start_app(), "Day Breakout Rule")
+    slider = lambda: next(widget for widget in app.slider if widget.key == "day_breakout_exit_pct")
+    box = lambda: next(widget for widget in app.number_input if widget.key == "day_breakout_exit_pct_input")
+    assert slider().value == box().value == 33
+
+    box().set_value(40)
+    open_tab(app, "Day Breakout Rule")
+    assert slider().value == 40 and not app.exception
+
+    slider().set_value(20)
+    open_tab(app, "Day Breakout Rule")
+    assert box().value == 20
+
+    open_tab(app, "Signal Analysis & Trade Plan")
+    full = next(widget for widget in app.number_input if widget.key == "full_size_confidence_input")
+    full.set_value(80)
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert next(widget for widget in app.slider if widget.key == "full_size_confidence").value == 80
