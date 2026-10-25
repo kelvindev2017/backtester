@@ -96,7 +96,7 @@ def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["Stock Screener", "Market Analysis", "Industry Analysis",
                                                "Stock Fundamentals", "Semicon Supply Chain", "Backtest",
-                                               "Signal Analysis & Trade Plan", "Validate"]
+                                               "Signal Analysis & Trade Plan", "Validate", "Day Breakout Rule"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
     open_tab(app, "Signal Analysis & Trade Plan")
@@ -318,3 +318,71 @@ def test_what_happened_next_settings(offline, monkeypatch):
         open_tab(app, "Stock Fundamentals")
         assert not app.exception, app.exception
         assert any(f"in the {look_ahead} after each check" in chart.proto.spec for chart in app.get("plotly_chart"))
+
+
+def test_day_breakout_tab(offline):
+    app = open_tab(start_app(), "Day Breakout Rule")
+    assert app.sidebar.header[0].value == "Day Breakout Rule"
+    assert [metric.label for metric in app.metric] == ["Net P&L", "Win rate", "Profit factor", "Max drawdown"]
+    assert any("Cumulative P&L" in chart.proto.spec for chart in app.get("plotly_chart"))
+
+    next(box for box in app.selectbox if box.key == "day_breakout_exit").select("Always sell at the close")
+    open_tab(app, "Day Breakout Rule")
+    assert app.metric
+
+    next(box for box in app.selectbox if box.key == "day_breakout_exit").select(
+        "Hold while the close is above a moving average")
+    open_tab(app, "Day Breakout Rule")
+    assert next(box for box in app.number_input if box.key == "day_breakout_ma_period").value == 20
+    assert app.metric
+
+    next(box for box in app.text_input if box.key == "day_breakout_tickers").input("")
+    open_tab(app, "Day Breakout Rule")
+    assert any("at least one ticker" in element.value for element in app.info)
+
+
+def test_day_breakout_signal_rule(offline):
+    app = open_tab(start_app(), "Backtest")
+    next(box for box in app.selectbox if box.label == "Signal rule").select(
+        "Day breakout (above the N-day high, hold on a top-third close)")
+    open_tab(app, "Backtest")
+    assert any(box.key == "signal_day_breakout_lookback" for box in app.number_input)
+    assert any("Day breakout" in element.value for element in app.info)
+    open_tab(app, "Signal Analysis & Trade Plan")
+    open_tab(app, "Validate")
+
+
+def test_settings_show_only_what_the_tab_and_rule_use(offline):
+    app = open_tab(start_app(), "Backtest")
+    labels = lambda: [w.label for w in list(app.number_input) + list(app.slider) + list(app.selectbox) + list(app.checkbox)]
+    assert "Risk per trade (% of equity)" not in labels()
+    assert "Allow short trades (otherwise sell signals mean exit)" not in labels()
+
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert {"Risk per trade (% of equity)", "Full-size confidence threshold", "Intraday opening range (minutes)",
+            "Allow short trades (otherwise sell signals mean exit)"} <= set(labels())
+
+    open_tab(app, "Validate")
+    assert "Full-size confidence threshold" in labels()
+    assert "Intraday opening range (minutes)" not in labels() and "Account size ($)" not in labels()
+
+    next(box for box in app.selectbox if box.label == "Signal rule").select(
+        "Day breakout (above the N-day high, hold on a top-third close)")
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert "Allow short trades (otherwise sell signals mean exit)" not in labels()
+    assert any("How the rule trades" in chart.proto.spec for chart in app.get("plotly_chart"))
+    for rule in ["Moving-average rule", "Breakout (new high/low on volume)",
+                 "Pullback in trend (dip to the EMA, then reversal)", "Reversal (buy a breakdown in an uptrend)"]:
+        next(box for box in app.selectbox if box.label == "Signal rule").select(rule)
+        open_tab(app, "Signal Analysis & Trade Plan")
+        assert any("How the rule trades" in chart.proto.spec for chart in app.get("plotly_chart")), rule
+
+    open_tab(app, "Day Breakout Rule")
+    assert "Exit MA period (days)" not in labels() and any("far below the day's high" in label for label in labels())
+    next(box for box in app.selectbox if box.key == "day_breakout_exit").select(
+        "Hold while the close is above a moving average")
+    open_tab(app, "Day Breakout Rule")
+    assert "Exit MA period (days)" in labels() and not any("far below the day's high" in label for label in labels())
+    next(box for box in app.selectbox if box.key == "day_breakout_exit").select("Always sell at the close")
+    open_tab(app, "Day Breakout Rule")
+    assert "Exit MA period (days)" not in labels() and not any("far below the day's high" in label for label in labels())

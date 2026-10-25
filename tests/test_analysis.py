@@ -424,6 +424,31 @@ def test_reversal_detector_buys_breakdown_only_in_uptrend():
     assert report.direction == 1 and report.plan.stop < up["Low"].iloc[-1]
 
 
+def test_day_breakout_signal_needs_a_strong_close_and_marks_weak_closes_as_exits():
+    from analysis.patterns import detect_day_breakouts, detect_signals
+    rng = np.random.default_rng(2)
+    up = make_bars(np.linspace(50, 120, 300) + rng.normal(0, 0.6, 300), seed=5)
+    last = up.index[-1]
+    up.loc[last, ["Open", "High", "Low"]] = [up["High"].iloc[-11:-1].max() - 1, up["High"].iloc[-11:-1].max() + 3,
+                                              up["High"].iloc[-11:-1].max() - 2]
+    up.loc[last, "Close"] = up.loc[last, "High"] - 0.5
+    signals = detect_day_breakouts(up, 10)
+    assert bool(signals["Signal_Up"].iloc[-1]) and not signals["Signal_Down"].any()
+    assert signals["Trigger_Up"].iloc[-1] == pytest.approx(up["High"].iloc[-11:-1].max())
+    assert signals["Invalidation_Up"].iloc[-1] == up["Low"].iloc[-1]
+    assert (signals["Exit_Long"] == (signals["Close_Location"] < 2 / 3)).all()
+    pd.testing.assert_frame_equal(detect_signals(up, "day_breakout", 10, 1.5), signals)
+
+    weak = up.copy()
+    weak.loc[last, "Close"] = weak.loc[last, "Low"] + 0.5
+    assert not detect_day_breakouts(weak, 10)["Signal_Up"].iloc[-1]
+
+    report = analyze("DB", up, to_weekly(up), settings=AnalysisSettings(setup="day_breakout", breakout_lookback=10))
+    assert report.direction == 1 and report.plan.stop < up["Low"].iloc[-1]
+    quiet = analyze("DB", weak, to_weekly(weak), settings=AnalysisSettings(setup="day_breakout", breakout_lookback=10))
+    assert quiet.direction != 1 or "day breakout" in quiet.headline.lower()
+
+
 def test_ma_rule_fires_once_per_cross_and_matches_backtest_rule():
     from analysis.patterns import detect_signals, ma_rule_conditions
 
@@ -493,3 +518,31 @@ def test_no_signal_headlines_use_chosen_periods(breakout_daily):
         setup="reversal", breakout_lookback=9, trend_mid=40, trend_slow=150))
     if report.action == "NO SIGNAL":
         assert "9-bar low" in report.headline and "150-bar MA" in report.headline
+
+
+def test_breakout_and_reversal_exits():
+    import numpy as np
+    import pandas as pd
+    from analysis.patterns import detect_signals
+
+    dates = pd.bdate_range("2020-01-01", periods=310)
+    close = pd.Series(np.r_[np.linspace(100, 150, 250), np.linspace(150, 120, 60)], index=dates)
+    df = pd.DataFrame({"Open": close, "High": close + 1, "Low": close - 1, "Close": close, "Volume": 1e6})
+    breakout = detect_signals(df, "breakout", 20, 1.5, exit_ma=50)
+    assert breakout["Exit_Long"].iloc[-1] and not breakout["Exit_Long"].iloc[200]
+    reversal = detect_signals(df, "reversal", 20, 1.5)
+    bounce = pd.Series([100, 98, 97, 99.5], index=dates[:4])
+    bars = pd.DataFrame({"Open": bounce, "High": bounce + 1, "Low": bounce - 1, "Close": bounce, "Volume": 1e6})
+    assert detect_signals(bars, "reversal", 2, 1.5)["Exit_Long"].tolist() == [False, False, False, True]
+    assert not reversal["Exit_Long"].iloc[-1]
+
+
+def test_position_engine_max_hold():
+    import pandas as pd
+    from App import run_position_engine
+
+    df = pd.DataFrame({"Close": range(1, 11)}, index=pd.bdate_range("2021-01-01", periods=10))
+    buy = pd.Series([True] + [False] * 9, index=df.index)
+    sell = pd.Series(False, index=df.index)
+    result = run_position_engine(df, buy, sell, max_hold=3)
+    assert list(result["Raw_Position"])[:5] == [1, 1, 1, 0, 0]

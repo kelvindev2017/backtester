@@ -27,6 +27,7 @@ from analysis.patterns import (
     assess_trend,
     assess_volume,
     breakout_quality,
+    day_breakout_quality,
     detect_breakouts,
     detect_signals,
     historical_edge_score,
@@ -63,6 +64,8 @@ class AnalysisSettings:
     swing_bars: int = 20
     pullback_bars: int = 5
     min_depth_atr: float = 1.5
+    keep_fraction: float = 2 / 3
+    exit_ma: int = 200
 
     def detector_kwargs(self):
         """Keyword arguments for ``detect_signals`` beyond setup, lookback and volume multiple."""
@@ -75,6 +78,8 @@ class AnalysisSettings:
             "swing_bars": self.swing_bars,
             "pullback_bars": self.pullback_bars,
             "min_depth_atr": self.min_depth_atr,
+            "keep_fraction": self.keep_fraction,
+            "exit_ma": self.exit_ma,
         }
 
 
@@ -106,6 +111,7 @@ SETUP_NAMES = {
     "breakout": ("breakout above", "breakdown below"),
     "pullback": ("pullback entry above", "bounce-failure entry below"),
     "reversal": ("reversal buy after breakdown at", "-"),
+    "day_breakout": ("day breakout above", "-"),
     "ma_rule": ("MA rule buy at", "MA rule sell at"),
 }
 
@@ -185,6 +191,12 @@ def analyze(
                 f"(close above the {settings.trend_slow}-bar MA, {settings.trend_mid}-bar MA above it) and a daily close below the prior "
                 f"{settings.breakout_lookback}-bar low (currently {last['Prior_Low']:,.2f})."
             )
+        elif settings.setup == "day_breakout":
+            report.headline = (
+                f"No day breakout in the last {settings.signal_window} bars. A BUY needs price to trade above the prior "
+                f"{settings.breakout_lookback}-day high (currently {last['Prior_High']:,.2f}) and close in the top "
+                f"{(1 - settings.keep_fraction) * 100:.0f}% of the day's range; otherwise the rule sells at the close."
+            )
         elif settings.setup == "pullback":
             report.headline = (
                 f"No pullback entry in the last {settings.signal_window} bars. A BUY needs an uptrend ({settings.trend_mid}-bar "
@@ -235,6 +247,15 @@ def analyze(
             f"a short-term reversal buy, invalidated below {signal['invalidation']:,.2f}."
         )
         quality_metrics = {"Drop over 5 bars (ATR)": float(signal_row["Drop_ATR"]), "RVOL": float(signal_row["RVOL"])}
+    elif settings.setup == "day_breakout":
+        quality, quality_details, trigger = day_breakout_quality(
+            signal_row, signal_close, direction, settings.breakout_lookback, settings.keep_fraction
+        )
+        signal_text = (
+            f"Day breakout on {signal['date']:%Y-%m-%d} ({signal['bars_ago']} bar(s) ago) with a top-of-range close, "
+            f"invalidated below the day's low {signal['invalidation']:,.2f}."
+        )
+        quality_metrics = {"Close location": float(signal_row["Close_Location"]), "RVOL": float(signal_row["RVOL"])}
     elif settings.setup == "pullback":
         quality, quality_details, trigger = pullback_quality(signal_row, signal_close, direction)
         signal_text = (
@@ -354,7 +375,7 @@ def analyze(
         entry = float(daily["Close"].iloc[-1])
         entry_basis = "last daily close (indicative - final entry comes from the intraday trigger)"
 
-    if settings.setup in ("pullback", "reversal", "ma_rule"):
+    if settings.setup in ("pullback", "reversal", "day_breakout", "ma_rule"):
         # The pullback / signal-bar extreme is the level that invalidates the setup.
         invalidation = signal["invalidation"]
         broken_level = PriceZone(
