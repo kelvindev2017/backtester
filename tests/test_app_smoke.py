@@ -356,13 +356,18 @@ def test_settings_show_only_what_the_tab_and_rule_use(offline):
     open_tab(app, "Signal Analysis & Trade Plan")
     assert "Allow short trades (otherwise sell signals mean exit)" not in labels()
     assert any("How the rule trades" in chart.proto.spec for chart in app.get("plotly_chart"))
+    for rule in ["Moving-average rule", "Breakout (new high/low on volume)",
+                 "Pullback in trend (dip to the EMA, then reversal)", "Reversal (buy a breakdown in an uptrend)"]:
+        next(box for box in app.selectbox if box.label == "Signal rule").select(rule)
+        open_tab(app, "Signal Analysis & Trade Plan")
+        assert any("How the rule trades" in chart.proto.spec for chart in app.get("plotly_chart")), rule
 
     open_tab(app, "Day Breakout Rule")
-    assert "Exit MA period (days)" not in labels() and any("this far up" in label for label in labels())
+    assert "Exit MA period (days)" not in labels() and any("far below the day's high" in label for label in labels())
     next(box for box in app.selectbox if box.key == "day_breakout_exit").select(
         "Hold while the close is above a moving average")
     open_tab(app, "Day Breakout Rule")
-    assert "Exit MA period (days)" in labels() and not any("this far up" in label for label in labels())
+    assert "Exit MA period (days)" in labels() and not any("far below the day's high" in label for label in labels())
     next(box for box in app.selectbox if box.key == "day_breakout_exit").select("Always sell at the close")
     open_tab(app, "Day Breakout Rule")
-    assert "Exit MA period (days)" not in labels() and not any("this far up" in label for label in labels())
+    assert "Exit MA period (days)" not in labels() and not any("far below the day's high" in label for label in labels())

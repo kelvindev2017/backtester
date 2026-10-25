@@ -30,12 +30,20 @@ from analysis.notify import send_webhook, short_summary
 from analysis.patterns import (
     MA_RULE_OPERATORS,
     MA_RULE_SERIES,
+    describe_ma_rule,
     detect_signals,
     ma_rule_conditions,
     moving_average,
     rule_condition,
 )
 from analysis.risk import RiskSettings
+from analysis.rule_diagrams import (
+    breakout_figure,
+    day_breakout_figure,
+    ma_rule_figure,
+    pullback_figure,
+    reversal_figure,
+)
 from analysis.screener import (
     LINE_KINDS as SCREEN_LINE_KINDS,
     OPERATORS as SCREEN_OPERATORS,
@@ -3082,12 +3090,11 @@ def strategy_settings(tab="Backtest"):
         elif setup == "day_breakout":
             breakout_lookback = int(st.number_input("Breakout above the prior N-day high", min_value=1, max_value=250,
                                                     value=10, step=1, key="signal_day_breakout_lookback"))
-            keep_fraction = float(st.slider("Hold when the close is at least this far up the day's range", 0.0, 1.0,
-                                            2 / 3, 0.05, key="signal_day_breakout_keep"))
+            keep_fraction = exit_pct_slider("signal_day_breakout_exit_pct")
             st.caption(
-                f"Buy: price trades above the prior {breakout_lookback}-day high (buy-stop at that level) and closes at "
-                f"least {keep_fraction * 100:.0f}% of the way up the day's range. Sell / exit: the first close below "
-                "that. Long only. The Day Breakout Rule tab runs it on many tickers with fixed $ size."
+                f"Buy: price trades above the prior {breakout_lookback}-day high (buy-stop at that level) and closes "
+                f"within {(1 - keep_fraction) * 100:.0f}% of the day's range from its high. Sell / exit: the first close "
+                "further below the high than that. Long only. The Day Breakout Rule tab runs it on many tickers with fixed $ size."
             )
         elif setup == "pullback":
             trend_columns = st.columns(2)
@@ -3115,8 +3122,21 @@ def strategy_settings(tab="Backtest"):
                 "their stop or target."
             )
 
-        if setup == "day_breakout":
-            show_day_breakout_concept(breakout_lookback, "top_range", keep_fraction)
+        if setup == "ma_rule":
+            preview = {"fast_type": fast_type, "fast_period": fast_period, "slow_type": slow_type,
+                       "slow_period": slow_period, "buy": (buy_left, buy_operator, buy_right),
+                       "sell": (sell_left, sell_operator, sell_right)}
+            diagram = ma_rule_figure(f"{fast_type} {fast_period}", f"{slow_type} {slow_period}",
+                                     describe_ma_rule(preview, "buy"), describe_ma_rule(preview, "sell"))
+        elif setup == "breakout":
+            diagram = breakout_figure(breakout_lookback, volume_multiple)
+        elif setup == "pullback":
+            diagram = pullback_figure(pullback_ema, trend_mid, trend_slow, min_depth_atr)
+        elif setup == "reversal":
+            diagram = reversal_figure(breakout_lookback, trend_mid, trend_slow)
+        else:
+            diagram = day_breakout_figure(breakout_lookback, "top_range", keep_fraction)
+        show_rule_diagram(diagram)
 
         # The Backtest is long only and the reversal and day-breakout rules have no short side.
         allow_short = bool(st.session_state.get("allow_short", False))
@@ -3673,74 +3693,22 @@ def render_backtest(s):
 # Day Breakout Rule tab
 # ============================================================
 
-def day_breakout_concept_figure(lookback=10, exit_mode="top_range", keep_fraction=2 / 3, ma_label="SMA 20"):
-    """Illustration (made-up prices) of the day-breakout entry and the chosen overnight exit."""
+def show_rule_diagram(fig):
+    """A rule's illustration under its settings, static so it reads like a picture on a phone."""
 
-    # (open, high, low, close): a base under 104, the breakout day, two strong closes, then a pullback.
-    bars = [(100, 102, 98.5, 101), (101, 103, 99.5, 99.8), (99.8, 101.5, 98, 100.6), (100.6, 104, 100, 103.2),
-            (103.2, 103.6, 100.5, 101.4), (101.4, 102.4, 99.8, 100.2), (100.2, 102.8, 99.6, 102.2),
-            (102.2, 103.4, 101, 101.8), (101.8, 102.6, 100.4, 102.1), (102.1, 103.5, 101.2, 102.9),
-            (103.4, 108, 102.8, 107.6), (107.6, 110.5, 106.8, 110.1), (110.1, 112.4, 109.4, 112.0),
-            (112.0, 113.0, 108.6, 109.4), (109.4, 110.2, 106.5, 107.0), (107.0, 108.0, 104.2, 104.6)]
-    frame = pd.DataFrame(bars, columns=["Open", "High", "Low", "Close"])
-    days = list(range(1, len(frame) + 1))
-    breakout = 10
-    level = frame["High"].iloc[:breakout].max()
-    ma = frame["Close"].rolling(6, min_periods=1).mean()
-    location = (frame["Close"] - frame["Low"]) / (frame["High"] - frame["Low"])
-    if exit_mode == "same_day":
-        exit_index, exit_text = breakout, "Sell at the close<br>(never held overnight)"
-    elif exit_mode == "above_ma":
-        exit_index = next((i for i in range(breakout, len(frame)) if frame["Close"].iloc[i] < ma.iloc[i]), len(frame) - 1)
-        exit_text = f"First close below<br>the {ma_label}: sell"
-    else:
-        exit_index = next((i for i in range(breakout, len(frame)) if location.iloc[i] < keep_fraction), len(frame) - 1)
-        exit_text = f"Close not in the top<br>{(1 - keep_fraction) * 100:.0f}%: sell at the close"
-
-    fig = go.Figure(go.Candlestick(
-        x=days, open=frame["Open"], high=frame["High"], low=frame["Low"], close=frame["Close"], showlegend=False,
-        increasing_line_color="seagreen", decreasing_line_color="indianred", hoverinfo="skip",
-    ))
-    fig.add_shape(type="line", x0=0.5, x1=breakout + 1.5, y0=level, y1=level, line=dict(color="royalblue", dash="dash"))
-    fig.add_annotation(x=3, y=level, text=f"Prior {lookback}-day high", showarrow=False, yshift=9,
-                       font=dict(size=10, color="royalblue"))
-    if exit_mode == "above_ma":
-        fig.add_trace(go.Scatter(x=days, y=ma, mode="lines", line=dict(color="darkorange", width=1.5),
-                                 showlegend=False, hoverinfo="skip"))
-        fig.add_annotation(x=days[2], y=ma.iloc[2], text=ma_label, showarrow=False, yshift=-14,
-                           bgcolor="rgba(255,255,255,0.85)",
-                           font=dict(size=10, color="darkorange"))
-    elif exit_mode == "top_range":
-        # Shade the hold zone of the breakout bar: the top part of its range.
-        high, low = frame["High"].iloc[breakout], frame["Low"].iloc[breakout]
-        fig.add_shape(type="rect", x0=breakout + 0.6, x1=breakout + 1.4, y0=low + keep_fraction * (high - low), y1=high,
-                      fillcolor="seagreen", opacity=0.35, line_width=0)
-    fig.add_annotation(x=breakout + 1, y=level, text="Buy-stop fills<br>at the high", ax=-50, ay=55,
-                       font=dict(size=10, color="#333"), arrowhead=2, bgcolor="rgba(255,255,255,0.85)")
-    hold_text = (f"Close in the top {(1 - keep_fraction) * 100:.0f}%: hold" if exit_mode == "top_range"
-                 else f"Close above the {ma_label}: hold")
-    if exit_index > breakout:
-        fig.add_annotation(x=breakout + 1, y=frame["High"].iloc[breakout], text=hold_text, ax=-45, ay=-28,
-                           font=dict(size=10, color="seagreen"), arrowhead=2,
-                           bgcolor="rgba(255,255,255,0.85)")
-    same_day = exit_index == breakout
-    fig.add_annotation(x=exit_index + 1, y=frame["Close"].iloc[exit_index], text=exit_text,
-                       ax=-50 if same_day else 0, ay=-45 if same_day else 60,
-                       font=dict(size=10, color="indianred"), arrowhead=2,
-                       bgcolor="rgba(255,255,255,0.85)")
-    fig.update_layout(height=290, margin=dict(l=5, r=5, t=30, b=5), xaxis_rangeslider_visible=False,
-                      title=dict(text="How the rule trades (illustration)", font=dict(size=13)),
-                      xaxis=dict(showticklabels=False, showgrid=False),
-                      yaxis=dict(showticklabels=False, showgrid=False, range=[93, 115]),
-                      plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-    return fig
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False, "staticPlot": True})
 
 
-def show_day_breakout_concept(lookback, exit_mode, keep_fraction, ma_label="SMA 20"):
-    """The concept figure under a tab's settings, static so it reads like a picture on a phone."""
+def exit_pct_slider(key):
+    """The day-breakout exit as the user reads it: sell when the close is more than X% of the range below the high.
 
-    st.plotly_chart(day_breakout_concept_figure(lookback, exit_mode, keep_fraction, ma_label), width="stretch",
-                    config={"displayModeBar": False, "staticPlot": True})
+    Returns the hold threshold the rule uses, (close - low) / (high - low) >= 1 - X/100.
+    """
+
+    exit_pct = st.slider("Exit when the close is more than this far below the day's high (% of the day's range)",
+                         0, 100, 33, 1, key=key, format="%d%%",
+                         help="33% is the top third: a close in the top third of the day's range is held overnight.")
+    return 1 - exit_pct / 100
 
 
 DEFAULT_DAY_BREAKOUT_TICKERS = "MU, ASML, TSM, QCOM, GOOG, INTC, SNDK, AAPL, TER, NVDA"
@@ -3770,14 +3738,11 @@ def render_day_breakout():
         exit_label = st.selectbox("Overnight rule", list(EXIT_MODES), key="day_breakout_exit")
         exit_mode = EXIT_MODES[exit_label]
         # Only the chosen overnight rule's own settings are shown; the others keep their last value.
-        keep_fraction = st.session_state.get("day_breakout_keep", 2 / 3)
+        keep_fraction = 1 - st.session_state.get("day_breakout_exit_pct", 33) / 100
         exit_ma_type = st.session_state.get("day_breakout_ma_type", "SMA")
         exit_ma_period = int(st.session_state.get("day_breakout_ma_period", 20))
         if exit_mode == "top_range":
-            keep_fraction = st.slider(
-                "Hold when the close is at least this far up the day's range", 0.0, 1.0, 2 / 3, 0.05,
-                key="day_breakout_keep", help="0.67 is the top third: (close - low) / (high - low) >= 0.67.",
-            )
+            keep_fraction = exit_pct_slider("day_breakout_exit_pct")
         elif exit_mode == "above_ma":
             ma_columns = st.columns(2)
             exit_ma_type = ma_columns[0].selectbox("Exit MA type", ["SMA", "EMA"], key="day_breakout_ma_type")
@@ -3793,7 +3758,7 @@ def render_day_breakout():
                                                             step=1_000.0, key="day_breakout_size"))
         fee = float(money_columns[1].number_input("Fees per round trip ($)", min_value=0.0, value=1.5, step=0.5,
                                                   key="day_breakout_fee"))
-        show_day_breakout_concept(lookback, exit_mode, keep_fraction, f"{exit_ma_type} {exit_ma_period}")
+        show_rule_diagram(day_breakout_figure(lookback, exit_mode, keep_fraction, f"{exit_ma_type} {exit_ma_period}"))
 
     tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
     if not tickers:
