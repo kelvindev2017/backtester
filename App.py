@@ -2179,6 +2179,7 @@ TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", FUNDAMENT
              DAY_BREAKOUT_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
+CHART_TOUCH_MODES = ["Scroll the page", "Zoom and pan the chart"]
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
 TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart")
@@ -2265,6 +2266,12 @@ def slider_with_input(label, min_value, max_value, value, step=1, key=None, help
 def show_chart(fig, **kwargs):
     """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width."""
 
+    if MOBILE and st.session_state.get("chart_touch", CHART_TOUCH_MODES[0]) == CHART_TOUCH_MODES[0]:
+        # Plotly takes every touch on the plot for zoom and pan, so a chart taller than the screen traps the page.
+        # Without drag and with fixed axes, a swipe scrolls the page; a tap still shows the values under the finger.
+        fig.update_layout(dragmode=False)
+        fig.update_xaxes(fixedrange=True)
+        fig.update_yaxes(fixedrange=True)
     if MOBILE:
         fig.update_layout(
             legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0, font=dict(size=10),
@@ -3981,4 +3988,9 @@ if check_password():
             "Layout", LAYOUT_MODES, key="layout_mode",
             help="Auto picks the mobile layout on phones and tablets. Desktop puts each tab's settings in the "
             "sidebar; Mobile puts them in collapsible menus above the charts.",
+        )
+        st.radio(
+            "Swiping on a chart (mobile layout)", CHART_TOUCH_MODES, key="chart_touch",
+            help="Scroll the page: a swipe over a chart scrolls as anywhere else, and a tap shows the values. "
+            "Zoom and pan the chart: a swipe zooms into or moves the chart, so scroll beside it.",
         )

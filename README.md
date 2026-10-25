@@ -6,7 +6,8 @@ Streamlit app for stock trend analysis, breakout identification and pre-trade re
 
 Each tab keeps its own settings. On a desktop they fill the sidebar and change with the open tab; on a phone
 or tablet (detected from the browser) there is no sidebar and the settings sit in collapsible menus above the
-charts. **Display > Layout** overrides the detection. The main US and industry indexes (S&P 500, Nasdaq,
+charts. **Display > Layout** overrides the detection. In the mobile layout a swipe over a chart scrolls the page
+and a tap shows the values; **Display > Swiping on a chart** switches charts back to zoom and pan. The main US and industry indexes (S&P 500, Nasdaq,
 Dow, Russell 2000, ^SOX, the sector ETFs ...) load when the app starts and are cached for 6 hours.
 
 ## Tabs
