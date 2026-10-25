@@ -116,6 +116,7 @@ from analysis.validation import ValidationSettings, base_rates, exit_signal_stat
 
 st.set_page_config(
     page_title="Trade Strategy Backtest",
+    page_icon=os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png"),
     layout="wide",
     initial_sidebar_state="auto",
 )
