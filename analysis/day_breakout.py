@@ -7,7 +7,8 @@ This is the rule that came out of reviewing Kelvin's 2026 IBKR trades (fit on Ma
 * at every close, including the entry day, keep the position only if the close is in the top part of the
   day's range (default the top third: (close - low) / (high - low) >= 2/3); otherwise sell at the close;
 * or, instead of the range test, hold while the close stays above a moving average (SMA or EMA, default
-  SMA 20), or never hold overnight;
+  SMA 20), sell on a daily break (the first close below the average close of the prior N days, default N = 1,
+  that is a close below yesterday's close), or never hold overnight;
 * a fixed dollar amount per trade (default $10,000), so no single trade dominates the result.
 
 Daily bars stand in for the intraday fill: the entry assumes a stop order resting at the breakout level, and
@@ -26,6 +27,7 @@ EXIT_MODES = {
     "Hold only on a top-of-range close": "top_range",
     "Always sell at the close": "same_day",
     "Hold while the close is above a moving average": "above_ma",
+    "Daily break (close below the prior N-day average)": "daily_break",
 }
 TRADE_COLUMNS = ["Ticker", "Entry date", "Entry", "Exit date", "Exit", "Days held", "Shares", "P&L", "Return %",
                  "Status"]
@@ -42,6 +44,7 @@ class DayBreakoutSettings:
     trend_sma: int = 0
     exit_ma_type: str = "SMA"
     exit_ma_period: int = 20
+    break_days: int = 1
 
 
 def close_location(daily):
@@ -52,11 +55,21 @@ def close_location(daily):
     return location.fillna(0.5)
 
 
-def keep_overnight(mode, location, close, exit_ma, keep_fraction):
+def prior_average_close(daily, days=1):
+    """Average close of the ``days`` days before each day, excluding that day (``days`` = 1 is yesterday's close)."""
+
+    days = max(1, int(days))
+    return daily["Close"].shift(1).rolling(days, min_periods=days).mean()
+
+
+def keep_overnight(mode, location, close, exit_ma, keep_fraction, break_level=np.nan):
     if mode == "same_day":
         return False
     if mode == "above_ma":
         return bool(np.isfinite(exit_ma) and close > exit_ma)
+    if mode == "daily_break":
+        # Without enough history for the average there is no break to detect, so the position is held.
+        return not (np.isfinite(break_level) and close < break_level)
     return location >= keep_fraction
 
 
@@ -76,6 +89,7 @@ def day_breakout_trades(daily, settings=None, ticker="", start=None, end=None):
     period = max(1, int(settings.exit_ma_period))
     exit_ma = (daily["Close"].ewm(span=period, adjust=False).mean() if settings.exit_ma_type == "EMA"
                else daily["Close"].rolling(period).mean()).to_numpy()
+    break_level = prior_average_close(daily, settings.break_days).to_numpy()
     trend = (daily["Close"].rolling(settings.trend_sma).mean().shift(1).to_numpy()
              if settings.trend_sma > 0 else None)
     dates = daily.index
@@ -101,7 +115,8 @@ def day_breakout_trades(daily, settings=None, ticker="", start=None, end=None):
             held = j - i + 1
             if settings.max_hold and held >= settings.max_hold:
                 break
-            if not keep_overnight(settings.exit_mode, location[j], closes[j], exit_ma[j], settings.keep_fraction):
+            if not keep_overnight(settings.exit_mode, location[j], closes[j], exit_ma[j], settings.keep_fraction,
+                                  break_level[j]):
                 break
             if j + 1 >= len(dates):
                 status = "Open"

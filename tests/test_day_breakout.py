@@ -7,6 +7,7 @@ from analysis.day_breakout import (
     close_location,
     day_breakout_trades,
     monthly_pnl,
+    prior_average_close,
     run_day_breakout,
     split_summary,
     ticker_summary,
@@ -112,3 +113,23 @@ def test_moving_average_exit_holds_until_a_close_below_the_average():
     # Until the average has enough history, it cannot hold a position.
     long_ma = DayBreakoutSettings(exit_mode="above_ma", exit_ma_period=60, max_hold=0)
     assert day_breakout_trades(frame, long_ma, "X").iloc[0]["Days held"] == 0
+
+
+def test_daily_break_exit_sells_on_a_close_below_the_prior_average_close():
+    rising = [(100 + i, 101 + i, 99 + i, 100 + i) for i in range(10)]
+    # Breakout closes 112.5, then 113 (higher), 112.8 (below yesterday), 111 (below the prior 3-day average).
+    frame = bars(rising + [(110, 113, 109.5, 112.5), (112.5, 114, 112, 113), (113, 114, 112, 112.8),
+                           (112.8, 113, 110, 111)])
+    yesterday = DayBreakoutSettings(exit_mode="daily_break", max_hold=0)
+    trade = day_breakout_trades(frame, yesterday, "X").iloc[0]
+    assert trade["Exit date"] == frame.index[12] and trade["Exit"] == 112.8
+    # Prior 3-day average before day 12 is (109 + 112.5 + 113) / 3 = 111.5, so 112.8 holds; 111 < 112.77 sells.
+    three_days = DayBreakoutSettings(exit_mode="daily_break", break_days=3, max_hold=0)
+    trade = day_breakout_trades(frame, three_days, "X").iloc[0]
+    assert trade["Exit date"] == frame.index[13] and trade["Exit"] == 111
+
+
+def test_prior_average_close_excludes_today():
+    frame = bars([(1, 2, 0.5, 1), (1, 3, 1, 2), (2, 4, 2, 3), (3, 5, 3, 10)])
+    assert prior_average_close(frame, 1).tolist()[1:] == [1, 2, 3]
+    assert prior_average_close(frame, 2).tolist()[2:] == [1.5, 2.5]

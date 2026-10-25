@@ -18,6 +18,8 @@ def test_labels_follow_the_settings():
     assert "30%" in texts(day_breakout_figure(10, "top_range", 0.7))
     assert "Prior 15-day high" in texts(day_breakout_figure(15, "same_day"))
     assert "SMA 20" in texts(day_breakout_figure(10, "above_ma", ma_label="SMA 20"))
+    assert "yesterday's close" in texts(day_breakout_figure(10, "daily_break"))
+    assert "prior 5-day<br>average close" in texts(day_breakout_figure(10, "daily_break", break_days=5))
     assert "Prior 55-bar high" in texts(breakout_figure(55, 2.0)) and "2x" in texts(breakout_figure(55, 2.0))
     assert "EMA 9" in texts(ma_rule_figure("EMA 9", "SMA 30"))
 

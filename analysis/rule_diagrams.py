@@ -55,7 +55,7 @@ def finish(fig, y_range=None, height=290, title="How the rule trades (illustrati
     return fig
 
 
-def day_breakout_figure(lookback=10, exit_mode="top_range", keep_fraction=2 / 3, ma_label="SMA 20"):
+def day_breakout_figure(lookback=10, exit_mode="top_range", keep_fraction=2 / 3, ma_label="SMA 20", break_days=1):
     """Day breakout: buy-stop above the prior N-day high, then the chosen overnight exit."""
 
     # (open, high, low, close): a base under 104, the breakout day, two strong closes, then a pullback.
@@ -70,11 +70,19 @@ def day_breakout_figure(lookback=10, exit_mode="top_range", keep_fraction=2 / 3,
     ma = frame["Close"].rolling(6, min_periods=1).mean()
     location = (frame["Close"] - frame["Low"]) / (frame["High"] - frame["Low"])
     exit_pct = (1 - keep_fraction) * 100
+    # The daily-break line is drawn with at most 3 days so it reacts within the few bars shown.
+    break_days = max(1, int(break_days))
+    prior_average = frame["Close"].shift(1).rolling(min(break_days, 3), min_periods=1).mean()
+    break_label = "yesterday's close" if break_days == 1 else f"the prior {break_days}-day<br>average close"
     if exit_mode == "same_day":
         exit_index, exit_text = breakout, "Sell at the close<br>(never held overnight)"
     elif exit_mode == "above_ma":
         exit_index = next((i for i in range(breakout, len(frame)) if frame["Close"].iloc[i] < ma.iloc[i]), len(frame) - 1)
         exit_text = f"First close below<br>the {ma_label}: sell"
+    elif exit_mode == "daily_break":
+        exit_index = next((i for i in range(breakout, len(frame)) if frame["Close"].iloc[i] < prior_average.iloc[i]),
+                          len(frame) - 1)
+        exit_text = f"Close below<br>{break_label}: sell"
     else:
         exit_index = next((i for i in range(breakout, len(frame)) if location.iloc[i] < keep_fraction), len(frame) - 1)
         exit_text = f"Close more than {exit_pct:.0f}%<br>below the high: sell"
@@ -86,6 +94,8 @@ def day_breakout_figure(lookback=10, exit_mode="top_range", keep_fraction=2 / 3,
     if exit_mode == "above_ma":
         line(fig, ma, AVERAGE)
         note(fig, 3, ma.iloc[2], ma_label, AVERAGE, arrow=False, yshift=-14)
+    elif exit_mode == "daily_break" and break_days > 1:
+        line(fig, prior_average, AVERAGE, dash="dot")
     elif exit_mode == "top_range":
         # Shade the hold zone of the breakout bar: within the exit % of the day's high.
         high, low = frame["High"].iloc[breakout], frame["Low"].iloc[breakout]
@@ -93,6 +103,7 @@ def day_breakout_figure(lookback=10, exit_mode="top_range", keep_fraction=2 / 3,
                       y1=high, fillcolor=UP, opacity=0.35, line_width=0)
     note(fig, breakout + 1, level, "Buy-stop fills<br>at the high", ax=-50, ay=55)
     hold_text = (f"Close within {exit_pct:.0f}% of the high: hold" if exit_mode == "top_range"
+                 else f"Close not below<br>{break_label}: hold" if exit_mode == "daily_break"
                  else f"Close above the {ma_label}: hold")
     if exit_index > breakout:
         note(fig, breakout + 1, frame["High"].iloc[breakout], hold_text, UP, ax=-45, ay=-28)

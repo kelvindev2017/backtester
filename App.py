@@ -3925,7 +3925,8 @@ def render_day_breakout():
     st.caption(
         "Buys the first day a stock trades above its prior N-day high (filled at that level, or at the open on a gap "
         "up), then decides at each close: hold overnight only when the close is in the top part of the day's range "
-        "(or, with the moving-average exit, above the chosen SMA/EMA), otherwise sell at the close. Each trade is a fixed dollar amount. This is the rule that turned the review of "
+        "(or, with the moving-average exit, above the chosen SMA/EMA; with the daily-break exit, not below the average "
+        "close of the prior N days), otherwise sell at the close. Each trade is a fixed dollar amount. This is the rule that turned the review of "
         "your 2026 IBKR trades positive; here it takes every breakout, not only the ones you picked. Results before "
         "the split date are where the rule was fitted, results after it are the check."
     )
@@ -3946,6 +3947,7 @@ def render_day_breakout():
         keep_fraction = 1 - st.session_state.get("day_breakout_exit_pct", 33) / 100
         exit_ma_type = st.session_state.get("day_breakout_ma_type", "SMA")
         exit_ma_period = int(st.session_state.get("day_breakout_ma_period", 20))
+        break_days = int(st.session_state.get("day_breakout_break_days", 1))
         if exit_mode == "top_range":
             keep_fraction = exit_pct_slider("day_breakout_exit_pct")
         elif exit_mode == "above_ma":
@@ -3954,6 +3956,10 @@ def render_day_breakout():
             exit_ma_period = int(ma_columns[1].number_input(
                 "Exit MA period (days)", min_value=2, max_value=250, value=20, step=1, key="day_breakout_ma_period",
                 help="Hold while the close stays above this average; sell at the first close below it."))
+        elif exit_mode == "daily_break":
+            break_days = slider_with_input(
+                "Sell below the average close of the prior N days", 1, 50, 1, key="day_breakout_break_days",
+                help="The average excludes today. N = 1 sells at the first close below yesterday's close.")
         max_hold = int(st.number_input("Sell after at most this many days (0 = no limit)", min_value=0,
                                        max_value=250, value=60, step=1, key="day_breakout_max_hold"))
         trend_sma = int(st.number_input("Only when the prior close is above its SMA (0 = off)", min_value=0,
@@ -3963,7 +3969,8 @@ def render_day_breakout():
                                                             step=1_000.0, key="day_breakout_size"))
         fee = float(money_columns[1].number_input("Fees per round trip ($)", min_value=0.0, value=1.5, step=0.5,
                                                   key="day_breakout_fee"))
-        show_rule_diagram(day_breakout_figure(lookback, exit_mode, keep_fraction, f"{exit_ma_type} {exit_ma_period}"))
+        show_rule_diagram(day_breakout_figure(lookback, exit_mode, keep_fraction, f"{exit_ma_type} {exit_ma_period}",
+                                              break_days))
 
     tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
     if not tickers:
@@ -3971,9 +3978,10 @@ def render_day_breakout():
         return
     settings = DayBreakoutSettings(lookback=lookback, exit_mode=EXIT_MODES[exit_label], keep_fraction=keep_fraction,
                                    max_hold=max_hold, position_size=position_size, fee_per_trade=fee,
-                                   trend_sma=trend_sma, exit_ma_type=exit_ma_type, exit_ma_period=exit_ma_period)
+                                   trend_sma=trend_sma, exit_ma_type=exit_ma_type, exit_ma_period=exit_ma_period,
+                                   break_days=int(break_days))
     # Enough history before the first trade for the N-day high and the SMA filter.
-    days = (date.today() - start).days + 2 * max(lookback, trend_sma, exit_ma_period) + 30
+    days = (date.today() - start).days + 2 * max(lookback, trend_sma, exit_ma_period, int(break_days)) + 30
     with st.spinner("Loading daily prices..."):
         prices = load_price_panel(tickers, days=days)
     missing = [t for t in tickers if t not in prices]
