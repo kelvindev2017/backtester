@@ -2713,7 +2713,8 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
         # Load two extra years so TTM EPS, and its year-on-year growth for PEG, exist from the first day shown.
         earnings_start = (pd.Timestamp(history_start) - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
         earnings = load_earnings_data(ticker, earnings_start, today)
-        valuation, _ = build_valuation_data(load_data(ticker, earnings_start, today, "Daily"), earnings)
+        prices = load_data(ticker, earnings_start, today, "Daily")
+        valuation, _ = build_valuation_data(prices, earnings)
     trend = fundamental_trend(fundamentals)
     if trend and "Revenue" in fundamentals:
         revenue = fundamentals["Revenue"].dropna()
@@ -2739,18 +2740,20 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
                                      for name, series in growth.items()}))
         show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates,
                                      price_change=price_change, growth=growth,
-                                     close=valuation["Close"].loc[history_start:], log_price=log_price),
+                                     close=valuation["Close"].loc[history_start:], log_price=log_price,
+                                     ohlcv=prices.loc[history_start:] if not prices.empty else None),
                    width="stretch")
         st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
         st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
         st.caption(
             "YoY change: the price daily, revenue and EPS by quarter, left empty when the year-ago value is zero or "
             "negative. Revenue is in billions of the reporting currency. EPS is Yahoo's reported (adjusted) EPS per "
-            "share, on the quarter it reports rather than the announcement date. The daily close is split-adjusted "
-            "(not dividend-adjusted), the same price the P/E uses. The gray line on the right-hand axis of each "
-            "panel is that same close, for comparison; where it crosses a panel's own line depends only on the "
-            "axis scales. Trailing P/E is price / last 4 quarters' EPS, so it can differ from GAAP P/E; a spike usually means earnings fell, not that the price "
-            "ran. PEG is that P/E / EPS growth %, blank while growth is zero or negative. Hatched bars are analyst "
+            "share, on the quarter it reports rather than the announcement date. The top panel shows daily candles "
+            "(open, high, low, close), split-adjusted but not dividend-adjusted, the same price the P/E uses, with "
+            "daily volume on its right-hand axis. The gray line on the right-hand axis of every other panel is that "
+            "close, for comparison; where it crosses a panel's own line depends only on the axis scales. Trailing "
+            "P/E is price / last 4 quarters' EPS, so it can differ from GAAP P/E; a spike usually means earnings "
+            "fell, not that the price ran. PEG is that P/E / EPS growth %, blank while growth is zero or negative. Hatched bars are analyst "
             "estimates, not results."
         )
     else:

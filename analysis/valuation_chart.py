@@ -24,6 +24,8 @@ EPS_COLOR = "darkorange"
 EPS_ESTIMATE_COLOR = "rgba(255, 140, 0, 0.35)"
 PRICE_COLOR = "dimgray"
 CLOSE_OVERLAY_COLOR = "rgba(105, 105, 105, 0.55)"
+UP_COLOR, DOWN_COLOR = "seagreen", "indianred"
+VOLUME_UP_COLOR, VOLUME_DOWN_COLOR = "rgba(46, 139, 87, 0.6)", "rgba(205, 92, 92, 0.6)"
 GROWTH_AXIS_CAP = 300
 LAGS = {"price 1 quarter earlier": 1, "same quarter": 0, "1 quarter later": -1, "1 year later": -4}
 
@@ -251,6 +253,28 @@ def add_close_overlay(fig, close, row, log_price=False, name="Close (right axis)
                              hovertemplate="%{x|%Y-%m-%d} close: %{y:,.2f}<extra></extra>"))
 
 
+def add_volume_overlay(fig, ohlcv, row):
+    """Daily volume as bars on a right-hand axis of subplot ``row``, kept to the bottom quarter of the panel.
+
+    The axis is scaled to the 99th percentile, so a few extreme days don't flatten every other bar.
+    """
+
+    volume = pd.to_numeric(ohlcv["Volume"], errors="coerce").fillna(0)
+    if not (volume > 0).any():
+        return
+    subplot = fig.get_subplot(row, 1)
+    x_axis, y_axis = subplot.xaxis.plotly_name.replace("axis", ""), subplot.yaxis.plotly_name.replace("axis", "")
+    taken = [int(key[5:] or 1) for key in fig.layout.to_plotly_json() if key.startswith("yaxis")]
+    number = max(taken) + 1
+    fig.layout[f"yaxis{number}"] = dict(overlaying=y_axis, anchor=x_axis, side="right", showgrid=False,
+                                        range=[0, float(volume.quantile(0.99)) * 4], tickformat=".2s", automargin=True,
+                                        tickfont=dict(color=PRICE_COLOR, size=10), zeroline=False)
+    colors = np.where(ohlcv["Close"] >= ohlcv["Open"], VOLUME_UP_COLOR, VOLUME_DOWN_COLOR)
+    fig.add_trace(go.Bar(x=volume.index, y=volume, name="Volume (right axis)", xaxis=x_axis, yaxis=f"y{number}",
+                         marker=dict(color=colors, line_width=0),
+                         hovertemplate="%{x|%Y-%m-%d} volume: %{y:,.0f}<extra></extra>"))
+
+
 def panel_legend(row):
     """Legend id for subplot ``row``: Plotly names them legend, legend2, legend3 ..."""
 
@@ -287,8 +311,11 @@ def legends_under_panels(fig, rows, height, gap_px=6):
 
 
 def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
-                      price_change=None, growth=None, close=None, log_price=False, height=None):
-    """Growth vs price, revenue, EPS, daily price, trailing P/E and PEG panels, top to bottom, on one date axis.
+                      price_change=None, growth=None, close=None, log_price=False, height=None, ohlcv=None):
+    """Daily price, growth vs price, revenue, EPS, trailing P/E and PEG panels, top to bottom, on one date axis.
+
+    ``ohlcv`` (optional, daily Open/High/Low/Close/Volume) turns the price panel into candlesticks with
+    volume on a right-hand axis; with only ``close`` it is a line.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -304,9 +331,17 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     growth = {name: series.loc[series.index >= price_change.index.min()] if not price_change.empty else series
               for name, series in growth.items()}
 
-    # Panels top to bottom: growth vs price, revenue, EPS, price, trailing P/E, PEG. Optional ones drop out.
+    # Panels top to bottom: price, growth vs price, revenue, EPS, trailing P/E, PEG. Optional ones drop out.
     # Titles stay short enough for a phone; the page caption defines each one.
+    candles = ohlcv.dropna(subset=["Open", "High", "Low", "Close"]) if ohlcv is not None else pd.DataFrame()
+    close = close.dropna() if close is not None else pd.Series(dtype=float)
+    if close.empty and not candles.empty:
+        close = candles["Close"]
     panels = {}
+    if not candles.empty:
+        panels["price"] = ("Daily OHLC (split-adjusted) and volume", 0.34)
+    elif not close.empty:
+        panels["price"] = ("Daily close (split-adjusted)", 0.26)
     if not price_change.empty:
         values = pd.concat([price_change] + list(growth.values())).dropna()
         panels["growth"] = ("YoY change, %" + (f" (capped at {GROWTH_AXIS_CAP}%)" if values.max() > GROWTH_AXIS_CAP else ""),
@@ -314,10 +349,6 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     panels["revenue"] = ("Revenue by quarter, billions", 0.3)
     if not eps.empty:
         panels["eps"] = ("EPS by quarter (adjusted)", 0.22)
-    close = close.dropna() if close is not None else pd.Series(dtype=float)
-    if not close.empty:
-        # Right above P/E and PEG: price = P/E x TTM EPS, so a price move reads as a re-rating or an earnings move.
-        panels["price"] = ("Daily close (split-adjusted)", 0.26)
     panels["pe"] = ("Trailing P/E", 0.3)
     if not peg.empty:
         panels["peg"] = ("Trailing PEG" + (f" (capped at {PEG_AXIS_CAP})" if peg.max() > PEG_AXIS_CAP else ""), 0.22)
@@ -329,9 +360,16 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.12, 80 / height),
                         row_heights=[h / sum(heights) for h in heights],
                         subplot_titles=[title for title, _ in panels.values()])
-    if not close.empty:
+    if not candles.empty:
+        fig.add_trace(go.Candlestick(x=candles.index, open=candles["Open"], high=candles["High"], low=candles["Low"],
+                                     close=candles["Close"], name="OHLC", increasing_line_color=UP_COLOR,
+                                     decreasing_line_color=DOWN_COLOR, line=dict(width=1)), row=row["price"], col=1)
+        if "Volume" in candles:
+            add_volume_overlay(fig, candles, row["price"])
+    elif not close.empty:
         fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close", line=dict(color=PRICE_COLOR, width=1.5),
                                  hovertemplate="%{x|%Y-%m-%d}: %{y:,.2f}<extra></extra>"), row=row["price"], col=1)
+    if "price" in row:
         fig.update_yaxes(tickformat=",.0f", type="log" if log_price else "linear", row=row["price"], col=1)
 
     pe = trailing_pe.dropna() if trailing_pe is not None else pd.Series(dtype=float)
@@ -413,6 +451,7 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
 
     fig.update_yaxes(ticksuffix="x", rangemode="tozero", row=row["pe"], col=1)
     fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=row["revenue"], col=1)
+    fig.update_xaxes(rangeslider_visible=False)
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), bargap=0.15)
     legends_under_panels(fig, rows, height)
     return fig

@@ -260,7 +260,7 @@ def test_stock_fundamentals_tab(offline, monkeypatch):
     app = open_tab(start_app(), "Stock Fundamentals")
     assert app.sidebar.header[0].value == "Stock Fundamentals"
     assert app.subheader[0].value == "NVDA"
-    assert any("Price YoY" in chart.proto.spec and "Daily close" in chart.proto.spec and "Trailing P" in chart.proto.spec
+    assert any("Price YoY" in chart.proto.spec and "Daily OHLC" in chart.proto.spec and "Trailing P" in chart.proto.spec
                for chart in app.get("plotly_chart"))
 
     # Any ticker and history length.
