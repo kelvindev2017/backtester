@@ -371,3 +371,24 @@ def test_settings_show_only_what_the_tab_and_rule_use(offline):
     next(box for box in app.selectbox if box.key == "day_breakout_exit").select("Always sell at the close")
     open_tab(app, "Day Breakout Rule")
     assert "Exit MA period (days)" not in labels() and not any("far below the day's high" in label for label in labels())
+
+
+def test_sliders_have_a_number_box_in_sync(offline):
+    app = open_tab(start_app(), "Day Breakout Rule")
+    slider = lambda: next(widget for widget in app.slider if widget.key == "day_breakout_exit_pct")
+    box = lambda: next(widget for widget in app.number_input if widget.key == "day_breakout_exit_pct_input")
+    assert slider().value == box().value == 33
+
+    box().set_value(40)
+    open_tab(app, "Day Breakout Rule")
+    assert slider().value == 40 and not app.exception
+
+    slider().set_value(20)
+    open_tab(app, "Day Breakout Rule")
+    assert box().value == 20
+
+    open_tab(app, "Signal Analysis & Trade Plan")
+    full = next(widget for widget in app.number_input if widget.key == "full_size_confidence_input")
+    full.set_value(80)
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert next(widget for widget in app.slider if widget.key == "full_size_confidence").value == 80
