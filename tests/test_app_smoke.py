@@ -328,6 +328,21 @@ def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
     st.cache_resource.clear()
 
 
+def test_what_happened_next_settings(offline, monkeypatch):
+    monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
+    app = open_tab(start_app(), "Stock Fundamentals")
+    assert any("What happened next" in element.value for element in app.markdown)
+    assert any("P/E percentile" in element.value for element in app.caption)
+    assert any("How one dot is calculated" in chart.proto.spec for chart in app.get("plotly_chart"))
+
+    for frequency, look_ahead in [("Week", "1 month"), ("Day", "1 week")]:
+        next(radio for radio in app.radio if radio.key == "next_frequency").set_value(frequency)
+        next(slider for slider in app.select_slider if slider.key == "next_look_ahead").set_value(look_ahead)
+        open_tab(app, "Stock Fundamentals")
+        assert not app.exception, app.exception
+        assert any(f"in the {look_ahead} after each check" in chart.proto.spec for chart in app.get("plotly_chart"))
+
+
 def test_day_breakout_tab(offline):
     app = open_tab(start_app(), "Day Breakout Rule")
     assert app.sidebar.header[0].value == "Day Breakout Rule"
