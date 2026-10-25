@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 from plotly.subplots import make_subplots
 
@@ -120,6 +121,49 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="auto",
 )
+
+# Streamlit Community Cloud wraps the app in its own page, whose install
+# manifest and home-screen icon are Streamlit's. Both pages share an origin,
+# so point the wrapper's manifest and apple-touch-icon at our favicon.
+components.html(
+    """
+<script>
+(function () {
+  try {
+    const top = window.top.document;
+    const favicon = window.parent.document.querySelector("link[rel~='icon']");
+    if (!favicon || top.documentElement.dataset.backtestIcon) return;
+    const icon = favicon.href;
+    const origin = window.top.location.origin;
+    const manifest = {
+      name: "Trade Strategy Backtest",
+      short_name: "Backtest",
+      icons: [{ src: icon, type: "image/png", sizes: "512x512", purpose: "any" }],
+      start_url: origin + "/",
+      scope: origin + "/",
+      display: "standalone",
+      theme_color: "#000000",
+      background_color: "#000000",
+    };
+    const blob = new Blob([JSON.stringify(manifest)], { type: "application/manifest+json" });
+    let link = top.querySelector("link[rel='manifest']");
+    if (!link) {
+      link = top.createElement("link");
+      link.rel = "manifest";
+      top.head.appendChild(link);
+    }
+    link.href = URL.createObjectURL(blob);
+    top.querySelectorAll("link[rel='apple-touch-icon']").forEach((el) => (el.href = icon));
+    top.documentElement.dataset.backtestIcon = "1";
+  } catch (e) {
+    // Not same-origin (e.g. embedded elsewhere): keep the defaults.
+  }
+})();
+</script>
+""",
+    height=0,
+)
+
 st.title("Trade Strategy Backtester")
 
 
