@@ -176,3 +176,19 @@ def test_legend_follows_panel_order():
     fig = revenue_pe_figure(revenue, pe, price_change=price_change)
     by_rank = [trace.name for trace in sorted(fig.data, key=lambda trace: trace.legendrank)]
     assert by_rank == ["Price YoY %", "Revenue YoY %", "Revenue (reported)", "Trailing P/E"]
+
+
+def test_price_panel_sits_right_above_pe_and_peg():
+    quarters = pd.date_range("2023-03-31", periods=12, freq="QE")
+    revenue = pd.Series(np.linspace(10e9, 40e9, 12), index=quarters)
+    days = pd.bdate_range("2024-01-01", periods=400)
+    pe = pd.Series(np.linspace(60, 30, 400), index=days)
+    peg = pd.Series(np.linspace(1.5, 0.5, 400), index=days)
+    close = pd.Series(np.linspace(100, 180, 400), index=days)
+    fig = revenue_pe_figure(revenue, pe, peg=peg, close=close)
+    titles = [annotation.text for annotation in fig.layout.annotations[:4]]
+    assert titles == ["Revenue by quarter, billions", "Daily close (split-adjusted)", "Trailing P/E", "Trailing PEG"]
+    close_trace = next(trace for trace in fig.data if trace.name == "Close")
+    assert close_trace.yaxis == "y2" and close_trace.y[-1] == 180
+    assert fig.layout.yaxis2.type == "linear"
+    assert revenue_pe_figure(revenue, pe, peg=peg, close=close, log_price=True).layout.yaxis2.type == "log"
