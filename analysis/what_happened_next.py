@@ -16,6 +16,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from analysis.valuation_chart import add_close_overlay, legends_under_panels
+
 CHECK_FREQUENCIES = {"Day": None, "Week": "W-FRI", "Month": "ME"}
 LOOK_AHEADS = {
     "1 week": pd.DateOffset(weeks=1),
@@ -34,6 +36,7 @@ OTHER_COLOR = "#a3a3a3"
 SIMILAR_COLOR = "#2563eb"
 INK = "#1f2937"
 MUTED = "#6b7280"
+CLOSE_OVERLAY_COLOR = "rgba(124, 58, 237, 0.5)"  # violet: the P/E panel already uses gray for the pre-window line
 LOOKBACK_FILL = "rgba(37, 99, 235, 0.06)"
 AHEAD_FILL = "rgba(245, 158, 11, 0.10)"
 
@@ -250,11 +253,15 @@ def walkthrough_figure(valuation, total_return, benchmark, obs, example, ticker,
         fig.add_vrect(x0=window_start, x1=example, fillcolor=LOOKBACK_FILL, line_width=0, row=panel, col=1)
         fig.add_vrect(x0=example, x1=end_day, fillcolor=AHEAD_FILL, line_width=0, row=panel, col=1)
     fig.add_vline(x=example, line=dict(color=INK, width=1.5, dash="dash"))
+    # The close on a right-hand axis in the EPS and P/E panels (panel 1 is the close, panel 4 is its return).
+    for panel in (2, 3):
+        add_close_overlay(fig, close, panel, color=CLOSE_OVERLAY_COLOR)
     fig.add_annotation(x=window_start, y=1, yref="y domain", text="Look-back: only data known by then", showarrow=False,
                        xanchor="left", yanchor="top", font=dict(color=MUTED, size=11), row=1, col=1)
     fig.add_annotation(x=example, y=1, yref="y domain", text=f"next {look_ahead}", showarrow=False, xanchor="left",
                        yanchor="top", xshift=6, font=dict(color=MUTED, size=11), row=1, col=1)
-    fig.update_layout(title=f"How one dot is calculated: {ticker}, {example:%d %b %Y}", height=height or 1000,
-                      template="plotly_white", font=dict(color=INK), legend=dict(orientation="h", y=-0.06),
-                      margin=dict(t=80, l=60, r=100, b=50))
+    height = height or 1000
+    fig.update_layout(title=f"How one dot is calculated: {ticker}, {example:%d %b %Y}", height=height,
+                      template="plotly_white", font=dict(color=INK), margin=dict(t=80, l=60, r=100, b=60))
+    legends_under_panels(fig, 4, height)
     return fig

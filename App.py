@@ -2307,11 +2307,18 @@ def show_chart(fig, **kwargs):
         fig.update_xaxes(fixedrange=True)
         fig.update_yaxes(fixedrange=True)
     if MOBILE:
-        fig.update_layout(
-            legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0, font=dict(size=10),
-                        entrywidth=0.5, entrywidthmode="fraction"),
-            margin=dict(l=5, r=5),
-        )
+        compact = dict(font=dict(size=10), entrywidth=0.5, entrywidthmode="fraction")
+        legends = [key for key in fig.layout.to_plotly_json() if key.startswith("legend") and key != "legend"]
+        if legends:
+            # A chart with a legend under each panel keeps them where they are, just smaller.
+            for key in ["legend"] + legends:
+                fig.layout[key].update(compact)
+            fig.update_layout(margin=dict(l=5, r=5))
+        else:
+            fig.update_layout(
+                legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0, **compact),
+                margin=dict(l=5, r=5),
+            )
     st.plotly_chart(fig, **kwargs)
 
 
@@ -2740,8 +2747,9 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
             "YoY change: the price daily, revenue and EPS by quarter, left empty when the year-ago value is zero or "
             "negative. Revenue is in billions of the reporting currency. EPS is Yahoo's reported (adjusted) EPS per "
             "share, on the quarter it reports rather than the announcement date. The daily close is split-adjusted "
-            "(not dividend-adjusted), the same price the P/E uses. Trailing P/E is price / last 4 "
-            "quarters' EPS, so it can differ from GAAP P/E; a spike usually means earnings fell, not that the price "
+            "(not dividend-adjusted), the same price the P/E uses. The gray line on the right-hand axis of each "
+            "panel is that same close, for comparison; where it crosses a panel's own line depends only on the "
+            "axis scales. Trailing P/E is price / last 4 quarters' EPS, so it can differ from GAAP P/E; a spike usually means earnings fell, not that the price "
             "ran. PEG is that P/E / EPS growth %, blank while growth is zero or negative. Hatched bars are analyst "
             "estimates, not results."
         )

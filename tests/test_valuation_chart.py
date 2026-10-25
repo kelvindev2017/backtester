@@ -50,7 +50,7 @@ def test_figure_stacks_revenue_above_pe_and_marks_estimates():
     fig = revenue_pe_figure(revenue, pe, estimates)
     names = [trace.name for trace in fig.data]
     assert names == ["Trailing P/E", "Revenue (reported)", "Revenue (analyst estimate)"]
-    # Two separate y-axes in stacked rows, never an overlaid secondary axis.
+    # Two separate y-axes in stacked rows; without a close there is no right-hand axis.
     assert fig.data[0].yaxis == "y2" and fig.data[1].yaxis == "y"
     assert fig.layout.yaxis2.overlaying is None
     assert fig.data[1].y[-1] == 60.0  # billions
@@ -192,3 +192,26 @@ def test_price_panel_sits_right_above_pe_and_peg():
     assert close_trace.yaxis == "y2" and close_trace.y[-1] == 180
     assert fig.layout.yaxis2.type == "linear"
     assert revenue_pe_figure(revenue, pe, peg=peg, close=close, log_price=True).layout.yaxis2.type == "log"
+
+
+def test_close_on_a_right_hand_axis_in_every_other_panel_and_a_legend_under_each():
+    quarters = pd.date_range("2023-03-31", periods=12, freq="QE")
+    revenue = pd.Series(np.linspace(10e9, 40e9, 12), index=quarters)
+    days = pd.bdate_range("2024-01-01", periods=400)
+    pe = pd.Series(np.linspace(60, 30, 400), index=days)
+    close = pd.Series(np.linspace(100, 180, 400), index=days)
+    fig = revenue_pe_figure(revenue, pe, close=close, log_price=True)
+    overlays = [trace for trace in fig.data if trace.name == "Close (right axis)"]
+    # Revenue and P/E panels get the overlay; the close panel itself does not.
+    overlaid = {fig.layout[trace.yaxis.replace("y", "yaxis")].overlaying for trace in overlays}
+    assert overlaid == {"y", "y3"}
+    for trace in overlays:
+        axis = fig.layout[trace.yaxis.replace("y", "yaxis")]
+        assert axis.side == "right" and axis.type == "log"
+    # One legend per panel, each right under its panel.
+    revenue_trace = next(trace for trace in fig.data if trace.name == "Revenue (reported)")
+    pe_trace = next(trace for trace in fig.data if trace.name == "Trailing P/E")
+    assert revenue_trace.legend == "legend" and pe_trace.legend == "legend3"
+    assert {trace.legend for trace in overlays} == {"legend", "legend3"}
+    for legend, axis in [("legend", fig.layout.yaxis), ("legend2", fig.layout.yaxis2), ("legend3", fig.layout.yaxis3)]:
+        assert axis.domain[0] - 0.1 < fig.layout[legend].y < axis.domain[0]
