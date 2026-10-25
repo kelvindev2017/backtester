@@ -1,9 +1,10 @@
 """Revenue, EPS and valuation (P/E, PEG) history for one company, drawn as
 stacked panels on a shared date axis.
 
-The panels are stacked rather than overlaid on twin y-axes on purpose: with
-two y-scales the visual crossing of the P/E line and the revenue bars depends
-only on how each axis was scaled, and reads as a signal it is not.
+Each measure keeps its own panel. The daily close is also drawn in every panel on
+a right-hand axis, so each measure can be read against the price; where the two
+lines cross depends only on how each axis was scaled, so a crossing is not a signal.
+Each panel has its own legend right under it.
 """
 
 import numpy as np
@@ -22,6 +23,9 @@ PEG_AXIS_CAP = 4
 EPS_COLOR = "darkorange"
 EPS_ESTIMATE_COLOR = "rgba(255, 140, 0, 0.35)"
 PRICE_COLOR = "dimgray"
+CLOSE_OVERLAY_COLOR = "rgba(105, 105, 105, 0.55)"
+UP_COLOR, DOWN_COLOR = "seagreen", "indianred"
+VOLUME_UP_COLOR, VOLUME_DOWN_COLOR = "rgba(46, 139, 87, 0.6)", "rgba(205, 92, 92, 0.6)"
 GROWTH_AXIS_CAP = 300
 LAGS = {"price 1 quarter earlier": 1, "same quarter": 0, "1 quarter later": -1, "1 year later": -4}
 
@@ -230,9 +234,88 @@ def correlation_text(correlations):
             "quarters are not independent and r looks stronger than it is.")
 
 
+def add_close_overlay(fig, close, row, log_price=False, name="Close (right axis)", color=CLOSE_OVERLAY_COLOR):
+    """Draw the daily close in subplot ``row`` (one-column figure) on its own right-hand y-axis."""
+
+    close = close.dropna() if close is not None else pd.Series(dtype=float)
+    if close.empty:
+        return
+    subplot = fig.get_subplot(row, 1)
+    x_axis, y_axis = subplot.xaxis.plotly_name, subplot.yaxis.plotly_name  # e.g. "xaxis3", "yaxis3"
+    taken = [int(key[5:] or 1) for key in fig.layout.to_plotly_json() if key.startswith("yaxis")]
+    number = max(taken) + 1
+    fig.layout[f"yaxis{number}"] = dict(
+        overlaying=y_axis.replace("axis", ""), anchor=x_axis.replace("axis", ""), side="right", showgrid=False,
+        type="log" if log_price else "linear", rangemode="tozero", tickformat=",.0f", automargin=True,
+        tickfont=dict(color=PRICE_COLOR, size=10), zeroline=False)
+    fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name=name, xaxis=x_axis.replace("axis", ""),
+                             yaxis=f"y{number}", line=dict(color=color, width=1.2),
+                             hovertemplate="%{x|%Y-%m-%d} close: %{y:,.2f}<extra></extra>"))
+
+
+def add_volume_overlay(fig, ohlcv, row):
+    """Daily volume as bars on a right-hand axis of subplot ``row``, kept to the bottom quarter of the panel.
+
+    The axis is scaled to the 99th percentile, so a few extreme days don't flatten every other bar.
+    """
+
+    volume = pd.to_numeric(ohlcv["Volume"], errors="coerce").fillna(0)
+    if not (volume > 0).any():
+        return
+    subplot = fig.get_subplot(row, 1)
+    x_axis, y_axis = subplot.xaxis.plotly_name.replace("axis", ""), subplot.yaxis.plotly_name.replace("axis", "")
+    taken = [int(key[5:] or 1) for key in fig.layout.to_plotly_json() if key.startswith("yaxis")]
+    number = max(taken) + 1
+    fig.layout[f"yaxis{number}"] = dict(overlaying=y_axis, anchor=x_axis, side="right", showgrid=False,
+                                        range=[0, float(volume.quantile(0.99)) * 4], tickformat=".2s", automargin=True,
+                                        tickfont=dict(color=PRICE_COLOR, size=10), zeroline=False)
+    colors = np.where(ohlcv["Close"] >= ohlcv["Open"], VOLUME_UP_COLOR, VOLUME_DOWN_COLOR)
+    fig.add_trace(go.Bar(x=volume.index, y=volume, name="Volume (right axis)", xaxis=x_axis, yaxis=f"y{number}",
+                         marker=dict(color=colors, line_width=0),
+                         hovertemplate="%{x|%Y-%m-%d} volume: %{y:,.0f}<extra></extra>"))
+
+
+def panel_legend(row):
+    """Legend id for subplot ``row``: Plotly names them legend, legend2, legend3 ..."""
+
+    return "legend" if row == 1 else f"legend{row}"
+
+
+def legends_under_panels(fig, rows, height, gap_px=6):
+    """Give each subplot row its own horizontal legend, placed right under that row.
+
+    Traces are assigned by their y-axis; overlay axes count for the row they overlay.
+    """
+
+    layout = fig.layout
+    row_of_axis = {}
+    for row in range(1, rows + 1):
+        name = fig.get_subplot(row, 1).yaxis.plotly_name.replace("axis", "")
+        row_of_axis[name] = row
+    for key in layout.to_plotly_json():
+        if key.startswith("yaxis") and layout[key].overlaying:
+            row_of_axis[key.replace("axis", "")] = row_of_axis.get(layout[key].overlaying)
+    used = set()
+    for trace in fig.data:
+        row = row_of_axis.get(trace.yaxis or "y")
+        if row is None:
+            continue
+        trace.legend = panel_legend(row)
+        used.add(row)
+    for row in used:
+        bottom = fig.get_subplot(row, 1).yaxis.domain[0]
+        # The bottom row carries the date tick labels, so its legend goes below them.
+        offset = (gap_px + (28 if row == rows else 0)) / height
+        layout[panel_legend(row)] = dict(orientation="h", yanchor="top", y=bottom - offset, xanchor="left", x=0,
+                                         bgcolor="rgba(0,0,0,0)")
+
+
 def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
-                      price_change=None, growth=None, close=None, log_price=False, height=None):
-    """Growth vs price, revenue, EPS, daily price, trailing P/E and PEG panels, top to bottom, on one date axis.
+                      price_change=None, growth=None, close=None, log_price=False, height=None, ohlcv=None):
+    """Daily price, growth vs price, revenue, EPS, trailing P/E and PEG panels, top to bottom, on one date axis.
+
+    ``ohlcv`` (optional, daily Open/High/Low/Close/Volume) turns the price panel into candlesticks with
+    volume on a right-hand axis; with only ``close`` it is a line.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -248,9 +331,17 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     growth = {name: series.loc[series.index >= price_change.index.min()] if not price_change.empty else series
               for name, series in growth.items()}
 
-    # Panels top to bottom: growth vs price, revenue, EPS, price, trailing P/E, PEG. Optional ones drop out.
+    # Panels top to bottom: price, growth vs price, revenue, EPS, trailing P/E, PEG. Optional ones drop out.
     # Titles stay short enough for a phone; the page caption defines each one.
+    candles = ohlcv.dropna(subset=["Open", "High", "Low", "Close"]) if ohlcv is not None else pd.DataFrame()
+    close = close.dropna() if close is not None else pd.Series(dtype=float)
+    if close.empty and not candles.empty:
+        close = candles["Close"]
     panels = {}
+    if not candles.empty:
+        panels["price"] = ("Daily OHLC (split-adjusted) and volume", 0.34)
+    elif not close.empty:
+        panels["price"] = ("Daily close (split-adjusted)", 0.26)
     if not price_change.empty:
         values = pd.concat([price_change] + list(growth.values())).dropna()
         panels["growth"] = ("YoY change, %" + (f" (capped at {GROWTH_AXIS_CAP}%)" if values.max() > GROWTH_AXIS_CAP else ""),
@@ -258,22 +349,27 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     panels["revenue"] = ("Revenue by quarter, billions", 0.3)
     if not eps.empty:
         panels["eps"] = ("EPS by quarter (adjusted)", 0.22)
-    close = close.dropna() if close is not None else pd.Series(dtype=float)
-    if not close.empty:
-        # Right above P/E and PEG: price = P/E x TTM EPS, so a price move reads as a re-rating or an earnings move.
-        panels["price"] = ("Daily close (split-adjusted)", 0.26)
     panels["pe"] = ("Trailing P/E", 0.3)
     if not peg.empty:
         panels["peg"] = ("Trailing PEG" + (f" (capped at {PEG_AXIS_CAP})" if peg.max() > PEG_AXIS_CAP else ""), 0.22)
     row = {key: number for number, key in enumerate(panels, start=1)}
     rows = len(panels)
     heights = [weight for _, weight in panels.values()]
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+    height = height or {2: 560, 3: 740, 4: 920, 5: 1120}.get(rows, 1320)
+    # Room between panels for the legend under each panel and the next panel's title.
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.12, 80 / height),
                         row_heights=[h / sum(heights) for h in heights],
                         subplot_titles=[title for title, _ in panels.values()])
-    if not close.empty:
+    if not candles.empty:
+        fig.add_trace(go.Candlestick(x=candles.index, open=candles["Open"], high=candles["High"], low=candles["Low"],
+                                     close=candles["Close"], name="OHLC", increasing_line_color=UP_COLOR,
+                                     decreasing_line_color=DOWN_COLOR, line=dict(width=1)), row=row["price"], col=1)
+        if "Volume" in candles:
+            add_volume_overlay(fig, candles, row["price"])
+    elif not close.empty:
         fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close", line=dict(color=PRICE_COLOR, width=1.5),
                                  hovertemplate="%{x|%Y-%m-%d}: %{y:,.2f}<extra></extra>"), row=row["price"], col=1)
+    if "price" in row:
         fig.update_yaxes(tickformat=",.0f", type="log" if log_price else "linear", row=row["price"], col=1)
 
     pe = trailing_pe.dropna() if trailing_pe is not None else pd.Series(dtype=float)
@@ -344,12 +440,18 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
         # Added last: add_vline only reaches the panels that already hold traces.
         fig.add_vline(x=actual.index[-1] + pd.Timedelta(days=45), line=dict(color="gray", width=1, dash="dot"))
 
-    # Legend in panel order, top to bottom, whatever order the traces were added in.
+    # Legend entries in the order the traces were added, within each panel's own legend.
     for position, trace in enumerate(fig.data):
         trace.legendrank = int(trace.yaxis[1:] or 1) * 100 + position
 
+    # The close on a right-hand axis in every panel but the close panel itself.
+    for key, number in row.items():
+        if key != "price":
+            add_close_overlay(fig, close, number, log_price)
+
     fig.update_yaxes(ticksuffix="x", rangemode="tozero", row=row["pe"], col=1)
     fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=row["revenue"], col=1)
-    fig.update_layout(height=height or {2: 480, 3: 620, 4: 760, 5: 940}.get(rows, 1100), margin=dict(l=10, r=10, t=60, b=10),
-                      bargap=0.15, legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0))
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), bargap=0.15)
+    legends_under_panels(fig, rows, height)
     return fig

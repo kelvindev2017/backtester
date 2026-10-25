@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 import pandas as pd
 
@@ -50,7 +51,7 @@ def test_figure_stacks_revenue_above_pe_and_marks_estimates():
     fig = revenue_pe_figure(revenue, pe, estimates)
     names = [trace.name for trace in fig.data]
     assert names == ["Trailing P/E", "Revenue (reported)", "Revenue (analyst estimate)"]
-    # Two separate y-axes in stacked rows, never an overlaid secondary axis.
+    # Two separate y-axes in stacked rows; without a close there is no right-hand axis.
     assert fig.data[0].yaxis == "y2" and fig.data[1].yaxis == "y"
     assert fig.layout.yaxis2.overlaying is None
     assert fig.data[1].y[-1] == 60.0  # billions
@@ -178,7 +179,7 @@ def test_legend_follows_panel_order():
     assert by_rank == ["Price YoY %", "Revenue YoY %", "Revenue (reported)", "Trailing P/E"]
 
 
-def test_price_panel_sits_right_above_pe_and_peg():
+def test_price_panel_is_the_first_row():
     quarters = pd.date_range("2023-03-31", periods=12, freq="QE")
     revenue = pd.Series(np.linspace(10e9, 40e9, 12), index=quarters)
     days = pd.bdate_range("2024-01-01", periods=400)
@@ -187,8 +188,53 @@ def test_price_panel_sits_right_above_pe_and_peg():
     close = pd.Series(np.linspace(100, 180, 400), index=days)
     fig = revenue_pe_figure(revenue, pe, peg=peg, close=close)
     titles = [annotation.text for annotation in fig.layout.annotations[:4]]
-    assert titles == ["Revenue by quarter, billions", "Daily close (split-adjusted)", "Trailing P/E", "Trailing PEG"]
+    assert titles == ["Daily close (split-adjusted)", "Revenue by quarter, billions", "Trailing P/E", "Trailing PEG"]
     close_trace = next(trace for trace in fig.data if trace.name == "Close")
-    assert close_trace.yaxis == "y2" and close_trace.y[-1] == 180
-    assert fig.layout.yaxis2.type == "linear"
-    assert revenue_pe_figure(revenue, pe, peg=peg, close=close, log_price=True).layout.yaxis2.type == "log"
+    assert close_trace.yaxis == "y" and close_trace.y[-1] == 180
+    assert fig.layout.yaxis.type == "linear"
+    assert revenue_pe_figure(revenue, pe, peg=peg, close=close, log_price=True).layout.yaxis.type == "log"
+
+
+def test_ohlcv_draws_candles_with_volume_on_a_right_hand_axis():
+    quarters = pd.date_range("2023-03-31", periods=12, freq="QE")
+    revenue = pd.Series(np.linspace(10e9, 40e9, 12), index=quarters)
+    days = pd.bdate_range("2024-01-01", periods=400)
+    pe = pd.Series(np.linspace(60, 30, 400), index=days)
+    close = np.linspace(100, 180, 400)
+    ohlcv = pd.DataFrame({"Open": close - 1, "High": close + 2, "Low": close - 2, "Close": close,
+                          "Volume": np.linspace(1e6, 2e6, 400)}, index=days)
+    fig = revenue_pe_figure(revenue, pe, ohlcv=ohlcv)
+    assert fig.layout.annotations[0].text == "Daily OHLC (split-adjusted) and volume"
+    candles = next(trace for trace in fig.data if trace.type == "candlestick")
+    volume = next(trace for trace in fig.data if trace.name == "Volume (right axis)")
+    assert candles.yaxis == "y" and candles.legend == "legend"
+    axis = fig.layout[volume.yaxis.replace("y", "yaxis")]
+    assert axis.overlaying == "y" and axis.side == "right" and volume.legend == "legend"
+    # Volume stays in the bottom quarter of the panel, under the candles.
+    assert axis.range[1] == pytest.approx(4 * ohlcv["Volume"].quantile(0.99))
+    # The close for the other panels' right-hand axes comes from the candles when no close is passed.
+    assert {trace.name for trace in fig.data} >= {"Close (right axis)"}
+    assert not fig.layout.xaxis.rangeslider.visible
+
+
+def test_close_on_a_right_hand_axis_in_every_other_panel_and_a_legend_under_each():
+    quarters = pd.date_range("2023-03-31", periods=12, freq="QE")
+    revenue = pd.Series(np.linspace(10e9, 40e9, 12), index=quarters)
+    days = pd.bdate_range("2024-01-01", periods=400)
+    pe = pd.Series(np.linspace(60, 30, 400), index=days)
+    close = pd.Series(np.linspace(100, 180, 400), index=days)
+    fig = revenue_pe_figure(revenue, pe, close=close, log_price=True)
+    overlays = [trace for trace in fig.data if trace.name == "Close (right axis)"]
+    # Revenue and P/E panels get the overlay; the close panel itself does not.
+    overlaid = {fig.layout[trace.yaxis.replace("y", "yaxis")].overlaying for trace in overlays}
+    assert overlaid == {"y2", "y3"}
+    for trace in overlays:
+        axis = fig.layout[trace.yaxis.replace("y", "yaxis")]
+        assert axis.side == "right" and axis.type == "log"
+    # One legend per panel, each right under its panel.
+    revenue_trace = next(trace for trace in fig.data if trace.name == "Revenue (reported)")
+    pe_trace = next(trace for trace in fig.data if trace.name == "Trailing P/E")
+    assert revenue_trace.legend == "legend2" and pe_trace.legend == "legend3"
+    assert {trace.legend for trace in overlays} == {"legend2", "legend3"}
+    for legend, axis in [("legend", fig.layout.yaxis), ("legend2", fig.layout.yaxis2), ("legend3", fig.layout.yaxis3)]:
+        assert axis.domain[0] - 0.1 < fig.layout[legend].y < axis.domain[0]
