@@ -65,6 +65,7 @@ class AnalysisSettings:
     pullback_bars: int = 5
     min_depth_atr: float = 1.5
     keep_fraction: float = 2 / 3
+    exit_ma: int = 200
 
     def detector_kwargs(self):
         """Keyword arguments for ``detect_signals`` beyond setup, lookback and volume multiple."""
@@ -78,6 +79,7 @@ class AnalysisSettings:
             "pullback_bars": self.pullback_bars,
             "min_depth_atr": self.min_depth_atr,
             "keep_fraction": self.keep_fraction,
+            "exit_ma": self.exit_ma,
         }
 
 

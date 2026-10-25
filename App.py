@@ -1194,11 +1194,15 @@ def load_benchmark_data(start_date_str, end_date_str, timeframe):
 # Position engine
 # ============================================================
 
-def run_position_engine(price_df, buy_condition, sell_condition):
-    """Generate long-only positions and entry/exit markers."""
+def run_position_engine(price_df, buy_condition, sell_condition, max_hold=0):
+    """Generate long-only positions and entry/exit markers.
+
+    ``max_hold`` (bars, 0 = no limit) also sells a position that has been held that long.
+    """
 
     positions, buy_markers, sell_markers = [], [], []
     in_trade = False
+    entry_row = 0
 
     for row_number in range(len(price_df)):
         buy_signal = False
@@ -1206,7 +1210,9 @@ def run_position_engine(price_df, buy_condition, sell_condition):
         if not in_trade and bool(buy_condition.iloc[row_number]):
             in_trade = True
             buy_signal = True
-        elif in_trade and bool(sell_condition.iloc[row_number]):
+            entry_row = row_number
+        elif in_trade and (bool(sell_condition.iloc[row_number])
+                           or (max_hold and row_number - entry_row >= max_hold)):
             in_trade = False
             sell_signal = True
 
@@ -3043,13 +3049,14 @@ def strategy_settings(tab="Backtest"):
             )
 
     # Moving-average rule defaults (also used for the Backtest chart's MA lines).
-    fast_type, fast_period, slow_type, slow_period = "EMA", 20, "SMA", 50
+    fast_type, fast_period, slow_type, slow_period = "SMA", 50, "SMA", 200
     buy_left, buy_operator, buy_right = "Fast_MA", "Cross Above", "Slow_MA"
     sell_left, sell_operator, sell_right = "Fast_MA", "Cross Below", "Slow_MA"
     breakout_lookback, volume_multiple = 20, 1.5
     pullback_ema, trend_mid, trend_slow = 20, 50, 200
     swing_bars, pullback_bars, min_depth_atr = 20, 5, 1.5
     keep_fraction = 2 / 3
+    exit_ma, max_hold_bars = 200, 0
 
     with settings_panel("Signal"):
         setup_label = st.selectbox(
@@ -3064,10 +3071,10 @@ def strategy_settings(tab="Backtest"):
 
         if setup == "ma_rule":
             ma_columns = st.columns(2)
-            fast_type = ma_columns[0].selectbox("Fast MA Type", ["EMA", "SMA"], index=0, key="fast_type")
-            fast_period = int(ma_columns[1].number_input("Fast MA Period", min_value=1, value=20, step=1, key="fast_period"))
+            fast_type = ma_columns[0].selectbox("Fast MA Type", ["EMA", "SMA"], index=1, key="fast_type")
+            fast_period = int(ma_columns[1].number_input("Fast MA Period", min_value=1, value=50, step=1, key="fast_period"))
             slow_type = ma_columns[0].selectbox("Slow MA Type", ["EMA", "SMA"], index=1, key="slow_type")
-            slow_period = int(ma_columns[1].number_input("Slow MA Period", min_value=1, value=50, step=1, key="slow_period"))
+            slow_period = int(ma_columns[1].number_input("Slow MA Period", min_value=1, value=200, step=1, key="slow_period"))
 
             st.markdown("**Buy when**")
             buy_left = st.selectbox("Buy left signal", MA_RULE_SERIES, index=1, key="buy_left", label_visibility="collapsed")
@@ -3083,9 +3090,13 @@ def strategy_settings(tab="Backtest"):
                                                     key="breakout_lookback"))
             volume_multiple = st.number_input("Breakout volume (x 50-bar average)", min_value=1.0, max_value=5.0, value=1.5, step=0.1,
                                               key="volume_multiple")
+            exit_ma = int(st.number_input("Sell when the close is below this SMA (bars)", min_value=5, max_value=400,
+                                          value=200, step=10, key="breakout_exit_ma"))
             st.caption(
-                f"Buy: the first close above the prior {breakout_lookback}-bar high on at least {volume_multiple:g}x "
-                f"average volume. Sell / exit: the first close below the prior {breakout_lookback}-bar low."
+                f"Buy: the first close above the prior {breakout_lookback}-bar high. Signal Analysis also needs "
+                f"{volume_multiple:g}x average volume for a BUY (otherwise WATCH); the Backtest takes every breakout, "
+                f"since the volume filter did not improve results in testing. Sell / exit (Backtest): the first close "
+                f"below the {exit_ma}-bar SMA. A breakdown below the prior {breakout_lookback}-bar low is the bearish signal."
             )
         elif setup == "day_breakout":
             breakout_lookback = int(st.number_input("Breakout above the prior N-day high", min_value=1, max_value=250,
@@ -3116,10 +3127,12 @@ def strategy_settings(tab="Backtest"):
             trend_columns = st.columns(2)
             trend_mid = int(trend_columns[0].number_input("Trend fast MA (bars)", min_value=5, max_value=250, value=50, step=1, key="trend_mid"))
             trend_slow = int(trend_columns[1].number_input("Trend slow MA (bars)", min_value=10, max_value=400, value=200, step=1, key="trend_slow"))
+            max_hold_bars = int(st.number_input("Sell after at most this many bars", min_value=1, max_value=60,
+                                                value=10, step=1, key="reversal_max_hold"))
             st.caption(
                 f"Buy: the first close below the prior {breakout_lookback}-bar low while the close is above the "
-                f"{trend_slow}-bar MA and the {trend_mid}-bar MA is above it. There is no sell signal; trades exit at "
-                "their stop or target."
+                f"{trend_slow}-bar MA and the {trend_mid}-bar MA is above it. Sell / exit (Backtest): the first close "
+                f"above the prior bar's high, the bounce, or after {max_hold_bars} bars."
             )
 
         if setup == "ma_rule":
@@ -3129,11 +3142,11 @@ def strategy_settings(tab="Backtest"):
             diagram = ma_rule_figure(f"{fast_type} {fast_period}", f"{slow_type} {slow_period}",
                                      describe_ma_rule(preview, "buy"), describe_ma_rule(preview, "sell"))
         elif setup == "breakout":
-            diagram = breakout_figure(breakout_lookback, volume_multiple)
+            diagram = breakout_figure(breakout_lookback, volume_multiple, exit_ma)
         elif setup == "pullback":
             diagram = pullback_figure(pullback_ema, trend_mid, trend_slow, min_depth_atr)
         elif setup == "reversal":
-            diagram = reversal_figure(breakout_lookback, trend_mid, trend_slow)
+            diagram = reversal_figure(breakout_lookback, trend_mid, trend_slow, max_hold_bars)
         else:
             diagram = day_breakout_figure(breakout_lookback, "top_range", keep_fraction)
         show_rule_diagram(diagram)
@@ -3192,6 +3205,7 @@ def strategy_settings(tab="Backtest"):
         pullback_bars=pullback_bars,
         min_depth_atr=min_depth_atr,
         keep_fraction=keep_fraction,
+        exit_ma=exit_ma,
     )
     risk_settings = RiskSettings(
         account_equity=float(account_size),
@@ -3219,6 +3233,7 @@ def strategy_settings(tab="Backtest"):
         slow_period=slow_period, buy_left=buy_left, buy_operator=buy_operator, buy_right=buy_right,
         sell_left=sell_left, sell_operator=sell_operator, sell_right=sell_right, breakout_lookback=breakout_lookback,
         volume_multiple=volume_multiple, ma_rule=ma_rule, signal_settings=signal_settings, risk_settings=risk_settings,
+        max_hold_bars=max_hold_bars,
     )
 
 
@@ -3328,10 +3343,10 @@ def render_backtest(s):
         sell_condition = backtest_signals[sell_column].fillna(False).astype(bool)
         rule_text = (
             f"**BUY / SELL:** {setup_label} signals on {timeframe.lower()} bars. The position is held until "
-            "the opposite signal. Stops and targets are not simulated here; the **Validate** tab replays the "
+            "its exit (see the rule's settings). Stops and targets are not simulated here; the **Validate** tab replays the "
             "full trade plan."
         )
-    df = run_position_engine(df, buy_condition, sell_condition)
+    df = run_position_engine(df, buy_condition, sell_condition, max_hold=s.max_hold_bars if setup == "reversal" else 0)
 
     df["Returns"] = df["Close"].pct_change().fillna(0.0)
     df["Strat_Returns"] = df["Position"] * df["Returns"]

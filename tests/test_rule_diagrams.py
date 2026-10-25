@@ -20,3 +20,8 @@ def test_labels_follow_the_settings():
     assert "SMA 20" in texts(day_breakout_figure(10, "above_ma", ma_label="SMA 20"))
     assert "Prior 55-bar high" in texts(breakout_figure(55, 2.0)) and "2x" in texts(breakout_figure(55, 2.0))
     assert "EMA 9" in texts(ma_rule_figure("EMA 9", "SMA 30"))
+
+
+def test_tuned_exits_are_labelled():
+    assert "SMA" in texts(breakout_figure(20, 1.5, 150)) and "150-bar SMA" in texts(breakout_figure(20, 1.5, 150))
+    assert "after 7 bars" in texts(reversal_figure(20, 50, 200, 7))
