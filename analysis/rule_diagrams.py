@@ -125,33 +125,36 @@ def ma_rule_figure(fast_label="EMA 20", slow_label="SMA 50", buy_text="Fast MA c
     return finish(fig)
 
 
-def breakout_figure(lookback=20, volume_multiple=1.5):
-    """Breakout: first close above the prior N-bar high on heavy volume; exit on a close below the N-bar low."""
+def breakout_figure(lookback=20, volume_multiple=1.5, exit_ma=200):
+    """Breakout: first close above the prior N-bar high; sell on a close below the exit SMA."""
 
     closes = np.r_[[100, 101.5, 99.5, 101, 102.5, 100.5, 99, 100.8, 102.2, 101, 100, 101.6],
-                   [105.2, 106.5, 107.2, 105.8, 104, 102, 100.2, 97.2]]
+                   [105.2, 106.5, 107.2, 105.8, 104, 102.4, 101.2, 99.6]]
     frame = bars_from_closes(closes, wick=0.7)
     volume = np.r_[np.full(12, 1.0) + np.sin(np.arange(12)) * 0.15, [2.3, 1.4, 1.2, 1.0, 1.1, 1.2, 1.3, 1.5]]
     breakout = 12
     high = frame["High"].iloc[:breakout].max()
-    low = frame["Low"].iloc[:breakout].min()
-    exit_index = next(i for i in range(breakout + 1, len(frame)) if frame["Close"].iloc[i] < low)
+    average = pd.Series(np.r_[np.full(4, 99.0), closes]).rolling(10).mean().iloc[4:].bfill().reset_index(drop=True)
+    exit_index = next(i for i in range(breakout + 1, len(frame)) if frame["Close"].iloc[i] < average.iloc[i])
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
     candles(fig, frame, row=1, col=1)
-    for level, label in [(high, f"Prior {lookback}-bar high"), (low, f"Prior {lookback}-bar low")]:
-        fig.add_shape(type="line", x0=0.5, x1=len(frame) + 0.5, y0=level, y1=level,
-                      line=dict(color=LEVEL, dash="dash"), row=1, col=1)
-        fig.add_annotation(x=3, y=level, text=label, showarrow=False, yshift=9 if level == high else -9,
-                           font=dict(size=10, color=LEVEL), row=1, col=1)
+    line(fig, average, SLOW_AVERAGE, row=1, col=1)
+    fig.add_shape(type="line", x0=0.5, x1=breakout + 1.5, y0=high, y1=high, line=dict(color=LEVEL, dash="dash"),
+                  row=1, col=1)
+    fig.add_annotation(x=3, y=high, text=f"Prior {lookback}-bar high", showarrow=False, yshift=9,
+                       font=dict(size=10, color=LEVEL), row=1, col=1)
+    fig.add_annotation(x=4, y=average.iloc[3], text=f"{exit_ma}-bar SMA", showarrow=False, yshift=-12,
+                       font=dict(size=10, color=SLOW_AVERAGE), bgcolor=LABEL_BACKGROUND, row=1, col=1)
     fig.add_trace(go.Bar(x=list(range(1, len(frame) + 1)), y=volume, showlegend=False, hoverinfo="skip",
                          marker_color=["darkorange" if i == breakout else "lightgray" for i in range(len(frame))]),
                   row=2, col=1)
     fig.add_annotation(x=breakout + 1, y=frame["Close"].iloc[breakout],
-                       text=f"BUY: close above the high<br>on ≥{volume_multiple:g}x average volume", ax=-60, ay=-40,
-                       arrowhead=2, arrowcolor=UP, font=dict(size=10, color=UP), bgcolor=LABEL_BACKGROUND, row=1, col=1)
-    fig.add_annotation(x=exit_index + 1, y=frame["Close"].iloc[exit_index], text="SELL: close below the low",
-                       ax=-55, ay=25, arrowhead=2, arrowcolor=DOWN, font=dict(size=10, color=DOWN),
+                       text=f"BUY: close above the high<br>(Signal Analysis: on ≥{volume_multiple:g}x volume)",
+                       ax=-65, ay=-40, arrowhead=2, arrowcolor=UP, font=dict(size=10, color=UP),
+                       bgcolor=LABEL_BACKGROUND, row=1, col=1)
+    fig.add_annotation(x=exit_index + 1, y=frame["Close"].iloc[exit_index], text=f"SELL: close below<br>the {exit_ma}-bar SMA",
+                       ax=-45, ay=35, arrowhead=2, arrowcolor=DOWN, font=dict(size=10, color=DOWN),
                        bgcolor=LABEL_BACKGROUND, row=1, col=1)
     fig.add_annotation(x=2, y=1.6, text="Volume", showarrow=False, font=dict(size=9, color="gray"), row=2, col=1)
     return finish(fig, height=320)
@@ -182,14 +185,15 @@ def pullback_figure(pullback_ema=20, trend_mid=50, trend_slow=200, min_depth_atr
     return finish(fig)
 
 
-def reversal_figure(lookback=20, trend_mid=50, trend_slow=200):
-    """Reversal: in a long-term uptrend, buy the first close below the prior N-bar low."""
+def reversal_figure(lookback=20, trend_mid=50, trend_slow=200, max_hold=10):
+    """Reversal: in a long-term uptrend, buy the first close below the prior N-bar low; sell on the bounce."""
 
     closes = np.r_[np.linspace(100, 109, 10), [108.4, 109.2, 108.6, 107.5, 106.8, 105.2, 104.4, 105.6, 107.2, 108.8]]
     frame = bars_from_closes(closes, wick=0.6)
     trend = pd.Series(np.linspace(94, 101, len(closes)))
     signal = 16
     low = frame["Low"].iloc[signal - 10:signal].min()
+    exit_index = next(i for i in range(signal + 1, len(frame)) if frame["Close"].iloc[i] > frame["High"].iloc[i - 1])
 
     fig = go.Figure()
     candles(fig, frame)
@@ -198,8 +202,8 @@ def reversal_figure(lookback=20, trend_mid=50, trend_slow=200):
     note(fig, signal - 6, low, f"Prior {lookback}-bar low", LEVEL, arrow=False, yshift=-10)
     note(fig, 5, trend.iloc[4], f"Above the {trend_slow}-bar MA, {trend_mid} above it", SLOW_AVERAGE, arrow=False,
          yshift=-12)
-    note(fig, signal + 1, frame["Close"].iloc[signal], "BUY: first close below<br>the low, in an uptrend", UP,
-         ax=-60, ay=45)
-    note(fig, signal + 1, frame["Low"].iloc[signal], "Stop below<br>that day's low", DOWN, ax=45, ay=40)
-    note(fig, 20, frame["High"].iloc[19], "Exit at the stop<br>or the target", TEXT, ax=-10, ay=-35)
+    note(fig, signal + 1, frame["Low"].iloc[signal], "BUY: first close below<br>the low, in an uptrend", UP,
+         ax=-60, ay=40)
+    note(fig, exit_index + 1, frame["High"].iloc[exit_index],
+         f"SELL: first close above the prior<br>bar's high, or after {max_hold} bars", DOWN, ax=-30, ay=-45)
     return finish(fig)

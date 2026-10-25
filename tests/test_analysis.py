@@ -518,3 +518,31 @@ def test_no_signal_headlines_use_chosen_periods(breakout_daily):
         setup="reversal", breakout_lookback=9, trend_mid=40, trend_slow=150))
     if report.action == "NO SIGNAL":
         assert "9-bar low" in report.headline and "150-bar MA" in report.headline
+
+
+def test_breakout_and_reversal_exits():
+    import numpy as np
+    import pandas as pd
+    from analysis.patterns import detect_signals
+
+    dates = pd.bdate_range("2020-01-01", periods=310)
+    close = pd.Series(np.r_[np.linspace(100, 150, 250), np.linspace(150, 120, 60)], index=dates)
+    df = pd.DataFrame({"Open": close, "High": close + 1, "Low": close - 1, "Close": close, "Volume": 1e6})
+    breakout = detect_signals(df, "breakout", 20, 1.5, exit_ma=50)
+    assert breakout["Exit_Long"].iloc[-1] and not breakout["Exit_Long"].iloc[200]
+    reversal = detect_signals(df, "reversal", 20, 1.5)
+    bounce = pd.Series([100, 98, 97, 99.5], index=dates[:4])
+    bars = pd.DataFrame({"Open": bounce, "High": bounce + 1, "Low": bounce - 1, "Close": bounce, "Volume": 1e6})
+    assert detect_signals(bars, "reversal", 2, 1.5)["Exit_Long"].tolist() == [False, False, False, True]
+    assert not reversal["Exit_Long"].iloc[-1]
+
+
+def test_position_engine_max_hold():
+    import pandas as pd
+    from App import run_position_engine
+
+    df = pd.DataFrame({"Close": range(1, 11)}, index=pd.bdate_range("2021-01-01", periods=10))
+    buy = pd.Series([True] + [False] * 9, index=df.index)
+    sell = pd.Series(False, index=df.index)
+    result = run_position_engine(df, buy, sell, max_hold=3)
+    assert list(result["Raw_Position"])[:5] == [1, 1, 1, 0, 0]
