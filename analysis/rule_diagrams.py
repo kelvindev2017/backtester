@@ -12,6 +12,7 @@ from plotly.subplots import make_subplots
 
 UP, DOWN = "seagreen", "indianred"
 LEVEL, AVERAGE, SLOW_AVERAGE, TEXT = "royalblue", "darkorange", "mediumpurple", "#333"
+TREND_SLOW = "gray"
 LABEL_BACKGROUND = "rgba(255,255,255,0.85)"
 
 
@@ -160,29 +161,66 @@ def breakout_figure(lookback=20, volume_multiple=1.5, exit_ma=200):
     return finish(fig, height=320)
 
 
-def pullback_figure(pullback_ema=20, trend_mid=50, trend_slow=200, min_depth_atr=1.5):
-    """Pullback in an uptrend: a dip to the EMA, then the first close above the prior bar's high."""
+def pullback_figure(pullback_ema=20, trend_mid=50, trend_slow=200, min_depth_atr=1.5, swing_bars=20,
+                    pullback_bars=5):
+    """Pullback in an uptrend: a dip to the EMA, then the first close above the prior bar's high.
+
+    Every setting is drawn where it acts, numbered in the order the rule checks them, with the steps spelled
+    out under the chart: the two trend MAs, the swing-high lookback as a bracket over the bars it scans, the
+    pullback window as a shaded band of the last bars, the dip depth and the pullback EMA.
+    """
 
     closes = np.r_[np.linspace(95, 108, 12), [109.5, 108.2, 106.6, 105.3, 104.6, 104.9, 106.4, 107.8, 109.6, 111]]
     frame = bars_from_closes(closes, wick=0.6)
     ema = pd.Series(closes).ewm(span=8, adjust=False).mean()
-    trend = pd.Series(np.linspace(90, 101, len(closes)))
+    fast_trend = pd.Series(np.linspace(93, 103, len(closes)))
+    slow_trend = pd.Series(np.linspace(90, 95.5, len(closes)))
     swing = 12
     trigger = 18  # first close above the prior bar's high after the dip
+    low_bar = int(frame["Low"].iloc[swing:trigger + 1].idxmin())
+    swing_high, dip_low = frame["High"].iloc[swing], frame["Low"].iloc[low_bar]
+    window_start = trigger - 4  # five bars drawn, ending on the signal bar
+    lookback_start = trigger - 12  # the bars before the signal bar searched for the swing high
+    bracket_y = swing_high + 2
 
     fig = go.Figure()
+    fig.add_shape(type="rect", x0=window_start + 0.5, x1=trigger + 1.5, y0=dip_low - 1.6, y1=swing_high + 0.9,
+                  fillcolor=LEVEL, opacity=0.12, line_width=0)
+    note(fig, (window_start + trigger) / 2 + 1, dip_low - 1.6, f"③ Pullback window:<br>last {pullback_bars} bars",
+         LEVEL, arrow=False, yanchor="top")
+    fig.add_shape(type="path", path=f"M {lookback_start + 0.5},{bracket_y - 0.6} V {bracket_y} H {trigger + 0.5} "
+                  f"V {bracket_y - 0.6}", line=dict(color=TEXT, width=1))
+    note(fig, (lookback_start + trigger) / 2 + 0.5, bracket_y, f"② Swing high lookback: {swing_bars} bars", TEXT,
+         arrow=False, yshift=9)
     candles(fig, frame)
     line(fig, ema, AVERAGE)
-    line(fig, trend, SLOW_AVERAGE, dash="dot")
-    note(fig, 4, ema.iloc[3], f"{pullback_ema} EMA", AVERAGE, arrow=False, yshift=12)
-    note(fig, 9, trend.iloc[8], f"{trend_mid}-bar MA rising, above the {trend_slow}", SLOW_AVERAGE, arrow=False,
-         yshift=-12)
-    note(fig, swing + 1, frame["High"].iloc[swing], "Swing high", TEXT, ax=-25, ay=-30)
-    note(fig, 17, frame["Low"].iloc[16], f"Dip of ≥{min_depth_atr:g} ATR<br>to the EMA, light volume", TEXT,
-         ax=-10, ay=45)
-    note(fig, trigger + 1, frame["High"].iloc[trigger], "BUY: close above<br>the prior bar's high", UP,
-         ax=30, ay=-50)
-    return finish(fig)
+    line(fig, fast_trend, SLOW_AVERAGE)
+    line(fig, slow_trend, TREND_SLOW, dash="dot")
+    note(fig, 3, ema.iloc[1], f"③ Pullback EMA {pullback_ema}", AVERAGE, arrow=False, yshift=12, xanchor="left")
+    note(fig, 1, fast_trend.iloc[0], f"① Fast MA {trend_mid} (rising)", SLOW_AVERAGE, arrow=False, yshift=-10,
+         xanchor="left")
+    note(fig, 1, slow_trend.iloc[0], f"① Slow MA {trend_slow}", TREND_SLOW, arrow=False, yshift=-10, xanchor="left")
+    note(fig, swing + 1, swing_high, "Swing high", TEXT, ax=-35, ay=-12)
+    depth_x = swing + 0.4
+    fig.add_shape(type="line", x0=depth_x, x1=low_bar + 1, y0=dip_low, y1=dip_low, line=dict(color=DOWN, width=1, dash="dot"))
+    fig.add_annotation(x=depth_x, y=dip_low, ax=depth_x, ay=swing_high, xref="x", yref="y", axref="x", ayref="y",
+                       showarrow=True, arrowhead=2, arrowside="end+start", arrowcolor=DOWN, text="")
+    note(fig, depth_x - 0.2, (swing_high + dip_low) / 2, f"③ Dip ≥ {min_depth_atr:g} ATR", DOWN, arrow=False,
+         xanchor="right")
+    note(fig, trigger + 1, frame["High"].iloc[trigger], "④ BUY", UP, ax=-5, ay=-40)
+    steps = [
+        f"① Trend: fast MA {trend_mid} rising, above slow MA {trend_slow}",
+        f"② Swing high: highest high of the {swing_bars} bars before",
+        f"③ In the last {pullback_bars} bars the low fell ≥ {min_depth_atr:g} ATR",
+        f"    below the swing high and reached the {pullback_ema} EMA",
+        "④ BUY: first close above the prior bar's high",
+    ]
+    fig.add_annotation(x=0, y=0, xref="paper", yref="paper", xanchor="left", yanchor="top", yshift=-6, align="left",
+                       showarrow=False, text="<br>".join(steps), font=dict(size=11, color=TEXT))
+    finish(fig, [slow_trend.min() - 2.5, bracket_y + 2.5], height=440)
+    fig.update_layout(margin=dict(b=95))
+    fig.update_xaxes(range=[0.3, len(frame) + 0.7])
+    return fig
 
 
 def reversal_figure(lookback=20, trend_mid=50, trend_slow=200, max_hold=10):

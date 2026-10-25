@@ -2229,6 +2229,39 @@ def settings_panel(title, expanded=True):
     return st.sidebar.expander(title, expanded=expanded)
 
 
+def _copy_widget_value(source, target):
+    st.session_state[target] = st.session_state[source]
+
+
+def slider_with_input(label, min_value, max_value, value, step=1, key=None, help=None, **slider_kwargs):
+    """A slider with a number box beside it for typing an exact value; the two stay in sync.
+
+    The slider keeps ``key``, so code that reads ``st.session_state[key]`` is unchanged.
+    """
+
+    box_key = f"{key}_input"
+    if key not in st.session_state:
+        st.session_state[key] = value
+    if box_key not in st.session_state:
+        st.session_state[box_key] = st.session_state[key]
+    # Keep the box beside the slider on phones too, where Streamlit would otherwise stack the columns.
+    st.markdown(
+        "<style>[class*='st-key-slider-pair-'] [data-testid='stHorizontalBlock'] {flex-wrap: nowrap; gap: 0.75rem}"
+        "[class*='st-key-slider-pair-'] [data-testid='stColumn'] {min-width: 0}"
+        "[class*='st-key-slider-pair-'] [data-testid='stColumn']:last-child {flex: 0 0 4.5rem}</style>",
+        unsafe_allow_html=True,
+    )
+    with st.container(key=f"slider-pair-{key}"):
+        slider_column, box_column = st.columns([3, 1], vertical_alignment="bottom")
+    with slider_column:
+        result = st.slider(label, min_value, max_value, step=step, key=key, help=help,
+                           on_change=_copy_widget_value, args=(key, box_key), **slider_kwargs)
+    with box_column:
+        st.number_input(f"{label} (type a value)", min_value=min_value, max_value=max_value, step=step, key=box_key,
+                        label_visibility="collapsed", on_change=_copy_widget_value, args=(box_key, key))
+    return result
+
+
 def show_chart(fig, **kwargs):
     """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width."""
 
@@ -3189,7 +3222,7 @@ def strategy_settings(tab="Backtest"):
         elif setup == "breakout":
             diagram = breakout_figure(breakout_lookback, volume_multiple, exit_ma)
         elif setup == "pullback":
-            diagram = pullback_figure(pullback_ema, trend_mid, trend_slow, min_depth_atr)
+            diagram = pullback_figure(pullback_ema, trend_mid, trend_slow, min_depth_atr, swing_bars, pullback_bars)
         elif setup == "reversal":
             diagram = reversal_figure(breakout_lookback, trend_mid, trend_slow, max_hold_bars)
         else:
@@ -3218,10 +3251,11 @@ def strategy_settings(tab="Backtest"):
                                            step=0.1, key="risk_pct")
                 max_position_pct = st.number_input("Max position (% of equity)", min_value=1.0, max_value=100.0,
                                                    value=25.0, step=1.0, key="max_position_pct")
-            full_size_confidence = st.slider("Full-size confidence threshold", 50, 95, 75, key="full_size_confidence",
-                                             help="Confidence = 50 + 50 x the weighted score of signal quality, "
-                                             "trend, volume, intraday, fundamentals and historical edge.")
-            half_size_confidence = st.slider("Half-size confidence threshold", 40, 90, 60, key="half_size_confidence")
+            full_size_confidence = slider_with_input(
+                "Full-size confidence threshold", 50, 95, 75, key="full_size_confidence",
+                help="Confidence = 50 + 50 x the weighted score of signal quality, "
+                "trend, volume, intraday, fundamentals and historical edge.")
+            half_size_confidence = slider_with_input("Half-size confidence threshold", 40, 90, 60, key="half_size_confidence")
             if tab == SIGNAL_TAB:
                 opening_range_minutes = st.selectbox(
                     "Intraday opening range (minutes)", [15, 30, 60], index=1, key="opening_range_minutes",
@@ -3765,9 +3799,9 @@ def exit_pct_slider(key):
     Returns the hold threshold the rule uses, (close - low) / (high - low) >= 1 - X/100.
     """
 
-    exit_pct = st.slider("Exit when the close is more than this far below the day's high (% of the day's range)",
-                         0, 100, 33, 1, key=key, format="%d%%",
-                         help="33% is the top third: a close in the top third of the day's range is held overnight.")
+    exit_pct = slider_with_input("Exit when the close is more than this far below the day's high (% of the day's range)",
+                                 0, 100, 33, 1, key=key, format="%d%%",
+                                 help="33% is the top third: a close in the top third of the day's range is held overnight.")
     return 1 - exit_pct / 100
 
 
