@@ -2713,7 +2713,10 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
 
 
 def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
-    """Growth vs price, revenue, EPS, trailing P/E and PEG for one ticker, with their captions."""
+    """Growth vs price, revenue, EPS, trailing P/E and PEG for one ticker, with their captions.
+
+    Returns False, after a warning, when there is no price history for the ticker.
+    """
 
     today = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
     history_start = (pd.Timestamp(date.today()) - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
@@ -2723,7 +2726,11 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
         earnings_start = (pd.Timestamp(history_start) - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
         earnings = load_earnings_data(ticker, earnings_start, today)
         prices = load_data(ticker, earnings_start, today, "Daily")
-        valuation, _ = build_valuation_data(prices, earnings)
+    if prices.empty or "Close" not in prices:
+        st.warning(f"Yahoo Finance has no price history for {ticker}. Check the symbol: it must be the ticker "
+                   "Yahoo uses, e.g. a US listing or an OTC ADR such as BESIY.")
+        return False
+    valuation, _ = build_valuation_data(prices, earnings)
     trend = fundamental_trend(fundamentals)
     if trend and "Revenue" in fundamentals:
         revenue = fundamentals["Revenue"].dropna()
@@ -2842,7 +2849,8 @@ def render_stock_fundamentals():
         return
     name = load_fundamental_snapshot(ticker).get("shortName")
     st.subheader(f"{ticker} · {name}" if name else ticker)
-    render_fundamentals(ticker, years, log_price)
+    if render_fundamentals(ticker, years, log_price) is False:
+        return
     render_what_happened_next(ticker, years, frequency, look_ahead, lookback_years, band)
 
 

@@ -291,6 +291,13 @@ def test_stock_fundamentals_tab(offline, monkeypatch):
     open_tab(app, "Stock Fundamentals")
     assert any("Enter a ticker" in element.value for element in app.info)
 
+    # A symbol Yahoo doesn't know returns no prices: a warning, not a crash.
+    monkeypatch.setattr(yf, "download", lambda tickers, *args, **kwargs: (
+        pd.DataFrame() if tickers == "SKNX" else fake_download(tickers, *args, **kwargs)))
+    next(box for box in app.text_input if box.key == "fundamentals_ticker").input("SKNX")
+    open_tab(app, "Stock Fundamentals")
+    assert any("no price history for SKNX" in element.value for element in app.warning)
+
 
 def test_mobile_layout_has_no_sidebar(offline):
     app = start_app()
