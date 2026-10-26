@@ -195,17 +195,33 @@ def test_screener_tab_scans_a_custom_list(offline):
     assert "stocks pass" in " ".join(element.value for element in app.success)
 
 
-def test_market_and_industry_tabs(offline):
+def test_market_and_industry_tabs(offline, monkeypatch):
+    import analysis.universe
+    # Only the Dow list is built in; the others come from the web, so give Nasdaq-100 a small fake list.
+    real_members = analysis.universe.load_us_index_members
+    monkeypatch.setattr(analysis.universe, "load_us_index_members",
+                        lambda name: real_members("Dow Jones 30").head(8) if name == "Nasdaq-100" else real_members(name))
     app = open_tab(start_app(), "Market Analysis")
     assert app.sidebar.header[0].value == "Market Analysis"
     # Index trends come from the data preloaded at start; breadth waits for its button.
     assert any("Market filter" in element.value for element in list(app.success) + list(app.error))
-    next(box for box in app.selectbox if box.label == "Breadth universe").select("Dow Jones 30")
+    next(box for box in app.selectbox if box.key == "market_index").select("Dow Jones")
     open_tab(app, "Market Analysis")
     next(button for button in app.button if button.key == "market_load_btn").click()
     open_tab(app, "Market Analysis")
     assert not app.exception, app.exception
     assert any(metric.label.startswith("Above SMA") for metric in app.metric)
+    assert any(header.value == "Market breadth: Dow Jones" for header in app.subheader)
+    # Once breadth was loaded, switching index loads and shows that index's breadth without the button.
+    next(box for box in app.selectbox if box.key == "market_index").select("Nasdaq-100")
+    open_tab(app, "Market Analysis")
+    assert not app.exception, app.exception
+    assert any(header.value == "Market breadth: Nasdaq-100" for header in app.subheader)
+    assert any(metric.label.startswith("Above SMA") for metric in app.metric)
+    next(box for box in app.selectbox if box.key == "market_index").select("Russell 2000")
+    open_tab(app, "Market Analysis")
+    assert not app.exception, app.exception
+    assert not any(metric.label.startswith("Above SMA") for metric in app.metric)
 
     open_tab(app, "Industry Analysis")
     assert any("Industry indexes" in chart.proto.spec for chart in app.get("plotly_chart"))

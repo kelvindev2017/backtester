@@ -2333,15 +2333,21 @@ def load_main_indexes():
 # Market Analysis tab
 # ============================================================
 
-MARKET_ANALYSIS_UNIVERSES = ["S&P 500", "Nasdaq-100", "Dow Jones 30"]
+# Index -> member list used for its breadth. Indexes without a member list have no breadth.
+MARKET_BREADTH_UNIVERSES = {"S&P 500": "S&P 500", "Nasdaq-100": "Nasdaq-100", "Dow Jones": "Dow Jones 30"}
 
 
 def render_market_analysis(index_prices):
     """US index trends, market breadth and the market filter. Stores the filter verdict for the screener."""
 
     indexes = SCREENER_MARKETS["US"]["indexes"]
-    with settings_panel("Breadth data"):
-        universe = st.selectbox("Breadth universe", MARKET_ANALYSIS_UNIVERSES, key="market_universe")
+    with settings_panel("Index"):
+        chart_index = st.selectbox(
+            "Index", list(indexes), key="market_index",
+            help="Drives the index chart and the market breadth below. Breadth needs a member list, so it covers "
+                 "S&P 500, Nasdaq-100 and Dow Jones only.",
+        )
+        universe = MARKET_BREADTH_UNIVERSES.get(chart_index)
         recent_days = int(st.number_input(
             "New-high window (days)", min_value=1, max_value=120, value=20, step=1, key="market_recent_days",
             help="Breadth counts stocks that made a new 52-week high (or low) at least once in this many trading days.",
@@ -2353,7 +2359,6 @@ def render_market_analysis(index_prices):
         ma_fast = int(ma_columns[0].number_input("Short", min_value=2, max_value=400, value=20, step=1, key="market_ma_fast"))
         ma_mid = int(ma_columns[1].number_input("Medium", min_value=2, max_value=400, value=50, step=1, key="market_ma_mid"))
         ma_slow = int(ma_columns[2].number_input("Long", min_value=2, max_value=400, value=200, step=1, key="market_ma_slow"))
-        chart_index = st.selectbox("Index chart", list(indexes), key="market_index_chart")
     ma_periods = tuple(dict.fromkeys([ma_fast, ma_mid, ma_slow]))
     with settings_panel("Market filter", expanded=False):
         gate_index = st.selectbox("Index", list(indexes), key="market_gate_index")
@@ -2386,22 +2391,26 @@ def render_market_analysis(index_prices):
     else:
         st.warning("No index data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
 
-    members, members_error = load_universe_members("US", universe)
-    tickers = members["Ticker"].tolist()
-    data_key = json.dumps([universe, tickers])
-    loaded = st.session_state.get("market_data")
-    if load_clicked and tickers:
-        progress = st.progress(0.0, text="Downloading prices...")
-        prices = load_price_panel(tickers, progress=lambda value: progress.progress(value, text="Downloading prices..."))
-        progress.empty()
-        loaded = {"key": data_key, "prices": prices}
-        st.session_state["market_data"] = loaded
-
+    # Prices are kept per universe, so switching index shows that index's breadth. Once any breadth
+    # has been loaded this session, picking another index downloads its members without the button.
+    loaded_universes = st.session_state.setdefault("market_data", {})
     breadth_latest = pd.Series(dtype=float)
-    st.subheader(f"Market breadth: {universe}")
-    if members.empty:
+    st.subheader(f"Market breadth: {chart_index}")
+    members, members_error = (pd.DataFrame(), "") if universe is None else load_universe_members("US", universe)
+    tickers = [] if members.empty else members["Ticker"].tolist()
+    data_key = json.dumps([universe, tickers])
+    loaded = loaded_universes.get(data_key)
+    if tickers and (load_clicked or (loaded is None and loaded_universes)):
+        progress = st.progress(0.0, text=f"Downloading {chart_index} prices...")
+        prices = load_price_panel(tickers, progress=lambda value: progress.progress(value, text=f"Downloading {chart_index} prices..."))
+        progress.empty()
+        loaded = loaded_universes[data_key] = {"prices": prices}
+
+    if universe is None:
+        st.info(f"No member list for {chart_index}, so no breadth. Pick S&P 500, Nasdaq-100 or Dow Jones.")
+    elif members.empty:
         st.error(f"Could not load the members of {universe}. {members_error}")
-    elif loaded is None or loaded["key"] != data_key:
+    elif loaded is None:
         st.info(f"Press **Load breadth data** in the settings to download the {len(tickers)} members of {universe}.")
     elif not loaded["prices"]:
         st.error("No price data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
