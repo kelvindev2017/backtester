@@ -2316,15 +2316,23 @@ def slider_with_input(label, min_value, max_value, value, step=1, key=None, help
     return result
 
 
-def show_chart(fig, **kwargs):
-    """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width."""
+def show_chart(fig, zoom_dates=False, **kwargs):
+    """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width.
+
+    ``zoom_dates`` keeps a date chart zoomable on mobile even when swipes scroll the page: a sideways drag
+    on the plot zooms into those dates (double-tap to zoom back out), while the y-axes stay fixed, so a
+    swipe on the y-axis labels at either side still scrolls the page.
+    """
 
     if MOBILE and st.session_state.get("chart_touch", CHART_TOUCH_MODES[0]) == CHART_TOUCH_MODES[0]:
         # Plotly takes every touch on the plot for zoom and pan, so a chart taller than the screen traps the page.
         # Without drag and with fixed axes, a swipe scrolls the page; a tap still shows the values under the finger.
-        fig.update_layout(dragmode=False)
-        fig.update_xaxes(fixedrange=True)
         fig.update_yaxes(fixedrange=True)
+        if zoom_dates:
+            fig.update_layout(dragmode="zoom")
+        else:
+            fig.update_layout(dragmode=False)
+            fig.update_xaxes(fixedrange=True)
     if MOBILE:
         compact = dict(font=dict(size=10), entrywidth=0.5, entrywidthmode="fraction")
         legends = [key for key in fig.layout.to_plotly_json() if key.startswith("legend") and key != "legend"]
@@ -2440,7 +2448,7 @@ def render_economic_analysis():
             st.caption(f"Rebased to 100 on {first_day:%d %b %Y}{note}. S&P 500 is SPY, Treasuries IEF and TLT, gold GLD, "
                        "all with dividends reinvested. Oil is the Brent front-month futures price, which an oil fund "
                        "does not earn (rolling futures costs money); bitcoin is BTC-USD.")
-            show_chart(assets_figure(rebased, gap_px=135 if MOBILE else 80), width="stretch")
+            show_chart(assets_figure(rebased, gap_px=163 if MOBILE else 108), width="stretch", zoom_dates=True)
             table = asset_table(rebased)
             correlation_column = f"Correlation with {ECONOMY_BENCHMARK}"
             st.dataframe(table.style.format({column: "{:+,.0f}" for column in ["Total return %", "Below peak now %",
@@ -2474,14 +2482,14 @@ def render_economic_analysis():
     sp500 = sp500[SP500_INDEX].dropna() if SP500_INDEX in sp500 else pd.Series(dtype=float)
     last_day = max(series.index[-1] for series in values.values())
     start = window_start(last_day, HISTORY_CHOICES[macro_history])
-    fig = macro_figure(values, sp500, recession, start=start, gap_px=110 if MOBILE else 80)
+    fig = macro_figure(values, sp500, recession, start=start, gap_px=138 if MOBILE else 108)
     if fig is None:
         st.info("No data in the chosen window.")
         return
     st.caption("Monthly data from FRED (St. Louis Fed); the S&P 500 index level (^GSPC, no dividends) on a right-hand "
                "log axis in every panel. Grey bands are NBER US recessions. Where the lines cross depends only on "
                "how each axis is scaled, so a crossing is not a signal.")
-    show_chart(fig, width="stretch")
+    show_chart(fig, width="stretch", zoom_dates=True)
     st.markdown("\n".join(f"- {latest_text(name, series)}" for name, series in values.items()))
 
 
