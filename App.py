@@ -25,6 +25,24 @@ from analysis.day_breakout import (
     split_summary,
     ticker_summary,
 )
+from analysis.economy import (
+    ASSETS,
+    BENCHMARK as ECONOMY_BENCHMARK,
+    DEFAULT_ASSETS,
+    DEFAULT_INDICATORS,
+    HISTORY_CHOICES,
+    INDICATORS,
+    RECESSION_SERIES,
+    SP500_INDEX,
+    asset_table,
+    assets_figure,
+    fred_series,
+    indicator_values,
+    latest_text,
+    macro_figure,
+    rebase,
+    window_start,
+)
 from analysis.engine import AnalysisSettings, analyze, report_to_dict, report_to_markdown
 from analysis.indicators import resample_ohlcv
 from analysis.notify import send_webhook, short_summary
@@ -2207,10 +2225,11 @@ def index_membership(market, tickers):
 SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
 FUNDAMENTALS_TAB = "Stock Fundamentals"
 DAY_BREAKOUT_TAB = "Day Breakout Rule"
+ECONOMY_TAB = "Economic analysis"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
-TAB_NAMES = ["Stock Screener", "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Backtest", "Signal Analysis & Trade Plan", "Validate",
-             DAY_BREAKOUT_TAB]
+TAB_NAMES = [ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Stock Screener", "Backtest",
+             "Signal Analysis & Trade Plan", "Validate", DAY_BREAKOUT_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
 CHART_TOUCH_MODES = ["Scroll the page", "Zoom and pan the chart"]
@@ -2327,6 +2346,143 @@ def load_main_indexes():
     """Daily prices (about 5 years) for the main US and industry indexes, loaded when the app starts."""
 
     return load_price_panel(MAIN_INDEX_SYMBOLS, days=1900)
+
+
+# ============================================================
+# Economic analysis tab
+# ============================================================
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _download_asset_closes(symbols):
+    end = pd.Timestamp(date.today()) + pd.Timedelta(days=1)
+    data = yf.download(list(symbols), start="1950-01-01", end=end.strftime("%Y-%m-%d"), auto_adjust=True,
+                       progress=False, threads=True)
+    if data is None or data.empty or "Close" not in data.columns.get_level_values(0):
+        raise ValueError("no prices returned")  # raised, not returned, so a failure is not cached
+    closes = data["Close"]
+    if isinstance(closes, pd.Series):
+        closes = closes.to_frame(symbols[0])
+    closes = closes.reindex(columns=list(symbols))
+    closes.index = pd.to_datetime(closes.index)
+    if getattr(closes.index, "tz", None) is not None:
+        closes.index = closes.index.tz_localize(None)
+    return closes.sort_index()
+
+
+def load_asset_closes(symbols):
+    """Dividend-adjusted daily closes since 1950, a column per symbol (empty on failure). Cached for 6 hours."""
+
+    try:
+        return _download_asset_closes(symbols)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def _download_fred(series_id):
+    return fred_series(series_id)
+
+
+def load_fred(series_id):
+    """A FRED series and "", or an empty Series and the error. Successes are cached for 12 hours."""
+
+    try:
+        return _download_fred(series_id), ""
+    except Exception as error:
+        return pd.Series(dtype=float), f"{type(error).__name__}: {error}"
+
+
+def render_economic_analysis():
+    """The S&P 500 next to other asset classes, and next to inflation, unemployment and interest rates."""
+
+    with settings_panel("Assets"):
+        asset_names = st.multiselect("Compare with the S&P 500", [name for name in ASSETS if name != ECONOMY_BENCHMARK],
+                                     default=[name for name in DEFAULT_ASSETS if name != ECONOMY_BENCHMARK],
+                                     key="economy_assets")
+        asset_history = st.select_slider("Asset history", list(HISTORY_CHOICES), value="10y", key="economy_asset_years",
+                                         help="All lines start at 100 on the first day every asset shown has a price, "
+                                              "so an asset with a short history (bitcoin from 2014) moves the start.")
+    with settings_panel("Economy"):
+        indicator_names = st.multiselect("Indicators", list(INDICATORS), default=DEFAULT_INDICATORS,
+                                         key="economy_indicators",
+                                         help="Each gets its own panel, with the S&P 500 on a right-hand log axis.")
+        macro_history = st.select_slider("Economy history", list(HISTORY_CHOICES), value="30y", key="economy_macro_years")
+
+    st.caption(
+        "Context, not a timing signal. Over 1992-2026, switching from stocks to Treasuries on inflation, "
+        "unemployment, the Fed rate or the yield curve did not beat holding the S&P 500; the better rules mostly "
+        "cut the worst fall at a small cost in return. How much to hold elsewhere is mostly a question of how big "
+        "a fall you can sit through: the table below shows each asset's volatility, worst fall and correlation."
+    )
+
+    st.subheader("S&P 500 vs other assets")
+    names = [ECONOMY_BENCHMARK] + [name for name in asset_names if name != ECONOMY_BENCHMARK]
+    symbols = tuple(ASSETS[name][0] for name in names)
+    with st.spinner("Loading asset prices..."):
+        closes = load_asset_closes(symbols)
+    missing = [name for name in names if closes.empty or ASSETS[name][0] not in closes or closes[ASSETS[name][0]].dropna().empty]
+    if ECONOMY_BENCHMARK in missing:
+        st.warning("No S&P 500 prices were returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
+    else:
+        if missing:
+            st.warning(f"No prices for {', '.join(missing)}; left out.")
+        shown = [name for name in names if name not in missing]
+        frame = closes[[ASSETS[name][0] for name in shown]].set_axis(shown, axis=1)
+        last_day = frame.dropna(how="all").index[-1]
+        rebased, first_day = rebase(frame, window_start(last_day, HISTORY_CHOICES[asset_history]))
+        if first_day is None or len(rebased) < 30:
+            st.info("Not enough overlapping history to compare these assets.")
+        else:
+            starts = {name: frame[name].first_valid_index() for name in shown}
+            limiter = max(starts, key=starts.get)
+            note = (f" ({limiter} has prices only from {starts[limiter]:%b %Y})"
+                    if starts[limiter] is not None and starts[limiter] >= first_day - pd.Timedelta(days=7) else "")
+            st.caption(f"Rebased to 100 on {first_day:%d %b %Y}{note}. S&P 500 is SPY, Treasuries IEF and TLT, gold GLD, "
+                       "all with dividends reinvested. Oil is the Brent front-month futures price, which an oil fund "
+                       "does not earn (rolling futures costs money); bitcoin is BTC-USD.")
+            show_chart(assets_figure(rebased, gap_px=135 if MOBILE else 80), width="stretch")
+            table = asset_table(rebased)
+            correlation_column = f"Correlation with {ECONOMY_BENCHMARK}"
+            st.dataframe(table.style.format({column: "{:+,.0f}" for column in ["Total return %", "Below peak now %",
+                                                                              "Worst fall %"]}
+                                            | {"Per year %": "{:+.1f}", "Volatility %/yr": "{:.0f}",
+                                               correlation_column: "{:+.2f}"}, na_rep="-"),
+                         width="stretch")
+            st.caption("Volatility and correlation use weekly returns. A correlation near 0 or below means the asset "
+                       "has tended to move on its own when the S&P 500 moves, which is what makes it a diversifier; it "
+                       "changes over time (see the bottom panel), e.g. stocks and Treasuries fell together in 2022.")
+
+    st.subheader("S&P 500 vs the US economy")
+    if not indicator_names:
+        st.info("Pick at least one indicator in the settings.")
+        return
+    with st.spinner("Loading FRED data..."):
+        values, errors = {}, []
+        for name in indicator_names:
+            series_id, transform, _, _ = INDICATORS[name]
+            raw, error = load_fred(series_id)
+            if raw.empty:
+                errors.append(f"{name} ({series_id}): {error or 'no data'}")
+            else:
+                values[name] = indicator_values(raw, transform)
+        recession, _ = load_fred(RECESSION_SERIES)
+        sp500 = load_asset_closes((SP500_INDEX,))
+    if errors:
+        st.warning("Could not load from FRED: " + "; ".join(errors))
+    if not values:
+        return
+    sp500 = sp500[SP500_INDEX].dropna() if SP500_INDEX in sp500 else pd.Series(dtype=float)
+    last_day = max(series.index[-1] for series in values.values())
+    start = window_start(last_day, HISTORY_CHOICES[macro_history])
+    fig = macro_figure(values, sp500, recession, start=start, gap_px=110 if MOBILE else 80)
+    if fig is None:
+        st.info("No data in the chosen window.")
+        return
+    st.caption("Monthly data from FRED (St. Louis Fed); the S&P 500 index level (^GSPC, no dividends) on a right-hand "
+               "log axis in every panel. Grey bands are NBER US recessions. Where the lines cross depends only on "
+               "how each axis is scaled, so a crossing is not a signal.")
+    show_chart(fig, width="stretch")
+    st.markdown("\n".join(f"- {latest_text(name, series)}" for name, series in values.items()))
 
 
 # ============================================================
@@ -4089,7 +4245,9 @@ if check_password():
         with tab:
             if not tab_is_open(tab, label):
                 continue
-            if label == "Stock Screener":
+            if label == ECONOMY_TAB:
+                render_economic_analysis()
+            elif label == "Stock Screener":
                 render_stock_screener()
             elif label == "Market Analysis":
                 render_market_analysis(main_index_prices)
