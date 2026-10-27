@@ -95,8 +95,8 @@ def open_tab(app, label):
 
 def test_app_runs_both_tabs(offline):
     app = start_app()
-    assert [tab.label for tab in app.tabs] == ["Stock Screener", "Market Analysis", "Industry Analysis",
-                                               "Stock Fundamentals", "Semicon Supply Chain", "Backtest",
+    assert [tab.label for tab in app.tabs] == ["Economic analysis", "Market Analysis", "Industry Analysis",
+                                               "Stock Fundamentals", "Semicon Supply Chain", "Stock Screener", "Backtest",
                                                "Signal Analysis & Trade Plan", "Validate", "Day Breakout Rule"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
@@ -108,6 +108,30 @@ def test_app_runs_both_tabs(offline):
     )
     assert "AAPL" in rendered
     assert any("Trade plan" in element.value for element in app.subheader)
+
+
+def test_economic_analysis_tab_opens_first(offline, monkeypatch):
+    import analysis.economy
+    fred = {
+        "CPIAUCSL": pd.Series(np.linspace(250, 320, 120), index=pd.date_range("2016-01-01", periods=120, freq="MS")),
+        "UNRATE": pd.Series(np.linspace(5, 4, 120), index=pd.date_range("2016-01-01", periods=120, freq="MS")),
+        "USREC": pd.Series([0] * 50 + [1] * 3 + [0] * 67, index=pd.date_range("2016-01-01", periods=120, freq="MS")),
+    }
+
+    def fake_fred(series_id, timeout=30):
+        if series_id not in fred:
+            raise OSError("not in the test data")
+        return fred[series_id]
+
+    monkeypatch.setattr(analysis.economy, "fred_series", fake_fred)
+    app = start_app()
+    assert not app.exception, app.exception
+    assert app.sidebar.header[0].value == "Economic analysis"
+    assert [element.value for element in app.subheader] == ["S&P 500 vs other assets", "S&P 500 vs the US economy"]
+    assert any("Correlation with S&P 500" in str(frame.value.columns) for frame in app.dataframe)
+    # FEDFUNDS is missing from the fake data: a warning, and the other panels still draw.
+    assert any("FEDFUNDS" in element.value for element in app.warning)
+    assert any("Unemployment rate: 4.00%" in element.value for element in app.markdown)
 
 
 def test_validate_tab_runs(offline):
@@ -169,7 +193,7 @@ def test_setup_periods_are_editable(offline):
 
 
 def test_screener_tab_scans_a_custom_list(offline):
-    app = start_app()
+    app = open_tab(start_app(), "Stock Screener")
     assert app.sidebar.header[0].value == "Stock Screener"
     next(box for box in app.selectbox if box.label == "Universe").select("Custom list").run()
     next(button for button in app.button if button.key == "screener_load_btn").click().run()
@@ -302,7 +326,7 @@ def test_stock_fundamentals_tab(offline, monkeypatch):
 def test_mobile_layout_has_no_sidebar(offline):
     app = start_app()
     app.session_state["layout_mode"] = "Mobile"
-    app.run()
+    open_tab(app, "Stock Screener")
     assert not app.exception, app.exception
     assert len(app.sidebar.children) == 0
     expanders = [element.label for element in app.get("expander")]
@@ -341,7 +365,7 @@ def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
 
     monkeypatch.setattr(yf, "Ticker", BlockedTicker)
     st.cache_resource.clear()
-    app = start_app()
+    app = open_tab(start_app(), "Stock Screener")
     next(box for box in app.selectbox if box.label == "Universe").select("Custom list").run()
     next(button for button in app.button if button.key == "screener_load_btn").click().run()
     next(box for box in app.selectbox if box.label == "Signal group").select("Mkt cap").run()
