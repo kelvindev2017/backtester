@@ -130,7 +130,14 @@ def asset_table(rebased, benchmark=BENCHMARK):
     return pd.DataFrame.from_dict(rows, orient="index")
 
 
-def assets_figure(rebased, colors=None, benchmark=BENCHMARK, height=None, gap_px=80):
+def dates_on_every_panel(fig, rows, height):
+    """Date tick labels under every panel (not only the bottom one), each panel's legend below them."""
+
+    fig.update_xaxes(showticklabels=True)
+    legends_under_panels(fig, rows, height, dates_every_row=True)
+
+
+def assets_figure(rebased, colors=None, benchmark=BENCHMARK, height=None, gap_px=108):
     """Rebased growth (log), drawdown and rolling correlation with the benchmark, stacked on one date axis.
 
     ``gap_px`` is the room between panels for a panel's legend and the next panel's title; a narrow
@@ -144,7 +151,7 @@ def assets_figure(rebased, colors=None, benchmark=BENCHMARK, height=None, gap_px
         panels.append((f"{CORRELATION_WEEKS}-week correlation with the {benchmark}", 0.28))
     rows = len(panels)
     height = height or {2: 640, 3: 900}[rows] + (gap_px - 80) * (rows - 1)
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.15, gap_px / height),
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.18, gap_px / height),
                         row_heights=[weight for _, weight in panels], subplot_titles=[title for title, _ in panels])
     for column in rebased.columns:
         color = colors.get(column, "gray")
@@ -167,7 +174,7 @@ def assets_figure(rebased, colors=None, benchmark=BENCHMARK, height=None, gap_px
     fig.update_yaxes(type="log", tickformat=",.0f", row=1, col=1)
     fig.update_yaxes(ticksuffix="%", row=2, col=1)
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), hovermode="x unified")
-    legends_under_panels(fig, rows, height)
+    dates_on_every_panel(fig, rows, height)
     return fig
 
 
@@ -187,7 +194,7 @@ def recession_periods(recession):
     return periods
 
 
-def macro_figure(indicators, sp500, recession=None, start=None, height=None, gap_px=80):
+def macro_figure(indicators, sp500, recession=None, start=None, height=None, gap_px=108):
     """One panel per indicator, each with the S&P 500 on a right-hand log axis and recessions shaded.
 
     ``indicators`` maps a name from :data:`INDICATORS` (or any name) to a Series of values. ``gap_px`` is
@@ -204,7 +211,7 @@ def macro_figure(indicators, sp500, recession=None, start=None, height=None, gap
         return None
     height = height or 220 + (180 + gap_px) * rows
     titles = [f"{name}, {INDICATORS.get(name, (None, None, '%'))[2]}" for name in indicators]
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.15, gap_px / height),
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.18, gap_px / height),
                         subplot_titles=titles)
     for row, (name, series) in enumerate(indicators.items(), start=1):
         color = INDICATORS.get(name, (None, None, None, "royalblue"))[3]
@@ -233,7 +240,7 @@ def macro_figure(indicators, sp500, recession=None, start=None, height=None, gap
                                      marker=dict(symbol="square", size=12, color=RECESSION_FILL)), row=1, col=1)
             fig.data[-1].legendrank = 102
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), hovermode="x unified")
-    legends_under_panels(fig, rows, height)
+    dates_on_every_panel(fig, rows, height)
     return fig
 
 

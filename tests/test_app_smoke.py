@@ -133,6 +133,14 @@ def test_economic_analysis_tab_opens_first(offline, monkeypatch):
     assert any("FEDFUNDS" in element.value for element in app.warning)
     assert any("Unemployment rate: 4.00%" in element.value for element in app.markdown)
 
+    # On phones, with swipes scrolling the page, the dates still zoom; the y-axes stay fixed.
+    app.session_state["layout_mode"] = "Mobile"
+    app = open_tab(app, "Economic analysis")
+    for chart in app.get("plotly_chart"):
+        layout = json.loads(chart.proto.spec)["layout"]
+        assert layout["dragmode"] == "zoom"
+        assert not layout["xaxis"].get("fixedrange") and layout["yaxis"]["fixedrange"] is True
+
 
 def test_validate_tab_runs(offline):
     app = open_tab(start_app(300), "Validate")
