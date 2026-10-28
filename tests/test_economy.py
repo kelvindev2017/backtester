@@ -60,6 +60,7 @@ def test_assets_figure_has_three_panels_with_their_own_legends():
     # Dates under every panel, not only the bottom one.
     assert all(fig.layout[axis].showticklabels for axis in ["xaxis", "xaxis2", "xaxis3"])
     assert fig.layout.yaxis.type == "log"
+    assert fig.layout.meta["axis_hover"] is True  # values on the axes instead of Plotly's hover box
     # Only the other asset gets a correlation line.
     assert [trace.name for trace in fig.data if trace.legend == "legend3"] == ["Gold"]
 
