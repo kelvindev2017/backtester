@@ -350,6 +350,11 @@ def test_mobile_charts_keep_their_zoom_for_touch_gestures(offline):
     assert "dragmode" not in layout and not layout.get("xaxis", {}).get("fixedrange")
     assert json.loads(chart.config)["scrollZoom"] is True
     assert not any(radio.key == "chart_touch" for radio in app.radio)
+    assert not any(box.key == "layout_mode" for box in app.selectbox)  # no Display panel on any tab
+    # Time charts with a unified hover show their values on the axes instead of in a hover box.
+    layouts = [json.loads(chart.proto.spec)["layout"] for chart in app.get("plotly_chart")]
+    assert all(layout.get("meta", {}).get("axis_hover") for layout in layouts if layout.get("hovermode") == "x unified")
+    assert any(layout.get("meta", {}).get("axis_hover") for layout in layouts)
 
     # On desktop a mouse wheel still scrolls the page.
     app.session_state["layout_mode"] = "Desktop"

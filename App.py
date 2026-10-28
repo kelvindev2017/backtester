@@ -332,15 +332,17 @@ CHART_AXIS_HOVER_JS = """
     const labels = { left: [], right: [] }, dates = new Map();
     for (const point of points) {
       const xa = point.xaxis, ya = point.yaxis;
-      if (!xa || !ya || typeof point.y !== "number" || !isFinite(point.y)) continue;
+      const value = typeof point.y === "number" ? point.y : point.close;  // candlesticks have no y
+      if (!xa || !ya || typeof value !== "number" || !isFinite(value)) continue;
       const bottom = ya._offset + ya._length;
       if (!dates.has(xa) || dates.get(xa).bottom < bottom) dates.set(xa, { bottom: bottom, x: point.x });
-      const y = pixel(ya, point.y);
+      const y = pixel(ya, value);
       if (y < ya._offset - 1 || y > ya._offset + ya._length + 1) continue;  // off the visible range
-      const color = (point.data.line && point.data.line.color) || (point.data.marker && point.data.marker.color) || "#555";
+      let color = (point.data.line && point.data.line.color) || (point.data.marker && point.data.marker.color) || "#555";
+      if (typeof color !== "string") color = "#555";  // per-bar colour lists
       box(overlay, { left: xa._offset + "px", width: xa._length + "px", top: y + "px",
                      borderTop: "1px dashed " + color, opacity: "0.8" });
-      labels[ya.side === "right" ? "right" : "left"].push({ y: y, xa: xa, color: color, text: format(point.y, ya) });
+      labels[ya.side === "right" ? "right" : "left"].push({ y: y, xa: xa, color: color, text: format(value, ya) });
     }
     for (const side of ["left", "right"]) {
       // Keep labels on the same axis from overlapping: push each one at least a label's height down.
@@ -2473,7 +2475,6 @@ NEXT_BENCHMARK = "SPY"
 TAB_NAMES = [ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Stock Screener", "Backtest",
              "Signal Analysis & Trade Plan", "Validate", DAY_BREAKOUT_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
-LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
 TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart")
@@ -2498,9 +2499,10 @@ def keep_settings_across_tabs():
 
 
 def detect_mobile():
-    """Mobile layout when chosen in Display, else when the browser's user agent is a phone or tablet.
+    """Mobile layout when the browser's user agent is a phone or tablet.
 
     Streamlit has no device check of its own; the user agent is the signal the server can see.
+    ``layout_mode`` in session state ("Desktop" or "Mobile") overrides it; the tests use this.
     """
 
     mode = st.session_state.get("layout_mode", "Auto")
@@ -2565,6 +2567,9 @@ def show_chart(fig, **kwargs):
     desktop still scrolls the page.
     """
 
+    if fig.layout.hovermode in ("x", "x unified"):
+        # Values on the axes (CHART_AXIS_HOVER_JS) instead of a hover box that covers the lines.
+        fig.update_layout(meta={**(fig.layout.meta or {}), "axis_hover": True})
     if MOBILE:
         kwargs["config"] = {**kwargs.get("config", {}), "scrollZoom": True}
         compact = dict(font=dict(size=10), entrywidth=0.5, entrywidthmode="fraction")
@@ -4513,9 +4518,3 @@ if check_password():
                 else:
                     render_validation(strategy.signal_settings, strategy.risk_settings, strategy.end_date)
 
-    with settings_panel("Display", expanded=False):
-        st.selectbox(
-            "Layout", LAYOUT_MODES, key="layout_mode",
-            help="Auto picks the mobile layout on phones and tablets. Desktop puts each tab's settings in the "
-            "sidebar; Mobile puts them in collapsible menus above the charts.",
-        )
