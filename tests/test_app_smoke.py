@@ -339,15 +339,22 @@ def test_mobile_layout_has_no_sidebar(offline):
     assert any("Conditions" in label for label in expanders)
 
 
-def test_mobile_charts_keep_their_zoom_for_the_hold_gesture(offline):
-    # Swipes scroll the page and a held finger turns on zoom and pan in the browser (CHART_HOLD_ZOOM_JS),
-    # so the charts themselves keep Plotly's zoom and pan, and there is no Display setting for it.
+def test_mobile_charts_keep_their_zoom_for_touch_gestures(offline):
+    # Swipes scroll the page and two fingers zoom in the browser (CHART_TOUCH_JS), which needs Plotly's
+    # scroll zoom; the charts themselves keep Plotly's zoom and pan, and there is no Display setting for it.
     app = start_app()
     app.session_state["layout_mode"] = "Mobile"
     app = open_tab(app, "Industry Analysis")
-    layout = json.loads(app.get("plotly_chart")[0].proto.spec)["layout"]
+    chart = app.get("plotly_chart")[0].proto
+    layout = json.loads(chart.spec)["layout"]
     assert "dragmode" not in layout and not layout.get("xaxis", {}).get("fixedrange")
+    assert json.loads(chart.config)["scrollZoom"] is True
     assert not any(radio.key == "chart_touch" for radio in app.radio)
+
+    # On desktop a mouse wheel still scrolls the page.
+    app.session_state["layout_mode"] = "Desktop"
+    app = open_tab(app, "Industry Analysis")
+    assert not json.loads(app.get("plotly_chart")[0].proto.config or "{}").get("scrollZoom")
 
 
 def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
