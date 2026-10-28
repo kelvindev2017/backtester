@@ -16,7 +16,7 @@ from analysis.economy import (
 
 def test_rebase_starts_on_the_first_common_weekday():
     days = pd.date_range("2024-01-01", periods=60, freq="D")  # includes weekends, like bitcoin
-    closes = pd.DataFrame({"S&P 500": np.linspace(100, 160, 60), "Bitcoin": np.linspace(10, 40, 60)}, index=days)
+    closes = pd.DataFrame({"Stock (S&P 500)": np.linspace(100, 160, 60), "Bitcoin": np.linspace(10, 40, 60)}, index=days)
     closes.loc[:"2024-01-09", "Bitcoin"] = np.nan
     rebased, first = rebase(closes)
     assert first == pd.Timestamp("2024-01-10")
@@ -38,19 +38,22 @@ def test_drawdown_and_table():
     up = pd.Series(np.linspace(100, 200, 600), index=days)
     dip = up.copy()
     dip.iloc[300:350] = dip.iloc[300] * 0.6
-    rebased = pd.DataFrame({"S&P 500": up, "Gold": dip})
-    assert drawdowns(rebased)["S&P 500"].min() == 0
+    rebased = pd.DataFrame({"Stock (S&P 500)": up, "Gold": dip})
+    assert drawdowns(rebased)["Stock (S&P 500)"].min() == 0
     assert round(drawdowns(rebased)["Gold"].min()) == -40
     table = asset_table(rebased / rebased.iloc[0] * 100)
-    assert table.at["S&P 500", "Correlation with S&P 500"] == 1.0
-    assert round(table.at["S&P 500", "Total return %"]) == 100
+    assert table.at["Stock (S&P 500)", "Correlation with Stock (S&P 500)"] == 1.0
+    assert round(table.at["Stock (S&P 500)", "Total return %"]) == 100
     assert round(table.at["Gold", "Worst fall %"]) == -40
+    # Without the S&P 500 there is nothing to correlate with.
+    assert "Correlation with Stock (S&P 500)" not in asset_table(rebased[["Gold"]]).columns
+    assert len(assets_figure(rebased[["Gold"]]).layout.annotations) == 2  # growth and drawdown panels only
 
 
 def test_assets_figure_has_three_panels_with_their_own_legends():
     days = pd.bdate_range("2020-01-01", periods=600)
     rng = np.random.default_rng(1)
-    rebased = pd.DataFrame({"S&P 500": 100 * np.cumprod(1 + rng.normal(0, 0.01, 600)),
+    rebased = pd.DataFrame({"Stock (S&P 500)": 100 * np.cumprod(1 + rng.normal(0, 0.01, 600)),
                             "Gold": 100 * np.cumprod(1 + rng.normal(0, 0.01, 600))}, index=days)
     fig = assets_figure(rebased)
     assert {trace.legend for trace in fig.data} == {"legend", "legend2", "legend3"}

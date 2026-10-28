@@ -153,6 +153,81 @@ st.set_page_config(
     initial_sidebar_state="auto",
 )
 
+# On touch screens a swipe over a chart scrolls the page, like anywhere else, and a tap shows the values.
+# Holding a finger still on a chart for HOLD_MS turns on that chart's zoom and pan (outlined in red), and the
+# same finger can carry on to zoom or pan. The next touch outside the chart's plot area goes back to scrolling;
+# the chart keeps its zoom. Charts that turn dragging off themselves (the supply chain graph) are left alone.
+# Runs in the app page itself (not this component's iframe), so it outlives reruns; installed once.
+CHART_HOLD_ZOOM_JS = """
+(function () {
+  const HOLD_MS = 200, SLOP_PX = 10;
+  let active = null, timer = null, start = null;
+  const style = document.createElement("style");
+  style.textContent = ".js-plotly-plot{-webkit-touch-callout:none}"
+    + ".chart-zoom-on{outline:2px solid #ff4b4b;outline-offset:2px;border-radius:4px}";
+  document.head.appendChild(style);
+
+  // The chart under a touch on its plot or axis area (Plotly's drag layers), unless the chart turned dragging off.
+  function chartOf(target) {
+    const gd = target.closest && target.closest(".drag") ? target.closest(".js-plotly-plot") : null;
+    const layout = gd && (gd._fullLayout || gd.layout);
+    return gd && !(layout && layout.dragmode === false) ? gd : null;
+  }
+  function cancelHold() { clearTimeout(timer); timer = null; start = null; }
+  // Send Plotly the touch it missed (untrusted events, which the listeners below let through). Throws
+  // without a Touch constructor (older Safari).
+  function replay(held, types) {
+    const point = new Touch({ identifier: held.id, target: held.target, clientX: held.x, clientY: held.y,
+                              pageX: held.x + window.scrollX, pageY: held.y + window.scrollY });
+    for (const type of types) {
+      const down = type === "touchstart";
+      held.target.dispatchEvent(new TouchEvent(type, { touches: down ? [point] : [], targetTouches: down ? [point] : [],
+        changedTouches: [point], bubbles: true, cancelable: true }));
+    }
+  }
+
+  document.addEventListener("touchstart", function (event) {
+    if (!event.isTrusted) return;
+    const gd = chartOf(event.target);
+    if (active && gd === active) return;  // zoom and pan: Plotly takes it
+    if (active) { active.classList.remove("chart-zoom-on"); active = null; }
+    cancelHold();
+    if (!gd || event.touches.length !== 1) return;
+    event.stopPropagation();  // Plotly never sees the touch, so the page scrolls
+    const target = event.target, touch = event.touches[0];
+    start = { x: touch.clientX, y: touch.clientY, id: touch.identifier, target: target };
+    timer = setTimeout(function () {
+      const held = start;
+      timer = null;
+      active = gd;
+      gd.classList.add("chart-zoom-on");
+      if (navigator.vibrate) navigator.vibrate(15);
+      try {  // hand the finger that is still down to Plotly, so it can zoom or pan straight away
+        replay(held, ["touchstart"]);
+      } catch (error) {
+        // Lift the finger and touch again to zoom or pan.
+      }
+    }, HOLD_MS);
+  }, { capture: true, passive: true });
+
+  document.addEventListener("touchmove", function (event) {
+    if (!timer) return;
+    const touch = event.touches[0];
+    if (Math.abs(touch.clientX - start.x) > SLOP_PX || Math.abs(touch.clientY - start.y) > SLOP_PX) cancelHold();
+  }, { capture: true, passive: true });
+  document.addEventListener("touchend", function (event) {
+    if (!timer || !event.isTrusted) return;
+    // A quick tap: give Plotly the whole tap, so it shows the values under the finger. Like Plotly, cancel
+    // the browser's follow-up mouse events, whose mouseout would hide the values again.
+    const tap = start;
+    cancelHold();
+    event.preventDefault();
+    setTimeout(function () { try { replay(tap, ["touchstart", "touchend"]); } catch (error) {} }, 0);
+  }, { capture: true, passive: false });
+  document.addEventListener("touchcancel", function () { if (timer) cancelHold(); }, { capture: true, passive: true });
+})();
+"""
+
 # Streamlit Community Cloud wraps the app in its own page, whose install
 # manifest and home-screen icon are Streamlit's. Both pages share an origin,
 # so point the wrapper's manifest and apple-touch-icon at our favicon.
@@ -190,8 +265,16 @@ components.html(
     // Not same-origin (e.g. embedded elsewhere): keep the defaults.
   }
 })();
+(function () {
+  const app = window.parent.document;
+  if (app.documentElement.dataset.chartHoldZoom) return;
+  app.documentElement.dataset.chartHoldZoom = "1";
+  const script = app.createElement("script");
+  script.textContent = %s;
+  app.head.appendChild(script);
+})();
 </script>
-""",
+""" % json.dumps(CHART_HOLD_ZOOM_JS),
     height=0,
 )
 
@@ -2232,7 +2315,6 @@ TAB_NAMES = [ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_T
              "Signal Analysis & Trade Plan", "Validate", DAY_BREAKOUT_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
-CHART_TOUCH_MODES = ["Scroll the page", "Zoom and pan the chart"]
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
 TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart")
@@ -2316,23 +2398,13 @@ def slider_with_input(label, min_value, max_value, value, step=1, key=None, help
     return result
 
 
-def show_chart(fig, zoom_dates=False, **kwargs):
+def show_chart(fig, **kwargs):
     """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width.
 
-    ``zoom_dates`` keeps a date chart zoomable on mobile even when swipes scroll the page: a sideways drag
-    on the plot zooms into those dates (double-tap to zoom back out), while the y-axes stay fixed, so a
-    swipe on the y-axis labels at either side still scrolls the page.
+    On touch screens a swipe over a chart scrolls the page; holding a finger on a chart turns on its zoom
+    and pan (see CHART_HOLD_ZOOM_JS).
     """
 
-    if MOBILE and st.session_state.get("chart_touch", CHART_TOUCH_MODES[0]) == CHART_TOUCH_MODES[0]:
-        # Plotly takes every touch on the plot for zoom and pan, so a chart taller than the screen traps the page.
-        # Without drag and with fixed axes, a swipe scrolls the page; a tap still shows the values under the finger.
-        fig.update_yaxes(fixedrange=True)
-        if zoom_dates:
-            fig.update_layout(dragmode="zoom")
-        else:
-            fig.update_layout(dragmode=False)
-            fig.update_xaxes(fixedrange=True)
     if MOBILE:
         compact = dict(font=dict(size=10), entrywidth=0.5, entrywidthmode="fraction")
         legends = [key for key in fig.layout.to_plotly_json() if key.startswith("legend") and key != "legend"]
@@ -2404,9 +2476,8 @@ def render_economic_analysis():
     """The S&P 500 next to other asset classes, and next to inflation, unemployment and interest rates."""
 
     with settings_panel("Assets"):
-        asset_names = st.multiselect("Compare with the S&P 500", [name for name in ASSETS if name != ECONOMY_BENCHMARK],
-                                     default=[name for name in DEFAULT_ASSETS if name != ECONOMY_BENCHMARK],
-                                     key="economy_assets")
+        asset_names = st.multiselect("Assets", list(ASSETS), default=DEFAULT_ASSETS, key="economy_assets",
+                                     help="The correlation panel and column need Stock (S&P 500) in the list.")
         asset_history = st.select_slider("Asset history", list(HISTORY_CHOICES), value="10y", key="economy_asset_years",
                                          help="All lines start at 100 on the first day every asset shown has a price, "
                                               "so an asset with a short history (bitcoin from 2014) moves the start.")
@@ -2423,17 +2494,21 @@ def render_economic_analysis():
         "a fall you can sit through: the table below shows each asset's volatility, worst fall and correlation."
     )
 
-    st.subheader("S&P 500 vs other assets")
-    names = [ECONOMY_BENCHMARK] + [name for name in asset_names if name != ECONOMY_BENCHMARK]
-    symbols = tuple(ASSETS[name][0] for name in names)
-    with st.spinner("Loading asset prices..."):
-        closes = load_asset_closes(symbols)
-    missing = [name for name in names if closes.empty or ASSETS[name][0] not in closes or closes[ASSETS[name][0]].dropna().empty]
-    if ECONOMY_BENCHMARK in missing:
-        st.warning("No S&P 500 prices were returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
+    st.subheader("Asset classes compared")
+    names = [name for name in ASSETS if name in asset_names]
+    if not names:
+        st.info("Pick at least one asset in the settings.")
     else:
-        if missing:
+        symbols = tuple(ASSETS[name][0] for name in names)
+        with st.spinner("Loading asset prices..."):
+            closes = load_asset_closes(symbols)
+        missing = [name for name in names
+                   if closes.empty or ASSETS[name][0] not in closes or closes[ASSETS[name][0]].dropna().empty]
+        if len(missing) == len(names):
+            st.warning("No prices were returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
+        elif missing:
             st.warning(f"No prices for {', '.join(missing)}; left out.")
+    if names and len(missing) < len(names):
         shown = [name for name in names if name not in missing]
         frame = closes[[ASSETS[name][0] for name in shown]].set_axis(shown, axis=1)
         last_day = frame.dropna(how="all").index[-1]
@@ -2445,16 +2520,15 @@ def render_economic_analysis():
             limiter = max(starts, key=starts.get)
             note = (f" ({limiter} has prices only from {starts[limiter]:%b %Y})"
                     if starts[limiter] is not None and starts[limiter] >= first_day - pd.Timedelta(days=7) else "")
-            st.caption(f"Rebased to 100 on {first_day:%d %b %Y}{note}. S&P 500 is SPY, Treasuries IEF and TLT, gold GLD, "
-                       "all with dividends reinvested. Oil is the Brent front-month futures price, which an oil fund "
+            st.caption(f"Rebased to 100 on {first_day:%d %b %Y}{note}. Stock (S&P 500) is SPY; it, the Treasury ETFs and "
+                       "GLD are shown with dividends reinvested. Oil is the Brent front-month futures price, which an oil fund "
                        "does not earn (rolling futures costs money); bitcoin is BTC-USD.")
-            show_chart(assets_figure(rebased, gap_px=163 if MOBILE else 108), width="stretch", zoom_dates=True)
+            show_chart(assets_figure(rebased, gap_px=163 if MOBILE else 108), width="stretch")
             table = asset_table(rebased)
-            correlation_column = f"Correlation with {ECONOMY_BENCHMARK}"
-            st.dataframe(table.style.format({column: "{:+,.0f}" for column in ["Total return %", "Below peak now %",
-                                                                              "Worst fall %"]}
-                                            | {"Per year %": "{:+.1f}", "Volatility %/yr": "{:.0f}",
-                                               correlation_column: "{:+.2f}"}, na_rep="-"),
+            formats = {column: "{:+,.0f}" for column in ["Total return %", "Below peak now %", "Worst fall %"]}
+            formats |= {"Per year %": "{:+.1f}", "Volatility %/yr": "{:.0f}"}
+            formats |= {column: "{:+.2f}" for column in table.columns if column.startswith("Correlation")}
+            st.dataframe(table.style.format(formats, na_rep="-"),
                          width="stretch")
             st.caption("Volatility and correlation use weekly returns. A correlation near 0 or below means the asset "
                        "has tended to move on its own when the S&P 500 moves, which is what makes it a diversifier; it "
@@ -2489,7 +2563,7 @@ def render_economic_analysis():
     st.caption("Monthly data from FRED (St. Louis Fed); the S&P 500 index level (^GSPC, no dividends) on a right-hand "
                "log axis in every panel. Grey bands are NBER US recessions. Where the lines cross depends only on "
                "how each axis is scaled, so a crossing is not a signal.")
-    show_chart(fig, width="stretch", zoom_dates=True)
+    show_chart(fig, width="stretch")
     st.markdown("\n".join(f"- {latest_text(name, series)}" for name, series in values.items()))
 
 
@@ -4283,9 +4357,4 @@ if check_password():
             "Layout", LAYOUT_MODES, key="layout_mode",
             help="Auto picks the mobile layout on phones and tablets. Desktop puts each tab's settings in the "
             "sidebar; Mobile puts them in collapsible menus above the charts.",
-        )
-        st.radio(
-            "Swiping on a chart (mobile layout)", CHART_TOUCH_MODES, key="chart_touch",
-            help="Scroll the page: a swipe over a chart scrolls as anywhere else, and a tap shows the values. "
-            "Zoom and pan the chart: a swipe zooms into or moves the chart, so scroll beside it.",
         )

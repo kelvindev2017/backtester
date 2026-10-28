@@ -127,19 +127,17 @@ def test_economic_analysis_tab_opens_first(offline, monkeypatch):
     app = start_app()
     assert not app.exception, app.exception
     assert app.sidebar.header[0].value == "Economic analysis"
-    assert [element.value for element in app.subheader] == ["S&P 500 vs other assets", "S&P 500 vs the US economy"]
-    assert any("Correlation with S&P 500" in str(frame.value.columns) for frame in app.dataframe)
+    assert [element.value for element in app.subheader] == ["Asset classes compared", "S&P 500 vs the US economy"]
+    assert any("Correlation with Stock (S&P 500)" in str(frame.value.columns) for frame in app.dataframe)
     # FEDFUNDS is missing from the fake data: a warning, and the other panels still draw.
     assert any("FEDFUNDS" in element.value for element in app.warning)
     assert any("Unemployment rate: 4.00%" in element.value for element in app.markdown)
 
-    # On phones, with swipes scrolling the page, the dates still zoom; the y-axes stay fixed.
-    app.session_state["layout_mode"] = "Mobile"
+    # Stock (S&P 500) can be removed like any other asset; the correlation panel and column go with it.
+    next(box for box in app.multiselect if box.key == "economy_assets").unselect("Stock (S&P 500)")
     app = open_tab(app, "Economic analysis")
-    for chart in app.get("plotly_chart"):
-        layout = json.loads(chart.proto.spec)["layout"]
-        assert layout["dragmode"] == "zoom"
-        assert not layout["xaxis"].get("fixedrange") and layout["yaxis"]["fixedrange"] is True
+    assert not any("Correlation" in str(frame.value.columns) for frame in app.dataframe)
+    assert any("Gold (GLD)" in str(frame.value.index) for frame in app.dataframe)
 
 
 def test_validate_tab_runs(offline):
@@ -341,24 +339,15 @@ def test_mobile_layout_has_no_sidebar(offline):
     assert any("Conditions" in label for label in expanders)
 
 
-def test_mobile_charts_let_a_swipe_scroll_the_page(offline):
+def test_mobile_charts_keep_their_zoom_for_the_hold_gesture(offline):
+    # Swipes scroll the page and a held finger turns on zoom and pan in the browser (CHART_HOLD_ZOOM_JS),
+    # so the charts themselves keep Plotly's zoom and pan, and there is no Display setting for it.
     app = start_app()
     app.session_state["layout_mode"] = "Mobile"
     app = open_tab(app, "Industry Analysis")
-    spec = json.loads(app.get("plotly_chart")[0].proto.spec)
-    assert spec["layout"]["dragmode"] is False and spec["layout"]["xaxis"]["fixedrange"] is True
-
-    # Display setting: swipes zoom and pan the chart again.
-    next(radio for radio in app.radio if radio.key == "chart_touch").set_value("Zoom and pan the chart")
-    app = open_tab(app, "Industry Analysis")
-    spec = json.loads(app.get("plotly_chart")[0].proto.spec)
-    assert "dragmode" not in spec["layout"] and not spec["layout"].get("xaxis", {}).get("fixedrange")
-
-    # Desktop is unchanged.
-    app.session_state["layout_mode"] = "Desktop"
-    next(radio for radio in app.radio if radio.key == "chart_touch").set_value("Scroll the page")
-    app = open_tab(app, "Industry Analysis")
-    assert "dragmode" not in json.loads(app.get("plotly_chart")[0].proto.spec)["layout"]
+    layout = json.loads(app.get("plotly_chart")[0].proto.spec)["layout"]
+    assert "dragmode" not in layout and not layout.get("xaxis", {}).get("fixedrange")
+    assert not any(radio.key == "chart_touch" for radio in app.radio)
 
 
 def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
