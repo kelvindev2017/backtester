@@ -157,7 +157,9 @@ st.set_page_config(
 # - a swipe over a chart scrolls the page, like anywhere else;
 # - a tap shows the values under the finger, and a double-tap resets the zoom;
 # - holding a finger still for HOLD_MS and then moving it moves the hover line with the finger;
-# - two fingers zoom (pinch) and pan the chart's dates.
+# - two fingers zoom (pinch) and pan the chart's dates;
+# - after a tap on the toolbar's Pan or Zoom button, one finger pans or box-zooms that chart instead of
+#   scrolling; a second tap on the same button goes back to scrolling.
 # The gestures reach Plotly as the mouse and wheel events it already understands (wheel zoom needs the
 # chart's scrollZoom, which show_chart turns on in the mobile layout). Mice and touchpads are untouched.
 # Charts that turn dragging off themselves (the supply chain graph) are left alone.
@@ -200,8 +202,20 @@ CHART_TOUCH_JS = """
     return Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
   }
   function endPinch() {
-    if (gesture && gesture.mode === "pinch") mouse("mouseup", gesture.target, gesture.centre.x, gesture.centre.y, 0);
+    if (!gesture || gesture.mode !== "pinch") return;
+    mouse("mouseup", gesture.target, gesture.centre.x, gesture.centre.y, 0);
+    modebar(gesture.gd, "dragmode", [gesture.dragmode]);  // back to the tool the chart had before
   }
+
+  // The Pan or Zoom button chosen on a chart's toolbar (a real tap, not the presses this script makes).
+  document.addEventListener("click", function (event) {
+    const button = event.isTrusted && event.target.closest && event.target.closest('.modebar-btn[data-attr="dragmode"]');
+    const gd = button && button.closest(".js-plotly-plot");
+    if (!gd) return;
+    const tool = button.getAttribute("data-val");
+    if (gd.dataset.touchTool === tool) delete gd.dataset.touchTool;
+    else gd.dataset.touchTool = tool;
+  }, true);
 
   document.addEventListener("touchstart", function (event) {
     if (!event.isTrusted) return;
@@ -211,18 +225,26 @@ CHART_TOUCH_JS = """
     if (gesture && gesture.gd === gd && event.touches.length === 2 && gesture.mode !== "scroll") {
       // A second finger: pinch to zoom, move both to pan.
       clearTimeout(gesture.timer);
+      if (gesture.mode === "tool" && gesture.started) mouse("mouseup", gesture.target, gesture.x, gesture.y, 0);
       if (event.cancelable) event.preventDefault();
+      const dragmode = (gd._fullLayout && gd._fullLayout.dragmode) || "zoom";
       modebar(gd, "dragmode", ["pan"]);
       const c = centre(event.touches);
       // Zoom and pan the dates only, through the x-axis strip of the touched panel: zooming the values too
       // would soon push the lines out of the panel.
       const strip = gesture.target.parentNode && gesture.target.parentNode.querySelector(".ewdrag");
-      gesture = { gd: gd, target: strip || gesture.target, mode: "pinch", centre: c, spread: spread(event.touches) };
+      gesture = { gd: gd, target: strip || gesture.target, mode: "pinch", centre: c, spread: spread(event.touches),
+                  dragmode: dragmode };
       mouse("mousedown", gesture.target, c.x, c.y, 1);
       return;
     }
     if (event.touches.length !== 1) return;
     const touch = event.touches[0];
+    if (gd.dataset.touchTool === "pan" || gd.dataset.touchTool === "zoom") {
+      // One finger works the chosen tool, through Plotly's own mouse dragging, once it moves.
+      gesture = { gd: gd, target: event.target, mode: "tool", x: touch.clientX, y: touch.clientY };
+      return;
+    }
     gesture = { gd: gd, target: event.target, mode: "pending", x: touch.clientX, y: touch.clientY };
     const held = gesture;
     held.timer = setTimeout(function () {
@@ -246,7 +268,17 @@ CHART_TOUCH_JS = """
     if (gesture.mode === "scroll") return;
     event.stopPropagation();
     if (event.cancelable) event.preventDefault();  // the page stays still while the chart follows the finger
-    if (gesture.mode === "scrub") {
+    if (gesture.mode === "tool") {
+      const touch = event.touches[0];
+      if (!gesture.started) {
+        if (Math.abs(touch.clientX - gesture.x) <= SLOP_PX && Math.abs(touch.clientY - gesture.y) <= SLOP_PX) return;
+        gesture.started = true;
+        mouse("mousedown", gesture.target, gesture.x, gesture.y, 1);
+      }
+      gesture.x = touch.clientX;
+      gesture.y = touch.clientY;
+      mouse("mousemove", gesture.target, gesture.x, gesture.y, 1);
+    } else if (gesture.mode === "scrub") {
       const touch = event.touches[0];
       const target = document.elementFromPoint(touch.clientX, touch.clientY);
       mouse("mousemove", target && target.closest && target.closest(".drag") ? target : gesture.target,
@@ -274,7 +306,10 @@ CHART_TOUCH_JS = """
     }
     if (event.touches.length) return;
     clearTimeout(gesture.timer);
-    if (gesture.mode === "pending") {
+    if (gesture.mode === "tool" && gesture.started) {
+      if (event.cancelable) event.preventDefault();
+      mouse("mouseup", gesture.target, gesture.x, gesture.y, 0);
+    } else if (gesture.mode === "pending" || gesture.mode === "tool") {
       // A tap: show the values under the finger; a second tap soon after resets the zoom. Cancel the
       // browser's follow-up mouse events, whose mouseout would hide the values again.
       if (event.cancelable) event.preventDefault();
@@ -289,7 +324,11 @@ CHART_TOUCH_JS = """
     }
     gesture = null;
   }, { capture: true, passive: false });
-  document.addEventListener("touchcancel", function () { endPinch(); gesture = null; }, { capture: true, passive: true });
+  document.addEventListener("touchcancel", function () {
+    if (gesture && gesture.mode === "tool" && gesture.started) mouse("mouseup", gesture.target, gesture.x, gesture.y, 0);
+    endPinch();
+    gesture = null;
+  }, { capture: true, passive: true });
 })();
 """
 
