@@ -175,7 +175,9 @@ def assets_figure(rebased, colors=None, benchmark=BENCHMARK, height=None, gap_px
         fig.update_yaxes(range=[-1, 1], row=3, col=1)
     fig.update_yaxes(type="log", tickformat=",.0f", row=1, col=1)
     fig.update_yaxes(ticksuffix="%", row=2, col=1)
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), hovermode="x unified")
+    # meta.axis_hover: the app shows hovered values as labels on the y-axes instead of Plotly's hover box.
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), hovermode="x unified",
+                      meta=dict(axis_hover=True))
     dates_on_every_panel(fig, rows, height)
     return fig
 
@@ -241,7 +243,9 @@ def macro_figure(indicators, sp500, recession=None, start=None, height=None, gap
             fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name="US recession (shaded)",
                                      marker=dict(symbol="square", size=12, color=RECESSION_FILL)), row=1, col=1)
             fig.data[-1].legendrank = 102
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), hovermode="x unified")
+    # meta.axis_hover: the app shows hovered values as labels on the y-axes instead of Plotly's hover box.
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), hovermode="x unified",
+                      meta=dict(axis_hover=True))
     dates_on_every_panel(fig, rows, height)
     return fig
 

@@ -228,6 +228,95 @@ CHART_HOLD_ZOOM_JS = """
 })();
 """
 
+# Charts whose layout has meta={"axis_hover": True} drop Plotly's hover box, which covers the lines, for
+# TradingView-style labels: each hovered value sits on its own y-axis (left or right) in the series' colour,
+# with a dashed line across the panel at that level, and the date sits on the x-axis.
+CHART_AXIS_HOVER_JS = """
+(function () {
+  const style = document.createElement("style");
+  style.textContent = ".axis-hover .hoverlayer .legend, .axis-hover .hoverlayer .hovertext{display:none}"
+    + ".axis-hover-overlay{position:absolute;inset:0;pointer-events:none;z-index:5}"
+    + ".axis-hover-overlay div{position:absolute;font:11px sans-serif;line-height:16px;white-space:nowrap}";
+  document.head.appendChild(style);
+
+  function format(value, axis) {
+    const digits = Math.abs(value) >= 100 ? 0 : 2;
+    return value.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })
+      + (axis.ticksuffix || "");
+  }
+  function pixel(axis, value) {
+    const position = axis.type === "date" ? axis.d2p(value) : axis.c2p(value);
+    return axis._offset + position;
+  }
+  function box(overlay, css, text) {
+    const el = document.createElement("div");
+    Object.assign(el.style, css);
+    if (text) el.textContent = text;
+    overlay.appendChild(el);
+    return el;
+  }
+  function show(gd, points) {
+    let overlay = gd.querySelector(".axis-hover-overlay");
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.className = "axis-hover-overlay";
+      gd.style.position = "relative";
+      gd.appendChild(overlay);
+    }
+    overlay.textContent = "";
+    const labels = { left: [], right: [] }, dates = new Map();
+    for (const point of points) {
+      const xa = point.xaxis, ya = point.yaxis;
+      if (!xa || !ya || typeof point.y !== "number" || !isFinite(point.y)) continue;
+      const y = pixel(ya, point.y);
+      if (y < ya._offset - 1 || y > ya._offset + ya._length + 1) continue;  // off the visible range
+      const color = (point.data.line && point.data.line.color) || (point.data.marker && point.data.marker.color) || "#555";
+      box(overlay, { left: xa._offset + "px", width: xa._length + "px", top: y + "px",
+                     borderTop: "1px dashed " + color, opacity: "0.8" });
+      labels[ya.side === "right" ? "right" : "left"].push({ y: y, xa: xa, color: color, text: format(point.y, ya) });
+      const bottom = ya._offset + ya._length;
+      if (!dates.has(xa) || dates.get(xa).bottom < bottom) dates.set(xa, { bottom: bottom, x: point.x });
+    }
+    for (const side of ["left", "right"]) {
+      // Keep labels on the same axis from overlapping: push each one at least a label's height down.
+      labels[side].sort((a, b) => a.y - b.y);
+      let last = -Infinity;
+      for (const label of labels[side]) {
+        const top = Math.max(label.y - 8, last + 17);
+        last = top;
+        const css = { top: top + "px", background: label.color, color: "#fff", padding: "0 4px", borderRadius: "2px" };
+        if (side === "left") css.right = (gd.clientWidth - label.xa._offset + 1) + "px";
+        else css.left = (label.xa._offset + label.xa._length + 1) + "px";
+        box(overlay, css, label.text);
+      }
+    }
+    for (const [xa, date] of dates) {
+      const x = pixel(xa, date.x);
+      const text = String(date.x).slice(0, 10);
+      box(overlay, { top: (date.bottom + 2) + "px", left: (x - 36) + "px", width: "72px", textAlign: "center",
+                     background: "#444", color: "#fff", borderRadius: "2px" }, text);
+    }
+  }
+  function attach(gd) {
+    if (gd.dataset.axisHover || !gd.layout || !gd.layout.meta || !gd.layout.meta.axis_hover || !gd.on) return;
+    gd.dataset.axisHover = "1";
+    gd.classList.add("axis-hover");
+    gd.on("plotly_hover", function (event) { show(gd, event.points); });
+    // A tap on a touch screen hovers without a hover event; Plotly reports it as a click instead.
+    gd.on("plotly_click", function (event) { show(gd, event.points); });
+    gd.on("plotly_unhover", function () { const o = gd.querySelector(".axis-hover-overlay"); if (o) o.textContent = ""; });
+    gd.on("plotly_relayout", function () { const o = gd.querySelector(".axis-hover-overlay"); if (o) o.textContent = ""; });
+  }
+  function scan() { document.querySelectorAll(".js-plotly-plot").forEach(attach); }
+  // Touch screens get no unhover: clear the labels when the next touch starts (a tap draws them again).
+  document.addEventListener("touchstart", function () {
+    document.querySelectorAll(".axis-hover-overlay").forEach(function (o) { o.textContent = ""; });
+  }, { capture: true, passive: true });
+  new MutationObserver(scan).observe(document.body, { childList: true, subtree: true });
+  scan();
+})();
+"""
+
 # Streamlit Community Cloud wraps the app in its own page, whose install
 # manifest and home-screen icon are Streamlit's. Both pages share an origin,
 # so point the wrapper's manifest and apple-touch-icon at our favicon.
@@ -274,7 +363,7 @@ components.html(
   app.head.appendChild(script);
 })();
 </script>
-""" % json.dumps(CHART_HOLD_ZOOM_JS),
+""" % json.dumps(CHART_HOLD_ZOOM_JS + CHART_AXIS_HOVER_JS),
     height=0,
 )
 
