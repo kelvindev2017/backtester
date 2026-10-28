@@ -20,17 +20,17 @@ from plotly.subplots import make_subplots
 
 from analysis.valuation_chart import add_close_overlay, legends_under_panels
 
-BENCHMARK = "S&P 500"
+BENCHMARK = "Stock (S&P 500)"
 # Name -> (Yahoo symbol, line color). ETF prices are dividend-adjusted, so the lines are total returns.
 ASSETS = {
     BENCHMARK: ("SPY", "black"),
-    "Treasuries 7-10y": ("IEF", "royalblue"),
-    "Treasuries 20y+": ("TLT", "lightskyblue"),
-    "Gold": ("GLD", "goldenrod"),
+    "Treasuries 7-10y (IEF)": ("IEF", "royalblue"),
+    "Treasuries 20y+ (TLT)": ("TLT", "lightskyblue"),
+    "Gold (GLD)": ("GLD", "goldenrod"),
     "Oil (Brent)": ("BZ=F", "saddlebrown"),
-    "Bitcoin": ("BTC-USD", "mediumorchid"),
+    "Bitcoin (BTC-USD)": ("BTC-USD", "mediumorchid"),
 }
-DEFAULT_ASSETS = [BENCHMARK, "Treasuries 7-10y", "Gold", "Oil (Brent)", "Bitcoin"]
+DEFAULT_ASSETS = [BENCHMARK, "Treasuries 7-10y (IEF)", "Gold (GLD)", "Oil (Brent)", "Bitcoin (BTC-USD)"]
 SP500_INDEX = "^GSPC"
 
 # Name -> (FRED series, transform, unit, color). "yoy" turns an index level into a 12-month % change.
@@ -109,7 +109,7 @@ def rolling_correlation(rebased, benchmark=BENCHMARK, weeks=CORRELATION_WEEKS):
 
 
 def asset_table(rebased, benchmark=BENCHMARK):
-    """Return, risk and correlation with the benchmark for each rebased column."""
+    """Return, risk and correlation with the benchmark for each rebased column (no correlation without it)."""
 
     rows = {}
     days = (rebased.index[-1] - rebased.index[0]).days
@@ -125,8 +125,10 @@ def asset_table(rebased, benchmark=BENCHMARK):
             "Volatility %/yr": weekly_returns.std() * np.sqrt(52) * 100,
             "Worst fall %": drawdowns(series.to_frame()).iloc[:, 0].min(),
             "Below peak now %": drawdowns(series.to_frame()).iloc[-1, 0],
-            f"Correlation with {benchmark}": weekly_returns.corr(weekly[benchmark]) if column != benchmark else 1.0,
         }
+        if benchmark in weekly:
+            rows[column][f"Correlation with {benchmark}"] = (weekly_returns.corr(weekly[benchmark])
+                                                             if column != benchmark else 1.0)
     return pd.DataFrame.from_dict(rows, orient="index")
 
 
@@ -148,7 +150,7 @@ def assets_figure(rebased, colors=None, benchmark=BENCHMARK, height=None, gap_px
     correlations = rolling_correlation(rebased, benchmark) if benchmark in rebased and rebased.shape[1] > 1 else pd.DataFrame()
     panels = [("Growth of 100, log scale (dividends reinvested)", 0.45), ("Below previous peak, %", 0.27)]
     if not correlations.empty:
-        panels.append((f"{CORRELATION_WEEKS}-week correlation with the {benchmark}", 0.28))
+        panels.append((f"{CORRELATION_WEEKS}-week correlation with {benchmark}", 0.28))
     rows = len(panels)
     height = height or {2: 640, 3: 900}[rows] + (gap_px - 80) * (rows - 1)
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.18, gap_px / height),
