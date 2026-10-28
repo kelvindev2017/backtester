@@ -320,6 +320,7 @@ CHART_AXIS_HOVER_JS = """
 # Streamlit Community Cloud wraps the app in its own page, whose install
 # manifest and home-screen icon are Streamlit's. Both pages share an origin,
 # so point the wrapper's manifest and apple-touch-icon at our favicon.
+# The manifest's id is ours too: see the comment on it below.
 components.html(
     """
 <script>
@@ -331,6 +332,10 @@ components.html(
     const icon = favicon.href;
     const origin = window.top.location.origin;
     const manifest = {
+      // An id of our own, so Chrome treats Streamlit's manifest (which it sometimes reads when it checks an
+      // installed app for updates, before this script has run) as a different app instead of an update
+      // that swaps our icon and splash screen back to Streamlit's.
+      id: "/backtest-app",
       name: "Trade Strategy Backtest",
       short_name: "Backtest",
       icons: [{ src: icon, type: "image/png", sizes: "512x512", purpose: "any" }],
