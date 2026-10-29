@@ -571,7 +571,9 @@ def test_first_bar_day_trade_is_a_backtest_rule(offline):
     assert any(box.key == "opening_bar_commissions" for box in app.selectbox)
     assert any("long days" in block.value for block in app.markdown)
     # The usual Backtest chart, with the day trades as its signals.
-    assert any("Price, Indicators and Trade Signals" in chart.proto.spec for chart in app.get("plotly_chart"))
+    spec = next(chart.proto.spec for chart in app.get("plotly_chart") if "Price, Indicators and Trade Signals" in chart.proto.spec)
+    # Every intraday bar is drawn as a candle.
+    assert '"candlestick"' in spec and "5-min bars" in spec
     next(box for box in app.selectbox if box.label == "Timeframe").select("15 min")
     open_tab(app, "Backtest")
     assert any("15-minute bars" in block.value for block in app.markdown)
