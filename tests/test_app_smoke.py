@@ -97,7 +97,8 @@ def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["Economic analysis", "Market Analysis", "Industry Analysis",
                                                "Stock Fundamentals", "Semicon Supply Chain", "Stock Screener", "Backtest",
-                                               "Signal Analysis & Trade Plan", "Validate", "Day Breakout Rule"]
+                                               "Signal Analysis & Trade Plan", "Validate", "Day Breakout Rule",
+                                               "First 5-min Day Trade"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
     open_tab(app, "Signal Analysis & Trade Plan")
@@ -481,3 +482,15 @@ def test_sliders_have_a_number_box_in_sync(offline):
     full.set_value(80)
     open_tab(app, "Signal Analysis & Trade Plan")
     assert next(widget for widget in app.slider if widget.key == "full_size_confidence").value == 80
+
+
+def test_opening_bar_tab(offline):
+    app = open_tab(start_app(), "First 5-min Day Trade")
+    assert app.sidebar.header[0].value == "First 5-min Day Trade"
+    assert any(box.key == "opening_bar_fill" for box in app.selectbox)
+    assert any("long days" in block.value for block in app.markdown)
+    next(box for box in app.selectbox if box.key == "opening_bar_exit").select(
+        "Lower high: a bar's high below the previous bar's high")
+    open_tab(app, "First 5-min Day Trade")
+    # The fill choice belongs to the pullback exit only.
+    assert not any(box.key == "opening_bar_fill" for box in app.selectbox)
