@@ -3847,6 +3847,7 @@ SETUP_OPTIONS = {
 }
 OPENING_BAR_RULE = next(label for label, setup in SETUP_OPTIONS.items() if setup == "opening_bar")
 INTRADAY_TIMEFRAMES = {"1 min": 1, "5 min": 5, "15 min": 15}
+OPENING_BAR_SESSIONS_SHOWN = 3
 
 
 def strategy_settings(tab="Backtest"):
@@ -4244,7 +4245,8 @@ def render_backtest(s):
         rows=7,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.025,
+        # The day trade's price panel has its own time labels, which need room above the next title.
+        vertical_spacing=0.035 if setup == "opening_bar" else 0.025,
         subplot_titles=(
             f"{ticker} Price, Indicators and Trade Signals",
             f"{ticker} Quarterly and TTM EPS",
@@ -4267,7 +4269,15 @@ def render_backtest(s):
     )
 
     # Row 1: price, moving averages and signals
-    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gray", width=1)), row=1, col=1)
+    if setup == "opening_bar":
+        # Every intraday bar as a candle, so the signals can be read against the bars they came from.
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+            name=f"{s.opening_bar.bar_minutes}-min bars", increasing_line_color="seagreen",
+            decreasing_line_color="indianred", increasing_line_width=1, decreasing_line_width=1,
+        ), row=1, col=1)
+    else:
+        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gray", width=1)), row=1, col=1)
     if setup == "ma_rule":
         fig.add_trace(go.Scatter(x=df.index, y=df["Fast_MA"], name=f"{fast_type} {fast_period}", line=dict(color="orange", width=1.5)), row=1, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
@@ -4555,6 +4565,23 @@ def render_backtest(s):
             row=subplot_row,
             col=1,
         )
+
+    if setup == "opening_bar":
+        # The price panel gets its own time axis without nights and weekends, opening on the last few sessions so
+        # the bars are readable; the other panels keep the whole period. Drag or pinch to move along it.
+        sessions = df.index.normalize().unique()
+        shown = df[df.index.normalize() >= sessions[-min(OPENING_BAR_SESSIONS_SHOWN, len(sessions))]]
+        pad = (shown["High"].max() - shown["Low"].min()) * 0.05
+        fig.update_xaxes(
+            matches=None, showticklabels=True, autorange=False, tickformat="%b %d %H:%M",
+            range=[shown.index.min() - pd.Timedelta(minutes=s.opening_bar.bar_minutes),
+                   shown.index.max() + pd.Timedelta(minutes=2 * s.opening_bar.bar_minutes)],
+            rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[16, 9.5], pattern="hour")],
+            row=1, col=1,
+        )
+        fig.update_yaxes(range=[shown["Low"].min() - pad, shown["High"].max() + pad], row=1, col=1)
+        st.caption(f"The price panel shows every {s.opening_bar.bar_minutes}-minute bar and opens on the last "
+                   f"{OPENING_BAR_SESSIONS_SHOWN} sessions; drag or pinch it to see the others (double-tap resets).")
 
     chart_state_text = "|".join(
         [
