@@ -108,6 +108,37 @@ INDUSTRY_INDEXES = {
     "Solar (TAN)": "TAN",
     "Uranium (URA)": "URA",
 }
+# Three of the largest holdings of each industry's fund (the ETF that tracks the index, for an index), for when
+# Yahoo does not answer; written down in October 2026, so the live holdings from Yahoo come first.
+INDUSTRY_TOP_HOLDINGS = {
+    "^GSPC": ["NVDA", "MSFT", "AAPL"],
+    "^SOX": ["INTC", "AMD", "MU"],
+    "XLK": ["NVDA", "AAPL", "MSFT"],
+    "IGV": ["MSFT", "ORCL", "PLTR"],
+    "FDN": ["AMZN", "META", "NFLX"],
+    "CIBR": ["AVGO", "CSCO", "CRWD"],
+    "XLC": ["META", "GOOGL", "NFLX"],
+    "XLF": ["BRK-B", "JPM", "V"],
+    "^BKX": ["JPM", "BAC", "WFC"],
+    "KRE": ["HBAN", "RF", "CFG"],
+    "XLV": ["LLY", "JNJ", "ABBV"],
+    "^NBI": ["VRTX", "GILD", "AMGN"],
+    "XLE": ["XOM", "CVX", "COP"],
+    "XOP": ["COP", "EOG", "DVN"],
+    "XLI": ["GE", "CAT", "RTX"],
+    "ITA": ["GE", "RTX", "BA"],
+    "^DJT": ["UBER", "UNP", "UPS"],
+    "XLY": ["AMZN", "TSLA", "HD"],
+    "XRT": ["WMT", "COST", "TJX"],
+    "ITB": ["DHI", "LEN", "PHM"],
+    "XLP": ["WMT", "COST", "PG"],
+    "XLU": ["NEE", "SO", "CEG"],
+    "XLRE": ["PLD", "AMT", "WELL"],
+    "XLB": ["LIN", "SHW", "ECL"],
+    "^HUI": ["NEM", "AEM", "WPM"],
+    "TAN": ["FSLR", "ENPH", "NXT"],
+    "URA": ["CCJ", "NXE", "UEC"],
+}
 DEFAULT_INDUSTRIES = [
     "Semiconductors (PHLX ^SOX)", "Software (IGV)", "Financials (XLF)", "Energy (XLE)", "Health Care (XLV)",
 ]

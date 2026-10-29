@@ -1,6 +1,7 @@
 """Run App.py headlessly with Yahoo Finance and SEC calls replaced by synthetic data."""
 
 import json
+from types import SimpleNamespace
 import urllib.request
 from pathlib import Path
 
@@ -285,6 +286,52 @@ def test_industry_indexes_can_be_added_and_removed(offline):
     next(button for button in app.button if button.key == "industry_reset_btn").click()
     app = open_tab(app, "Industry Analysis")
     assert "Software (IGV)" in chosen() and "Semiconductor ETF (SMH)" not in chosen()
+
+
+def test_leading_companies_are_found_for_a_fund_and_for_a_stock(offline, monkeypatch):
+    class Ticker(FakeTicker):
+        @property
+        def funds_data(self):
+            if self.symbol != "SOXX":
+                raise ValueError("not a fund")
+            holdings = pd.DataFrame({"Holding Percent": [0.1, 0.09, 0.08, 0.07]}, index=["INTC", "AMD", "MU", "NVDA"])
+            return SimpleNamespace(top_holdings=holdings)
+
+        @property
+        def info(self):
+            return {**FakeTicker(self.symbol).info, "industryKey": "space"}
+
+        @info.setter
+        def info(self, value):
+            pass
+
+    monkeypatch.setattr(yf, "Ticker", Ticker)
+    monkeypatch.setattr(yf, "Industry", lambda key: SimpleNamespace(
+        top_companies=pd.DataFrame({"market weight": [0.4, 0.3, 0.2]}, index=["LMT", "RKLB", "NOC"])), raising=False)
+    app = open_tab(start_app(), "Industry Analysis")
+    leaders = lambda: next(box for box in app.text_input if box.key == "industry_leaders").value
+
+    # An index stands in for the ETF that tracks it.
+    next(box for box in app.selectbox if box.key == "industry_leaders_of").select("Semiconductors (PHLX ^SOX)")
+    app = open_tab(app, "Industry Analysis")
+    assert leaders() == "INTC, AMD, MU"
+    assert any(header.value == "Leading companies: Semiconductors (PHLX ^SOX)" for header in app.subheader)
+
+    # A stock: itself and the two largest others in its industry.
+    next(box for box in app.text_input if box.key == "industry_add_symbol").input("RKLB")
+    next(button for button in app.button if button.key == "industry_add_btn").click()
+    app = open_tab(app, "Industry Analysis")
+    next(box for box in app.selectbox if box.key == "industry_leaders_of").select("RKLB")
+    app = open_tab(app, "Industry Analysis")
+    assert leaders() == "RKLB, LMT, NOC"
+
+
+def test_leading_companies_fall_back_to_the_built_in_list(offline):
+    # Yahoo gives no holdings (FakeTicker has none): the built-in list for the built-in industries.
+    app = open_tab(start_app(), "Industry Analysis")
+    next(box for box in app.selectbox if box.key == "industry_leaders_of").select("Financials (XLF)")
+    app = open_tab(app, "Industry Analysis")
+    assert next(box for box in app.text_input if box.key == "industry_leaders").value == "BRK-B, JPM, V"
 
 
 def test_industry_index_without_history_is_refused(offline, monkeypatch):

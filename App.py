@@ -99,6 +99,7 @@ from analysis.signal_groups import (
     FUNDAMENTAL_COLUMNS,
     GICS_SECTORS,
     INDUSTRY_INDEXES,
+    INDUSTRY_TOP_HOLDINGS,
     MOVING_AVERAGE,
     NUMBER_OPERATORS,
     SIGNAL_GROUPS,
@@ -2951,6 +2952,73 @@ def add_industry_index():
         st.session_state["industry_indexes"] = st.session_state["industry_indexes"] + [label]
 
 
+# Yahoo lists holdings for funds, not indexes: the ETF that tracks each index stands in for it.
+INDEX_FUNDS = {"^GSPC": "SPY", "^SOX": "SOXX", "^BKX": "KBWB", "^NBI": "IBB", "^DJT": "IYT", "^HUI": "GDX",
+               "^IXIC": "QQQ", "^NDX": "QQQ", "^DJI": "DIA", "^RUT": "IWM"}
+NO_LEADERS = "None"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _yahoo_industry_leaders(symbol, count):
+    fund = INDEX_FUNDS.get(symbol, symbol)
+    try:
+        holdings = yf.Ticker(fund).funds_data.top_holdings
+    except Exception:
+        holdings = None
+    if holdings is not None and not holdings.empty:
+        return [normalize_ticker(ticker) for ticker in holdings.index if str(ticker).strip()][:count]
+    industry = (yf.Ticker(symbol).info or {}).get("industryKey")
+    if industry:
+        peers = [normalize_ticker(ticker) for ticker in yf.Industry(industry).top_companies.index]
+        return [symbol] + [ticker for ticker in peers if ticker and ticker != symbol][:count - 1]
+    raise LookupError(symbol)  # raised, not returned, so a Yahoo hiccup is not cached
+
+
+def sp500_competitors(symbol, count):
+    """The S&P 500 members in the stock's GICS sub-industry that trade the most dollars a day (a stand-in for size)."""
+
+    members, _ = load_universe_members("US", "S&P 500")
+    row = members[members["Ticker"].map(normalize_ticker) == symbol]
+    if row.empty or not str(row["Industry"].iloc[0]).strip():
+        return []
+    peers = [normalize_ticker(ticker) for ticker in members.loc[members["Industry"] == row["Industry"].iloc[0], "Ticker"]]
+    peers = [ticker for ticker in peers if ticker != symbol]
+    dollar_volume = {ticker: (frame["Close"] * frame["Volume"]).tail(60).mean()
+                     for ticker, frame in load_price_panel(peers, days=100).items() if not frame.empty}
+    return sorted(dollar_volume, key=dollar_volume.get, reverse=True)[:count]
+
+
+def industry_leaders(symbol, count=3):
+    """The leading companies for one line of the industry chart.
+
+    For an ETF (or the ETF that tracks an index) its largest holdings; for a stock, the stock and the largest
+    companies in its industry. Yahoo answers first; without it, a built-in list for the built-in industries, and
+    the stock's S&P 500 sub-industry for a stock. Empty when none of these has an answer.
+    """
+
+    try:
+        return _yahoo_industry_leaders(symbol, count)
+    except Exception:
+        pass
+    if symbol in INDUSTRY_TOP_HOLDINGS:
+        return INDUSTRY_TOP_HOLDINGS[symbol][:count]
+    competitors = sp500_competitors(symbol, count - 1)
+    return [symbol] + competitors if competitors else []
+
+
+def fill_industry_leaders():
+    label = st.session_state.get("industry_leaders_of", NO_LEADERS)
+    if label == NO_LEADERS:
+        return
+    symbol = INDUSTRY_INDEXES.get(label) or st.session_state.get("industry_added", {}).get(label, label)
+    leaders = industry_leaders(symbol)
+    if leaders:
+        st.session_state["industry_leaders"] = ", ".join(leaders)
+    else:
+        st.session_state["industry_leaders_error"] = (
+            f"Yahoo has no holdings or industry for {label}; type the tickers to compare in the settings.")
+
+
 def reset_industry_list():
     st.session_state["industry_indexes"] = list(DEFAULT_INDUSTRIES)
     st.session_state["industry_added"] = {}
@@ -2981,9 +3049,19 @@ def render_industry_analysis(index_prices):
         normalize = st.toggle("Normalize (start = 100)", value=True, key="industry_normalize")
         log_scale = st.checkbox("Log scale", value=False, key="industry_log")
     with settings_panel("Leading companies", expanded=False):
-        leaders_on = st.checkbox("Compare the leading companies of one industry", value=False, key="industry_leaders_on")
+        if st.session_state.get("industry_leaders_of", NO_LEADERS) not in chosen:
+            st.session_state["industry_leaders_of"] = NO_LEADERS
+        leaders_of = st.selectbox(
+            "Compare the leading companies of", [NO_LEADERS] + chosen, key="industry_leaders_of",
+            on_change=fill_industry_leaders,
+            help="Picks the top 3 holdings of an index or ETF, or a stock and its 2 largest competitors. "
+            "You can change the tickers below.",
+        )
+        leaders_on = leaders_of != NO_LEADERS
         leaders_text = st.text_input("Industry leaders (up to 5 tickers)", value="NVDA, AMD, AVGO, TSM, INTC",
                                      key="industry_leaders", disabled=not leaders_on)
+        if st.session_state.get("industry_leaders_error"):
+            st.warning(st.session_state.pop("industry_leaders_error"))
         leaders_metric = st.radio("Quarterly chart", ["Revenue", "Net_Income"], horizontal=True, key="industry_fund_metric",
                                   format_func=lambda value: value.replace("_", " "), disabled=not leaders_on)
 
@@ -3040,7 +3118,7 @@ def render_industry_analysis(index_prices):
                        "Downtrend when both are reversed; otherwise Mixed.")
 
     if leaders_on:
-        st.subheader("Leading companies")
+        st.subheader(f"Leading companies: {leaders_of}")
         render_industry_leaders(leaders_text, leaders_metric)
 
 
