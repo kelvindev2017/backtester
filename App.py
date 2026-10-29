@@ -2710,6 +2710,9 @@ def render_economic_analysis():
         asset_history = st.select_slider("Asset history", list(HISTORY_CHOICES), value="10y", key="economy_asset_years",
                                          help="All lines start at 100 on the first day every asset shown has a price, "
                                               "so an asset with a short history (bitcoin from 2014) moves the start.")
+        asset_scale = st.radio("Scale", ["Start = 100", "Highest = 100%"], horizontal=True, key="economy_asset_scale",
+                               help="Highest = 100% shows each asset as a share of its own highest value in the window, "
+                                    "so assets with very different gains fit on one linear axis.")
     with settings_panel("Economy"):
         indicator_names = st.multiselect("Indicators", list(INDICATORS), default=DEFAULT_INDICATORS,
                                          key="economy_indicators",
@@ -2752,7 +2755,8 @@ def render_economic_analysis():
             st.caption(f"Rebased to 100 on {first_day:%d %b %Y}{note}. Stock (S&P 500) is SPY; it, the Treasury ETFs and "
                        "GLD are shown with dividends reinvested. Oil is the Brent front-month futures price, which an oil fund "
                        "does not earn (rolling futures costs money); bitcoin is BTC-USD.")
-            show_chart(assets_figure(rebased, gap_px=163 if MOBILE else 108), width="stretch")
+            show_chart(assets_figure(rebased, gap_px=163 if MOBILE else 108,
+                                     scale="peak" if asset_scale == "Highest = 100%" else "start"), width="stretch")
             table = asset_table(rebased)
             formats = {column: "{:+,.0f}" for column in ["Total return %", "Below peak now %", "Worst fall %"]}
             formats |= {"Per year %": "{:+.1f}", "Volatility %/yr": "{:.0f}"}

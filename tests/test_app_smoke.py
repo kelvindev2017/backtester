@@ -134,6 +134,11 @@ def test_economic_analysis_tab_opens_first(offline, monkeypatch):
     assert any("FEDFUNDS" in element.value for element in app.warning)
     assert any("Unemployment rate: 4.00%" in element.value for element in app.markdown)
 
+    # Each asset against its own high.
+    next(radio for radio in app.radio if radio.key == "economy_asset_scale").set_value("Highest = 100%")
+    app = open_tab(app, "Economic analysis")
+    assert any("highest value" in chart.proto.spec for chart in app.get("plotly_chart"))
+
     # Stock (S&P 500) can be removed like any other asset; the correlation panel and column go with it.
     next(box for box in app.multiselect if box.key == "economy_assets").unselect("Stock (S&P 500)")
     app = open_tab(app, "Economic analysis")
