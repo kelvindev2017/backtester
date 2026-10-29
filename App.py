@@ -330,6 +330,40 @@ CHART_TOUCH_JS = """
 })();
 """
 
+# Charts whose layout has meta={"fit_y": True} refit the first panel's price scale to the candles in view whenever
+# that panel's time range changes (a pinch or drag), so bars of another day are not left off the screen.
+CHART_FIT_Y_JS = """
+(function () {
+  function fit(gd) {
+    const layout = gd._fullLayout, range = layout.xaxis && layout.xaxis.range;
+    if (!range || !window.Plotly) return;
+    let low = Infinity, high = -Infinity;
+    for (const trace of gd._fullData) {
+      if (trace.type !== "candlestick" || (trace.xaxis || "x") !== "x") continue;
+      // One slot per bar: the bars in view are the slots inside the range.
+      const first = Math.max(0, Math.ceil(range[0])), last = Math.min(trace.low.length - 1, Math.floor(range[1]));
+      for (let i = first; i <= last; i++) {
+        if (trace.low[i] < low) low = trace.low[i];
+        if (trace.high[i] > high) high = trace.high[i];
+      }
+    }
+    if (!isFinite(low)) return;
+    const pad = (high - low) * 0.05 || 1;
+    window.Plotly.relayout(gd, { "yaxis.range": [low - pad, high + pad] });
+  }
+  function attach(gd) {
+    if (gd.dataset.fitY || !gd.layout || !gd.layout.meta || !gd.layout.meta.fit_y || !gd.on) return;
+    gd.dataset.fitY = "1";
+    gd.on("plotly_relayout", function (event) {
+      if (Object.keys(event).some(function (key) { return key.indexOf("xaxis.range") === 0 || key === "xaxis.autorange"; })) fit(gd);
+    });
+  }
+  function scan() { document.querySelectorAll(".js-plotly-plot").forEach(attach); }
+  new MutationObserver(scan).observe(document.body, { childList: true, subtree: true });
+  scan();
+})();
+"""
+
 # Charts whose layout has meta={"axis_hover": True} drop Plotly's hover box, which covers the lines, for
 # TradingView-style labels: each hovered value sits on its own y-axis (left or right) in the series' colour,
 # with a dashed line across the panel at that level, and the date sits on the x-axis.
@@ -347,7 +381,7 @@ CHART_AXIS_HOVER_JS = """
       + (axis.ticksuffix || "");
   }
   function pixel(axis, value) {
-    const position = axis.type === "date" ? axis.d2p(value) : axis.c2p(value);
+    const position = axis.type === "date" || axis.type === "category" ? axis.d2p(value) : axis.c2p(value);
     return axis._offset + position;
   }
   function box(overlay, css, text) {
@@ -407,7 +441,8 @@ CHART_AXIS_HOVER_JS = """
       const x = pixel(xa, date.x);
       // The time too on intraday charts.
       const full = String(date.x), time = full.slice(11, 16);
-      const text = time && time !== "00:00" ? full.slice(0, 10) + " " + time : full.slice(0, 10);
+      // A category axis (one slot per bar) already names its bars, e.g. "Oct 28 09:35".
+      const text = xa.type === "category" ? full : time && time !== "00:00" ? full.slice(0, 10) + " " + time : full.slice(0, 10);
       const width = text.length > 10 ? 108 : 72;
       box(overlay, { top: (date.bottom + 2) + "px", left: (x - width / 2) + "px", width: width + "px",
                      textAlign: "center", background: "#444", color: "#fff", borderRadius: "2px" }, text);
@@ -484,7 +519,7 @@ components.html(
   app.head.appendChild(script);
 })();
 </script>
-""" % json.dumps(CHART_TOUCH_JS + CHART_AXIS_HOVER_JS),
+""" % json.dumps(CHART_TOUCH_JS + CHART_AXIS_HOVER_JS + CHART_FIT_Y_JS),
     height=0,
 )
 
@@ -4272,7 +4307,7 @@ def render_backtest(s):
     if setup == "opening_bar":
         # Every intraday bar as a candle, so the signals can be read against the bars they came from.
         fig.add_trace(go.Candlestick(
-            x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+            x=bar_labels(df.index), open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
             name=f"{s.opening_bar.bar_minutes}-min bars", increasing_line_color="seagreen",
             decreasing_line_color="indianred", increasing_line_width=1, decreasing_line_width=1,
         ), row=1, col=1)
@@ -4283,7 +4318,7 @@ def render_backtest(s):
         fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
 
     if setup == "opening_bar":
-        for trace in opening_bar_signal_traces(trades):
+        for trace in opening_bar_signal_traces(trades, s.opening_bar.bar_minutes):
             fig.add_trace(trace, row=1, col=1)
     else:
         buy_points = df.loc[df["Buy_Signal"]]
@@ -4567,21 +4602,20 @@ def render_backtest(s):
         )
 
     if setup == "opening_bar":
-        # The price panel gets its own time axis without nights and weekends, opening on the last few sessions so
-        # the bars are readable; the other panels keep the whole period. Drag or pinch to move along it.
+        # The price panel gets its own axis with one slot per bar, so nights and weekends take no room, opening on
+        # the last few sessions so the bars are readable; the other panels keep the whole period. Plotly's date
+        # rangebreaks did this before, but a pinch or drag on them snapped back on phones.
         sessions = df.index.normalize().unique()
         shown = df[df.index.normalize() >= sessions[-min(OPENING_BAR_SESSIONS_SHOWN, len(sessions))]]
         pad = (shown["High"].max() - shown["Low"].min()) * 0.05
         fig.update_xaxes(
-            matches=None, showticklabels=True, autorange=False, tickformat="%b %d %H:%M",
-            range=[shown.index.min() - pd.Timedelta(minutes=s.opening_bar.bar_minutes),
-                   shown.index.max() + pd.Timedelta(minutes=2 * s.opening_bar.bar_minutes)],
-            rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[16, 9.5], pattern="hour")],
-            row=1, col=1,
+            matches=None, type="category", showticklabels=True, autorange=False, nticks=4 if MOBILE else 8,
+            tickangle=0, showgrid=False, range=[len(df) - len(shown) - 0.5, len(df) + 0.5], row=1, col=1,
         )
         fig.update_yaxes(range=[shown["Low"].min() - pad, shown["High"].max() + pad], row=1, col=1)
+        fig.update_layout(meta=dict(axis_hover=True, fit_y=True))
         st.caption(f"The price panel shows every {s.opening_bar.bar_minutes}-minute bar and opens on the last "
-                   f"{OPENING_BAR_SESSIONS_SHOWN} sessions; drag or pinch it to see the others (double-tap resets).")
+                   f"{OPENING_BAR_SESSIONS_SHOWN} sessions; drag or pinch it to see the others (double-tap resets); the price scale follows the bars in view.")
 
     chart_state_text = "|".join(
         [
@@ -4767,8 +4801,14 @@ def opening_bar_rule_text(settings):
             f"${settings.slippage:.2f} a share of slippage.")
 
 
-def opening_bar_signal_traces(trades):
-    """Entry and exit markers of the day trades for the price panel."""
+def bar_labels(times):
+    """The price panel's bar names (one category per bar): "Oct 28 09:35"."""
+
+    return pd.DatetimeIndex(times).strftime("%b %d %H:%M")
+
+
+def opening_bar_signal_traces(trades, bar_minutes=5):
+    """Entry and exit markers of the day trades for the price panel, each on the bar whose price it is."""
 
     marks = [
         ("BUY", trades[trades["Side"] == "Long"], "Entry", "triangle-up", "lime", "darkgreen"),
@@ -4781,10 +4821,13 @@ def opening_bar_signal_traces(trades):
         if rows.empty:
             continue
         reason = rows["Exit reason"] if column == "Exit" else pd.Series("", index=rows.index)
+        # Entries and exits are timed at the end of their bar; an end-of-day sale at the open of its bar.
+        bar_start = rows[f"{column} time"].where(reason == "End of day",
+                                                 rows[f"{column} time"] - pd.Timedelta(minutes=bar_minutes))
         traces.append(go.Scatter(
-            x=rows[f"{column} time"], y=rows[column], mode="markers", name=name, customdata=reason,
+            x=bar_labels(bar_start), y=rows[column], mode="markers", name=name, customdata=reason,
             marker=dict(symbol=symbol, size=10, color=color, line=dict(color=edge, width=1)),
-            hovertemplate=f"{name} %{{customdata}}<br>%{{x|%Y-%m-%d %H:%M}}<br>Price: %{{y:.2f}}<extra></extra>",
+            hovertemplate=f"{name} %{{customdata}}<br>%{{x}}<br>Price: %{{y:.2f}}<extra></extra>",
         ))
     return traces
 
