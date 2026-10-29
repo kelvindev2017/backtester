@@ -287,6 +287,26 @@ def test_industry_indexes_can_be_added_and_removed(offline):
     assert "Software (IGV)" in chosen() and "Semiconductor ETF (SMH)" not in chosen()
 
 
+def test_industry_index_without_history_is_refused(offline, monkeypatch):
+    # Yahoo has only today's quote for some indexes, such as ^SPACE.
+    def download(tickers, *args, **kwargs):
+        prices = fake_download(tickers, *args, **kwargs)
+        return prices.tail(1) if "^SPACE" in tickers else prices
+    monkeypatch.setattr(yf, "download", download)
+    app = open_tab(start_app(), "Industry Analysis")
+    next(box for box in app.text_input if box.key == "industry_add_symbol").input("^SPACE")
+    next(button for button in app.button if button.key == "industry_add_btn").click()
+    app = open_tab(app, "Industry Analysis")
+    assert "^SPACE" not in next(box for box in app.multiselect if box.key == "industry_indexes").value
+    assert any("no daily price history for ^SPACE" in element.value for element in app.warning)
+
+    # One saved before this check is listed as not charted.
+    app.session_state["industry_added"] = {"^SPACE": "^SPACE"}
+    app.session_state["industry_indexes"] = ["Software (IGV)", "^SPACE"]
+    app = open_tab(app, "Industry Analysis")
+    assert any("Not charted" in element.value and "^SPACE" in element.value for element in app.warning)
+
+
 class FakeTickerWithRevenue(FakeTicker):
     def __init__(self, symbol):
         super().__init__(symbol)
