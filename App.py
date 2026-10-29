@@ -2899,6 +2899,7 @@ INDUSTRY_PERIODS = ["1M", "3M", "6M", "YTD", "1Y", "2Y", "3Y", "5Y"]
 # The industry list (chosen indexes and the ones the user added) is kept in a browser cookie, so it is
 # still there on the next visit. Streamlit reads cookies when a session starts; the page writes them.
 INDUSTRY_COOKIE = "industry_indexes"
+INDUSTRY_MIN_BARS = 20  # days of history an added index needs to be worth a line on the chart
 
 
 def industry_list_from_cookie():
@@ -2935,8 +2936,12 @@ def add_industry_index():
     st.session_state["industry_add_symbol"] = st.session_state["industry_add_name"] = ""
     if not symbol:
         return
-    if not load_price_panel([symbol], days=30):
-        st.session_state["industry_add_error"] = f"Yahoo has no prices for {symbol}; check the symbol."
+    history = load_price_panel([symbol], days=60).get(symbol)
+    if history is None or len(history) < INDUSTRY_MIN_BARS:
+        st.session_state["industry_add_error"] = (
+            f"Yahoo has no daily price history for {symbol}, so it can't be charted. Check the symbol, or add an ETF "
+            "that tracks the index instead (some indexes, such as ^SPACE, only have today's quote on Yahoo)."
+        )
         return
     builtin = next((label for label, known in INDUSTRY_INDEXES.items() if known == symbol), None)
     label = builtin or (f"{name} ({symbol})" if name else symbol)
@@ -2995,10 +3000,12 @@ def render_industry_analysis(index_prices):
         if to_fetch:
             with st.spinner("Loading prices..."):
                 raw_prices.update(load_price_panel(to_fetch, days=1900))
-        prices = {label: raw_prices[symbol] for label, symbol in symbols.items() if symbol in raw_prices}
+        prices = {label: raw_prices[symbol] for label, symbol in symbols.items()
+                  if symbol in raw_prices and len(raw_prices[symbol]) >= INDUSTRY_MIN_BARS}
         missing = [label for label in symbols if label not in prices]
         if missing:
-            st.caption(f"No price data for: {', '.join(missing)}")
+            st.warning(f"Not charted, because Yahoo has no daily price history for: {', '.join(missing)}. "
+                       "Remove it and add an ETF that tracks the index instead.")
         if prices:
             last_date = max(frame.index[-1] for frame in prices.values())
             start = period_start(last_date, period)
