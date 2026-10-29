@@ -166,7 +166,9 @@ st.set_page_config(
 # - a swipe over a chart scrolls the page, like anywhere else;
 # - a tap shows the values under the finger, and a double-tap resets the zoom;
 # - holding a finger still for HOLD_MS and then moving it moves the hover line with the finger;
-# - two fingers zoom (pinch) and pan the chart's dates.
+# - two fingers zoom (pinch) and pan the chart, dates and values both;
+# - after a tap on the chart's own Pan button, one finger pans the chart instead of scrolling the page,
+#   until the Zoom button is tapped.
 # The gestures reach Plotly as the mouse and wheel events it already understands (wheel zoom needs the
 # chart's scrollZoom, which show_chart turns on in the mobile layout). Mice and touchpads are untouched.
 # Charts that turn dragging off themselves (the supply chain graph) are left alone.
@@ -208,8 +210,15 @@ CHART_TOUCH_JS = """
   function spread(touches) {
     return Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
   }
+  // The drag mode the person chose on the chart's toolbar. The pinch presses Pan itself, which must not
+  // stop swipes from scrolling the page, so only a real tap counts.
+  document.addEventListener("click", function (event) {
+    const button = event.isTrusted && event.target.closest && event.target.closest('.modebar-btn[data-attr="dragmode"]');
+    const gd = button && button.closest(".js-plotly-plot");
+    if (gd) gd.dataset.chosenDrag = button.getAttribute("data-val");
+  }, true);
   function endPinch() {
-    if (gesture && gesture.mode === "pinch") mouse("mouseup", gesture.target, gesture.centre.x, gesture.centre.y, 0);
+    if (gesture && (gesture.mode === "pinch" || gesture.mode === "pan")) mouse("mouseup", gesture.target, gesture.centre.x, gesture.centre.y, 0);
   }
 
   document.addEventListener("touchstart", function (event) {
@@ -223,10 +232,9 @@ CHART_TOUCH_JS = """
       if (event.cancelable) event.preventDefault();
       modebar(gd, "dragmode", ["pan"]);
       const c = centre(event.touches);
-      // Zoom and pan the dates only, through the x-axis strip of the touched panel: zooming the values too
-      // would soon push the lines out of the panel.
-      const strip = gesture.target.parentNode && gesture.target.parentNode.querySelector(".ewdrag");
-      gesture = { gd: gd, target: strip || gesture.target, mode: "pinch", centre: c, spread: spread(event.touches) };
+      // Zoom and pan through the touched panel's plot area, so the values zoom with the dates.
+      if (gesture.mode === "pan") mouse("mouseup", gesture.target, c.x, c.y, 0);
+      gesture = { gd: gd, target: gesture.target, mode: "pinch", centre: c, spread: spread(event.touches) };
       mouse("mousedown", gesture.target, c.x, c.y, 1);
       return;
     }
@@ -248,14 +256,25 @@ CHART_TOUCH_JS = """
       const touch = event.touches[0];
       if (Math.abs(touch.clientX - gesture.x) > SLOP_PX || Math.abs(touch.clientY - gesture.y) > SLOP_PX) {
         clearTimeout(gesture.timer);
-        gesture.mode = "scroll";  // a swipe: the browser scrolls the page
+        if (gesture.gd.dataset.chosenDrag === "pan") {
+          // Pan chosen on the toolbar: the chart follows the finger.
+          gesture.mode = "pan";
+          modebar(gesture.gd, "dragmode", ["pan"]);
+          mouse("mousedown", gesture.target, gesture.x, gesture.y, 1);
+        } else {
+          gesture.mode = "scroll";  // a swipe: the browser scrolls the page
+          return;
+        }
+      } else {
+        return;
       }
-      return;
     }
     if (gesture.mode === "scroll") return;
     event.stopPropagation();
     if (event.cancelable) event.preventDefault();  // the page stays still while the chart follows the finger
-    if (gesture.mode === "scrub") {
+    if (gesture.mode === "pan") {
+      mouse("mousemove", gesture.target, event.touches[0].clientX, event.touches[0].clientY, 1);
+    } else if (gesture.mode === "scrub") {
       const touch = event.touches[0];
       const target = document.elementFromPoint(touch.clientX, touch.clientY);
       mouse("mousemove", target && target.closest && target.closest(".drag") ? target : gesture.target,
@@ -283,6 +302,12 @@ CHART_TOUCH_JS = """
     }
     if (event.touches.length) return;
     clearTimeout(gesture.timer);
+    if (gesture.mode === "pan") {
+      const touch = event.changedTouches[0];
+      mouse("mouseup", gesture.target, touch.clientX, touch.clientY, 0);
+      gesture = null;
+      return;
+    }
     if (gesture.mode === "pending") {
       // A tap: show the values under the finger; a second tap soon after resets the zoom. Cancel the
       // browser's follow-up mouse events, whose mouseout would hide the values again.
@@ -447,6 +472,15 @@ components.html(
 )
 
 st.title("Trade Strategy Backtester")
+
+# Streamlit sizes a setting's help tooltip to its text and can place it past the right edge of a phone
+# screen; keep it inside the screen and let the text wrap.
+st.markdown(
+    "<style>div[data-baseweb='tooltip'], div[data-baseweb='popover'] {max-width: calc(100vw - 1rem)}"
+    "[data-testid='stTooltipContent'] {max-width: calc(100vw - 2rem); white-space: normal; "
+    "overflow-wrap: anywhere}</style>",
+    unsafe_allow_html=True,
+)
 
 
 # ============================================================
@@ -2485,7 +2519,6 @@ NEXT_BENCHMARK = "SPY"
 TAB_NAMES = [ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Stock Screener", "Backtest",
              "Signal Analysis & Trade Plan", "Validate", DAY_BREAKOUT_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
-LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
 TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart")
@@ -2510,7 +2543,9 @@ def keep_settings_across_tabs():
 
 
 def detect_mobile():
-    """Mobile layout when chosen in Display, else when the browser's user agent is a phone or tablet.
+    """Mobile layout on phones and tablets, told apart by the browser's user agent.
+
+    ``layout_mode`` in Session State ("Desktop" or "Mobile") overrides it; the tests use it.
 
     Streamlit has no device check of its own; the user agent is the signal the server can see.
     """
@@ -4764,10 +4799,3 @@ if check_password():
                     render_signal_analysis(strategy.ticker, strategy.end_date, strategy.signal_settings, strategy.risk_settings)
                 else:
                     render_validation(strategy.signal_settings, strategy.risk_settings, strategy.end_date)
-
-    with settings_panel("Display", expanded=False):
-        st.selectbox(
-            "Layout", LAYOUT_MODES, key="layout_mode",
-            help="Auto picks the mobile layout on phones and tablets. Desktop puts each tab's settings in the "
-            "sidebar; Mobile puts them in collapsible menus above the charts.",
-        )
