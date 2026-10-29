@@ -100,3 +100,27 @@ def test_diagram_follows_the_settings():
     assert "open + 0.5" in text(opening_bar_figure(0.5, 2))
     assert "pullback" in text(opening_bar_figure(0, 2, "pullback"))
     assert "prior<br>bar's high" in text(opening_bar_figure(0, 12, "lower_high"))
+
+
+def test_short_days_trade_the_mirror_image():
+    # The long day turned upside down: price 200 minus each long price, so the short makes what the long made.
+    flipped = [(200 - o, 200 - l, 200 - h, 200 - c) for o, h, l, c in RUN]
+    frame = session("2026-10-01", flipped)
+    off, _ = opening_bar_trades(frame, OpeningBarSettings(skip_bars=0), "TEST")
+    assert off.empty
+    trades, days = opening_bar_trades(frame, OpeningBarSettings(skip_bars=0, allow_short=True), "TEST")
+    assert list(days["Short day"]) == [True]
+    trade = trades.iloc[0]
+    assert trade["Side"] == "Short" and trade["Entry"] == 99 and trade["Stop"] == 100.5
+    assert trade["Exit"] == 97.8 and trade["Exit reason"] == "Pullback"
+    assert np.isclose(trade["P&L"], trade["Shares"] * (99 - 97.8) - 2.0)
+    lower, _ = opening_bar_trades(frame, OpeningBarSettings(skip_bars=0, allow_short=True, exit_mode="lower_high"))
+    assert lower.iloc[0]["Exit"] == 97.8
+
+
+def test_short_stop_is_the_first_bar_high():
+    flipped = [(200 - o, 200 - l, 200 - h, 200 - c) for o, h, l, c in RUN]
+    flipped[3] = (97.8, 101.0, 97.7, 100.8)
+    trades, _ = opening_bar_trades(session("2026-10-01", flipped), OpeningBarSettings(skip_bars=0, allow_short=True))
+    assert trades.iloc[0]["Exit reason"] == "Stop" and trades.iloc[0]["Exit"] == 100.5
+    assert trades.iloc[0]["P&L"] < 0

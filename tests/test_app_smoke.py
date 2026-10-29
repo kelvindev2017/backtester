@@ -494,3 +494,6 @@ def test_opening_bar_tab(offline):
     open_tab(app, "First 5-min Day Trade")
     # The fill choice belongs to the pullback exit only.
     assert not any(box.key == "opening_bar_fill" for box in app.selectbox)
+    next(box for box in app.checkbox if box.key == "opening_bar_short").check()
+    open_tab(app, "First 5-min Day Trade")
+    assert any("short days" in block.value for block in app.markdown)

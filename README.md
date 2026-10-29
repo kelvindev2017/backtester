@@ -56,7 +56,9 @@ rule was fitted on and the check after it, with equity, monthly P&L, per-ticker 
 **First 5-min Day Trade**: a day trade decided by the session's first 5-minute bar. If that bar closes at least N
 points above its open (default 0, any green bar) the day is a long day: buy at its close with the stop at its low,
 sized so a stop-out loses at most 10% of the allocated capital (adjustable, and by default never more shares than
-the capital buys). Other days the rule stays out (long only). After ignoring the next M bars (default 2; the stop
+the capital buys). Other days the rule stays out, unless "Short on short days" is ticked: then a first bar that
+closes at least N points below its open is shorted, the mirror image of the long trade (stop at its high, exits
+on a close above the last bounce or a higher low). After ignoring the next M bars (default 2; the stop
 still applies), sell everything on the chosen exit: **pullback** (a close below the previous close sets the
 pullback; the next close below it sells, filled at that close or, as written, at the pullback price) or **lower
 high** (the first bar whose high is below the previous bar's high sells at its close). Anything still held is sold
