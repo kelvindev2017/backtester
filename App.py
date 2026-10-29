@@ -21,6 +21,9 @@ from plotly.subplots import make_subplots
 from analysis.opening_bar import (
     EXIT_FILLS as OPENING_BAR_FILLS,
     EXIT_MODES as OPENING_BAR_EXITS,
+    EXIT_OPERATORS as OPENING_BAR_OPERATORS,
+    EXIT_VALUES as OPENING_BAR_VALUES,
+    CustomExit,
     COMMISSION_PLANS as OPENING_BAR_COMMISSIONS,
     OpeningBarSettings,
     run_opening_bar,
@@ -3963,7 +3966,7 @@ def strategy_settings(tab="Backtest"):
             diagram = reversal_figure(breakout_lookback, trend_mid, trend_slow, max_hold_bars)
         elif setup == "opening_bar":
             diagram = opening_bar_figure(opening_bar.min_move, opening_bar.skip_bars, opening_bar.exit_mode,
-                                         opening_bar.bar_minutes)
+                                         opening_bar.bar_minutes, opening_bar.custom_exit)
         else:
             diagram = day_breakout_figure(breakout_lookback, "top_range", keep_fraction)
         show_rule_diagram(diagram)
@@ -4609,6 +4612,27 @@ def opening_bar_settings(capital, bar_minutes=5):
                                       key="opening_bar_skip",
                                       help="The stop at the first bar's low still applies to these bars."))
     exit_fill = "close"
+    custom_exit = CustomExit()
+    if exit_mode == "custom":
+        value_labels = list(OPENING_BAR_VALUES)
+        left = st.selectbox("Sell when", value_labels, index=value_labels.index("Close"), key="opening_bar_custom_left",
+                            help="Checked on every bar after the ignored ones; the sale is at that bar's close. "
+                            "On a short day everything is turned upside down (below becomes above, a high becomes "
+                            "a low).")
+        operator = st.selectbox("is", OPENING_BAR_OPERATORS, key="opening_bar_custom_operator",
+                                help="Crosses below: it was at or above on the previous bar and is below now.")
+        right = st.selectbox("Compared with", value_labels, index=value_labels.index("Previous low"),
+                             key="opening_bar_custom_right")
+        offset = float(st.number_input("Plus ($, negative to subtract)", value=0.0, step=0.01, format="%.2f",
+                                       key="opening_bar_custom_offset",
+                                       help="Added to the right-hand value, e.g. -0.05 for 5 cents below the "
+                                       "previous low."))
+        ema_period = 9
+        if "ema" in (OPENING_BAR_VALUES[left], OPENING_BAR_VALUES[right]):
+            ema_period = int(st.number_input("EMA period (bars)", min_value=2, max_value=200, value=9, step=1,
+                                             key="opening_bar_custom_ema"))
+        custom_exit = CustomExit(OPENING_BAR_VALUES[left], operator, OPENING_BAR_VALUES[right], offset, ema_period)
+        st.caption(f"Exit: **{custom_exit.describe()}**")
     if exit_mode == "pullback":
         fill_label = st.selectbox(
             "Pullback exit fill", list(OPENING_BAR_FILLS), key="opening_bar_fill",
@@ -4629,7 +4653,7 @@ def opening_bar_settings(capital, bar_minutes=5):
     return OpeningBarSettings(min_move=min_move, skip_bars=skip_bars, exit_mode=exit_mode, risk_pct=risk_pct,
                               capital=float(capital), cap_at_capital=cap_at_capital, exit_fill=exit_fill,
                               commission_plan=OPENING_BAR_COMMISSIONS[plan_label], slippage=slippage,
-                              allow_short=allow_short, bar_minutes=int(bar_minutes))
+                              allow_short=allow_short, bar_minutes=int(bar_minutes), custom_exit=custom_exit)
 
 
 def load_opening_bar_bars(ticker, bar_minutes=5):
@@ -4677,8 +4701,9 @@ def opening_bar_equity(bars, trades, settings, account_size):
 
 
 def opening_bar_rule_text(settings):
-    exit_text = ("the next close below the last pullback close" if settings.exit_mode == "pullback"
-                 else "the first bar whose high is below the previous bar's high")
+    exit_text = {"pullback": "the next close below the last pullback close",
+                 "lower_high": "the first bar whose high is below the previous bar's high",
+                 "custom": f"the close of the first bar where {settings.custom_exit.describe()}"}[settings.exit_mode]
     side_text = " Short days are shorted, the mirror image." if settings.allow_short else ""
     return (f"**BUY / SELL:** on a long day (first {settings.bar_minutes}-minute bar closes at least "
             f"{settings.min_move:g} points above its open) buy at that bar's close, stop at its low, then after "
@@ -4733,8 +4758,8 @@ def render_opening_bar_details(trades, days, settings):
     tiles[3 % len(tiles)].metric("Costs", f"${summary['Costs']:,.0f}",
                                  f"${summary['Costs'] / summary['Trades']:.2f} a trade", delta_color="off")
     st.caption(f"Exits: {summary['Stopped out %']:.0f}% stopped out, "
-               f"{summary['Pullback exit %'] + summary['Lower high exit %']:.0f}% on the "
-               f"{'pullback' if exit_mode == 'pullback' else 'lower-high'} exit, "
+               f"{summary['Pullback exit %'] + summary['Lower high exit %'] + summary['Custom exit %']:.0f}% on the "
+               f"{exit_mode.replace('_', '-')} exit, "
                f"{summary['End of day %']:.0f}% sold before the close. Costs are commissions and fees; slippage is "
                "already in the fill prices.")
     if allow_short:

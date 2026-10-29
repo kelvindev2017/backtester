@@ -575,6 +575,17 @@ def test_first_bar_day_trade_is_a_backtest_rule(offline):
     next(box for box in app.checkbox if box.key == "opening_bar_short").check()
     open_tab(app, "Backtest")
     assert any("short days" in block.value for block in app.markdown)
+    # A custom exit: two values and how they compare.
+    next(box for box in app.selectbox if box.key == "opening_bar_exit").select(
+        "Custom: compare two values")
+    open_tab(app, "Backtest")
+    assert any("Close < Previous low" in block.value for block in app.caption)
+    assert not any(box.key == "opening_bar_custom_ema" for box in app.number_input)
+    next(box for box in app.selectbox if box.key == "opening_bar_custom_operator").select("crosses below")
+    next(box for box in app.selectbox if box.key == "opening_bar_custom_right").select("EMA of closes (this session)")
+    open_tab(app, "Backtest")
+    assert any(box.key == "opening_bar_custom_ema" for box in app.number_input)
+    assert any("Close crosses below EMA 9 of closes" in block.value for block in app.caption)
     # The other strategy tabs cannot replay it and say so.
     open_tab(app, "Validate")
     assert any("Backtest tab only" in element.value for element in app.info)

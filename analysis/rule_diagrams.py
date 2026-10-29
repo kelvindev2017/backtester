@@ -258,7 +258,7 @@ def reversal_figure(lookback=20, trend_mid=50, trend_slow=200, max_hold=10):
     return finish(fig)
 
 
-def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback", bar_minutes=5):
+def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback", bar_minutes=5, custom=None):
     """First-5-minute day trade: a green first bar buys at its close, stop at its low, then the chosen exit."""
 
     from analysis.opening_bar import exit_session
@@ -272,7 +272,7 @@ def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback", bar_minu
     entry, stop = frame["Close"].iloc[0], frame["Low"].iloc[0]
     # Up to 4 skipped bars are drawn so the exit still fits in the picture.
     drawn_skip = min(max(int(skip_bars), 0), 4)
-    exit_bar, exit_price, _ = exit_session(frame, entry, stop, drawn_skip, "close", exit_mode)
+    exit_bar, exit_price, reason = exit_session(frame, entry, stop, drawn_skip, "close", exit_mode, custom=custom)
 
     fig = go.Figure()
     candles(fig, frame)
@@ -285,7 +285,11 @@ def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback", bar_minu
     note(fig, len(frame) - 1.5, stop, "Stop: first bar's low", DOWN, arrow=False, yshift=-10)
     move_text = "Close > open" if not min_move else f"Close ≥ open + {min_move:g}"
     note(fig, 1, frame["Low"].iloc[0], f"Long day ({move_text}):<br>BUY at the first bar's close", UP, ax=45, ay=35)
-    if exit_mode == "lower_high":
+    if exit_mode == "custom":
+        rule = custom.describe() if custom is not None else "the custom exit"
+        sell_text = f"{rule}:<br>SELL all at its close" if reason == "Custom" else f"{rule} never held:<br>sold before the close"
+        note(fig, exit_bar + 1, frame["High"].iloc[exit_bar], sell_text, DOWN, ax=-20, ay=-50)
+    elif exit_mode == "lower_high":
         highs = frame["High"].to_numpy()
         fig.add_shape(type="line", x0=exit_bar - 0.4, x1=exit_bar + 1.4, y0=highs[exit_bar - 1], y1=highs[exit_bar - 1],
                       line=dict(color=LEVEL, dash="dot"))

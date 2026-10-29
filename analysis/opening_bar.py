@@ -12,7 +12,8 @@ Kelvin's rule (2026-10-29):
 * ignore the next ``skip_bars`` bars for the exit (the stop still applies), then sell everything on one of two
   exits: the pullback exit (every close below the previous close is a pullback; the first later close below the
   latest pullback sells), or the lower-high exit (the first bar whose high is below the previous bar's high sells
-  at that bar's close);
+  at that bar's close), or a custom exit that compares two values the user picks (e.g. the close below the
+  previous bar's low) and sells at the close of the first bar where the comparison holds;
 * anything still held is sold 5 minutes before the close (at the open of the first bar that starts 5 minutes or
   less before the close; with 15-minute bars that is the last bar, 15 minutes before).
 
@@ -23,7 +24,7 @@ Sizing is a separate function (``position_shares``) and the backtest takes a lis
 system or the stock screener can feed them later.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 import numpy as np
@@ -33,7 +34,28 @@ import pandas as pd
 EXIT_MODES = {
     "Pullback: next close below the last pullback close": "pullback",
     "Lower high: a bar's high below the previous bar's high": "lower_high",
+    "Custom: compare two values": "custom",
 }
+# Values a custom exit can compare, each a price on every bar. "Since entry" means the bars after the first bar,
+# before the bar being checked (starting at the entry price).
+EXIT_VALUES = {
+    "Close": "close",
+    "Open": "open",
+    "High": "high",
+    "Low": "low",
+    "Previous close": "prev_close",
+    "Previous open": "prev_open",
+    "Previous high": "prev_high",
+    "Previous low": "prev_low",
+    "Highest high since entry": "max_high",
+    "Lowest low since entry": "min_low",
+    "Entry price": "entry",
+    "First bar high": "first_high",
+    "First bar low": "first_low",
+    "VWAP (this session)": "vwap",
+    "EMA of closes (this session)": "ema",
+}
+EXIT_OPERATORS = ["<", "<=", ">", ">=", "crosses below", "crosses above"]
 EXIT_FILLS = {
     "At the close that broke the pullback (market order)": "close",
     "At the pullback price (as written)": "pullback",
@@ -56,6 +78,26 @@ DAY_COLUMNS = ["Ticker", "Date", "First bar open", "First bar close", "Move", "L
 
 
 @dataclass
+class CustomExit:
+    """Sell at the close of the first bar where ``left operator right + offset`` holds."""
+
+    left: str = "close"
+    operator: str = "<"
+    right: str = "prev_low"
+    offset: float = 0.0
+    ema_period: int = 9
+
+    def describe(self):
+        names = {key: label for label, key in EXIT_VALUES.items()}
+
+        def name(key):
+            return f"EMA {self.ema_period} of closes" if key == "ema" else names[key]
+
+        offset = f" {'+' if self.offset >= 0 else '-'} {abs(self.offset):g}" if self.offset else ""
+        return f"{name(self.left)} {self.operator} {name(self.right)}{offset}"
+
+
+@dataclass
 class OpeningBarSettings:
     min_move: float = 0.0
     skip_bars: int = 2
@@ -68,6 +110,7 @@ class OpeningBarSettings:
     slippage: float = 0.01
     allow_short: bool = False
     bar_minutes: int = 5
+    custom_exit: CustomExit = field(default_factory=CustomExit)
 
 
 def order_costs(shares, price, sell, plan="tiered"):
@@ -110,8 +153,62 @@ def is_short_day(first_bar, min_move=0.0):
 def mirrored(session):
     """Prices turned upside down (high becomes low), so a short is traded by the long rules."""
 
-    return pd.DataFrame({"Open": -session["Open"], "High": -session["Low"], "Low": -session["High"],
-                         "Close": -session["Close"]}, index=session.index)
+    frame = pd.DataFrame({"Open": -session["Open"], "High": -session["Low"], "Low": -session["High"],
+                          "Close": -session["Close"]}, index=session.index)
+    if "Volume" in session:
+        frame["Volume"] = session["Volume"]
+    return frame
+
+
+def exit_values(session, key, entry, ema_period=9):
+    """One of the ``EXIT_VALUES`` on every bar of the session (the first bar is the entry bar)."""
+
+    opens, highs, lows, closes = (session[c].to_numpy(dtype=float) for c in ("Open", "High", "Low", "Close"))
+    current = {"close": closes, "open": opens, "high": highs, "low": lows}
+    if key in current:
+        return current[key]
+    if key.startswith("prev_"):
+        values = current[key[5:]]
+        return np.concatenate([[np.nan], values[:-1]])
+    if key in ("max_high", "min_low"):
+        # Bars after the entry bar, up to the one before the bar being checked, starting at the entry price.
+        source = highs if key == "max_high" else lows
+        running = (np.maximum if key == "max_high" else np.minimum).accumulate(np.concatenate([[entry], source[1:]]))
+        return np.concatenate([[entry], running[:-1]])
+    if key == "entry":
+        return np.full(len(closes), float(entry))
+    if key in ("first_high", "first_low"):
+        return np.full(len(closes), highs[0] if key == "first_high" else lows[0])
+    if key == "vwap":
+        typical = (highs + lows + closes) / 3
+        volume = session["Volume"].to_numpy(dtype=float) if "Volume" in session else np.ones(len(closes))
+        volume = np.where(np.isfinite(volume) & (volume > 0), volume, 0.0)
+        weight = np.cumsum(volume)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            vwap = np.cumsum(typical * volume) / weight
+        return np.where(weight > 0, vwap, np.cumsum(typical) / np.arange(1, len(closes) + 1))
+    if key == "ema":
+        return pd.Series(closes).ewm(span=max(int(ema_period), 1), adjust=False).mean().to_numpy()
+    raise ValueError(f"Unknown exit value: {key}")
+
+
+def custom_exit_bars(session, entry, custom):
+    """True on every bar where the custom exit's comparison holds."""
+
+    left = exit_values(session, custom.left, entry, custom.ema_period)
+    right = exit_values(session, custom.right, entry, custom.ema_period) + custom.offset
+    previous_left, previous_right = np.roll(left, 1), np.roll(right, 1)
+    with np.errstate(invalid="ignore"):
+        hit = {
+            "<": left < right,
+            "<=": left <= right,
+            ">": left > right,
+            ">=": left >= right,
+            "crosses below": (previous_left >= previous_right) & (left < right),
+            "crosses above": (previous_left <= previous_right) & (left > right),
+        }[custom.operator]
+    hit[0] = False
+    return hit
 
 
 def position_shares(capital, entry, stop, risk_pct=10.0, cap_at_capital=True):
@@ -126,22 +223,29 @@ def position_shares(capital, entry, stop, risk_pct=10.0, cap_at_capital=True):
     return max(shares, 0)
 
 
-def exit_session(session, entry, stop, skip_bars=2, exit_fill="close", exit_mode="pullback", flat_bar=None):
+def exit_session(session, entry, stop, skip_bars=2, exit_fill="close", exit_mode="pullback", flat_bar=None,
+                 custom=None):
     """Exit of a long entered at the close of the session's first bar: (bar position, price, reason).
 
-    The stop is checked first on every bar (a gap below it fills at the open). The pullback or lower-high exit starts
-    after the skipped bars; ``flat_bar`` (default the last bar) is the flat-before-the-close exit, at its open.
+    The stop is checked first on every bar (a gap below it fills at the open). The pullback, lower-high or custom
+    exit starts after the skipped bars; ``flat_bar`` (default the last bar) is the flat-before-the-close exit, at its
+    open. A custom exit sells at the close of the bar where its comparison holds.
     """
 
     opens, highs, lows, closes = (session[c].to_numpy(dtype=float) for c in ("Open", "High", "Low", "Close"))
     last = len(session) - 1 if flat_bar is None else flat_bar
     pullback = np.nan
+    custom_hits = custom_exit_bars(session, entry, custom or CustomExit()) if exit_mode == "custom" else None
     for k in range(1, last + 1):
         if lows[k] <= stop:
             return k, min(opens[k], stop), "Stop"
         if k == last:
             return k, opens[k], "End of day"
         if k <= skip_bars:
+            continue
+        if exit_mode == "custom":
+            if custom_hits[k]:
+                return k, closes[k], "Custom"
             continue
         if exit_mode == "lower_high":
             if highs[k] < highs[k - 1]:
@@ -191,7 +295,8 @@ def opening_bar_trades(bars, settings=None, ticker=""):
         # A short is the long trade on upside-down prices.
         k, exit_price, reason = exit_session(session if long_day else mirrored(session), side * entry, side * stop,
                                               settings.skip_bars, settings.exit_fill, settings.exit_mode,
-                                              flat_bar_position(session.index, settings.bar_minutes))
+                                              flat_bar_position(session.index, settings.bar_minutes),
+                                              settings.custom_exit)
         exit_price *= side
         risk = shares * abs(entry - stop)
         # Slippage: every fill is a few cents worse than the bar price, in the trade's direction.
@@ -246,6 +351,7 @@ def summarize_opening_bar(trades, days=None):
         "Stopped out %": float(reasons.get("Stop", 0.0)),
         "Pullback exit %": float(reasons.get("Pullback", 0.0)),
         "Lower high exit %": float(reasons.get("Lower high", 0.0)),
+        "Custom exit %": float(reasons.get("Custom", 0.0)),
         "End of day %": float(reasons.get("End of day", 0.0)),
     }
 

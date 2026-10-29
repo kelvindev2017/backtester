@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.opening_bar import (
+    CustomExit,
     OpeningBarSettings,
     exit_session,
     flat_bar_position,
@@ -67,6 +68,48 @@ def test_lower_high_exit():
     assert exit_session(frame, 101, 99.5, skip_bars=0, exit_mode="lower_high") == (6, 102.2, "Lower high")
 
 
+def test_custom_exit_compares_the_chosen_values():
+    frame = session("2026-10-01", RUN)
+    # Bar 6 closes at 102.2, below bar 5's low of 102.4: sell at its close.
+    below_low = CustomExit("close", "<", "prev_low")
+    assert exit_session(frame, 101, 99.5, skip_bars=0, exit_mode="custom", custom=below_low) == (6, 102.2, "Custom")
+    # 30 cents below the previous low never happens: sold before the close.
+    deeper = CustomExit("close", "<", "prev_low", offset=-0.3)
+    assert exit_session(frame, 101, 99.5, skip_bars=0, exit_mode="custom", custom=deeper)[2] == "End of day"
+    # A dollar off the highest high since entry (103.6 by bar 6) is a trailing stop on closes.
+    trailing = CustomExit("close", "<", "max_high", offset=-1.0)
+    assert exit_session(frame, 101, 99.5, skip_bars=0, exit_mode="custom", custom=trailing)[:2] == (6, 102.2)
+    # Skipped bars are not checked: with 6 skipped, bar 7 (102.0 below bar 6's low of 102.1) sells.
+    assert exit_session(frame, 101, 99.5, skip_bars=6, exit_mode="custom", custom=below_low) == (7, 102.0, "Custom")
+    assert below_low.describe() == "Close < Previous low"
+    assert deeper.describe() == "Close < Previous low - 0.3"
+    assert CustomExit("close", "crosses below", "ema", ema_period=20).describe() == "Close crosses below EMA 20 of closes"
+
+
+def test_custom_exit_crossing_and_values():
+    frame = session("2026-10-01", RUN)
+    from analysis.opening_bar import custom_exit_bars, exit_values
+    closes = frame["Close"].to_numpy()
+    assert np.isnan(exit_values(frame, "prev_close", 101)[0]) and exit_values(frame, "prev_close", 101)[3] == 102.2
+    assert list(exit_values(frame, "max_high", 101)[:4]) == [101, 101, 101.8, 102.4]
+    # VWAP with equal volume is the running mean of the typical price.
+    typical = (frame["High"] + frame["Low"] + frame["Close"]) / 3
+    assert np.allclose(exit_values(frame, "vwap", 101), typical.expanding().mean())
+    # "Crosses below" fires once, on the bar that goes from at-or-above to below; "<" fires on every bar below.
+    below = custom_exit_bars(frame, 101, CustomExit("close", "<", "entry", offset=1.5))
+    crossing = custom_exit_bars(frame, 101, CustomExit("close", "crosses below", "entry", offset=1.5))
+    assert list(np.flatnonzero(below)) == [k for k in range(1, len(closes)) if closes[k] < 102.5]
+    assert list(np.flatnonzero(crossing)) == [6]
+
+
+def test_custom_exit_on_a_short_is_the_mirror_image():
+    flipped = [(200 - o, 200 - l, 200 - h, 200 - c) for o, h, l, c in RUN]
+    trades, _ = opening_bar_trades(session("2026-10-01", flipped), OpeningBarSettings(
+        skip_bars=0, allow_short=True, exit_mode="custom", custom_exit=CustomExit("close", "<", "prev_low"), **EXACT))
+    # Close above the previous high buys back: 200 - 102.2.
+    assert trades.iloc[0]["Exit"] == 97.8 and trades.iloc[0]["Exit reason"] == "Custom"
+
+
 def test_stop_and_end_of_day():
     bars = RUN[:3] + [(102.2, 102.3, 99.0, 99.2)] + RUN[4:]
     frame = session("2026-10-01", bars)
@@ -107,6 +150,7 @@ def test_diagram_follows_the_settings():
     assert "open + 0.5" in text(opening_bar_figure(0.5, 2))
     assert "pullback" in text(opening_bar_figure(0, 2, "pullback"))
     assert "prior<br>bar's high" in text(opening_bar_figure(0, 12, "lower_high"))
+    assert "Close < Previous low" in text(opening_bar_figure(0, 2, "custom", custom=CustomExit()))
 
 
 def test_short_days_trade_the_mirror_image():
