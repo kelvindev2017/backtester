@@ -97,7 +97,7 @@ def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["Economic analysis", "Market Analysis", "Industry Analysis",
                                                "Stock Fundamentals", "Semicon Supply Chain", "Stock Screener", "Backtest",
-                                               "Signal Analysis & Trade Plan", "Validate", "Day Breakout Rule"]
+                                               "Signal Analysis & Trade Plan", "Validate"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
     open_tab(app, "Signal Analysis & Trade Plan")
@@ -260,6 +260,33 @@ def test_market_and_industry_tabs(offline, monkeypatch):
     assert not app.exception, app.exception
 
 
+def test_industry_indexes_can_be_added_and_removed(offline):
+    app = open_tab(start_app(), "Industry Analysis")
+    chosen = lambda: next(box for box in app.multiselect if box.key == "industry_indexes").value
+    assert "Software (IGV)" in chosen()
+
+    next(box for box in app.text_input if box.key == "industry_add_symbol").input("smh")
+    next(box for box in app.text_input if box.key == "industry_add_name").input("Semiconductor ETF")
+    next(button for button in app.button if button.key == "industry_add_btn").click()
+    app = open_tab(app, "Industry Analysis")
+    assert "Semiconductor ETF (SMH)" in chosen()
+    assert next(box for box in app.text_input if box.key == "industry_add_symbol").value == ""
+    # A built-in index typed by its symbol is just chosen, not added twice.
+    next(box for box in app.text_input if box.key == "industry_add_symbol").input("XLK")
+    next(button for button in app.button if button.key == "industry_add_btn").click()
+    app = open_tab(app, "Industry Analysis")
+    assert "Technology (XLK)" in chosen()
+
+    next(box for box in app.multiselect if box.key == "industry_indexes").unselect("Software (IGV)")
+    app = open_tab(app, "Industry Analysis")
+    assert "Software (IGV)" not in chosen()
+    assert json.loads(app.session_state["industry_saved"])["added"] == {"Semiconductor ETF (SMH)": "SMH"}
+
+    next(button for button in app.button if button.key == "industry_reset_btn").click()
+    app = open_tab(app, "Industry Analysis")
+    assert "Software (IGV)" in chosen() and "Semiconductor ETF (SMH)" not in chosen()
+
+
 class FakeTickerWithRevenue(FakeTicker):
     def __init__(self, symbol):
         super().__init__(symbol)
@@ -394,27 +421,6 @@ def test_what_happened_next_settings(offline, monkeypatch):
         assert any(f"in the {look_ahead} after each check" in chart.proto.spec for chart in app.get("plotly_chart"))
 
 
-def test_day_breakout_tab(offline):
-    app = open_tab(start_app(), "Day Breakout Rule")
-    assert app.sidebar.header[0].value == "Day Breakout Rule"
-    assert [metric.label for metric in app.metric] == ["Net P&L", "Win rate", "Profit factor", "Max drawdown"]
-    assert any("Cumulative P&L" in chart.proto.spec for chart in app.get("plotly_chart"))
-
-    next(box for box in app.selectbox if box.key == "day_breakout_exit").select("Always sell at the close")
-    open_tab(app, "Day Breakout Rule")
-    assert app.metric
-
-    next(box for box in app.selectbox if box.key == "day_breakout_exit").select(
-        "Hold while the close is above a moving average")
-    open_tab(app, "Day Breakout Rule")
-    assert next(box for box in app.number_input if box.key == "day_breakout_ma_period").value == 20
-    assert app.metric
-
-    next(box for box in app.text_input if box.key == "day_breakout_tickers").input("")
-    open_tab(app, "Day Breakout Rule")
-    assert any("at least one ticker" in element.value for element in app.info)
-
-
 def test_day_breakout_signal_rule(offline):
     app = open_tab(start_app(), "Backtest")
     next(box for box in app.selectbox if box.label == "Signal rule").select(
@@ -451,29 +457,22 @@ def test_settings_show_only_what_the_tab_and_rule_use(offline):
         open_tab(app, "Signal Analysis & Trade Plan")
         assert any("How the rule trades" in chart.proto.spec for chart in app.get("plotly_chart")), rule
 
-    open_tab(app, "Day Breakout Rule")
-    assert "Exit MA period (days)" not in labels() and any("far below the day's high" in label for label in labels())
-    next(box for box in app.selectbox if box.key == "day_breakout_exit").select(
-        "Hold while the close is above a moving average")
-    open_tab(app, "Day Breakout Rule")
-    assert "Exit MA period (days)" in labels() and not any("far below the day's high" in label for label in labels())
-    next(box for box in app.selectbox if box.key == "day_breakout_exit").select("Always sell at the close")
-    open_tab(app, "Day Breakout Rule")
-    assert "Exit MA period (days)" not in labels() and not any("far below the day's high" in label for label in labels())
-
 
 def test_sliders_have_a_number_box_in_sync(offline):
-    app = open_tab(start_app(), "Day Breakout Rule")
-    slider = lambda: next(widget for widget in app.slider if widget.key == "day_breakout_exit_pct")
-    box = lambda: next(widget for widget in app.number_input if widget.key == "day_breakout_exit_pct_input")
+    app = open_tab(start_app(), "Backtest")
+    next(box for box in app.selectbox if box.label == "Signal rule").select(
+        "Day breakout (above the N-day high, hold on a top-third close)")
+    open_tab(app, "Backtest")
+    slider = lambda: next(widget for widget in app.slider if widget.key == "signal_day_breakout_exit_pct")
+    box = lambda: next(widget for widget in app.number_input if widget.key == "signal_day_breakout_exit_pct_input")
     assert slider().value == box().value == 33
 
     box().set_value(40)
-    open_tab(app, "Day Breakout Rule")
+    open_tab(app, "Backtest")
     assert slider().value == 40 and not app.exception
 
     slider().set_value(20)
-    open_tab(app, "Day Breakout Rule")
+    open_tab(app, "Backtest")
     assert box().value == 20
 
     open_tab(app, "Signal Analysis & Trade Plan")
