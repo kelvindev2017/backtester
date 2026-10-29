@@ -28,10 +28,10 @@ from analysis.day_breakout import (
 from analysis.opening_bar import (
     EXIT_FILLS as OPENING_BAR_FILLS,
     EXIT_MODES as OPENING_BAR_EXITS,
+    COMMISSION_PLANS as OPENING_BAR_COMMISSIONS,
     OpeningBarSettings,
     run_opening_bar,
     summarize_opening_bar,
-    ticker_table as opening_bar_ticker_table,
 )
 from analysis.economy import (
     ASSETS,
@@ -1570,17 +1570,20 @@ def get_secret(name, default=""):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_intraday_data(symbol, interval="5m", period="10d"):
-    """Download regular-session intraday bars (Yahoo keeps ~60 days of 5m data).
+def load_intraday_data(symbol, interval="5m", period="10d", start=None, end=None):
+    """Download regular-session intraday bars (Yahoo keeps ~60 days of 5m data, ~30 days of 1m data).
+
+    ``start`` and ``end`` (dates as text), when given, replace ``period``.
 
     The bar that is still forming is dropped, and timestamps are kept in the
     exchange's local time so that 09:30 is the open for US listings.
     """
 
     try:
+        window = dict(start=start, end=end) if start else dict(period=period)
         bars = yf.download(
             symbol,
-            period=period,
+            **window,
             interval=interval,
             auto_adjust=False,
             prepost=False,
@@ -3635,6 +3638,7 @@ SETUP_OPTIONS = {
     "First-bar day trade (the first five-minute bar decides the day)": "opening_bar",
 }
 OPENING_BAR_RULE = next(label for label, setup in SETUP_OPTIONS.items() if setup == "opening_bar")
+INTRADAY_TIMEFRAMES = {"1 min": 1, "5 min": 5, "15 min": 15}
 
 
 def strategy_settings(tab="Backtest"):
@@ -3645,12 +3649,18 @@ def strategy_settings(tab="Backtest"):
 
     # The first-bar day trade runs on the ~60 days of 5-minute bars Yahoo keeps, so timeframe and dates do not apply.
     intraday = st.session_state.get("signal_rule") == OPENING_BAR_RULE
+    bar_minutes = 5
     timeframe = st.session_state.get("timeframe", "Daily")
     date_range = st.session_state.get("date_range", (date(2022, 1, 1), date.today()))
     with settings_panel("Ticker & dates"):
         ticker = normalize_symbol(st.text_input("Ticker Symbol", value="AAPL", key="ticker_input"))
         if intraday:
             date_range = (date.today() - timedelta(days=60), date.today())
+            intraday_label = st.selectbox(
+                "Timeframe", list(INTRADAY_TIMEFRAMES), index=1, key="intraday_timeframe",
+                help="Bar length of the day trade. Yahoo keeps about 60 days of 5- and 15-minute bars and about "
+                "30 days of 1-minute bars, so that is the period tested.")
+            bar_minutes = INTRADAY_TIMEFRAMES[intraday_label]
         else:
             timeframe = st.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0, key="timeframe")
             date_range = st.date_input(
@@ -3733,7 +3743,7 @@ def strategy_settings(tab="Backtest"):
                 "further below the high than that. Long only. The Day Breakout Rule tab runs it on many tickers with fixed $ size."
             )
         elif setup == "opening_bar":
-            opening_bar = opening_bar_settings(account_size)
+            opening_bar = opening_bar_settings(account_size, bar_minutes)
         elif setup == "pullback":
             trend_columns = st.columns(2)
             trend_mid = int(trend_columns[0].number_input("Trend fast MA (bars)", min_value=5, max_value=250, value=50, step=1, key="trend_mid"))
@@ -3775,7 +3785,8 @@ def strategy_settings(tab="Backtest"):
         elif setup == "reversal":
             diagram = reversal_figure(breakout_lookback, trend_mid, trend_slow, max_hold_bars)
         elif setup == "opening_bar":
-            diagram = opening_bar_figure(opening_bar.min_move, opening_bar.skip_bars, opening_bar.exit_mode)
+            diagram = opening_bar_figure(opening_bar.min_move, opening_bar.skip_bars, opening_bar.exit_mode,
+                                         opening_bar.bar_minutes)
         else:
             diagram = day_breakout_figure(breakout_lookback, "top_range", keep_fraction)
         show_rule_diagram(diagram)
@@ -3885,9 +3896,18 @@ def render_backtest(s):
     buy_left, buy_operator, buy_right = s.buy_left, s.buy_operator, s.buy_right
     sell_left, sell_operator, sell_right = s.sell_left, s.sell_operator, s.sell_right
     breakout_lookback, volume_multiple, signal_settings = s.breakout_lookback, s.volume_multiple, s.signal_settings
+    intraday_bars = None
     if setup == "opening_bar":
-        render_opening_bar([ticker], s.opening_bar)
-        return
+        # The day trade runs on intraday bars; the daily data below only feeds the EPS, fundamentals and benchmark
+        # panels over the same days.
+        timeframe = "Daily"
+        with st.spinner(f"Loading {ticker} {s.opening_bar.bar_minutes}-minute bars..."):
+            intraday_bars = load_opening_bar_bars(ticker, s.opening_bar.bar_minutes)
+        if intraday_bars.empty:
+            st.error(f"No {s.opening_bar.bar_minutes}-minute bars were returned for {ticker}.")
+            return
+        start_date = intraday_bars.index.min().date()
+        end_date = intraday_bars.index.max().date() + timedelta(days=1)
 
     start_date_str = pd.Timestamp(start_date).strftime("%Y-%m-%d")
     end_date_str = pd.Timestamp(end_date).strftime("%Y-%m-%d")
@@ -3966,7 +3986,10 @@ def render_backtest(s):
     if not pe_error.empty:
         st.caption(f"Maximum internal P/E calculation error: ${pe_error.max():.8f}")
 
-    if setup == "ma_rule":
+    if setup == "opening_bar":
+        trades, days = run_opening_bar({ticker: intraday_bars}, s.opening_bar)
+        df, rule_text = opening_bar_equity(intraday_bars, trades, s.opening_bar, account_size), opening_bar_rule_text(s.opening_bar)
+    elif setup == "ma_rule":
         _, _, buy_condition, sell_condition = ma_rule_conditions(df, ma_rule)
         rule_text = (
             f"**BUY:** `{buy_left} {buy_operator} {buy_right}`\n\n"
@@ -3984,13 +4007,14 @@ def render_backtest(s):
             "its exit (see the rule's settings). Stops and targets are not simulated here; the **Validate** tab replays the "
             "full trade plan."
         )
-    df = run_position_engine(df, buy_condition, sell_condition, max_hold=s.max_hold_bars if setup == "reversal" else 0)
+    if setup != "opening_bar":
+        df = run_position_engine(df, buy_condition, sell_condition, max_hold=s.max_hold_bars if setup == "reversal" else 0)
 
-    df["Returns"] = df["Close"].pct_change().fillna(0.0)
-    df["Strat_Returns"] = df["Position"] * df["Returns"]
-    df["Equity"] = float(account_size) * (1.0 + df["Strat_Returns"]).cumprod()
-    df["Peak"] = df["Equity"].cummax()
-    df["Drawdown"] = df["Equity"] / df["Peak"] - 1.0
+        df["Returns"] = df["Close"].pct_change().fillna(0.0)
+        df["Strat_Returns"] = df["Position"] * df["Returns"]
+        df["Equity"] = float(account_size) * (1.0 + df["Strat_Returns"]).cumprod()
+        df["Peak"] = df["Equity"].cummax()
+        df["Drawdown"] = df["Equity"] / df["Peak"] - 1.0
 
     final_equity = df["Equity"].iloc[-1]
     total_return = (final_equity / float(account_size) - 1.0) * 100.0
@@ -4001,7 +4025,11 @@ def render_backtest(s):
     metric_col1, metric_col2, metric_col3 = st.columns(3)
     metric_col1.metric("Final Equity", f"${final_equity:,.2f}", f"{total_return:.2f}%")
     metric_col2.metric("Max Drawdown", f"{max_drawdown:.2f}%")
-    metric_col3.metric("Positive Active Bars", f"{positive_active_bars:.1f}%")
+    if setup == "opening_bar":
+        win_rate = (trades["P&L"] > 0).mean() * 100 if len(trades) else 0.0
+        metric_col3.metric("Win rate", f"{win_rate:.0f}%", f"{len(trades)} trades", delta_color="off")
+    else:
+        metric_col3.metric("Positive Active Bars", f"{positive_active_bars:.1f}%")
     st.info(rule_text)
 
     fig = make_subplots(
@@ -4036,22 +4064,26 @@ def render_backtest(s):
         fig.add_trace(go.Scatter(x=df.index, y=df["Fast_MA"], name=f"{fast_type} {fast_period}", line=dict(color="orange", width=1.5)), row=1, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
 
-    buy_points = df.loc[df["Buy_Signal"]]
-    sell_points = df.loc[df["Sell_Signal"]]
-    fig.add_trace(
-        go.Scatter(
-            x=buy_points.index, y=buy_points["Close"], mode="markers", name="BUY signal",
-            marker=dict(symbol="triangle-up", size=12, color="lime", line=dict(color="darkgreen", width=1)),
-            hovertemplate="BUY signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
-        ), row=1, col=1
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=sell_points.index, y=sell_points["Close"], mode="markers", name="SELL signal",
-            marker=dict(symbol="triangle-down", size=12, color="red", line=dict(color="darkred", width=1)),
-            hovertemplate="SELL signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
-        ), row=1, col=1
-    )
+    if setup == "opening_bar":
+        for trace in opening_bar_signal_traces(trades):
+            fig.add_trace(trace, row=1, col=1)
+    else:
+        buy_points = df.loc[df["Buy_Signal"]]
+        sell_points = df.loc[df["Sell_Signal"]]
+        fig.add_trace(
+            go.Scatter(
+                x=buy_points.index, y=buy_points["Close"], mode="markers", name="BUY signal",
+                marker=dict(symbol="triangle-up", size=12, color="lime", line=dict(color="darkgreen", width=1)),
+                hovertemplate="BUY signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
+            ), row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=sell_points.index, y=sell_points["Close"], mode="markers", name="SELL signal",
+                marker=dict(symbol="triangle-down", size=12, color="red", line=dict(color="darkred", width=1)),
+                hovertemplate="SELL signal<br>Date: %{x|%Y-%m-%d}<br>Price: %{y:.2f}<extra></extra>",
+            ), row=1, col=1
+        )
 
     # Row 2: quarterly and TTM EPS
     eps_trace_added = False
@@ -4321,7 +4353,7 @@ def render_backtest(s):
             ticker, start_date_str, end_date_str, timeframe, setup,
             fast_type, str(fast_period), slow_type, str(slow_period),
             buy_left, buy_operator, buy_right,
-            sell_left, sell_operator, sell_right, str(account_size),
+            sell_left, sell_operator, sell_right, str(account_size), str(s.opening_bar),
         ]
     )
     chart_revision = hashlib.sha256(chart_state_text.encode("utf-8")).hexdigest()[:16]
@@ -4340,6 +4372,8 @@ def render_backtest(s):
         key=f"backtest_chart_{chart_revision}",
         config={"responsive": True, "displaylogo": False},
     )
+    if setup == "opening_bar":
+        render_opening_bar_details(trades, days, s.opening_bar)
 
 
 # ============================================================
@@ -4499,16 +4533,16 @@ def render_day_breakout():
 # First-bar day trade (a Backtest signal rule)
 # ============================================================
 
-def opening_bar_settings(capital):
+def opening_bar_settings(capital, bar_minutes=5):
     """Settings of the first-bar day trade, shown in the Signal panel; ``capital`` is the Account size."""
 
     st.caption(
-        "If the first 5-minute bar closes at least N points above its open, the day is a long day: buy at that "
-        "bar's close with the stop at its low, sized so a stop-out loses at most the chosen % of the Account size "
-        "(the capital allocated to the stock). Other days the rule stays out, or, with shorting on, shorts a first "
-        "bar that closes at least N points below its open (the mirror image: stop at its high, exits on bounces and "
-        "higher lows). After skipping the next M bars, sell everything on the chosen exit; anything still held is "
-        "sold 5 minutes before the close. Runs on the last ~60 days of 5-minute bars."
+        f"If the first {bar_minutes}-minute bar closes at least N points above its open, the day is a long day: buy "
+        "at that bar's close with the stop at its low, sized so a stop-out loses at most the chosen % of the Account "
+        "size (the capital allocated to the stock). Other days the rule stays out, or, with shorting on, shorts a "
+        "first bar that closes at least N points below its open (the mirror image: stop at its high, exits on "
+        "bounces and higher lows). After skipping the next M bars, sell everything on the chosen exit; anything still "
+        "held is sold 5 minutes before the close."
     )
     risk_pct = float(st.number_input("Max loss per trade (% of capital)", min_value=0.1, max_value=100.0, value=10.0,
                                      step=0.5, key="opening_bar_risk"))
@@ -4535,35 +4569,111 @@ def opening_bar_settings(capital):
             help="The close below the pullback is only known when its bar ends, so a market order fills near "
             "that close. Filling at the pullback price itself is the rule as written but is optimistic.")
         exit_fill = OPENING_BAR_FILLS[fill_label]
-    fee = float(st.number_input("Fees per round trip ($)", min_value=0.0, value=2.0, step=0.5,
-                                key="opening_bar_fee"))
+    cost_columns = st.columns(2)
+    plan_label = cost_columns[0].selectbox(
+        "Commissions", list(OPENING_BAR_COMMISSIONS), key="opening_bar_commissions",
+        help="IBKR Pro Tiered: $0.0035 a share (min $0.35 an order) plus exchange (~$0.003 a share for a market "
+        "order), clearing and pass-through fees. Fixed: $0.005 a share, min $1 an order. Sales also pay the SEC and "
+        "FINRA fees. On a $10,000 position Tiered comes to about $1.30 a round trip.")
+    slippage = float(cost_columns[1].number_input(
+        "Slippage per share ($)", min_value=0.0, max_value=1.0, value=0.01, step=0.01, format="%.2f",
+        key="opening_bar_slippage",
+        help="How much worse than the bar price each market or stop order fills. About 1 cent is typical for "
+        "liquid large caps; use more for thinner stocks or fast opens."))
     return OpeningBarSettings(min_move=min_move, skip_bars=skip_bars, exit_mode=exit_mode, risk_pct=risk_pct,
                               capital=float(capital), cap_at_capital=cap_at_capital, exit_fill=exit_fill,
-                              fee_per_trade=fee, allow_short=allow_short)
+                              commission_plan=OPENING_BAR_COMMISSIONS[plan_label], slippage=slippage,
+                              allow_short=allow_short, bar_minutes=int(bar_minutes))
 
 
-def render_opening_bar(tickers, settings):
-    """Backtest of the first-bar day trade on the 5-minute history Yahoo keeps (about 60 days)."""
+def load_opening_bar_bars(ticker, bar_minutes=5):
+    """Intraday bars for the day trade: ~60 days of 5- or 15-minute bars, or ~30 days of 1-minute bars.
+
+    Yahoo serves 1-minute bars 7 days per request, so they are fetched in weekly pieces. Today's session is left out
+    until the market closes: its last bar so far is not the end-of-day exit.
+    """
+
+    if bar_minutes == 1:
+        end = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+        pieces = []
+        for _ in range(4):
+            start = end - pd.Timedelta(days=7)
+            pieces.append(load_intraday_data(ticker, "1m", start=f"{start:%Y-%m-%d}", end=f"{end:%Y-%m-%d}"))
+            end = start
+        pieces = [piece for piece in pieces if not piece.empty]
+        bars = pd.concat(pieces).sort_index() if pieces else pd.DataFrame()
+        bars = bars.loc[~bars.index.duplicated(keep="last")] if len(bars) else bars
+    else:
+        bars = load_intraday_data(ticker, f"{bar_minutes}m", "60d")
+    if bars.empty:
+        return bars
+    now = pd.Timestamp.now(tz="America/New_York")
+    if now.hour < 16:
+        bars = bars[bars.index.normalize() < now.tz_localize(None).normalize()]
+    return bars
+
+
+def opening_bar_equity(bars, trades, settings, account_size):
+    """The intraday bars with the account's equity and drawdown, booking each trade's P&L on its exit bar."""
+
+    frame = bars[["Open", "High", "Low", "Close"]].copy()
+    equity = pd.Series(0.0, index=frame.index)
+    if len(trades):
+        bar_length = pd.Timedelta(minutes=settings.bar_minutes)
+        exit_bar = trades["Exit time"].where(trades["Exit reason"] == "End of day", trades["Exit time"] - bar_length)
+        booked = trades.groupby(exit_bar.to_numpy())["P&L"].sum()
+        equity = booked.reindex(frame.index, fill_value=0.0).cumsum()
+    frame["Equity"] = float(account_size) + equity
+    frame["Peak"] = frame["Equity"].cummax()
+    frame["Drawdown"] = frame["Equity"] / frame["Peak"] - 1.0
+    frame["Strat_Returns"] = frame["Equity"].pct_change().fillna(0.0)
+    return frame
+
+
+def opening_bar_rule_text(settings):
+    exit_text = ("the next close below the last pullback close" if settings.exit_mode == "pullback"
+                 else "the first bar whose high is below the previous bar's high")
+    side_text = " Short days are shorted, the mirror image." if settings.allow_short else ""
+    return (f"**BUY / SELL:** on a long day (first {settings.bar_minutes}-minute bar closes at least "
+            f"{settings.min_move:g} points above its open) buy at that bar's close, stop at its low, then after "
+            f"{settings.skip_bars} bars sell on {exit_text}, or 5 minutes before the close.{side_text} Each trade risks "
+            f"at most {settings.risk_pct:g}% of the Account size, after IBKR commissions and "
+            f"${settings.slippage:.2f} a share of slippage.")
+
+
+def opening_bar_signal_traces(trades):
+    """Entry and exit markers of the day trades for the price panel."""
+
+    marks = [
+        ("BUY", trades[trades["Side"] == "Long"], "Entry", "triangle-up", "lime", "darkgreen"),
+        ("SELL", trades[trades["Side"] == "Long"], "Exit", "triangle-down", "red", "darkred"),
+        ("SHORT", trades[trades["Side"] == "Short"], "Entry", "triangle-down", "orange", "darkorange"),
+        ("COVER", trades[trades["Side"] == "Short"], "Exit", "triangle-up", "deepskyblue", "steelblue"),
+    ]
+    traces = []
+    for name, rows, column, symbol, color, edge in marks:
+        if rows.empty:
+            continue
+        reason = rows["Exit reason"] if column == "Exit" else pd.Series("", index=rows.index)
+        traces.append(go.Scatter(
+            x=rows[f"{column} time"], y=rows[column], mode="markers", name=name, customdata=reason,
+            marker=dict(symbol=symbol, size=10, color=color, line=dict(color=edge, width=1)),
+            hovertemplate=f"{name} %{{customdata}}<br>%{{x|%Y-%m-%d %H:%M}}<br>Price: %{{y:.2f}}<extra></extra>",
+        ))
+    return traces
+
+
+def render_opening_bar_details(trades, days, settings):
+    """Trade statistics and the trade list under the Backtest chart for the first-bar day trade."""
 
     allow_short, exit_mode = settings.allow_short, settings.exit_mode
-    with st.spinner("Loading 5-minute bars..."):
-        bars = {ticker: load_intraday_data(ticker, "5m", "60d") for ticker in tickers}
-    missing = [t for t, frame in bars.items() if frame.empty]
-    if missing:
-        st.warning(f"No 5-minute bars for {', '.join(missing)}.")
-    # Today's session is left out until the market closes: its last bar so far is not the end-of-day exit.
-    today = pd.Timestamp.now(tz="America/New_York")
-    if today.hour < 16:
-        bars = {t: frame[frame.index.normalize() < today.tz_localize(None).normalize()] for t, frame in bars.items()}
-    bars = {t: frame for t, frame in bars.items() if not frame.empty}
-    trades, days = run_opening_bar(bars, settings)
     if days.empty:
         st.info("No complete sessions to test.")
         return
     summary = summarize_opening_bar(trades, days)
     first_day, last_day = days["Date"].min(), days["Date"].max()
-    st.markdown(f"**{first_day:%b %d} to {last_day:%b %d, %Y}**: {summary['Days']} {'ticker-days' if len(bars) > 1 else 'days'}, "
-                f"{summary['Long days %']:.0f}% long days"
+    st.markdown(f"**{first_day:%b %d} to {last_day:%b %d, %Y}**: {summary['Days']} days of "
+                f"{settings.bar_minutes}-minute bars, {summary['Long days %']:.0f}% long days"
                 + (f", {days['Short day'].mean() * 100:.0f}% short days." if allow_short else "."))
     if trades.empty:
         st.info("No long or short days in this period." if allow_short else "No long days in this period.")
@@ -4571,15 +4681,16 @@ def render_opening_bar(tickers, settings):
 
     tiles = st.columns(2 if MOBILE else 4)
     tiles[0].metric("Net P&L", f"${summary['Net P&L']:+,.0f}", f"{summary['Trades']} trades", delta_color="off")
-    tiles[1].metric("Win rate", f"{summary['Win rate %']:.0f}%",
-                    f"avg win ${summary['Avg win']:,.0f} / loss ${-summary['Avg loss']:,.0f}", delta_color="off")
+    tiles[1].metric("Avg win / loss", f"${summary['Avg win']:,.0f} / ${-summary['Avg loss']:,.0f}")
     tiles[2 % len(tiles)].metric("Profit factor", f"{summary['Profit factor']:.2f}",
                                  f"avg {summary['Avg R']:+.2f} R", delta_color="off")
-    tiles[3 % len(tiles)].metric("Max drawdown", f"-${abs(summary['Max drawdown']):,.0f}")
+    tiles[3 % len(tiles)].metric("Costs", f"${summary['Costs']:,.0f}",
+                                 f"${summary['Costs'] / summary['Trades']:.2f} a trade", delta_color="off")
     st.caption(f"Exits: {summary['Stopped out %']:.0f}% stopped out, "
                f"{summary['Pullback exit %'] + summary['Lower high exit %']:.0f}% on the "
                f"{'pullback' if exit_mode == 'pullback' else 'lower-high'} exit, "
-               f"{summary['End of day %']:.0f}% sold before the close.")
+               f"{summary['End of day %']:.0f}% sold before the close. Costs are commissions and fees; slippage is "
+               "already in the fill prices.")
     if allow_short:
         sides = pd.DataFrame({side: summarize_opening_bar(trades[trades["Side"] == side])
                               for side in ("Long", "Short")}).T[["Trades", "Win rate %", "Net P&L", "Avg R",
@@ -4587,36 +4698,20 @@ def render_opening_bar(tickers, settings):
         st.dataframe(sides.style.format({"Trades": "{:.0f}", "Win rate %": "{:.0f}", "Net P&L": "${:+,.0f}",
                                          "Avg R": "{:+.2f}", "Profit factor": "{:.2f}"}, na_rep="-"),
                      width="stretch")
-
-    by_day = trades.groupby("Date")["P&L"].sum()
-    equity = go.Figure(go.Scatter(x=by_day.index, y=by_day.cumsum(), mode="lines",
-                                  line=dict(color="seagreen", width=2)))
-    equity.add_hline(y=0, line_color="lightgray")
-    equity.update_layout(height=300, margin=dict(l=20, r=20, t=40, b=20), title="Cumulative P&L ($)",
-                         showlegend=False)
-    show_chart(equity, width="stretch", config={"displaylogo": False})
-
-    if len(bars) > 1:
-        with st.expander("By ticker", expanded=not MOBILE):
-            table = opening_bar_ticker_table(trades, days)[["Trades", "Win rate %", "Net P&L", "Avg R",
-                                                            "Stopped out %"]]
-            st.dataframe(table.style.format({"Trades": "{:.0f}", "Win rate %": "{:.0f}", "Net P&L": "${:+,.0f}",
-                                             "Avg R": "{:+.2f}", "Stopped out %": "{:.0f}"}, na_rep="-"),
-                         width="stretch")
     with st.expander(f"All {len(trades):,} trades"):
         st.dataframe(
-            trades.sort_values("Entry time", ascending=False).style.format(
-                {"Entry": "{:.2f}", "Stop": "{:.2f}", "Exit": "{:.2f}", "Risk $": "${:,.0f}", "P&L": "${:+,.0f}",
-                 "Return %": "{:+.2f}", "R": "{:+.2f}", "Date": "{:%Y-%m-%d}", "Entry time": "{:%H:%M}",
-                 "Exit time": "{:%H:%M}"}, na_rep="-"),
+            trades.drop(columns=["Ticker"]).sort_values("Entry time", ascending=False).style.format(
+                {"Entry": "{:.2f}", "Stop": "{:.2f}", "Exit": "{:.2f}", "Risk $": "${:,.0f}", "Costs $": "${:,.2f}",
+                 "P&L": "${:+,.0f}", "Return %": "{:+.2f}", "R": "{:+.2f}", "Date": "{:%Y-%m-%d}",
+                 "Entry time": "{:%H:%M}", "Exit time": "{:%H:%M}"}, na_rep="-"),
             hide_index=True, width="stretch",
         )
-    st.download_button("Download trades (CSV)", trades.to_csv(index=False), file_name="first_5min_day_trades.csv",
+    st.download_button("Download trades (CSV)", trades.to_csv(index=False), file_name="first_bar_day_trades.csv",
                        mime="text/csv")
     st.caption(
-        "Yahoo keeps about 60 days of 5-minute bars, so this is a short sample: treat it as a first look, not proof. "
-        "The stop is checked before the exit on every bar and fills at the stop (or the open on a gap below it). "
-        "The end-of-day sale is at the open of the session's last 5-minute bar. Return % is P&L over the capital."
+        "Yahoo keeps about 60 days of 5- and 15-minute bars and 30 days of 1-minute bars, so this is a short sample: "
+        "treat it as a first look, not proof. The stop is checked before the exit on every bar and fills at the stop "
+        "(or the open on a gap past it). Return % is P&L over the capital."
     )
 
 

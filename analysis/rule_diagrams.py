@@ -258,12 +258,12 @@ def reversal_figure(lookback=20, trend_mid=50, trend_slow=200, max_hold=10):
     return finish(fig)
 
 
-def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback"):
+def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback", bar_minutes=5):
     """First-5-minute day trade: a green first bar buys at its close, stop at its low, then the chosen exit."""
 
     from analysis.opening_bar import exit_session
 
-    # (open, high, low, close) of 5-minute bars: a green first bar, a run up with a dip, then a pullback break.
+    # (open, high, low, close) of intraday bars: a green first bar, a run up with a dip, then a pullback break.
     bars = [(100, 101.4, 99.6, 101.2), (101.2, 101.9, 100.8, 101.7), (101.7, 102.2, 101.0, 101.3),
             (101.3, 102.6, 101.2, 102.4), (102.4, 103.3, 102.1, 103.0), (103.0, 103.2, 102.3, 102.6),
             (102.6, 103.8, 102.5, 103.6), (103.6, 104.3, 103.3, 104.1), (104.1, 104.2, 103.2, 103.5),
@@ -300,4 +300,4 @@ def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback"):
         note(fig, pullback_bar + 1, frame["High"].iloc[pullback_bar], "Close below the prior<br>close = pullback",
              LEVEL, ax=-10, ay=-40)
         note(fig, exit_bar + 1, exit_price, "Next close below the<br>pullback: SELL all", DOWN, ax=-15, ay=50)
-    return finish(fig, [97.6, 105.6], title="How the rule trades (illustration, 5-minute bars)")
+    return finish(fig, [97.6, 105.6], title=f"How the rule trades (illustration, {bar_minutes}-minute bars)")

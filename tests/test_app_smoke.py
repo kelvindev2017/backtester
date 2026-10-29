@@ -39,7 +39,7 @@ def fake_intraday():
 
 
 def fake_download(tickers, start=None, end=None, interval="1d", **kwargs):
-    if interval == "5m":
+    if interval in ("1m", "5m", "15m"):
         return fake_intraday()
     if isinstance(tickers, list):
         frames = {symbol: fake_daily(start, end) for symbol in tickers}
@@ -489,11 +489,18 @@ def test_first_bar_day_trade_is_a_backtest_rule(offline):
         "First-bar day trade (the first five-minute bar decides the day)")
     open_tab(app, "Backtest")
     labels = lambda: [w.label for w in list(app.selectbox) + list(app.date_input)]
-    # Timeframe and dates do not apply to the 5-minute rule; the Account size is its capital.
-    assert "Timeframe" not in labels() and "Date Range" not in labels()
+    # The timeframe offers intraday bars and the dates do not apply; the Account size is its capital.
+    assert next(box for box in app.selectbox if box.label == "Timeframe").options == ["1 min", "5 min", "15 min"]
+    assert "Date Range" not in labels()
     assert any(box.label == "Account size ($)" for box in app.number_input)
     assert any(box.key == "opening_bar_fill" for box in app.selectbox)
+    assert any(box.key == "opening_bar_commissions" for box in app.selectbox)
     assert any("long days" in block.value for block in app.markdown)
+    # The usual Backtest chart, with the day trades as its signals.
+    assert any("Price, Indicators and Trade Signals" in chart.proto.spec for chart in app.get("plotly_chart"))
+    next(box for box in app.selectbox if box.label == "Timeframe").select("15 min")
+    open_tab(app, "Backtest")
+    assert any("15-minute bars" in block.value for block in app.markdown)
     next(box for box in app.selectbox if box.key == "opening_bar_exit").select(
         "Lower high: a bar's high below the previous bar's high")
     open_tab(app, "Backtest")
@@ -509,4 +516,4 @@ def test_first_bar_day_trade_is_a_backtest_rule(offline):
     assert any("Backtest tab only" in element.value for element in app.info)
     next(box for box in app.selectbox if box.label == "Signal rule").select("Moving-average rule")
     open_tab(app, "Backtest")
-    assert "Timeframe" in labels()
+    assert next(box for box in app.selectbox if box.label == "Timeframe").value == "Daily"
