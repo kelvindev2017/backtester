@@ -221,19 +221,24 @@ CHART_TOUCH_JS = """
 
   document.addEventListener("touchstart", function (event) {
     if (!event.isTrusted) return;
-    const gd = chartOf(event.target);
+    const multi = event.touches.length >= 2;
+    const gd = chartOf(event.target) || (multi && gesture && gesture.gd) || null;
     if (!gd) { endPinch(); gesture = null; return; }
     event.stopPropagation();  // Plotly never sees the touch itself
-    if (gesture && gesture.gd === gd && event.touches.length === 2 && gesture.mode !== "scroll") {
-      // A second finger: pinch to zoom, move both to pan.
-      clearTimeout(gesture.timer);
+    if (multi) {
+      // A second finger: pinch to zoom, move both to pan. This holds whatever the first finger did (a swipe that
+      // started scrolling the page, or a touch beside the plot): left to the browser, a pinch zooms the whole
+      // page, every chart with it, and springs back when the fingers lift.
+      if (gesture) clearTimeout(gesture.timer);
       if (event.cancelable) event.preventDefault();
+      if (gesture && gesture.mode === "pinch") return;
       modebar(gd, "dragmode", ["pan"]);
       const c = centre(event.touches);
+      const target = gesture && gesture.gd === gd && gesture.target.closest(".drag") ? gesture.target : event.target;
+      if (gesture && gesture.mode === "pan") mouse("mouseup", gesture.target, c.x, c.y, 0);
       // Zoom and pan through the touched panel's plot area, so the values zoom with the dates.
-      if (gesture.mode === "pan") mouse("mouseup", gesture.target, c.x, c.y, 0);
-      gesture = { gd: gd, target: gesture.target, mode: "pinch", centre: c, spread: spread(event.touches) };
-      mouse("mousedown", gesture.target, c.x, c.y, 1);
+      gesture = { gd: gd, target: target, mode: "pinch", centre: c, spread: spread(event.touches) };
+      mouse("mousedown", target, c.x, c.y, 1);
       return;
     }
     if (event.touches.length !== 1) return;
@@ -337,7 +342,7 @@ CHART_AXIS_HOVER_JS = """
   document.head.appendChild(style);
 
   function format(value, axis) {
-    const digits = Math.abs(value) >= 100 ? 0 : 2;
+    const digits = Math.abs(value) >= 1000 ? 0 : 2;
     return value.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })
       + (axis.ticksuffix || "");
   }
@@ -364,15 +369,26 @@ CHART_AXIS_HOVER_JS = """
     const labels = { left: [], right: [] }, dates = new Map();
     for (const point of points) {
       const xa = point.xaxis, ya = point.yaxis;
-      if (!xa || !ya || typeof point.y !== "number" || !isFinite(point.y)) continue;
+      // A candle is labelled at its close.
+      const value = typeof point.y === "number" ? point.y : point.close;
+      if (!xa || !ya || typeof value !== "number" || !isFinite(value)) continue;
       const bottom = ya._offset + ya._length;
       if (!dates.has(xa) || dates.get(xa).bottom < bottom) dates.set(xa, { bottom: bottom, x: point.x });
-      const y = pixel(ya, point.y);
+      const y = pixel(ya, value);
       if (y < ya._offset - 1 || y > ya._offset + ya._length + 1) continue;  // off the visible range
-      const color = (point.data.line && point.data.line.color) || (point.data.marker && point.data.marker.color) || "#555";
+      const trace = point.fullData || point.data;  // the full trace has the default colours filled in
+      let color = trace.type === "candlestick"
+        ? ((point.close >= point.open ? trace.increasing : trace.decreasing) || {}).line
+        : null;
+      color = (color && color.color) || (trace.line && trace.line.color) || (trace.marker && trace.marker.color);
+      if (Array.isArray(color)) color = color[point.pointNumber];
+      color = typeof color === "string" ? color : "#555";
+      // Markers (trade signals) carry their name, since the hover box with it is gone.
+      const markersOnly = trace.mode && trace.mode.indexOf("markers") >= 0 && trace.mode.indexOf("lines") < 0;
       box(overlay, { left: xa._offset + "px", width: xa._length + "px", top: y + "px",
                      borderTop: "1px dashed " + color, opacity: "0.8" });
-      labels[ya.side === "right" ? "right" : "left"].push({ y: y, xa: xa, color: color, text: format(point.y, ya) });
+      labels[ya.side === "right" ? "right" : "left"].push(
+        { y: y, xa: xa, color: color, text: (markersOnly && trace.name ? trace.name + " " : "") + format(value, ya) });
     }
     for (const side of ["left", "right"]) {
       // Keep labels on the same axis from overlapping: push each one at least a label's height down.
@@ -389,9 +405,12 @@ CHART_AXIS_HOVER_JS = """
     }
     for (const [xa, date] of dates) {
       const x = pixel(xa, date.x);
-      const text = String(date.x).slice(0, 10);
-      box(overlay, { top: (date.bottom + 2) + "px", left: (x - 36) + "px", width: "72px", textAlign: "center",
-                     background: "#444", color: "#fff", borderRadius: "2px" }, text);
+      // The time too on intraday charts.
+      const full = String(date.x), time = full.slice(11, 16);
+      const text = time && time !== "00:00" ? full.slice(0, 10) + " " + time : full.slice(0, 10);
+      const width = text.length > 10 ? 108 : 72;
+      box(overlay, { top: (date.bottom + 2) + "px", left: (x - width / 2) + "px", width: width + "px",
+                     textAlign: "center", background: "#444", color: "#fff", borderRadius: "2px" }, text);
     }
   }
   function attach(gd) {
@@ -2604,11 +2623,16 @@ def slider_with_input(label, min_value, max_value, value, step=1, key=None, help
 def show_chart(fig, **kwargs):
     """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width.
 
+    Charts with a unified x hover show the hovered values as labels on their axes (see CHART_AXIS_HOVER_JS).
+
     On touch screens a swipe over a chart scrolls the page and two fingers zoom it (see CHART_TOUCH_JS),
     which needs Plotly's scroll zoom; it is only turned on in the mobile layout, so a mouse wheel on
     desktop still scrolls the page.
     """
 
+    # Time charts (one hover line across the panels) get the TradingView-style value labels on the axes.
+    if fig.layout.hovermode == "x unified" and fig.layout.meta is None:
+        fig.update_layout(meta=dict(axis_hover=True))
     if MOBILE:
         kwargs["config"] = {**kwargs.get("config", {}), "scrollZoom": True}
         compact = dict(font=dict(size=10), entrywidth=0.5, entrywidthmode="fraction")
