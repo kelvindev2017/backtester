@@ -102,3 +102,16 @@ def test_latest_text():
     months = pd.date_range("2024-01-01", periods=14, freq="MS")
     text = latest_text("Unemployment rate", pd.Series(np.linspace(4.0, 5.3, 14), index=months))
     assert text == "Unemployment rate: 5.30% (Feb 2025; 4.10% a year earlier)"
+
+
+def test_assets_figure_can_show_each_asset_against_its_own_high():
+    index = pd.bdate_range("2020-01-01", periods=300)
+    rebased = pd.DataFrame({"Stock (S&P 500)": np.linspace(100, 200, 300), "Gold": np.linspace(100, 120, 300)},
+                           index=index)
+    rebased.iloc[150, 1] = 150  # Gold's high is mid-window
+    fig = assets_figure(rebased, scale="peak")
+    growth = [trace for trace in fig.data if trace.yaxis == "y"]
+    assert [max(trace.y) for trace in growth] == [100, 100]
+    assert growth[1].y[-1] == 80
+    assert fig.layout.yaxis.type != "log" and fig.layout.yaxis.ticksuffix == "%"
+    assert "highest value" in fig.layout.annotations[0].text

@@ -139,28 +139,34 @@ def dates_on_every_panel(fig, rows, height):
     legends_under_panels(fig, rows, height, dates_every_row=True)
 
 
-def assets_figure(rebased, colors=None, benchmark=BENCHMARK, height=None, gap_px=108):
+def assets_figure(rebased, colors=None, benchmark=BENCHMARK, height=None, gap_px=108, scale="start"):
     """Rebased growth (log), drawdown and rolling correlation with the benchmark, stacked on one date axis.
 
     ``gap_px`` is the room between panels for a panel's legend and the next panel's title; a narrow
-    screen wraps the legend onto more lines and needs more.
+    screen wraps the legend onto more lines and needs more. ``scale="peak"`` shows each asset in the top
+    panel as a % of its own highest value in the window (linear axis) instead of growth of 100.
     """
 
     colors = colors or {name: color for name, (_, color) in ASSETS.items()}
     correlations = rolling_correlation(rebased, benchmark) if benchmark in rebased and rebased.shape[1] > 1 else pd.DataFrame()
-    panels = [("Growth of 100, log scale (dividends reinvested)", 0.45), ("Below previous peak, %", 0.27)]
+    peak = scale == "peak"
+    growth_title = ("% of each asset's highest value (dividends reinvested)" if peak
+                    else "Growth of 100, log scale (dividends reinvested)")
+    panels = [(growth_title, 0.45), ("Below previous peak, %", 0.27)]
     if not correlations.empty:
         panels.append((f"{CORRELATION_WEEKS}-week correlation with {benchmark}", 0.28))
     rows = len(panels)
     height = height or {2: 640, 3: 900}[rows] + (gap_px - 80) * (rows - 1)
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.18, gap_px / height),
                         row_heights=[weight for _, weight in panels], subplot_titles=[title for title, _ in panels])
-    for column in rebased.columns:
+    growth = rebased / rebased.max() * 100 if peak else rebased
+    for column in growth.columns:
         color = colors.get(column, "gray")
         width = 2.2 if column == benchmark else 1.4
-        series = rebased[column]
+        series = growth[column]
+        value = "%{y:.0f}%" if peak else "%{y:,.0f}"
         fig.add_trace(go.Scatter(x=series.index, y=series, mode="lines", name=column, line=dict(color=color, width=width),
-                                 hovertemplate=f"{column} %{{x|%Y-%m-%d}}: %{{y:,.0f}}<extra></extra>"), row=1, col=1)
+                                 hovertemplate=f"{column} %{{x|%Y-%m-%d}}: {value}<extra></extra>"), row=1, col=1)
     for column, series in drawdowns(rebased).items():
         fig.add_trace(go.Scatter(x=series.index, y=series, mode="lines", name=column,
                                  line=dict(color=colors.get(column, "gray"), width=2 if column == benchmark else 1.2),
@@ -173,7 +179,10 @@ def assets_figure(rebased, colors=None, benchmark=BENCHMARK, height=None, gap_px
                           row=3, col=1)
         fig.add_hline(y=0, line=dict(color="gray", width=1), row=3, col=1)
         fig.update_yaxes(range=[-1, 1], row=3, col=1)
-    fig.update_yaxes(type="log", tickformat=",.0f", row=1, col=1)
+    if peak:
+        fig.update_yaxes(ticksuffix="%", range=[0, 105], row=1, col=1)
+    else:
+        fig.update_yaxes(type="log", tickformat=",.0f", row=1, col=1)
     fig.update_yaxes(ticksuffix="%", row=2, col=1)
     # meta.axis_hover: the app shows hovered values as labels on the y-axes instead of Plotly's hover box.
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), hovermode="x unified",
