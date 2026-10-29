@@ -7,6 +7,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -17,14 +18,6 @@ import streamlit.components.v1 as components
 import yfinance as yf
 from plotly.subplots import make_subplots
 
-from analysis.day_breakout import (
-    EXIT_MODES,
-    DayBreakoutSettings,
-    monthly_pnl,
-    run_day_breakout,
-    split_summary,
-    ticker_summary,
-)
 from analysis.opening_bar import (
     EXIT_FILLS as OPENING_BAR_FILLS,
     EXIT_MODES as OPENING_BAR_EXITS,
@@ -146,6 +139,7 @@ from analysis.universe import (
     MARKETS as SCREENER_MARKETS,
     load_us_index_members,
     normalize_symbol,
+    normalize_ticker,
     parse_ticker_list,
 )
 from analysis.validation import ValidationSettings, base_rates, exit_signal_stats, summarize, verdict, walk_forward
@@ -2512,12 +2506,11 @@ def index_membership(market, tickers):
 
 SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
 FUNDAMENTALS_TAB = "Stock Fundamentals"
-DAY_BREAKOUT_TAB = "Day Breakout Rule"
 ECONOMY_TAB = "Economic analysis"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
 TAB_NAMES = [ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Stock Screener", "Backtest",
-             "Signal Analysis & Trade Plan", "Validate", DAY_BREAKOUT_TAB]
+             "Signal Analysis & Trade Plan", "Validate"]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
@@ -2903,15 +2896,81 @@ def render_market_analysis(index_prices):
 # ============================================================
 
 INDUSTRY_PERIODS = ["1M", "3M", "6M", "YTD", "1Y", "2Y", "3Y", "5Y"]
+# The industry list (chosen indexes and the ones the user added) is kept in a browser cookie, so it is
+# still there on the next visit. Streamlit reads cookies when a session starts; the page writes them.
+INDUSTRY_COOKIE = "industry_indexes"
+
+
+def industry_list_from_cookie():
+    """(chosen labels, added indexes as {label: symbol}) as saved in the browser, else the defaults."""
+
+    try:
+        saved = json.loads(unquote(st.context.cookies.get(INDUSTRY_COOKIE) or "")) or {}
+        added = {str(label): str(symbol) for label, symbol in dict(saved.get("added", {})).items()}
+        chosen = [str(label) for label in saved["chosen"] if label in INDUSTRY_INDEXES or label in added]
+        return chosen, {label: symbol for label, symbol in added.items() if label in chosen}
+    except Exception:
+        return list(DEFAULT_INDUSTRIES), {}
+
+
+def save_industry_list(chosen, added):
+    """Write the industry list to the browser cookie (for a year) when it differs from what is saved."""
+
+    value = json.dumps({"chosen": chosen, "added": {label: added[label] for label in chosen if label in added}})
+    if st.session_state.get("industry_saved") == value:
+        return
+    st.session_state["industry_saved"] = value
+    components.html(
+        "<script>window.parent.document.cookie = %s + '=' + encodeURIComponent(%s)"
+        " + '; path=/; max-age=31536000; SameSite=Lax';</script>" % (json.dumps(INDUSTRY_COOKIE), json.dumps(value)),
+        height=0,
+    )
+
+
+def add_industry_index():
+    """Add the typed symbol (and optional name) to the industry list; a built-in index is just chosen."""
+
+    symbol = normalize_ticker(st.session_state.get("industry_add_symbol", ""))
+    name = st.session_state.get("industry_add_name", "").strip()
+    st.session_state["industry_add_symbol"] = st.session_state["industry_add_name"] = ""
+    if not symbol:
+        return
+    if not load_price_panel([symbol], days=30):
+        st.session_state["industry_add_error"] = f"Yahoo has no prices for {symbol}; check the symbol."
+        return
+    builtin = next((label for label, known in INDUSTRY_INDEXES.items() if known == symbol), None)
+    label = builtin or (f"{name} ({symbol})" if name else symbol)
+    if not builtin:
+        st.session_state["industry_added"][label] = symbol
+    if label not in st.session_state["industry_indexes"]:
+        st.session_state["industry_indexes"] = st.session_state["industry_indexes"] + [label]
+
+
+def reset_industry_list():
+    st.session_state["industry_indexes"] = list(DEFAULT_INDUSTRIES)
+    st.session_state["industry_added"] = {}
 
 
 def render_industry_analysis(index_prices):
     """Overlay the main index of each chosen industry, plus an optional look at an industry's leading companies."""
 
+    if "industry_indexes" not in st.session_state or "industry_added" not in st.session_state:
+        st.session_state["industry_indexes"], st.session_state["industry_added"] = industry_list_from_cookie()
+    added = st.session_state["industry_added"]
     with settings_panel("Industries"):
-        chosen = st.multiselect("Industry indexes", list(INDUSTRY_INDEXES), default=DEFAULT_INDUSTRIES, key="industry_indexes")
-        extra_text = st.text_input("Other tickers", value="", key="industry_extra",
-                                   help="Any Yahoo symbols to add, e.g. ^RUT, SMH, XBI.")
+        chosen = st.multiselect(
+            "Industry indexes", list(INDUSTRY_INDEXES) + [label for label in added if label not in INDUSTRY_INDEXES],
+            key="industry_indexes",
+            help="Tap × on an index to remove it, or pick one from the list. Your list is remembered on this device.",
+        )
+        st.text_input("Add an index: Yahoo symbol", key="industry_add_symbol", placeholder="e.g. SMH, ^RUT, ^N225")
+        st.text_input("Name (optional)", key="industry_add_name", placeholder="e.g. Semiconductor ETF")
+        add_column, reset_column = st.columns(2)
+        add_column.button("Add index", key="industry_add_btn", on_click=add_industry_index)
+        reset_column.button("Reset list", key="industry_reset_btn", on_click=reset_industry_list)
+        if st.session_state.get("industry_add_error"):
+            st.warning(st.session_state.pop("industry_add_error"))
+        save_industry_list(chosen, added)
     with settings_panel("Chart"):
         period = st.select_slider("Period", INDUSTRY_PERIODS, value="1Y", key="industry_period")
         normalize = st.toggle("Normalize (start = 100)", value=True, key="industry_normalize")
@@ -2927,9 +2986,7 @@ def render_industry_analysis(index_prices):
         "Compare industries through their main index (or the ETF that tracks it, where Yahoo has no index history). "
         "With **Normalize** on, every line starts at 100 so moves are comparable."
     )
-    symbols = {label: INDUSTRY_INDEXES[label] for label in chosen}
-    for ticker in parse_ticker_list(extra_text):
-        symbols.setdefault(ticker, ticker)
+    symbols = {label: INDUSTRY_INDEXES.get(label) or added[label] for label in chosen}
     if not symbols:
         st.info("Pick at least one industry index in the settings.")
     else:
@@ -4433,137 +4490,6 @@ def exit_pct_slider(key):
     return 1 - exit_pct / 100
 
 
-DEFAULT_DAY_BREAKOUT_TICKERS = "MU, ASML, TSM, QCOM, GOOG, INTC, SNDK, AAPL, TER, NVDA"
-
-
-def render_day_breakout():
-    """Day-breakout rule from the IBKR trade review, run mechanically on a list of tickers with a fit/check split."""
-
-    st.caption(
-        "Buys the first day a stock trades above its prior N-day high (filled at that level, or at the open on a gap "
-        "up), then decides at each close: hold overnight only when the close is in the top part of the day's range "
-        "(or, with the moving-average exit, above the chosen SMA/EMA; with the daily-break exit, not below the average "
-        "close of the prior N days), otherwise sell at the close. Each trade is a fixed dollar amount. This is the rule that turned the review of "
-        "your 2026 IBKR trades positive; here it takes every breakout, not only the ones you picked. Results before "
-        "the split date are where the rule was fitted, results after it are the check."
-    )
-    with settings_panel("Day breakout rule"):
-        tickers_text = st.text_input("Tickers (comma-separated)", DEFAULT_DAY_BREAKOUT_TICKERS, key="day_breakout_tickers")
-        date_columns = st.columns(2)
-        start = date_columns[0].date_input("Trades from", value=date(2026, 3, 1), max_value=date.today(),
-                                           key="day_breakout_start")
-        split = date_columns[1].date_input("Check period from", value=date(2026, 8, 1), max_value=date.today(),
-                                           key="day_breakout_split",
-                                           help="Trades entered from this date are reported separately, as the "
-                                           "out-of-sample check.")
-        lookback = int(st.number_input("Breakout above the prior N-day high", min_value=1, max_value=250, value=10,
-                                       step=1, key="day_breakout_lookback"))
-        exit_label = st.selectbox("Overnight rule", list(EXIT_MODES), key="day_breakout_exit")
-        exit_mode = EXIT_MODES[exit_label]
-        # Only the chosen overnight rule's own settings are shown; the others keep their last value.
-        keep_fraction = 1 - st.session_state.get("day_breakout_exit_pct", 33) / 100
-        exit_ma_type = st.session_state.get("day_breakout_ma_type", "SMA")
-        exit_ma_period = int(st.session_state.get("day_breakout_ma_period", 20))
-        break_days = int(st.session_state.get("day_breakout_break_days", 1))
-        if exit_mode == "top_range":
-            keep_fraction = exit_pct_slider("day_breakout_exit_pct")
-        elif exit_mode == "above_ma":
-            ma_columns = st.columns(2)
-            exit_ma_type = ma_columns[0].selectbox("Exit MA type", ["SMA", "EMA"], key="day_breakout_ma_type")
-            exit_ma_period = int(ma_columns[1].number_input(
-                "Exit MA period (days)", min_value=2, max_value=250, value=20, step=1, key="day_breakout_ma_period",
-                help="Hold while the close stays above this average; sell at the first close below it."))
-        elif exit_mode == "daily_break":
-            break_days = slider_with_input(
-                "Sell below the average close of the prior N days", 1, 50, 1, key="day_breakout_break_days",
-                help="The average excludes today. N = 1 sells at the first close below yesterday's close.")
-        max_hold = int(st.number_input("Sell after at most this many days (0 = no limit)", min_value=0,
-                                       max_value=250, value=60, step=1, key="day_breakout_max_hold"))
-        trend_sma = int(st.number_input("Only when the prior close is above its SMA (0 = off)", min_value=0,
-                                        max_value=250, value=0, step=10, key="day_breakout_sma"))
-        money_columns = st.columns(2)
-        position_size = float(money_columns[0].number_input("Size per trade ($)", min_value=100.0, value=10_000.0,
-                                                            step=1_000.0, key="day_breakout_size"))
-        fee = float(money_columns[1].number_input("Fees per round trip ($)", min_value=0.0, value=1.5, step=0.5,
-                                                  key="day_breakout_fee"))
-        show_rule_diagram(day_breakout_figure(lookback, exit_mode, keep_fraction, f"{exit_ma_type} {exit_ma_period}",
-                                              break_days))
-
-    tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
-    if not tickers:
-        st.info("Enter at least one ticker in the settings.")
-        return
-    settings = DayBreakoutSettings(lookback=lookback, exit_mode=EXIT_MODES[exit_label], keep_fraction=keep_fraction,
-                                   max_hold=max_hold, position_size=position_size, fee_per_trade=fee,
-                                   trend_sma=trend_sma, exit_ma_type=exit_ma_type, exit_ma_period=exit_ma_period,
-                                   break_days=int(break_days))
-    # Enough history before the first trade for the N-day high and the SMA filter.
-    days = (date.today() - start).days + 2 * max(lookback, trend_sma, exit_ma_period, int(break_days)) + 30
-    with st.spinner("Loading daily prices..."):
-        prices = load_price_panel(tickers, days=days)
-    missing = [t for t in tickers if t not in prices]
-    if missing:
-        st.warning(f"No prices for {', '.join(missing)}.")
-    trades = run_day_breakout(prices, settings, start=start)
-    if trades.empty:
-        st.info("No breakouts in this period.")
-        return
-
-    split_table = split_summary(trades, split)
-    overall = split_table.loc["All"]
-    tiles = st.columns(2 if MOBILE else 4)
-    tiles[0].metric("Net P&L", f"${overall['Net P&L']:+,.0f}", f"{int(overall['Trades'])} closed trades",
-                    delta_color="off")
-    tiles[1].metric("Win rate", f"{overall['Win rate %']:.0f}%",
-                    f"avg win ${overall['Avg win']:,.0f} / loss ${-overall['Avg loss']:,.0f}", delta_color="off")
-    tiles[2 % len(tiles)].metric("Profit factor", f"{overall['Profit factor']:.2f}")
-    tiles[3 % len(tiles)].metric("Max drawdown", f"-${abs(overall['Max drawdown']):,.0f}")
-
-    st.markdown("**Fit period vs check period**")
-    st.dataframe(
-        split_table.style.format({"Trades": "{:.0f}", "Win rate %": "{:.0f}", "Net P&L": "${:+,.0f}",
-                                  "Avg / trade": "${:+,.0f}", "Avg win": "${:,.0f}", "Avg loss": "${:,.0f}",
-                                  "Profit factor": "{:.2f}", "Max drawdown": "${:,.0f}",
-                                  "Held overnight %": "{:.0f}"}, na_rep="-"),
-        width="stretch",
-    )
-
-    closed = trades[trades["Status"] == "Closed"]
-    equity = go.Figure()
-    equity.add_trace(go.Scatter(x=closed["Exit date"], y=closed["P&L"].cumsum(), mode="lines", name="Rule",
-                                line=dict(color="seagreen", width=2)))
-    equity.add_vline(x=pd.Timestamp(split), line_dash="dot", line_color="gray")
-    equity.add_hline(y=0, line_color="lightgray")
-    equity.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20), title="Cumulative P&L ($)",
-                         hovermode="x unified", showlegend=False)
-    show_chart(equity, width="stretch", config={"displaylogo": False})
-
-    months = monthly_pnl(trades)
-    if not months.empty:
-        bars = go.Figure(go.Bar(x=months.index.astype(str), y=months.values,
-                                marker_color=["seagreen" if v >= 0 else "indianred" for v in months.values]))
-        bars.update_layout(height=260, margin=dict(l=20, r=20, t=40, b=20), title="P&L by month ($)")
-        show_chart(bars, width="stretch", config={"displaylogo": False})
-
-    with st.expander("By ticker", expanded=not MOBILE):
-        st.dataframe(ticker_summary(trades).style.format({"Win rate %": "{:.0f}", "Net P&L": "${:+,.0f}"}),
-                     width="stretch")
-    with st.expander(f"All {len(trades):,} trades"):
-        st.dataframe(
-            trades.sort_values("Entry date", ascending=False).style.format(
-                {"Entry": "{:.2f}", "Exit": "{:.2f}", "P&L": "${:+,.0f}", "Return %": "{:+.2f}",
-                 "Entry date": "{:%Y-%m-%d}", "Exit date": "{:%Y-%m-%d}"}),
-            hide_index=True, width="stretch",
-        )
-    st.download_button("Download trades (CSV)", trades.to_csv(index=False),
-                       file_name=f"day_breakout_{start:%Y%m%d}.csv", mime="text/csv")
-    st.caption(
-        "Daily bars stand in for intraday fills: the entry assumes a buy-stop at the breakout level and every exit "
-        "is at a close. Tickers are traded side by side, so several positions can be open at once. A trade still "
-        "open on the last bar is listed but left out of the statistics."
-    )
-
-
 # ============================================================
 # First-bar day trade (a Backtest signal rule)
 # ============================================================
@@ -4787,8 +4713,6 @@ if check_password():
                 render_stock_fundamentals()
             elif label == SUPPLY_CHAIN_TAB:
                 render_supply_chain(main_index_prices)
-            elif label == DAY_BREAKOUT_TAB:
-                render_day_breakout()
             else:
                 strategy = strategy_settings(label)
                 if strategy is None:
