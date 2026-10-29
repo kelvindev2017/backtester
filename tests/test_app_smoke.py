@@ -97,8 +97,7 @@ def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["Economic analysis", "Market Analysis", "Industry Analysis",
                                                "Stock Fundamentals", "Semicon Supply Chain", "Stock Screener", "Backtest",
-                                               "Signal Analysis & Trade Plan", "Validate", "Day Breakout Rule",
-                                               "First 5-min Day Trade"]
+                                               "Signal Analysis & Trade Plan", "Validate", "Day Breakout Rule"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
     open_tab(app, "Signal Analysis & Trade Plan")
@@ -484,16 +483,30 @@ def test_sliders_have_a_number_box_in_sync(offline):
     assert next(widget for widget in app.slider if widget.key == "full_size_confidence").value == 80
 
 
-def test_opening_bar_tab(offline):
-    app = open_tab(start_app(), "First 5-min Day Trade")
-    assert app.sidebar.header[0].value == "First 5-min Day Trade"
+def test_first_bar_day_trade_is_a_backtest_rule(offline):
+    app = open_tab(start_app(), "Backtest")
+    next(box for box in app.selectbox if box.label == "Signal rule").select(
+        "First-bar day trade (the first five-minute bar decides the day)")
+    open_tab(app, "Backtest")
+    labels = lambda: [w.label for w in list(app.selectbox) + list(app.date_input)]
+    # Timeframe and dates do not apply to the 5-minute rule; the Account size is its capital.
+    assert "Timeframe" not in labels() and "Date Range" not in labels()
+    assert any(box.label == "Account size ($)" for box in app.number_input)
     assert any(box.key == "opening_bar_fill" for box in app.selectbox)
     assert any("long days" in block.value for block in app.markdown)
     next(box for box in app.selectbox if box.key == "opening_bar_exit").select(
         "Lower high: a bar's high below the previous bar's high")
-    open_tab(app, "First 5-min Day Trade")
+    open_tab(app, "Backtest")
     # The fill choice belongs to the pullback exit only.
     assert not any(box.key == "opening_bar_fill" for box in app.selectbox)
     next(box for box in app.checkbox if box.key == "opening_bar_short").check()
-    open_tab(app, "First 5-min Day Trade")
+    open_tab(app, "Backtest")
     assert any("short days" in block.value for block in app.markdown)
+    # The other strategy tabs cannot replay it and say so.
+    open_tab(app, "Validate")
+    assert any("Backtest tab only" in element.value for element in app.info)
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert any("Backtest tab only" in element.value for element in app.info)
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Moving-average rule")
+    open_tab(app, "Backtest")
+    assert "Timeframe" in labels()

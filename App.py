@@ -2476,12 +2476,11 @@ def index_membership(market, tickers):
 SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
 FUNDAMENTALS_TAB = "Stock Fundamentals"
 DAY_BREAKOUT_TAB = "Day Breakout Rule"
-OPENING_BAR_TAB = "First 5-min Day Trade"
 ECONOMY_TAB = "Economic analysis"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
 TAB_NAMES = [ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Stock Screener", "Backtest",
-             "Signal Analysis & Trade Plan", "Validate", DAY_BREAKOUT_TAB, OPENING_BAR_TAB]
+             "Signal Analysis & Trade Plan", "Validate", DAY_BREAKOUT_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 LAYOUT_MODES = ["Auto", "Desktop", "Mobile"]
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
@@ -3633,7 +3632,9 @@ SETUP_OPTIONS = {
     "Pullback in trend (dip to the EMA, then reversal)": "pullback",
     "Reversal (buy a breakdown in an uptrend)": "reversal",
     "Day breakout (above the N-day high, hold on a top-third close)": "day_breakout",
+    "First-bar day trade (the first five-minute bar decides the day)": "opening_bar",
 }
+OPENING_BAR_RULE = next(label for label, setup in SETUP_OPTIONS.items() if setup == "opening_bar")
 
 
 def strategy_settings(tab="Backtest"):
@@ -3642,16 +3643,23 @@ def strategy_settings(tab="Backtest"):
     Returns a namespace of the settings, or None (after saying why) when the ticker or dates are not usable.
     """
 
+    # The first-bar day trade runs on the ~60 days of 5-minute bars Yahoo keeps, so timeframe and dates do not apply.
+    intraday = st.session_state.get("signal_rule") == OPENING_BAR_RULE
+    timeframe = st.session_state.get("timeframe", "Daily")
+    date_range = st.session_state.get("date_range", (date(2022, 1, 1), date.today()))
     with settings_panel("Ticker & dates"):
         ticker = normalize_symbol(st.text_input("Ticker Symbol", value="AAPL", key="ticker_input"))
-        timeframe = st.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0, key="timeframe")
-        date_range = st.date_input(
-            "Date Range",
-            value=(date(2022, 1, 1), date.today()),
-            max_value=date.today(),
-            format="YYYY-MM-DD",
-            key="date_range",
-        )
+        if intraday:
+            date_range = (date.today() - timedelta(days=60), date.today())
+        else:
+            timeframe = st.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0, key="timeframe")
+            date_range = st.date_input(
+                "Date Range",
+                value=(date(2022, 1, 1), date.today()),
+                max_value=date.today(),
+                format="YYYY-MM-DD",
+                key="date_range",
+            )
         account_size = st.session_state.get("account_size", 100000.0)
         if tab != "Validate":  # Validate reports results in R, so the account size does not change them.
             account_size = st.number_input(
@@ -3660,7 +3668,8 @@ def strategy_settings(tab="Backtest"):
                 value=100000.0,
                 step=5000.0,
                 key="account_size",
-                help="Starting equity for the Backtest tab and the equity used for position sizing.",
+                help="Starting equity for the Backtest tab and the equity used for position sizing. The first-bar "
+                "day trade uses it as the capital allocated to the stock.",
             )
 
     # Moving-average rule defaults (also used for the Backtest chart's MA lines).
@@ -3672,6 +3681,7 @@ def strategy_settings(tab="Backtest"):
     swing_bars, pullback_bars, min_depth_atr = 20, 5, 1.5
     keep_fraction = 2 / 3
     exit_ma, max_hold_bars = 200, 0
+    opening_bar = None
 
     with settings_panel("Signal"):
         setup_label = st.selectbox(
@@ -3722,6 +3732,8 @@ def strategy_settings(tab="Backtest"):
                 f"within {(1 - keep_fraction) * 100:.0f}% of the day's range from its high. Sell / exit: the first close "
                 "further below the high than that. Long only. The Day Breakout Rule tab runs it on many tickers with fixed $ size."
             )
+        elif setup == "opening_bar":
+            opening_bar = opening_bar_settings(account_size)
         elif setup == "pullback":
             trend_columns = st.columns(2)
             trend_mid = int(trend_columns[0].number_input("Trend fast MA (bars)", min_value=5, max_value=250, value=50, step=1, key="trend_mid"))
@@ -3762,17 +3774,24 @@ def strategy_settings(tab="Backtest"):
             diagram = pullback_figure(pullback_ema, trend_mid, trend_slow, min_depth_atr, swing_bars, pullback_bars)
         elif setup == "reversal":
             diagram = reversal_figure(breakout_lookback, trend_mid, trend_slow, max_hold_bars)
+        elif setup == "opening_bar":
+            diagram = opening_bar_figure(opening_bar.min_move, opening_bar.skip_bars, opening_bar.exit_mode)
         else:
             diagram = day_breakout_figure(breakout_lookback, "top_range", keep_fraction)
         show_rule_diagram(diagram)
 
-        # The Backtest is long only and the reversal and day-breakout rules have no short side.
+        # The Backtest is long only and the reversal and day-breakout rules have no short side. The first-bar day
+        # trade has its own short setting.
         allow_short = bool(st.session_state.get("allow_short", False))
-        if tab != "Backtest" and setup not in ("reversal", "day_breakout"):
+        if tab != "Backtest" and setup not in ("reversal", "day_breakout", "opening_bar"):
             allow_short = st.checkbox("Allow short trades (otherwise sell signals mean exit)", value=False,
                                       key="allow_short")
-        elif setup in ("reversal", "day_breakout"):
+        elif setup in ("reversal", "day_breakout", "opening_bar"):
             allow_short = False
+
+    if setup == "opening_bar" and tab != "Backtest":
+        st.info("The first-bar day trade trades on 5-minute bars, so it runs in the Backtest tab only.")
+        return None
 
     # Sizing and confidence only shape the trade plan (Signal Analysis) and which replayed trades are taken
     # (Validate); the Backtest holds a full position on every signal. The intraday trigger cannot be replayed.
@@ -3849,7 +3868,7 @@ def strategy_settings(tab="Backtest"):
         slow_period=slow_period, buy_left=buy_left, buy_operator=buy_operator, buy_right=buy_right,
         sell_left=sell_left, sell_operator=sell_operator, sell_right=sell_right, breakout_lookback=breakout_lookback,
         volume_multiple=volume_multiple, ma_rule=ma_rule, signal_settings=signal_settings, risk_settings=risk_settings,
-        max_hold_bars=max_hold_bars,
+        max_hold_bars=max_hold_bars, opening_bar=opening_bar,
     )
 
 
@@ -3866,6 +3885,9 @@ def render_backtest(s):
     buy_left, buy_operator, buy_right = s.buy_left, s.buy_operator, s.buy_right
     sell_left, sell_operator, sell_right = s.sell_left, s.sell_operator, s.sell_right
     breakout_lookback, volume_multiple, signal_settings = s.breakout_lookback, s.volume_multiple, s.signal_settings
+    if setup == "opening_bar":
+        render_opening_bar([ticker], s.opening_bar)
+        return
 
     start_date_str = pd.Timestamp(start_date).strftime("%Y-%m-%d")
     end_date_str = pd.Timestamp(end_date).strftime("%Y-%m-%d")
@@ -4474,63 +4496,56 @@ def render_day_breakout():
 
 
 # ============================================================
-# First 5-min Day Trade tab
+# First-bar day trade (a Backtest signal rule)
 # ============================================================
 
-def render_opening_bar():
-    """Day trade decided by the first 5-minute bar, run on the 5-minute history Yahoo keeps (about 60 days)."""
+def opening_bar_settings(capital):
+    """Settings of the first-bar day trade, shown in the Signal panel; ``capital`` is the Account size."""
 
     st.caption(
         "If the first 5-minute bar closes at least N points above its open, the day is a long day: buy at that "
-        "bar's close with the stop at its low, sized so a stop-out loses at most the chosen % of the capital. Other "
-        "days are short days: the rule stays out, or, with shorting on, shorts a first bar that closes at least N "
-        "points below its open (the mirror image: stop at its high, exits on bounces and higher lows). After skipping the next M bars, sell everything on "
-        "the chosen exit; anything still held is sold 5 minutes before the close. Each ticker runs on its own "
-        "allocated capital."
+        "bar's close with the stop at its low, sized so a stop-out loses at most the chosen % of the Account size "
+        "(the capital allocated to the stock). Other days the rule stays out, or, with shorting on, shorts a first "
+        "bar that closes at least N points below its open (the mirror image: stop at its high, exits on bounces and "
+        "higher lows). After skipping the next M bars, sell everything on the chosen exit; anything still held is "
+        "sold 5 minutes before the close. Runs on the last ~60 days of 5-minute bars."
     )
-    with settings_panel("First 5-min day trade"):
-        tickers_text = st.text_input("Ticker(s) (comma-separated)", "NVDA", key="opening_bar_tickers",
-                                     help="Each ticker is run on its own allocated capital.")
-        money_columns = st.columns(2)
-        capital = float(money_columns[0].number_input("Allocated capital ($)", min_value=100.0, value=10_000.0,
-                                                      step=1_000.0, key="opening_bar_capital"))
-        risk_pct = float(money_columns[1].number_input("Max loss per trade (% of capital)", min_value=0.1,
-                                                       max_value=100.0, value=10.0, step=0.5, key="opening_bar_risk"))
-        cap_at_capital = st.checkbox("Never buy more than the allocated capital", value=True,
-                                     key="opening_bar_cap",
-                                     help="Off lets the stop distance alone set the size, which can mean margin "
-                                     "when the first bar is narrow.")
-        min_move = float(st.number_input("Long day: first bar closes at least N points above its open", min_value=0.0,
-                                         value=0.0, step=0.05, format="%.2f", key="opening_bar_min_move",
-                                         help="In dollars. 0 means any first bar that closes above its open."))
-        allow_short = st.checkbox("Short on short days", value=False, key="opening_bar_short",
-                                  help="Short when the first bar closes at least N points below its open: sell at its "
-                                  "close, stop at its high, and the exits turned upside down (a close above the last "
-                                  "bounce, or a bar whose low is above the previous bar's low, buys back). Borrow "
-                                  "costs are not included.")
-        exit_label = st.selectbox("Exit", list(OPENING_BAR_EXITS), key="opening_bar_exit")
-        exit_mode = OPENING_BAR_EXITS[exit_label]
-        skip_bars = int(slider_with_input("Ignore the next M bars before the exit applies", 0, 30, 2,
-                                          key="opening_bar_skip",
-                                          help="The stop at the first bar's low still applies to these bars."))
-        exit_fill = "close"
-        if exit_mode == "pullback":
-            fill_label = st.selectbox(
-                "Pullback exit fill", list(OPENING_BAR_FILLS), key="opening_bar_fill",
-                help="The close below the pullback is only known when its bar ends, so a market order fills near "
-                "that close. Filling at the pullback price itself is the rule as written but is optimistic.")
-            exit_fill = OPENING_BAR_FILLS[fill_label]
-        fee = float(st.number_input("Fees per round trip ($)", min_value=0.0, value=2.0, step=0.5,
-                                    key="opening_bar_fee"))
-        show_rule_diagram(opening_bar_figure(min_move, skip_bars, exit_mode))
+    risk_pct = float(st.number_input("Max loss per trade (% of capital)", min_value=0.1, max_value=100.0, value=10.0,
+                                     step=0.5, key="opening_bar_risk"))
+    cap_at_capital = st.checkbox("Never buy more than the capital", value=True, key="opening_bar_cap",
+                                 help="Off lets the stop distance alone set the size, which can mean margin when the "
+                                 "first bar is narrow.")
+    min_move = float(st.number_input("Long day: first bar closes at least N points above its open", min_value=0.0,
+                                     value=0.0, step=0.05, format="%.2f", key="opening_bar_min_move",
+                                     help="In dollars. 0 means any first bar that closes above its open."))
+    allow_short = st.checkbox("Short on short days", value=False, key="opening_bar_short",
+                              help="Short when the first bar closes at least N points below its open: sell at its "
+                              "close, stop at its high, and the exits turned upside down (a close above the last "
+                              "bounce, or a bar whose low is above the previous bar's low, buys back). Borrow "
+                              "costs are not included.")
+    exit_label = st.selectbox("Exit", list(OPENING_BAR_EXITS), key="opening_bar_exit")
+    exit_mode = OPENING_BAR_EXITS[exit_label]
+    skip_bars = int(slider_with_input("Ignore the next M bars before the exit applies", 0, 30, 2,
+                                      key="opening_bar_skip",
+                                      help="The stop at the first bar's low still applies to these bars."))
+    exit_fill = "close"
+    if exit_mode == "pullback":
+        fill_label = st.selectbox(
+            "Pullback exit fill", list(OPENING_BAR_FILLS), key="opening_bar_fill",
+            help="The close below the pullback is only known when its bar ends, so a market order fills near "
+            "that close. Filling at the pullback price itself is the rule as written but is optimistic.")
+        exit_fill = OPENING_BAR_FILLS[fill_label]
+    fee = float(st.number_input("Fees per round trip ($)", min_value=0.0, value=2.0, step=0.5,
+                                key="opening_bar_fee"))
+    return OpeningBarSettings(min_move=min_move, skip_bars=skip_bars, exit_mode=exit_mode, risk_pct=risk_pct,
+                              capital=float(capital), cap_at_capital=cap_at_capital, exit_fill=exit_fill,
+                              fee_per_trade=fee, allow_short=allow_short)
 
-    tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
-    if not tickers:
-        st.info("Enter at least one ticker in the settings.")
-        return
-    settings = OpeningBarSettings(min_move=min_move, skip_bars=skip_bars, exit_mode=exit_mode, risk_pct=risk_pct,
-                                  capital=capital, cap_at_capital=cap_at_capital, exit_fill=exit_fill,
-                                  fee_per_trade=fee, allow_short=allow_short)
+
+def render_opening_bar(tickers, settings):
+    """Backtest of the first-bar day trade on the 5-minute history Yahoo keeps (about 60 days)."""
+
+    allow_short, exit_mode = settings.allow_short, settings.exit_mode
     with st.spinner("Loading 5-minute bars..."):
         bars = {ticker: load_intraday_data(ticker, "5m", "60d") for ticker in tickers}
     missing = [t for t, frame in bars.items() if frame.empty]
@@ -4547,7 +4562,7 @@ def render_opening_bar():
         return
     summary = summarize_opening_bar(trades, days)
     first_day, last_day = days["Date"].min(), days["Date"].max()
-    st.markdown(f"**{first_day:%b %d} to {last_day:%b %d, %Y}**: {summary['Days']} ticker-days, "
+    st.markdown(f"**{first_day:%b %d} to {last_day:%b %d, %Y}**: {summary['Days']} {'ticker-days' if len(bars) > 1 else 'days'}, "
                 f"{summary['Long days %']:.0f}% long days"
                 + (f", {days['Short day'].mean() * 100:.0f}% short days." if allow_short else "."))
     if trades.empty:
@@ -4644,8 +4659,6 @@ if check_password():
                 render_supply_chain(main_index_prices)
             elif label == DAY_BREAKOUT_TAB:
                 render_day_breakout()
-            elif label == OPENING_BAR_TAB:
-                render_opening_bar()
             else:
                 strategy = strategy_settings(label)
                 if strategy is None:
