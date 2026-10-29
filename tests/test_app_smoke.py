@@ -256,6 +256,9 @@ def test_market_and_industry_tabs(offline, monkeypatch):
 
     open_tab(app, "Industry Analysis")
     assert any("Industry indexes" in chart.proto.spec for chart in app.get("plotly_chart"))
+    # Time charts get the TradingView-style value labels, as in Economic analysis.
+    chart = next(chart for chart in app.get("plotly_chart") if "Industry indexes" in chart.proto.spec)
+    assert json.loads(chart.proto.spec)["layout"]["meta"] == {"axis_hover": True}
     next(toggle for toggle in app.toggle if toggle.key == "industry_normalize").set_value(False)
     open_tab(app, "Industry Analysis")
     assert not app.exception, app.exception
