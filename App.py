@@ -215,6 +215,36 @@ CHART_TOUCH_JS = """
     const gd = button && button.closest(".js-plotly-plot");
     if (gd) gd.dataset.chosenDrag = button.getAttribute("data-val");
   }, true);
+  function pinchAxis(touches) {
+    const dx = Math.abs(touches[0].clientX - touches[1].clientX), dy = Math.abs(touches[0].clientY - touches[1].clientY);
+    const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+    return angle < 30 ? "x" : angle > 60 ? "y" : null;
+  }
+  function span(touches, axis) {
+    return axis === "x" ? Math.abs(touches[0].clientX - touches[1].clientX) : Math.abs(touches[0].clientY - touches[1].clientY);
+  }
+  // The x and y axes of the panel under a touch, from its drag box ("x2y3" names xaxis2 and yaxis3).
+  function axesOf(gd, target) {
+    const box = target.closest && target.closest(".drag");
+    const subplot = box && box.getAttribute("data-subplot");
+    const layout = gd._fullLayout, match = subplot && /^(x\\d*)(y\\d*)$/.exec(subplot);
+    if (!match || !window.Plotly) return null;
+    const xa = layout[match[1].replace("x", "xaxis")], ya = layout[match[2].replace("y", "yaxis")];
+    return xa && ya && !xa.fixedrange && !ya.fixedrange ? { x: xa, y: ya } : null;
+  }
+  function axisRange(axis) { return axis.range.map(axis.r2l); }
+  // Zoom one axis about the fingers' centre by how far apart the fingers moved along it.
+  function zoomAxis(gesture, touches) {
+    const axis = gesture.axes[gesture.axis], rect = gesture.gd.getBoundingClientRect();
+    const c = centre(touches);
+    const pixel = gesture.axis === "x" ? c.x - rect.left - axis._offset : c.y - rect.top - axis._offset;
+    const factor = gesture.span / Math.max(span(touches, gesture.axis), 1);
+    const start = gesture.start, at = axis.p2l(pixel);
+    const update = {};
+    update[axis._name + ".range"] = start.map(function (v) { return axis.l2r(at + (v - at) * factor); });
+    if (gesture.frame) cancelAnimationFrame(gesture.frame);
+    gesture.frame = requestAnimationFrame(function () { window.Plotly.relayout(gesture.gd, update); });
+  }
   function endPinch() {
     if (gesture && (gesture.mode === "pinch" || gesture.mode === "pan")) mouse("mouseup", gesture.target, gesture.centre.x, gesture.centre.y, 0);
   }
@@ -231,12 +261,20 @@ CHART_TOUCH_JS = """
       // page, every chart with it, and springs back when the fingers lift.
       if (gesture) clearTimeout(gesture.timer);
       if (event.cancelable) event.preventDefault();
-      if (gesture && gesture.mode === "pinch") return;
-      modebar(gd, "dragmode", ["pan"]);
+      if (gesture && (gesture.mode === "pinch" || gesture.mode === "axis-pinch")) return;
       const c = centre(event.touches);
       const target = gesture && gesture.gd === gd && gesture.target.closest(".drag") ? gesture.target : event.target;
       if (gesture && gesture.mode === "pan") mouse("mouseup", gesture.target, c.x, c.y, 0);
-      // Zoom and pan through the touched panel's plot area, so the values zoom with the dates.
+      // Fingers side by side zoom the time only, one above the other the values only (within 30 degrees).
+      const axis = pinchAxis(event.touches);
+      const axes = axis && axesOf(gd, target);
+      if (axes) {
+        gesture = { gd: gd, target: target, mode: "axis-pinch", axis: axis, axes: axes, centre: c,
+                    span: Math.max(span(event.touches, axis), 1), start: axisRange(axes[axis]) };
+        return;
+      }
+      modebar(gd, "dragmode", ["pan"]);
+      // At an angle: zoom and pan through the touched panel's plot area, so the values zoom with the dates.
       gesture = { gd: gd, target: target, mode: "pinch", centre: c, spread: spread(event.touches) };
       mouse("mousedown", target, c.x, c.y, 1);
       return;
@@ -282,6 +320,8 @@ CHART_TOUCH_JS = """
       const target = document.elementFromPoint(touch.clientX, touch.clientY);
       mouse("mousemove", target && target.closest && target.closest(".drag") ? target : gesture.target,
             touch.clientX, touch.clientY);
+    } else if (gesture.mode === "axis-pinch" && event.touches.length >= 2) {
+      zoomAxis(gesture, event.touches);
     } else if (gesture.mode === "pinch" && event.touches.length >= 2) {
       const c = centre(event.touches), s = spread(event.touches);
       mouse("mousemove", gesture.target, c.x, c.y, 1);  // pan with the fingers
@@ -299,7 +339,7 @@ CHART_TOUCH_JS = """
 
   document.addEventListener("touchend", function (event) {
     if (!gesture || !event.isTrusted) return;
-    if (gesture.mode === "pinch") {
+    if (gesture.mode === "pinch" || gesture.mode === "axis-pinch") {
       if (event.touches.length < 2) { endPinch(); gesture.mode = "done"; }
       return;
     }
@@ -3882,7 +3922,6 @@ SETUP_OPTIONS = {
 }
 OPENING_BAR_RULE = next(label for label, setup in SETUP_OPTIONS.items() if setup == "opening_bar")
 INTRADAY_TIMEFRAMES = {"1 min": 1, "5 min": 5, "15 min": 15}
-OPENING_BAR_SESSIONS_SHOWN = 3
 
 
 def strategy_settings(tab="Backtest"):
@@ -4602,20 +4641,20 @@ def render_backtest(s):
         )
 
     if setup == "opening_bar":
-        # The price panel gets its own axis with one slot per bar, so nights and weekends take no room, opening on
-        # the last few sessions so the bars are readable; the other panels keep the whole period. Plotly's date
-        # rangebreaks did this before, but a pinch or drag on them snapped back on phones.
-        sessions = df.index.normalize().unique()
-        shown = df[df.index.normalize() >= sessions[-min(OPENING_BAR_SESSIONS_SHOWN, len(sessions))]]
-        pad = (shown["High"].max() - shown["Low"].min()) * 0.05
+        # The price panel gets its own axis with one slot per bar, so nights and weekends take no room; it opens on
+        # every bar of the period. Plotly's date rangebreaks did this before, but a pinch or drag on them snapped
+        # back on phones.
+        pad = (df["High"].max() - df["Low"].min()) * 0.05
         fig.update_xaxes(
             matches=None, type="category", showticklabels=True, autorange=False, nticks=4 if MOBILE else 8,
-            tickangle=0, showgrid=False, range=[len(df) - len(shown) - 0.5, len(df) + 0.5], row=1, col=1,
+            tickangle=0, showgrid=False, range=[-0.5, len(df) - 0.5], row=1, col=1,
         )
-        fig.update_yaxes(range=[shown["Low"].min() - pad, shown["High"].max() + pad], row=1, col=1)
+        fig.update_yaxes(range=[df["Low"].min() - pad, df["High"].max() + pad], row=1, col=1)
         fig.update_layout(meta=dict(axis_hover=True, fit_y=True))
-        st.caption(f"The price panel shows every {s.opening_bar.bar_minutes}-minute bar and opens on the last "
-                   f"{OPENING_BAR_SESSIONS_SHOWN} sessions; drag or pinch it to see the others (double-tap resets); the price scale follows the bars in view.")
+        st.caption(f"The price panel shows every {s.opening_bar.bar_minutes}-minute bar. Pinch with two fingers "
+                   "side by side to zoom the time only, one above the other to zoom the price only, or at an angle "
+                   "for both; drag with two fingers to move (double-tap resets). After a time zoom or move the "
+                   "price scale fits the bars in view.")
 
     chart_state_text = "|".join(
         [
