@@ -256,3 +256,48 @@ def reversal_figure(lookback=20, trend_mid=50, trend_slow=200, max_hold=10):
     note(fig, exit_index + 1, frame["High"].iloc[exit_index],
          f"SELL: first close above the prior<br>bar's high, or after {max_hold} bars", DOWN, ax=-30, ay=-45)
     return finish(fig)
+
+
+def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback"):
+    """First-5-minute day trade: a green first bar buys at its close, stop at its low, then the chosen exit."""
+
+    from analysis.opening_bar import exit_session
+
+    # (open, high, low, close) of 5-minute bars: a green first bar, a run up with a dip, then a pullback break.
+    bars = [(100, 101.4, 99.6, 101.2), (101.2, 101.9, 100.8, 101.7), (101.7, 102.2, 101.0, 101.3),
+            (101.3, 102.6, 101.2, 102.4), (102.4, 103.3, 102.1, 103.0), (103.0, 103.2, 102.3, 102.6),
+            (102.6, 103.8, 102.5, 103.6), (103.6, 104.3, 103.3, 104.1), (104.1, 104.2, 103.2, 103.5),
+            (103.5, 103.9, 102.9, 103.1), (103.1, 103.4, 102.4, 102.7), (102.7, 103.0, 102.2, 102.5)]
+    frame = pd.DataFrame(bars, columns=["Open", "High", "Low", "Close"])
+    entry, stop = frame["Close"].iloc[0], frame["Low"].iloc[0]
+    # Up to 4 skipped bars are drawn so the exit still fits in the picture.
+    drawn_skip = min(max(int(skip_bars), 0), 4)
+    exit_bar, exit_price, _ = exit_session(frame, entry, stop, drawn_skip, "close", exit_mode)
+
+    fig = go.Figure()
+    candles(fig, frame)
+    if drawn_skip:
+        fig.add_shape(type="rect", x0=1.5, x1=drawn_skip + 1.5, y0=98.6, y1=105.2, fillcolor=TREND_SLOW,
+                      opacity=0.12, line_width=0)
+        bars_text = "bar" if skip_bars == 1 else "bars"
+        note(fig, 1.5 + drawn_skip / 2, 105.0, f"Next {skip_bars} {bars_text} ignored", TEXT, arrow=False)
+    fig.add_shape(type="line", x0=0.6, x1=len(frame) + 0.4, y0=stop, y1=stop, line=dict(color=DOWN, dash="dash"))
+    note(fig, len(frame) - 1.5, stop, "Stop: first bar's low", DOWN, arrow=False, yshift=-10)
+    move_text = "Close > open" if not min_move else f"Close ≥ open + {min_move:g}"
+    note(fig, 1, frame["Low"].iloc[0], f"Long day ({move_text}):<br>BUY at the first bar's close", UP, ax=45, ay=35)
+    if exit_mode == "lower_high":
+        highs = frame["High"].to_numpy()
+        fig.add_shape(type="line", x0=exit_bar - 0.4, x1=exit_bar + 1.4, y0=highs[exit_bar - 1], y1=highs[exit_bar - 1],
+                      line=dict(color=LEVEL, dash="dot"))
+        note(fig, exit_bar + 1, highs[exit_bar], "High below the prior<br>bar's high: SELL all<br>at its close", DOWN,
+             ax=0, ay=-50)
+    else:
+        closes = frame["Close"].to_numpy()
+        pullback_bar = max(k for k in range(drawn_skip + 1, exit_bar) if closes[k] < closes[k - 1])
+        pullback = closes[pullback_bar]
+        fig.add_shape(type="line", x0=pullback_bar + 0.6, x1=exit_bar + 1.4, y0=pullback, y1=pullback,
+                      line=dict(color=LEVEL, dash="dot"))
+        note(fig, pullback_bar + 1, frame["High"].iloc[pullback_bar], "Close below the prior<br>close = pullback",
+             LEVEL, ax=-10, ay=-40)
+        note(fig, exit_bar + 1, exit_price, "Next close below the<br>pullback: SELL all", DOWN, ax=-15, ay=50)
+    return finish(fig, [97.6, 105.6], title="How the rule trades (illustration, 5-minute bars)")

@@ -53,6 +53,16 @@ trend filter. Fixed dollars per trade and flat fees per round trip. Results are 
 rule was fitted on and the check after it, with equity, monthly P&L, per-ticker results and the trade list
 (`analysis/day_breakout.py`).
 
+**First 5-min Day Trade**: a day trade decided by the session's first 5-minute bar. If that bar closes at least N
+points above its open (default 0, any green bar) the day is a long day: buy at its close with the stop at its low,
+sized so a stop-out loses at most 10% of the allocated capital (adjustable, and by default never more shares than
+the capital buys). Other days the rule stays out (long only). After ignoring the next M bars (default 2; the stop
+still applies), sell everything on the chosen exit: **pullback** (a close below the previous close sets the
+pullback; the next close below it sells, filled at that close or, as written, at the pullback price) or **lower
+high** (the first bar whose high is below the previous bar's high sells at its close). Anything still held is sold
+5 minutes before the close. Runs on the ~60 days of 5-minute bars Yahoo keeps; each ticker gets its own capital
+(`analysis/opening_bar.py`).
+
 The first three tabs cover the market from the top down (`analysis/screener.py`, `analysis/signal_groups.py`,
 `analysis/universe.py`):
 
