@@ -1,4 +1,4 @@
-"""First-5-minute day trade: the first bar of the session decides whether the day is a long day.
+"""First-bar day trade: the first bar of the session (1, 5 or 15 minutes) decides whether the day is a long day.
 
 Kelvin's rule (2026-10-29):
 
@@ -13,7 +13,11 @@ Kelvin's rule (2026-10-29):
   exits: the pullback exit (every close below the previous close is a pullback; the first later close below the
   latest pullback sells), or the lower-high exit (the first bar whose high is below the previous bar's high sells
   at that bar's close);
-* anything still held is sold 5 minutes before the close (at the open of the session's last 5-minute bar).
+* anything still held is sold 5 minutes before the close (at the open of the first bar that starts 5 minutes or
+  less before the close; with 15-minute bars that is the last bar, 15 minutes before).
+
+Costs follow IBKR Pro for US stocks with market orders (see ``order_costs``), plus a slippage of a few cents per
+share on every fill.
 
 Sizing is a separate function (``position_shares``) and the backtest takes a list of tickers, so a portfolio risk
 system or the stock screener can feed them later.
@@ -35,7 +39,19 @@ EXIT_FILLS = {
     "At the pullback price (as written)": "pullback",
 }
 TRADE_COLUMNS = ["Ticker", "Date", "Side", "Entry time", "Entry", "Stop", "Exit time", "Exit", "Exit reason", "Shares",
-                 "Risk $", "P&L", "Return %", "R"]
+                 "Risk $", "Costs $", "P&L", "Return %", "R"]
+COMMISSION_PLANS = {
+    "IBKR Pro Tiered": "tiered",
+    "IBKR Pro Fixed": "fixed",
+    "No commission (IBKR Lite)": "none",
+}
+# IBKR Pro, US stocks (published rates, 2026). Tiered is the lowest-volume tier (up to 300,000 shares a month);
+# market orders take liquidity, so they pay the exchange's remove-liquidity fee (about $0.003 a share).
+TIERED_PER_SHARE, TIERED_MIN, MAX_PCT_OF_VALUE = 0.0035, 0.35, 0.01
+FIXED_PER_SHARE, FIXED_MIN = 0.005, 1.00
+EXCHANGE_PER_SHARE, CLEARING_PER_SHARE = 0.003, 0.0002
+PASS_THROUGH_OF_COMMISSION = 0.000175 + 0.000565  # NYSE and FINRA pass-through, as a share of the commission
+SEC_FEE_OF_SALES, FINRA_TAF_PER_SHARE, FINRA_TAF_MAX, CAT_PER_SHARE = 0.0000206, 0.000195, 9.79, 0.000003
 DAY_COLUMNS = ["Ticker", "Date", "First bar open", "First bar close", "Move", "Long day", "Short day"]
 
 
@@ -48,8 +64,33 @@ class OpeningBarSettings:
     capital: float = 10_000.0
     cap_at_capital: bool = True
     exit_fill: str = "close"
-    fee_per_trade: float = 2.0
+    commission_plan: str = "tiered"
+    slippage: float = 0.01
     allow_short: bool = False
+    bar_minutes: int = 5
+
+
+def order_costs(shares, price, sell, plan="tiered"):
+    """IBKR Pro cost of one market order for US stock: commission, exchange, clearing and regulatory fees.
+
+    Tiered: $0.0035 a share (min $0.35, max 1% of the value) plus exchange, clearing and pass-through fees. Fixed:
+    $0.005 a share (min $1, max 1%), which includes exchange and clearing fees. Sales also pay the SEC fee and the
+    FINRA trading activity fee, on either plan. A short sale pays them on the opening sell.
+    """
+
+    if shares <= 0:
+        return 0.0
+    value = shares * price
+    if plan == "fixed":
+        cost = min(max(FIXED_PER_SHARE * shares, FIXED_MIN), MAX_PCT_OF_VALUE * value)
+    elif plan == "tiered":
+        commission = min(max(TIERED_PER_SHARE * shares, TIERED_MIN), MAX_PCT_OF_VALUE * value)
+        cost = (commission * (1 + PASS_THROUGH_OF_COMMISSION) + (EXCHANGE_PER_SHARE + CLEARING_PER_SHARE) * shares)
+    else:
+        cost = 0.0
+    if sell:
+        cost += SEC_FEE_OF_SALES * value + min(FINRA_TAF_PER_SHARE * shares, FINRA_TAF_MAX) + CAT_PER_SHARE * shares
+    return cost
 
 
 def is_long_day(first_bar, min_move=0.0):
@@ -85,15 +126,15 @@ def position_shares(capital, entry, stop, risk_pct=10.0, cap_at_capital=True):
     return max(shares, 0)
 
 
-def exit_session(session, entry, stop, skip_bars=2, exit_fill="close", exit_mode="pullback"):
+def exit_session(session, entry, stop, skip_bars=2, exit_fill="close", exit_mode="pullback", flat_bar=None):
     """Exit of a long entered at the close of the session's first bar: (bar position, price, reason).
 
     The stop is checked first on every bar (a gap below it fills at the open). The pullback or lower-high exit starts
-    after the skipped bars; the session's last bar is the flat-by-the-close exit, at its open.
+    after the skipped bars; ``flat_bar`` (default the last bar) is the flat-before-the-close exit, at its open.
     """
 
     opens, highs, lows, closes = (session[c].to_numpy(dtype=float) for c in ("Open", "High", "Low", "Close"))
-    last = len(session) - 1
+    last = len(session) - 1 if flat_bar is None else flat_bar
     pullback = np.nan
     for k in range(1, last + 1):
         if lows[k] <= stop:
@@ -113,8 +154,17 @@ def exit_session(session, entry, stop, skip_bars=2, exit_fill="close", exit_mode
     return last, closes[last], "End of day"
 
 
+def flat_bar_position(index, bar_minutes=5, minutes_before_close=5):
+    """Position of the bar whose open is the flat-before-the-close sale: the first bar starting at most
+    ``minutes_before_close`` before the session's end, else the last bar."""
+
+    close_time = index[-1] + pd.Timedelta(minutes=bar_minutes)
+    late = np.flatnonzero(index >= close_time - pd.Timedelta(minutes=minutes_before_close))
+    return int(late[0]) if len(late) else len(index) - 1
+
+
 def opening_bar_trades(bars, settings=None, ticker=""):
-    """Trades of the rule on one ticker's regular-session 5-minute bars, plus the long/short call of every day."""
+    """Trades of the rule on one ticker's regular-session intraday bars, plus the long/short call of every day."""
 
     settings = settings or OpeningBarSettings()
     trades, days = [], []
@@ -134,20 +184,26 @@ def opening_bar_trades(bars, settings=None, ticker=""):
             continue
         side = 1 if long_day else -1
         entry, stop = float(first["Close"]), float(first["Low"] if long_day else first["High"])
+        bar_length = pd.Timedelta(minutes=settings.bar_minutes)
         shares = position_shares(settings.capital, entry, stop, settings.risk_pct, settings.cap_at_capital)
         if shares < 1:
             continue
         # A short is the long trade on upside-down prices.
         k, exit_price, reason = exit_session(session if long_day else mirrored(session), side * entry, side * stop,
-                                              settings.skip_bars, settings.exit_fill, settings.exit_mode)
+                                              settings.skip_bars, settings.exit_fill, settings.exit_mode,
+                                              flat_bar_position(session.index, settings.bar_minutes))
         exit_price *= side
         risk = shares * abs(entry - stop)
-        pnl = side * shares * (exit_price - entry) - settings.fee_per_trade
+        # Slippage: every fill is a few cents worse than the bar price, in the trade's direction.
+        entry_fill, exit_fill = entry + side * settings.slippage, exit_price - side * settings.slippage
+        costs = (order_costs(shares, entry_fill, sell=not long_day, plan=settings.commission_plan)
+                 + order_costs(shares, exit_fill, sell=long_day, plan=settings.commission_plan))
+        pnl = side * shares * (exit_fill - entry_fill) - costs
         trades.append({
-            "Ticker": ticker, "Date": day, "Side": "Long" if long_day else "Short", "Entry time": session.index[0] + pd.Timedelta(minutes=5), "Entry": entry,
-            "Stop": stop, "Exit time": session.index[k] + (pd.Timedelta(0) if reason == "End of day"
-                                                            else pd.Timedelta(minutes=5)),
-            "Exit": exit_price, "Exit reason": reason, "Shares": shares, "Risk $": risk, "P&L": pnl,
+            "Ticker": ticker, "Date": day, "Side": "Long" if long_day else "Short",
+            "Entry time": session.index[0] + bar_length, "Entry": entry_fill, "Stop": stop,
+            "Exit time": session.index[k] + (pd.Timedelta(0) if reason == "End of day" else bar_length),
+            "Exit": exit_fill, "Exit reason": reason, "Shares": shares, "Risk $": risk, "Costs $": costs, "P&L": pnl,
             "Return %": pnl / settings.capital * 100, "R": pnl / risk if risk > 0 else np.nan,
         })
     return pd.DataFrame(trades, columns=TRADE_COLUMNS), pd.DataFrame(days, columns=DAY_COLUMNS)
@@ -180,6 +236,7 @@ def summarize_opening_bar(trades, days=None):
         "Trades": int(len(pnl)),
         "Win rate %": float(len(wins) / len(pnl) * 100) if len(pnl) else np.nan,
         "Net P&L": float(pnl.sum()),
+        "Costs": float(trades["Costs $"].sum()) if len(trades) else 0.0,
         "Avg / trade": float(pnl.mean()) if len(pnl) else np.nan,
         "Avg win": float(wins.mean()) if len(wins) else 0.0,
         "Avg loss": float(losses.mean()) if len(losses) else 0.0,

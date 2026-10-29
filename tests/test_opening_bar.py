@@ -4,6 +4,8 @@ import pandas as pd
 from analysis.opening_bar import (
     OpeningBarSettings,
     exit_session,
+    flat_bar_position,
+    order_costs,
     is_long_day,
     opening_bar_trades,
     position_shares,
@@ -11,6 +13,9 @@ from analysis.opening_bar import (
     summarize_opening_bar,
 )
 from analysis.rule_diagrams import opening_bar_figure
+
+# No slippage, so fills are the bar prices; the IBKR fees still apply and are checked through "Costs $".
+EXACT = dict(slippage=0.0)
 
 
 def session(day, bars):
@@ -76,21 +81,23 @@ def test_stop_and_end_of_day():
 def test_trades_only_on_long_days():
     long_day = session("2026-10-01", RUN)
     short_day = session("2026-10-02", [(100, 100.5, 99, 99.5)] + RUN[1:])
-    trades, days = opening_bar_trades(pd.concat([long_day, short_day]), OpeningBarSettings(skip_bars=0), "TEST")
+    trades, days = opening_bar_trades(pd.concat([long_day, short_day]), OpeningBarSettings(skip_bars=0, **EXACT),
+                                       "TEST")
     assert list(days["Long day"]) == [True, False]
     assert len(trades) == 1
     trade = trades.iloc[0]
     assert trade["Entry"] == 101 and trade["Stop"] == 99.5 and trade["Shares"] == 99
-    assert trade["P&L"] == 99 * (102.2 - 101) - 2.0
+    assert np.isclose(trade["Costs $"], order_costs(99, 101, False) + order_costs(99, 102.2, True))
+    assert np.isclose(trade["P&L"], 99 * (102.2 - 101) - trade["Costs $"])
     assert trade["Exit time"] == pd.Timestamp("2026-10-01 10:05")
 
 
 def test_run_and_summary():
     bars = {"A": session("2026-10-01", RUN), "B": session("2026-10-01", RUN)}
-    trades, days = run_opening_bar(bars, OpeningBarSettings(skip_bars=0))
+    trades, days = run_opening_bar(bars, OpeningBarSettings(skip_bars=0, **EXACT))
     summary = summarize_opening_bar(trades, days)
     assert summary["Trades"] == 2 and summary["Long days %"] == 100
-    assert np.isclose(summary["Net P&L"], 2 * (99 * 1.2 - 2))
+    assert np.isclose(summary["Net P&L"], 2 * 99 * 1.2 - summary["Costs"])
     assert summary["Pullback exit %"] == 100
 
 
@@ -108,19 +115,49 @@ def test_short_days_trade_the_mirror_image():
     frame = session("2026-10-01", flipped)
     off, _ = opening_bar_trades(frame, OpeningBarSettings(skip_bars=0), "TEST")
     assert off.empty
-    trades, days = opening_bar_trades(frame, OpeningBarSettings(skip_bars=0, allow_short=True), "TEST")
+    trades, days = opening_bar_trades(frame, OpeningBarSettings(skip_bars=0, allow_short=True, **EXACT), "TEST")
     assert list(days["Short day"]) == [True]
     trade = trades.iloc[0]
     assert trade["Side"] == "Short" and trade["Entry"] == 99 and trade["Stop"] == 100.5
     assert trade["Exit"] == 97.8 and trade["Exit reason"] == "Pullback"
-    assert np.isclose(trade["P&L"], trade["Shares"] * (99 - 97.8) - 2.0)
-    lower, _ = opening_bar_trades(frame, OpeningBarSettings(skip_bars=0, allow_short=True, exit_mode="lower_high"))
+    # The short pays the sale fees when it opens.
+    assert np.isclose(trade["Costs $"], order_costs(trade["Shares"], 99, True) + order_costs(trade["Shares"], 97.8, False))
+    assert np.isclose(trade["P&L"], trade["Shares"] * (99 - 97.8) - trade["Costs $"])
+    lower, _ = opening_bar_trades(frame, OpeningBarSettings(skip_bars=0, allow_short=True, exit_mode="lower_high",
+                                                            **EXACT))
     assert lower.iloc[0]["Exit"] == 97.8
 
 
 def test_short_stop_is_the_first_bar_high():
     flipped = [(200 - o, 200 - l, 200 - h, 200 - c) for o, h, l, c in RUN]
     flipped[3] = (97.8, 101.0, 97.7, 100.8)
-    trades, _ = opening_bar_trades(session("2026-10-01", flipped), OpeningBarSettings(skip_bars=0, allow_short=True))
+    trades, _ = opening_bar_trades(session("2026-10-01", flipped),
+                                   OpeningBarSettings(skip_bars=0, allow_short=True, **EXACT))
     assert trades.iloc[0]["Exit reason"] == "Stop" and trades.iloc[0]["Exit"] == 100.5
     assert trades.iloc[0]["P&L"] < 0
+
+
+def test_ibkr_costs():
+    # Tiered, 50 shares at $200: the $0.35 minimum, plus exchange and clearing at $0.0032 a share.
+    assert np.isclose(order_costs(50, 200, False), 0.35 * 1.00074 + 50 * 0.0032)
+    # The sale adds the SEC fee on the value and the FINRA fees per share.
+    assert np.isclose(order_costs(50, 200, True) - order_costs(50, 200, False), 10_000 * 0.0000206 + 50 * 0.000198)
+    assert np.isclose(order_costs(1_000, 50, False, "fixed"), 5.0)
+    assert np.isclose(order_costs(50, 200, False, "fixed"), 1.0)
+    assert order_costs(50, 200, False, "none") == 0
+    # A $10,000 round trip on Tiered comes to about $1.30.
+    assert 1.0 < order_costs(50, 200, False) + order_costs(50, 200, True) < 1.5
+
+
+def test_slippage_worsens_both_fills():
+    trades, _ = opening_bar_trades(session("2026-10-01", RUN), OpeningBarSettings(skip_bars=0, slippage=0.02))
+    trade = trades.iloc[0]
+    assert np.isclose(trade["Entry"], 101.02) and np.isclose(trade["Exit"], 102.18)
+
+
+def test_flat_bar_by_timeframe():
+    day = lambda minutes: pd.date_range("2026-10-01 09:30", "2026-10-01 15:59", freq=f"{minutes}min")
+    assert day(5)[flat_bar_position(day(5), 5)] == pd.Timestamp("2026-10-01 15:55")
+    assert day(1)[flat_bar_position(day(1), 1)] == pd.Timestamp("2026-10-01 15:55")
+    # No 15-minute bar starts in the last 5 minutes: sold at the open of the last bar.
+    assert day(15)[flat_bar_position(day(15), 15)] == pd.Timestamp("2026-10-01 15:45")
