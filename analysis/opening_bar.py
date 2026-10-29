@@ -4,7 +4,9 @@ Kelvin's rule (2026-10-29):
 
 * the user picks a stock and allocates capital to the rule;
 * if the first 5-minute bar closes at least ``min_move`` points (dollars) above its open, the day is a long day;
-  otherwise it is a short day and the rule stays out (long only);
+  otherwise it is a short day and the rule stays out, unless ``allow_short`` is on: then a first bar that closes
+  at least ``min_move`` points below its open is shorted, the mirror image of the long trade (sell at its close,
+  stop at its high, the pullback exit on a close above the latest bounce, the lower-high exit on a higher low);
 * on a long day, buy at the first bar's close with the stop at the first bar's low; size the position so that a
   stop-out loses at most ``risk_pct`` of the allocated capital (and never more shares than the capital buys);
 * ignore the next ``skip_bars`` bars for the exit (the stop still applies), then sell everything on one of two
@@ -32,9 +34,9 @@ EXIT_FILLS = {
     "At the close that broke the pullback (market order)": "close",
     "At the pullback price (as written)": "pullback",
 }
-TRADE_COLUMNS = ["Ticker", "Date", "Entry time", "Entry", "Stop", "Exit time", "Exit", "Exit reason", "Shares",
+TRADE_COLUMNS = ["Ticker", "Date", "Side", "Entry time", "Entry", "Stop", "Exit time", "Exit", "Exit reason", "Shares",
                  "Risk $", "P&L", "Return %", "R"]
-DAY_COLUMNS = ["Ticker", "Date", "First bar open", "First bar close", "Move", "Long day"]
+DAY_COLUMNS = ["Ticker", "Date", "First bar open", "First bar close", "Move", "Long day", "Short day"]
 
 
 @dataclass
@@ -47,6 +49,7 @@ class OpeningBarSettings:
     cap_at_capital: bool = True
     exit_fill: str = "close"
     fee_per_trade: float = 2.0
+    allow_short: bool = False
 
 
 def is_long_day(first_bar, min_move=0.0):
@@ -57,10 +60,23 @@ def is_long_day(first_bar, min_move=0.0):
     return bool(move > 0 and move >= min_move - 1e-9)
 
 
-def position_shares(capital, entry, stop, risk_pct=10.0, cap_at_capital=True):
-    """Shares such that a stop-out loses at most ``risk_pct`` % of ``capital`` (0 when there is no risk to size on)."""
+def is_short_day(first_bar, min_move=0.0):
+    """The mirror image: the first bar closes below its open by at least ``min_move`` points."""
 
-    risk_per_share = entry - stop
+    return is_long_day({"Open": -first_bar["Open"], "Close": -first_bar["Close"]}, min_move)
+
+
+def mirrored(session):
+    """Prices turned upside down (high becomes low), so a short is traded by the long rules."""
+
+    return pd.DataFrame({"Open": -session["Open"], "High": -session["Low"], "Low": -session["High"],
+                         "Close": -session["Close"]}, index=session.index)
+
+
+def position_shares(capital, entry, stop, risk_pct=10.0, cap_at_capital=True):
+    """Shares (long or short) such that a stop-out loses at most ``risk_pct`` % of ``capital`` (0 when there is no risk to size on)."""
+
+    risk_per_share = abs(entry - stop)
     if not (np.isfinite(risk_per_share) and risk_per_share > 0 and entry > 0):
         return 0
     shares = math.floor(capital * risk_pct / 100 / risk_per_share)
@@ -111,20 +127,24 @@ def opening_bar_trades(bars, settings=None, ticker=""):
             continue
         first = session.iloc[0]
         long_day = is_long_day(first, settings.min_move)
+        short_day = is_short_day(first, settings.min_move)
         days.append({"Ticker": ticker, "Date": day, "First bar open": first["Open"], "First bar close": first["Close"],
-                     "Move": first["Close"] - first["Open"], "Long day": long_day})
-        if not long_day:
+                     "Move": first["Close"] - first["Open"], "Long day": long_day, "Short day": short_day})
+        if not (long_day or (short_day and settings.allow_short)):
             continue
-        entry, stop = float(first["Close"]), float(first["Low"])
+        side = 1 if long_day else -1
+        entry, stop = float(first["Close"]), float(first["Low"] if long_day else first["High"])
         shares = position_shares(settings.capital, entry, stop, settings.risk_pct, settings.cap_at_capital)
         if shares < 1:
             continue
-        k, exit_price, reason = exit_session(session, entry, stop, settings.skip_bars, settings.exit_fill,
-                                              settings.exit_mode)
-        risk = shares * (entry - stop)
-        pnl = shares * (exit_price - entry) - settings.fee_per_trade
+        # A short is the long trade on upside-down prices.
+        k, exit_price, reason = exit_session(session if long_day else mirrored(session), side * entry, side * stop,
+                                              settings.skip_bars, settings.exit_fill, settings.exit_mode)
+        exit_price *= side
+        risk = shares * abs(entry - stop)
+        pnl = side * shares * (exit_price - entry) - settings.fee_per_trade
         trades.append({
-            "Ticker": ticker, "Date": day, "Entry time": session.index[0] + pd.Timedelta(minutes=5), "Entry": entry,
+            "Ticker": ticker, "Date": day, "Side": "Long" if long_day else "Short", "Entry time": session.index[0] + pd.Timedelta(minutes=5), "Entry": entry,
             "Stop": stop, "Exit time": session.index[k] + (pd.Timedelta(0) if reason == "End of day"
                                                             else pd.Timedelta(minutes=5)),
             "Exit": exit_price, "Exit reason": reason, "Shares": shares, "Risk $": risk, "P&L": pnl,

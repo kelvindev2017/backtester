@@ -4483,7 +4483,8 @@ def render_opening_bar():
     st.caption(
         "If the first 5-minute bar closes at least N points above its open, the day is a long day: buy at that "
         "bar's close with the stop at its low, sized so a stop-out loses at most the chosen % of the capital. Other "
-        "days are short days and the rule stays out (long only). After skipping the next M bars, sell everything on "
+        "days are short days: the rule stays out, or, with shorting on, shorts a first bar that closes at least N "
+        "points below its open (the mirror image: stop at its high, exits on bounces and higher lows). After skipping the next M bars, sell everything on "
         "the chosen exit; anything still held is sold 5 minutes before the close. Each ticker runs on its own "
         "allocated capital."
     )
@@ -4502,6 +4503,11 @@ def render_opening_bar():
         min_move = float(st.number_input("Long day: first bar closes at least N points above its open", min_value=0.0,
                                          value=0.0, step=0.05, format="%.2f", key="opening_bar_min_move",
                                          help="In dollars. 0 means any first bar that closes above its open."))
+        allow_short = st.checkbox("Short on short days", value=False, key="opening_bar_short",
+                                  help="Short when the first bar closes at least N points below its open: sell at its "
+                                  "close, stop at its high, and the exits turned upside down (a close above the last "
+                                  "bounce, or a bar whose low is above the previous bar's low, buys back). Borrow "
+                                  "costs are not included.")
         exit_label = st.selectbox("Exit", list(OPENING_BAR_EXITS), key="opening_bar_exit")
         exit_mode = OPENING_BAR_EXITS[exit_label]
         skip_bars = int(slider_with_input("Ignore the next M bars before the exit applies", 0, 30, 2,
@@ -4524,7 +4530,7 @@ def render_opening_bar():
         return
     settings = OpeningBarSettings(min_move=min_move, skip_bars=skip_bars, exit_mode=exit_mode, risk_pct=risk_pct,
                                   capital=capital, cap_at_capital=cap_at_capital, exit_fill=exit_fill,
-                                  fee_per_trade=fee)
+                                  fee_per_trade=fee, allow_short=allow_short)
     with st.spinner("Loading 5-minute bars..."):
         bars = {ticker: load_intraday_data(ticker, "5m", "60d") for ticker in tickers}
     missing = [t for t, frame in bars.items() if frame.empty]
@@ -4542,9 +4548,10 @@ def render_opening_bar():
     summary = summarize_opening_bar(trades, days)
     first_day, last_day = days["Date"].min(), days["Date"].max()
     st.markdown(f"**{first_day:%b %d} to {last_day:%b %d, %Y}**: {summary['Days']} ticker-days, "
-                f"{summary['Long days %']:.0f}% long days.")
+                f"{summary['Long days %']:.0f}% long days"
+                + (f", {days['Short day'].mean() * 100:.0f}% short days." if allow_short else "."))
     if trades.empty:
-        st.info("No long days in this period.")
+        st.info("No long or short days in this period." if allow_short else "No long days in this period.")
         return
 
     tiles = st.columns(2 if MOBILE else 4)
@@ -4558,6 +4565,13 @@ def render_opening_bar():
                f"{summary['Pullback exit %'] + summary['Lower high exit %']:.0f}% on the "
                f"{'pullback' if exit_mode == 'pullback' else 'lower-high'} exit, "
                f"{summary['End of day %']:.0f}% sold before the close.")
+    if allow_short:
+        sides = pd.DataFrame({side: summarize_opening_bar(trades[trades["Side"] == side])
+                              for side in ("Long", "Short")}).T[["Trades", "Win rate %", "Net P&L", "Avg R",
+                                                                 "Profit factor"]]
+        st.dataframe(sides.style.format({"Trades": "{:.0f}", "Win rate %": "{:.0f}", "Net P&L": "${:+,.0f}",
+                                         "Avg R": "{:+.2f}", "Profit factor": "{:.2f}"}, na_rep="-"),
+                     width="stretch")
 
     by_day = trades.groupby("Date")["P&L"].sum()
     equity = go.Figure(go.Scatter(x=by_day.index, y=by_day.cumsum(), mode="lines",
