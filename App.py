@@ -116,6 +116,8 @@ from analysis.valuation_chart import (
     VALUATION_HISTORY_YEARS,
     correlation_text,
     eps_estimate_quarters,
+    forward_eps,
+    forward_valuation,
     growth_price_correlation,
     pe_summary,
     pe_summary_text,
@@ -3502,6 +3504,7 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
         st.markdown(f"**{ticker} fundamentals: growth, revenue, EPS and valuation, last {years} years**")
         peg = trailing_peg(valuation).loc[history_start:]
         peg_gaps = peg_gap_reasons(valuation).loc[history_start:]
+        forward = forward_valuation(valuation, forward_eps(earnings, load_earnings_estimates(ticker))).loc[history_start:]
         trailing_pe = valuation["Trailing_PE"].loc[history_start:]
         forward_pe = load_fundamental_snapshot(ticker).get("forwardPE")
         estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])
@@ -3517,7 +3520,7 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
                                      price_change=price_change, growth=growth,
                                      close=valuation["Close"].loc[history_start:], log_price=log_price,
                                      ohlcv=prices.loc[history_start:] if not prices.empty else None,
-                                     peg_gaps=peg_gaps),
+                                     peg_gaps=peg_gaps, forward=forward),
                    width="stretch")
         st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
         st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker), peg_gaps))
@@ -3531,7 +3534,11 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
             "P/E is price / last 4 quarters' EPS, so it can differ from GAAP P/E; a spike usually means earnings "
             "fell, not that the price ran. PEG is that P/E / EPS growth %. It is blank, and shaded, while EPS is a "
             "loss, while the year-ago EPS was a loss (growth from a loss has no %), or while EPS is below a year ago. "
-            "Hatched bars are analyst "
+            "The purple dashed lines are forward P/E (price / next four quarters' EPS) and forward PEG (that P/E / "
+            "EPS growth % from the last four quarters to the next four). Past points use the EPS later reported, "
+            "which nobody knew on the day, so they show how cheap the stock really was, not what it looked like then. "
+            "The dotted end uses analyst estimates for quarters not yet reported (Yahoo gives two quarters and next "
+            "fiscal year; the quarters between are filled on a steady growth path). Hatched bars are analyst "
             "estimates, not results."
         )
     else:
