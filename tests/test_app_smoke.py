@@ -98,7 +98,7 @@ def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["Economic analysis", "Market Analysis", "Industry Analysis",
                                                "Stock Fundamentals", "Semicon Supply Chain", "Stock Screener", "Backtest",
-                                               "Signal Analysis & Trade Plan", "Validate"]
+                                               "Signal Analysis & Trade Plan", "Validate", "Trade Journal"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
     open_tab(app, "Signal Analysis & Trade Plan")
@@ -607,3 +607,49 @@ def test_first_bar_day_trade_is_a_backtest_rule(offline):
     next(box for box in app.selectbox if box.label == "Signal rule").select("Moving-average rule")
     open_tab(app, "Backtest")
     assert next(box for box in app.selectbox if box.label == "Timeframe").value == "Daily"
+
+
+def journal_export():
+    """A small IBKR export: two AAPL round trips, an MSFT loser that was added to, and an HKD row to leave out."""
+
+    rows = [
+        ("AAPL", 20260504, "BUY", 20, 100.0, -1.0, "LMT", "USD"), ("AAPL", 20260505, "SELL", 20, 104.0, -1.0, "LMT", "USD"),
+        ("MSFT", 20260511, "BUY", 10, 120.0, -1.0, "LMT", "USD"), ("MSFT", 20260512, "BUY", 10, 112.0, -1.0, "LMT", "USD"),
+        ("MSFT", 20260514, "SELL", 20, 100.0, -1.5, "STP", "USD"),
+        ("AAPL", 20260518, "BUY", 20, 110.0, -1.0, "LMT", "USD"), ("AAPL", 20260518, "SELL", 20, 111.0, -1.0, "TRAIL", "USD"),
+        ("1347", 20260504, "BUY", 1000, 50.0, -40.0, "LMT", "HKD"),
+    ]
+    return pd.DataFrame([{"CurrencyPrimary": cur, "Symbol": sym, "TradeID": 100 + i, "OrderID": 200 + i, "TradeDate": day,
+                          "Buy/Sell": side, "Quantity": qty if side == "BUY" else -qty, "Price": price,
+                          "Commission": fee, "OrderType": kind}
+                         for i, (sym, day, side, qty, price, fee, kind, cur) in enumerate(rows)])
+
+
+def test_trade_journal_tab(offline):
+    from analysis.trade_journal import load_ibkr_trades, round_trips
+
+    app = open_tab(start_app(), "Trade Journal")
+    assert any("Upload an IBKR trade export" in element.value for element in app.info)
+    # AppTest cannot upload a file, so put the parsed export where the uploader would.
+    trades, notes = load_ibkr_trades(journal_export())
+    fills, trips = round_trips(trades)
+    app.session_state["journal_data"] = {"id": "test", "name": "test.csv", "notes": notes, "fills": fills, "trips": trips}
+    app = open_tab(app, "Trade Journal")
+    assert [element.value for element in app.subheader] == ["Your results", "Where the P&L comes from", "Trades"]
+    assert any("3 round trips" in element.value and "1 rows in HKD" in element.value for element in app.caption)
+    assert any("Turn on a rule" in element.value for element in app.info)
+
+    # A stop replays the trades on the (fake) price bars and adds the comparison and the stop sweep.
+    next(box for box in app.checkbox if box.key == "journal_use_stop").check()
+    app = open_tab(app, "Trade Journal")
+    assert any(element.value.startswith("What-if: stop 3% from the first buy") for element in app.subheader)
+    specs = [chart.proto.spec for chart in app.get("plotly_chart")]
+    assert any("Net P&L for each stop distance" in spec for spec in specs)
+    assert any("Cumulative P&L after fees" in spec for spec in specs)
+
+    next(box for box in app.selectbox if box.key == "journal_breakdown").select("Symbol")
+    next(box for box in app.checkbox if box.key == "journal_no_adds").check()
+    next(box for box in app.checkbox if box.key == "journal_use_days").check()
+    app = open_tab(app, "Trade Journal")
+    assert any("no adding to a losing position" in element.value for element in app.subheader)
+    assert any(set(frame.value.index) == {"AAPL", "MSFT"} for frame in app.dataframe)

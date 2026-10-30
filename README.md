@@ -44,6 +44,25 @@ Reports results in R (profit / planned risk) with a t-statistic, results per con
 and whether each score component actually ranks outcomes better than a random score would. Use it to test
 any signal setting across many tickers before trusting it (`analysis/validation.py`).
 
+**Trade Journal** (US-dollar trades): upload an IBKR Flex Query trade export (.xlsx or .csv with CurrencyPrimary, Symbol,
+TradeID, OrderID, TradeDate, Buy/Sell, Quantity, Price, Commission, OrderType; Date/Time optional). Trades in other
+currencies and currency conversions are left out. The fills of each stock are grouped into round trips (from the first
+buy, or short sale, to the sale that leaves no shares; a fill through zero is split), with P&L after IBKR's fees. The
+tab shows the headline numbers (win rate against the break-even win rate, average win against average loss, profit
+factor), cumulative P&L, a breakdown by holding time, exit order type, stock, month, long or short, adding to a losing
+position, number of buys, position size or weekday, and the trade list; select a trade to see its fills on its price
+bars. Filters: entry dates, stocks, side (cash-like funds such as SGOV are left out by default).
+
+**What-if rules** replay your own buys and sells on Yahoo's hourly bars (about two years) or 5-minute bars (about 60
+days, hourly before that), with any of: a stop placed with the first buy (filled at the stop, or the open on a gap,
+less a slippage), a profit target, no adding to a losing position (buys more than 0.2% below the first buy are skipped
+and later sells close only what is held), the same dollar amount on every trade (the first order scaled to it), and a
+time limit (sold at the close after N trading days). Your fills keep your commissions; new exits pay IBKR Pro Tiered.
+The result is compared with your own on the same trades, with a chart of net P&L for stop distances from 1% to 10%.
+Without trade times in the export, each fill is placed in the first bar of its day that traded at its price; stops are
+checked before your own fills in a bar, and on the buy's own bar only count when the bar closes beyond the stop - both
+the cautious choice. With no rule on, the replay gives back your actual P&L exactly (`analysis/trade_journal.py`).
+
 **Day Breakout Rule**: the rule from the review of the 2026 IBKR trades, run mechanically on a list of tickers.
 Long only: buy the first day a stock trades above its prior N-day high (default 10), filled at that level or at the
 open on a gap up; at each close hold overnight only if the close is in the top third of the day's range (other
