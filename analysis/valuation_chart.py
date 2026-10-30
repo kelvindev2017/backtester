@@ -86,6 +86,34 @@ def pe_summary_text(summary, forward_pe=None):
     return text
 
 
+PEG_GAP_COLORS = {
+    "Loss, no P/E": "rgba(205, 92, 92, 0.16)",
+    "Year-ago loss": "rgba(255, 165, 0, 0.18)",
+    "EPS below year ago": "rgba(128, 128, 128, 0.16)",
+}
+
+
+PEG_GAP_TEXT = {
+    "Loss, no P/E": "EPS is a loss",
+    "Year-ago loss": "the year-ago EPS was a loss, and growth from a loss has no %",
+    "EPS below year ago": "EPS is below a year ago",
+}
+
+
+def _ttm_eps_growth(valuation):
+    """TTM EPS, the TTM EPS of a year earlier and the growth (%) between them, by day."""
+
+    eps = valuation["TTM_Reported_EPS"]
+    clean = eps.dropna()
+    if clean.empty:
+        empty = pd.Series(np.nan, index=valuation.index)
+        return eps, empty, empty
+    year_ago = clean.reindex(valuation.index - pd.Timedelta(days=365), method="ffill")
+    year_ago.index = valuation.index
+    growth = (eps / year_ago.where(year_ago > 0) - 1) * 100
+    return eps, year_ago, growth
+
+
 def trailing_peg(valuation):
     """Daily trailing PEG: trailing P/E divided by TTM EPS growth (%) versus a year earlier.
 
@@ -95,22 +123,70 @@ def trailing_peg(valuation):
 
     if valuation is None or valuation.empty or not {"Trailing_PE", "TTM_Reported_EPS"}.issubset(valuation.columns):
         return pd.Series(dtype=float)
-    eps = valuation["TTM_Reported_EPS"]
-    clean = eps.dropna()
-    if clean.empty:
-        return pd.Series(np.nan, index=valuation.index)
-    year_ago = clean.reindex(valuation.index - pd.Timedelta(days=365), method="ffill")
-    year_ago.index = valuation.index
-    growth = (eps / year_ago.where(year_ago > 0) - 1) * 100
+    _, _, growth = _ttm_eps_growth(valuation)
     return (valuation["Trailing_PE"] / growth.where(growth > 0)).replace([np.inf, -np.inf], np.nan)
 
 
-def peg_summary_text(peg, forward_pe=None, forward_growth=None):
-    """One caption line: today's trailing PEG against its own history, plus a forward PEG when estimates exist."""
+def break_long_gaps(series, days=7):
+    """``series`` with a NaN inserted inside every gap longer than ``days``, so a line breaks there.
+
+    Weekends and market holidays stay joined; a reindex to business days would break the line on every holiday.
+    """
+
+    series = series.dropna()
+    if len(series) < 2:
+        return series
+    gaps = series.index[1:][np.diff(series.index.values) > np.timedelta64(days, "D")]
+    breaks = pd.Series(np.nan, index=gaps - pd.Timedelta(days=1))
+    return pd.concat([series, breaks]).sort_index()
+
+
+def peg_gap_reasons(valuation):
+    """Why trailing PEG is blank, by day: one of the ``PEG_GAP_COLORS`` keys, or NaN where PEG exists.
+
+    Days without a year-ago TTM EPS (too little history) stay NaN: that is missing data, not a reading.
+    """
+
+    if valuation is None or valuation.empty or "TTM_Reported_EPS" not in valuation.columns:
+        return pd.Series(dtype=object)
+    eps, year_ago, growth = _ttm_eps_growth(valuation)
+    reasons = pd.Series(np.nan, index=valuation.index, dtype=object)
+    reasons[(growth <= 0) & eps.notna()] = "EPS below year ago"
+    reasons[(year_ago <= 0) & eps.notna()] = "Year-ago loss"
+    reasons[eps <= 0] = "Loss, no P/E"
+    return reasons
+
+
+def gap_spans(reasons):
+    """Runs of the same reason as (start, end, reason); ``end`` is the first day after the run."""
+
+    spans = []
+    if reasons is None or reasons.empty:
+        return spans
+    run = (reasons.fillna("") != reasons.fillna("").shift()).cumsum()
+    for _, block in reasons.groupby(run):
+        reason = block.iloc[0]
+        if isinstance(reason, str):
+            after = reasons.index[reasons.index > block.index[-1]]
+            spans.append((block.index[0], after[0] if len(after) else block.index[-1], reason))
+    return spans
+
+
+def peg_summary_text(peg, forward_pe=None, forward_growth=None, gaps=None):
+    """One caption line: today's trailing PEG against its own history, plus a forward PEG when estimates exist.
+
+    ``gaps`` (from :func:`peg_gap_reasons`) explains a blank PEG today instead of quoting a stale one.
+    """
 
     series = peg.dropna() if peg is not None else pd.Series(dtype=float)
     parts = []
-    if not series.empty:
+    today_gap = gaps.dropna() if gaps is not None else pd.Series(dtype=object)
+    if not today_gap.empty and today_gap.index[-1] == gaps.index[-1]:
+        since = gap_spans(gaps)[-1][0]
+        parts.append(f"No trailing PEG today: {PEG_GAP_TEXT[today_gap.iloc[-1]]} (since {since:%b %Y}).")
+        if not series.empty:
+            parts.append(f"Last PEG was {series.iloc[-1]:.2f} on {series.index[-1]:%d %b %Y}.")
+    elif not series.empty:
         current = float(series.iloc[-1])
         parts.append(
             f"Trailing PEG {current:.2f} (P/E / last year's EPS growth %), {ordinal(round((series < current).mean() * 100))} "
@@ -312,11 +388,14 @@ def legends_under_panels(fig, rows, height, gap_px=6, dates_every_row=False):
 
 
 def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
-                      price_change=None, growth=None, close=None, log_price=False, height=None, ohlcv=None):
+                      price_change=None, growth=None, close=None, log_price=False, height=None, ohlcv=None,
+                      peg_gaps=None):
     """Daily price, growth vs price, revenue, EPS, trailing P/E and PEG panels, top to bottom, on one date axis.
 
     ``ohlcv`` (optional, daily Open/High/Low/Close/Volume) turns the price panel into candlesticks with
     volume on a right-hand axis; with only ``close`` it is a line.
+
+    ``peg_gaps`` (optional, from :func:`peg_gap_reasons`) shades the days PEG is blank, by reason.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -375,7 +454,9 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
 
     pe = trailing_pe.dropna() if trailing_pe is not None else pd.Series(dtype=float)
     if not pe.empty:
-        fig.add_trace(go.Scatter(x=pe.index, y=pe, mode="lines", name="Trailing P/E",
+        # Days with an EPS loss have no P/E; a straight line across them would invent one.
+        pe_line = break_long_gaps(pe)
+        fig.add_trace(go.Scatter(x=pe_line.index, y=pe_line, mode="lines", name="Trailing P/E", connectgaps=False,
                                  line=dict(color=PE_COLOR, width=2),
                                  hovertemplate="%{x|%Y-%m-%d}: %{y:.1f}x<extra></extra>"), row=row["pe"], col=1)
         median = float(pe.median())
@@ -388,7 +469,7 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
 
     if not peg.empty:
         # Gaps (growth <= 0) stay gaps: connecting them would invent PEG values.
-        full = peg.reindex(pd.date_range(peg.index.min(), peg.index.max(), freq="B"))
+        full = break_long_gaps(peg)
         fig.add_trace(go.Scatter(x=full.index, y=full, mode="lines", name="Trailing PEG", connectgaps=False,
                                  line=dict(color=PEG_COLOR, width=2),
                                  hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}<extra></extra>"), row=row["peg"], col=1)
@@ -396,6 +477,22 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
                       annotation_text="PEG 1", annotation_position="top left")
         # Right after earnings turn up, growth is tiny and PEG spikes; capping keeps the usual range readable.
         fig.update_yaxes(range=[0, min(PEG_AXIS_CAP, float(peg.max()) * 1.1)], row=row["peg"], col=1)
+
+    # Shade why PEG (and, for losses, P/E) is blank, with one legend entry per reason.
+    spans = gap_spans(peg_gaps.loc[peg_gaps.index >= peg.index.min()] if peg_gaps is not None and not peg.empty
+                      else peg_gaps)
+    for key, reasons in [("pe", ["Loss, no P/E"]), ("peg", list(PEG_GAP_COLORS))]:
+        if key not in row:
+            continue
+        shown = [reason for reason in reasons if any(span[2] == reason for span in spans)]
+        for start, end, reason in spans:
+            if reason in shown:
+                fig.add_vrect(x0=start, x1=end, fillcolor=PEG_GAP_COLORS[reason], line_width=0, layer="below",
+                              row=row[key], col=1)
+        for reason in shown:
+            fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name=reason, hoverinfo="skip",
+                                     marker=dict(symbol="square", size=12, color=PEG_GAP_COLORS[reason])),
+                          row=row[key], col=1)
 
     actual = revenue.dropna() / 1e9 if revenue is not None else pd.Series(dtype=float)
     fig.add_trace(go.Bar(x=actual.index, y=actual, name="Revenue (reported)", marker_color=ACTUAL_COLOR,

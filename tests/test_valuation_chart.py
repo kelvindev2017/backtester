@@ -9,6 +9,9 @@ from analysis.valuation_chart import (
     yoy_change,
     eps_estimate_quarters,
     quarterly_eps,
+    break_long_gaps,
+    gap_spans,
+    peg_gap_reasons,
     peg_summary_text,
     pe_summary,
     pe_summary_text,
@@ -238,3 +241,39 @@ def test_close_on_a_right_hand_axis_in_every_other_panel_and_a_legend_under_each
     assert {trace.legend for trace in overlays} == {"legend2", "legend3"}
     for legend, axis in [("legend", fig.layout.yaxis), ("legend2", fig.layout.yaxis2), ("legend3", fig.layout.yaxis3)]:
         assert axis.domain[0] - 0.1 < fig.layout[legend].y < axis.domain[0]
+
+
+def test_peg_gap_reasons_explain_each_blank_day():
+    index = pd.bdate_range("2023-01-02", "2026-12-31")
+    eps = pd.Series(1.0, index=index)
+    eps[index >= pd.Timestamp("2024-01-01")] = 0.5  # below a year ago
+    eps[index >= pd.Timestamp("2025-01-01")] = -0.2  # a loss
+    eps[index >= pd.Timestamp("2026-01-01")] = 0.4  # profit again, but the year-ago EPS was a loss
+    valuation = pd.DataFrame({"TTM_Reported_EPS": eps, "Trailing_PE": (20.0 / eps).where(eps > 0)}, index=index)
+    reasons = peg_gap_reasons(valuation)
+    assert reasons.loc["2023"].isna().all()  # no year-ago EPS yet: missing data, not shaded
+    assert reasons.loc["2024-06-03"] == "EPS below year ago"
+    assert reasons.loc["2025-06-02"] == "Loss, no P/E"
+    assert reasons.loc["2026-06-01"] == "Year-ago loss"
+    assert trailing_peg(valuation).loc["2024":].isna().all()
+    assert [reason for _, _, reason in gap_spans(reasons)] == [
+        "EPS below year ago", "Loss, no P/E", "Year-ago loss"]
+
+    text = peg_summary_text(trailing_peg(valuation), gaps=reasons)
+    assert text.startswith("No trailing PEG today: the year-ago EPS was a loss")
+
+    revenue = pd.Series([1e9], index=pd.to_datetime(["2024-03-31"]))
+    peg = pd.Series([0.8, 1.2], index=pd.to_datetime(["2023-06-01", "2023-12-29"]))
+    fig = revenue_pe_figure(revenue, valuation["Trailing_PE"], peg=peg, peg_gaps=reasons)
+    names = [trace.name for trace in fig.data]
+    assert names.count("Loss, no P/E") == 2  # legend entry under the P/E and the PEG panel
+    assert "Year-ago loss" in names and "EPS below year ago" in names
+    assert len(fig.layout.shapes) >= 4  # shaded spans (plus the PEG 1 and median lines)
+    pe_trace = next(trace for trace in fig.data if trace.name == "Trailing P/E")
+    assert pe_trace.connectgaps is False and np.isnan(np.array(pe_trace.y, dtype=float)).sum() == 1  # one break
+
+
+def test_lines_break_only_across_long_gaps():
+    series = pd.Series(1.0, index=pd.to_datetime(["2025-12-24", "2025-12-26", "2026-01-02", "2026-03-02"]))
+    line = break_long_gaps(series)
+    assert line.isna().sum() == 1 and line.index[line.isna()][0] == pd.Timestamp("2026-03-01")
