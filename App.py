@@ -148,6 +148,21 @@ from analysis.universe import (
     normalize_ticker,
     parse_ticker_list,
 )
+from analysis.trade_journal import (
+    BREAKDOWNS as JOURNAL_BREAKDOWNS,
+    CASH_LIKE as JOURNAL_CASH_LIKE,
+    WhatIfRules,
+    apply_filters as journal_filter,
+    breakdown as journal_breakdown,
+    equity_curve as journal_equity,
+    fill_bar_positions,
+    load_ibkr_trades,
+    prepare as journal_prepare,
+    round_trips,
+    simulate as journal_simulate,
+    stop_sweep,
+    summarize as journal_summary,
+)
 from analysis.validation import ValidationSettings, base_rates, exit_signal_stats, summarize, verdict, walk_forward
 
 
@@ -2607,14 +2622,15 @@ def index_membership(market, tickers):
 SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
 FUNDAMENTALS_TAB = "Stock Fundamentals"
 ECONOMY_TAB = "Economic analysis"
+JOURNAL_TAB = "Trade Journal"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
 TAB_NAMES = [ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Stock Screener", "Backtest",
-             "Signal Analysis & Trade Plan", "Validate"]
+             "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
-TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart")
+TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart", "_upload")  # a file uploader's value cannot be set
 TRANSIENT_KEYS = {"main_tab", "password_correct"}
 VIX_SYMBOL = "^VIX"
 MAIN_INDEX_SYMBOLS = list(dict.fromkeys(
@@ -4976,6 +4992,422 @@ def render_opening_bar_details(trades, days, settings):
 
 
 # ============================================================
+# Trade Journal: import IBKR trades, see where the P&L comes from, replay them with other rules
+# ============================================================
+
+JOURNAL_BAR_CHOICES = {
+    "Hourly bars (cover about two years)": "hourly",
+    "5-minute bars where Yahoo has them (last ~60 days), hourly before": "fine",
+}
+JOURNAL_TABLE_COLUMNS = ["Trip", "Side", "Entry date", "Exit date", "Days held", "Shares", "Avg entry", "Avg exit",
+                         "Cost $", "Net P&L", "Return %", "Last exit type", "Entry orders", "Added to loser"]
+JOURNAL_WHATIF_COLUMNS = ["What-if P&L", "What-if exit", "What-if exit date", "Change", "Skipped buys"]
+JOURNAL_FORMATS = {"Entry date": "{:%Y-%m-%d}", "Exit date": "{:%Y-%m-%d}", "What-if exit date": "{:%Y-%m-%d}",
+                   "Days held": "{:.0f}", "Shares": "{:,.0f}", "Avg entry": "{:,.2f}", "Avg exit": "{:,.2f}",
+                   "Cost $": "${:,.0f}", "Net P&L": "${:+,.0f}", "Return %": "{:+.2f}", "What-if P&L": "${:+,.0f}",
+                   "Change": "${:+,.0f}", "Skipped buys": "{:.0f}", "Trades": "{:,.0f}", "Win rate %": "{:.0f}",
+                   "Avg win": "${:,.0f}", "Avg loss": "${:,.0f}", "Profit factor": "{:.2f}",
+                   "What-if net P&L": "${:+,.0f}"}
+JOURNAL_ACTUAL_COLOR, JOURNAL_WHATIF_COLOR = "gray", "royalblue"
+
+
+def journal_symbol(symbol):
+    """Yahoo symbol for an IBKR one: ``BRK B`` -> ``BRK-B``."""
+
+    return normalize_symbol(str(symbol).strip().replace(" ", "."))
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_journal_bars(symbols, start_str, end_str, interval):
+    """Regular-session bars for the traded stocks as {IBKR symbol: frame}, in New York time. Cached for 6 hours.
+
+    Yahoo keeps about two years of hourly ("60m") bars and about 60 days of 5-minute bars.
+    """
+
+    yahoo_to_ibkr = {journal_symbol(symbol): symbol for symbol in symbols}
+    tickers = list(yahoo_to_ibkr)
+    bars = {}
+    for first in range(0, len(tickers), 40):
+        chunk = tickers[first:first + 40]
+        try:
+            data = yf.download(chunk, start=start_str, end=end_str, interval=interval, auto_adjust=False,
+                               prepost=False, progress=False, threads=True)
+        except Exception:
+            continue
+        if data is None or data.empty:
+            continue
+        if getattr(data.index, "tz", None) is not None:
+            data.index = data.index.tz_convert("America/New_York").tz_localize(None)
+        for ticker, frame in split_download(data, chunk).items():
+            bars[yahoo_to_ibkr[ticker]] = frame
+    return bars
+
+
+def journal_bars(trips, choice):
+    """Price bars for every traded stock: hourly, or [5-minute, hourly] per stock for the "fine" choice."""
+
+    symbols = tuple(sorted(trips["Symbol"].unique()))
+    start = trips["Entry date"].min() - pd.Timedelta(days=3)
+    end = trips["Exit date"].max() + pd.Timedelta(days=3)
+    hourly = load_journal_bars(symbols, f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}", "60m")
+    if choice != "fine":
+        return hourly
+    fine_start = max(start, pd.Timestamp(date.today()) - pd.Timedelta(days=58))
+    recent = tuple(sorted(trips.loc[trips["Exit date"] >= fine_start, "Symbol"].unique()))
+    fine = load_journal_bars(recent, f"{fine_start:%Y-%m-%d}", f"{end:%Y-%m-%d}", "5m") if recent else {}
+    return {symbol: [fine.get(symbol), hourly.get(symbol)] for symbol in symbols}
+
+
+def journal_prepared(data, bar_choice):
+    """Fills placed on price bars, once per file and bar choice (kept in Session State). Returns (prepared, bars)."""
+
+    key = [data["id"], bar_choice]
+    cached = st.session_state.get("journal_prepared")
+    if cached and cached["key"] == key:
+        return cached["value"], cached["bars"]
+    closed = data["trips"][data["trips"]["Status"] == "Closed"]
+    with st.spinner(f"Loading price bars for {closed['Symbol'].nunique()} stocks..."):
+        bars = journal_bars(closed, JOURNAL_BAR_CHOICES[bar_choice])
+        prepared = journal_prepare(data["fills"], closed, bars)
+    if any(value is not None for value in prepared.values()):  # do not keep an empty result from a failed download
+        st.session_state["journal_prepared"] = {"key": key, "value": prepared, "bars": bars}
+    return prepared, bars
+
+
+def journal_load_upload(upload, data):
+    """Read a newly uploaded file into Session State and reset the filters for it. Returns the journal data."""
+
+    file_id = f"{upload.name}:{upload.size}"
+    if data is not None and data["id"] == file_id:
+        return data
+    try:
+        with st.spinner(f"Reading {upload.name}..."):
+            trades, notes = load_ibkr_trades(upload, name=upload.name)
+            fills, trips = round_trips(trades)
+    except Exception as error:
+        st.error(f"Could not read {upload.name}: {error}")
+        return data
+    if trips.empty:
+        st.error(f"{upload.name} has no US-dollar stock trades.")
+        return data
+    data = {"id": file_id, "name": upload.name, "notes": notes, "fills": fills, "trips": trips}
+    st.session_state["journal_data"] = data
+    st.session_state.pop("journal_prepared", None)
+    st.session_state["journal_symbols"] = []
+    st.session_state["journal_exclude"] = sorted(set(JOURNAL_CASH_LIKE) & set(trips["Symbol"]))
+    st.session_state["journal_dates"] = (trips["Entry date"].min().date(), trips["Entry date"].max().date())
+    return data
+
+
+def journal_rules():
+    """What-if rule settings. Returns a WhatIfRules and the price-bar choice."""
+
+    with settings_panel("What-if rules"):
+        st.caption("Your own buys and sells, replayed on Yahoo price bars with these changes.")
+        use_stop = st.checkbox("Stop loss, placed with the first buy", key="journal_use_stop")
+        stop_pct = st.number_input("Stop distance from the first buy (%)", 0.25, 50.0, 3.0, 0.25,
+                                   key="journal_stop_pct", disabled=not use_stop)
+        use_target = st.checkbox("Profit target", key="journal_use_target")
+        target_pct = st.number_input("Target above the first buy (%)", 0.25, 100.0, 6.0, 0.25,
+                                     key="journal_target_pct", disabled=not use_target)
+        no_adds = st.checkbox("Don't add to a losing position", key="journal_no_adds",
+                              help="Skips any buy more than 0.2% below the first buy (for a short, a sale above it). "
+                              "Your later sells then close only the shares still held.")
+        use_size = st.checkbox("Same dollar amount on every trade", key="journal_use_size",
+                               help="Scales every fill of a trade so the first order is worth this amount.")
+        size = st.number_input("Dollars per trade", 500.0, 1_000_000.0, 10_000.0, 500.0, key="journal_size",
+                               disabled=not use_size)
+        use_days = st.checkbox("Time limit", key="journal_use_days")
+        max_days = st.number_input("Sell at the close after this many trading days (0 = the entry day)", 0, 250, 1, 1,
+                                   key="journal_max_days", disabled=not use_days)
+        slippage = st.number_input("Slippage on stop fills (basis points)", 0.0, 200.0, 5.0, 1.0,
+                                   key="journal_slippage",
+                                   help="1 bp = 0.01%. A triggered stop is a market order and usually fills a little "
+                                   "worse than the stop price.")
+        bar_choice = st.radio("Price bars", list(JOURNAL_BAR_CHOICES), key="journal_bars",
+                              help="Finer bars place stops more precisely. Yahoo keeps about 60 days of 5-minute bars, "
+                              "so older trades use hourly bars either way.")
+    rules = WhatIfRules(
+        stop_pct=float(stop_pct) if use_stop else None,
+        target_pct=float(target_pct) if use_target else None,
+        no_averaging_down=bool(no_adds),
+        fixed_size=float(size) if use_size else None,
+        max_days=int(max_days) if use_days else None,
+        slippage_bps=float(slippage),
+    )
+    return rules, bar_choice
+
+
+def journal_money(value, signed=True):
+    """Dollars with the sign in front: -$1,234, +$56 (``signed=False``: $1,234)."""
+
+    if value is None or pd.isna(value):
+        return "-"
+    if not signed:
+        return f"${value:,.0f}"
+    return f"{'-' if value < 0 else '+'}${abs(value):,.0f}"
+
+
+def journal_tiles(stats, compare=None):
+    """Four headline tiles; with ``compare`` (the actual stats), the what-if tiles show the change."""
+
+    tiles = st.columns(2 if MOBILE else 4)
+
+    def change(name, money=True):
+        if compare is None or pd.isna(stats[name]) or pd.isna(compare[name]):
+            return None
+        delta = stats[name] - compare[name]
+        return f"{journal_money(delta)} vs yours" if money else f"{delta:+.1f}"
+
+    win = stats["Win rate %"]
+    tiles[0].metric("Net P&L", journal_money(stats["Net P&L"]),
+                    change("Net P&L") if compare else f"{stats['Trades']:,} trades",
+                    delta_color="normal" if compare else "off")
+    tiles[1].metric("Win rate", "-" if pd.isna(win) else f"{win:.0f}%",
+                    f"break-even needs {stats['Breakeven win rate %']:.0f}%"
+                    if pd.notna(stats["Breakeven win rate %"]) else None, delta_color="off")
+    tiles[2 % len(tiles)].metric("Avg win / loss", f"{journal_money(stats['Avg win'], False)} / "
+                                 f"{journal_money(-stats['Avg loss'] if pd.notna(stats['Avg loss']) else None, False)}",
+                                 f"win is {stats['Payoff']:.2f}x the loss" if pd.notna(stats["Payoff"]) else None,
+                                 delta_color="off")
+    pf = stats["Profit factor"]
+    tiles[3 % len(tiles)].metric("Profit factor", "-" if pd.isna(pf) else f"{pf:.2f}",
+                                 f"fees {journal_money(stats['Fees'], False)}", delta_color="off")
+
+
+def journal_equity_chart(curves):
+    """Cumulative P&L lines: {name: (series, color)}."""
+
+    fig = go.Figure()
+    for name, (series, color) in curves.items():
+        fig.add_trace(go.Scatter(x=series.index, y=series.values, name=name, mode="lines",
+                                 line=dict(color=color, width=2 if name != "Your trades" else 1.5),
+                                 hovertemplate=f"{name}<br>%{{x|%Y-%m-%d}}<br>$%{{y:+,.0f}}<extra></extra>"))
+    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray")
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                      title="Cumulative P&L after fees", yaxis_title="$", legend=dict(orientation="h", y=1.12))
+    show_chart(fig, width="stretch", key="journal_equity_chart")
+
+
+def journal_breakdown_chart(table, has_whatif, title):
+    fig = go.Figure()
+    labels = [str(label) for label in table.index]
+    fig.add_trace(go.Bar(x=labels, y=table["Net P&L"], name="Your trades", marker_color=JOURNAL_ACTUAL_COLOR,
+                         hovertemplate="%{x}<br>$%{y:+,.0f}<extra>Your trades</extra>"))
+    if has_whatif:
+        fig.add_trace(go.Bar(x=labels, y=table["What-if net P&L"], name="What-if", marker_color=JOURNAL_WHATIF_COLOR,
+                             hovertemplate="%{x}<br>$%{y:+,.0f}<extra>What-if</extra>"))
+    fig.add_hline(y=0, line_width=1, line_color="gray")
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10), barmode="group", title=title,
+                      yaxis_title="Net P&L ($)", legend=dict(orientation="h", y=1.12))
+    show_chart(fig, width="stretch", key="journal_breakdown_chart")
+
+
+def render_journal_trip(trip, fills, bars_by_symbol, rules):
+    """One round trip: its fills, and its price bars with the buys, sells and what-if stop/target."""
+
+    trip_fills = fills[fills["Trip"] == trip["Trip"]].reset_index(drop=True)
+    line = (f"**{trip['Trip']}** - {trip['Side'].lower()}, {trip['Entry date']:%Y-%m-%d} to {trip['Exit date']:%Y-%m-%d}: "
+            f"{journal_money(trip['Net P&L'])} ({trip['Return %']:+.2f}%)")
+    if "What-if P&L" in trip and pd.notna(trip.get("What-if P&L")):
+        line += f"; what-if {journal_money(trip['What-if P&L'])} ({trip['What-if exit']})"
+    st.markdown(line)
+
+    frames = bars_by_symbol.get(trip["Symbol"]) if bars_by_symbol else None
+    if frames is None:
+        start, end = trip["Entry date"] - pd.Timedelta(days=5), trip["Exit date"] + pd.Timedelta(days=5)
+        frames = load_journal_bars((trip["Symbol"],), f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}", "60m").get(trip["Symbol"])
+    frames = frames if isinstance(frames, list) else [frames]
+    bars = next((frame for frame in frames if frame is not None and not frame.empty
+                 and frame.index[0].normalize() <= trip["Entry date"]), None)
+    table = trip_fills[["Date", "Time", "Quantity", "Price", "OrderType", "Cost"]].rename(
+        columns={"OrderType": "Order type", "Cost": "Fees"})
+    table.insert(2, "Action", np.where(trip_fills["Quantity"] > 0, "BUY", "SELL"))
+    if table["Time"].isna().all():
+        table = table.drop(columns="Time")
+    st.dataframe(table.style.format({"Date": "{:%Y-%m-%d}", "Quantity": "{:+,.0f}", "Price": "{:,.2f}",
+                                     "Fees": "${:,.2f}"}, na_rep="-"), hide_index=True, width="stretch")
+    if bars is None:
+        st.caption("Yahoo has no price bars for this stock and period.")
+        return
+
+    days = bars.index.normalize()
+    trading_days = days.unique()
+    first_no = max(0, int(np.searchsorted(trading_days, trip["Entry date"])) - 1)
+    last_no = min(len(trading_days) - 1, int(np.searchsorted(trading_days, trip["Exit date"])) + 1)
+    window = bars.loc[(days >= trading_days[first_no]) & (days <= trading_days[last_no])]
+    positions = fill_bar_positions(trip_fills, window)
+    labels = bar_labels(window.index)
+    fig = go.Figure(go.Candlestick(x=labels, open=window["Open"], high=window["High"], low=window["Low"],
+                                   close=window["Close"], name=trip["Symbol"], showlegend=False))
+    if positions is not None:
+        buys = trip_fills["Quantity"] > 0
+        for name, mask, symbol, color in [("BUY", buys, "triangle-up", "lime"), ("SELL", ~buys, "triangle-down", "red")]:
+            if mask.any():
+                fig.add_trace(go.Scatter(
+                    x=[labels[p] for p, keep in zip(positions, mask) if keep], y=trip_fills.loc[mask, "Price"],
+                    mode="markers", name=name, marker=dict(symbol=symbol, size=11, color=color,
+                                                           line=dict(color="black", width=1)),
+                    hovertemplate=f"{name} %{{y:.2f}}<br>%{{x}}<extra></extra>"))
+    first_price, sign = trip_fills["Price"].iloc[0], 1 if trip["Side"] == "Long" else -1
+    if rules.stop_pct:
+        fig.add_hline(y=first_price * (1 - sign * rules.stop_pct / 100), line_dash="dash", line_color="red",
+                      annotation_text=f"stop {rules.stop_pct:g}%", annotation_position="bottom left")
+    if rules.target_pct:
+        fig.add_hline(y=first_price * (1 + sign * rules.target_pct / 100), line_dash="dash", line_color="green",
+                      annotation_text=f"target {rules.target_pct:g}%", annotation_position="top left")
+    bar_minutes = int(round(pd.Series(window.index).diff().dt.total_seconds().div(60).mode().iloc[0])) \
+        if len(window) > 1 else 60
+    fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False,
+                      title=f"{trip['Symbol']}, {bar_minutes}-minute bars", legend=dict(orientation="h", y=1.1),
+                      xaxis=dict(type="category", nticks=8))
+    show_chart(fig, width="stretch", key="journal_trip_chart")
+    if trip_fills["Time"].isna().all():
+        st.caption("The export has no trade times, so each marker sits on the first bar of its day that traded at "
+                   "its price.")
+
+
+def render_trade_journal():
+    """Trade Journal tab: import IBKR trades (US dollars), see where the P&L comes from, replay with other rules."""
+
+    data = st.session_state.get("journal_data")
+    with settings_panel("Trade history"):
+        upload = st.file_uploader(
+            "IBKR trade export (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="journal_file_upload",
+            help="An IBKR Flex Query trade export with Symbol, TradeDate, Buy/Sell, Quantity, Price, Commission, "
+            "OrderType and CurrencyPrimary. Add Date/Time for exact fill times.")
+        if upload is not None:
+            data = journal_load_upload(upload, data)
+        elif data is not None:
+            st.caption(f"Using **{data['name']}**. Upload another file to replace it.")
+
+    st.caption("Import your IBKR trades, see where the profit and loss comes from, then replay the same trades with "
+               "different rules (a stop, a target, no adding to losers, a fixed size or a time limit). US-dollar trades "
+               "only for now.")
+    if data is None:
+        st.info("Upload an IBKR trade export in the settings to start.")
+        with st.expander("Which file to export from IBKR"):
+            st.markdown(
+                "In the IBKR Portal, **Performance & Reports > Flex Queries**: create an Activity Flex Query with the "
+                "**Trades** section (executions), these fields: *CurrencyPrimary, Symbol, TradeID, OrderID, TradeDate, "
+                "Date/Time, Buy/Sell, Quantity, TradePrice, IBCommission, OrderType*, and save it as CSV (an Excel "
+                "copy works too). *Date/Time* is optional but lets the what-if replay place each fill in the right bar. "
+                "Trades in other currencies and currency conversions are left out.")
+        return
+
+    trips_all, fills, notes = data["trips"], data["fills"], data["notes"]
+    symbols_all = sorted(trips_all["Symbol"].unique())
+    first_day, last_day = trips_all["Entry date"].min().date(), trips_all["Entry date"].max().date()
+    with settings_panel("Filter trades"):
+        dates = st.date_input("Entry dates", value=(first_day, last_day), key="journal_dates", format="YYYY-MM-DD")
+        only = st.multiselect("Only these stocks (empty = all)", symbols_all, key="journal_symbols")
+        exclude = st.multiselect("Leave out", symbols_all, key="journal_exclude",
+                                 help="Cash-like funds such as SGOV are left out when a file is loaded.")
+        side = st.radio("Side", ["All", "Long", "Short"], horizontal=True, key="journal_side")
+    rules, bar_choice = journal_rules()
+
+    start, end = (dates if isinstance(dates, (tuple, list)) and len(dates) == 2 else (first_day, last_day))
+    trips = journal_filter(trips_all, start, end, only, exclude, side)
+    closed = trips[trips["Status"] == "Closed"]
+    still_open = trips_all[trips_all["Status"] == "Open"]
+    dropped = []
+    if notes.get("other_currency"):
+        dropped.append(f"{notes['other_currency']:,} rows in {', '.join(notes['other_currencies'])}")
+    if notes.get("forex"):
+        dropped.append(f"{notes['forex']:,} currency conversions")
+    st.caption(
+        f"**{data['name']}**: {notes['kept']:,} US-dollar executions, {len(trips_all[trips_all['Status'] == 'Closed']):,} "
+        f"round trips from {first_day:%d %b} to {trips_all['Exit date'].max():%d %b %Y}"
+        + (f"; {len(still_open)} still open and not counted ({', '.join(still_open['Symbol'])})" if len(still_open) else "")
+        + (f"; left out: {'; '.join(dropped)}" if dropped else "") + ".")
+    if closed.empty:
+        st.info("No closed trades match the filters.")
+        return
+
+    whatif, prepared, bars_by_symbol = None, None, None
+    if rules.active():
+        prepared, bars_by_symbol = journal_prepared(data, bar_choice)
+        whatif = journal_simulate(fills, closed, None, rules, prepared=prepared)
+
+    st.subheader("Your results")
+    actual = journal_summary(closed)
+    journal_tiles(actual)
+    st.caption(f"A round trip runs from the first buy (or short sale) to the sale that leaves no shares. Average "
+               f"{journal_money(actual['Per trade'])} a trade; largest loss {journal_money(actual['Largest loss'])}. "
+               "Fees are IBKR's commissions and fees.")
+
+    if whatif is not None:
+        valid = whatif.dropna(subset=["What-if P&L"])
+        missing = len(whatif) - len(valid)
+        st.subheader("What-if: " + rules.describe())
+        if valid.empty:
+            st.warning("No price bars could be loaded for these stocks, so the trades cannot be replayed. Try again later.")
+        else:
+            base = journal_summary(valid)
+            tested = journal_summary(valid, "What-if P&L")
+            journal_tiles(tested, compare=base)
+            reasons = valid["What-if exit"].value_counts()
+            st.caption(
+                f"Compared on the same {len(valid):,} trades"
+                + (f" ({missing} without Yahoo price bars are left out of both)" if missing else "")
+                + f": your result {journal_money(base['Net P&L'])}, what-if {journal_money(tested['Net P&L'])}. Exits: "
+                + ", ".join(f"{count:,} {reason.lower()}" for reason, count in reasons.items())
+                + (f"; {int(valid['Skipped buys'].sum()):,} buys skipped" if valid["Skipped buys"].sum() else "")
+                + ". Stops are checked before your own fills in the same bar; on the buy's own bar a stop counts only "
+                "if the bar closes beyond it.")
+            journal_equity_chart({"Your trades": (journal_equity(valid), JOURNAL_ACTUAL_COLOR),
+                                  "What-if": (journal_equity(valid, "What-if P&L", "What-if exit date"),
+                                              JOURNAL_WHATIF_COLOR)})
+            sweep = stop_sweep(fills, closed.loc[valid.index], None, rules, prepared=prepared)
+            fig = go.Figure(go.Bar(
+                x=sweep["Stop %"], y=sweep["Net P&L"],
+                marker_color=[JOURNAL_ACTUAL_COLOR if label == "None" else JOURNAL_WHATIF_COLOR for label in sweep["Stop %"]],
+                customdata=np.column_stack([sweep["Win rate %"], sweep["Stopped %"]]),
+                hovertemplate="Stop %{x}<br>Net $%{y:+,.0f}<br>Win rate %{customdata[0]:.0f}%"
+                              "<br>Stopped out %{customdata[1]:.0f}%<extra></extra>"))
+            fig.add_hline(y=0, line_width=1, line_color="gray")
+            fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Net P&L ($)",
+                              xaxis_title="Stop distance from the first buy",
+                              title="Net P&L for each stop distance (the other rules as set)")
+            show_chart(fig, width="stretch", key="journal_sweep_chart")
+            st.caption("A tight stop cuts the big losses but also sells trades that dip and recover. The best stop on "
+                       "past trades is a guide, not a promise: check it again on trades made after you chose it.")
+    else:
+        journal_equity_chart({"Your trades": (journal_equity(closed), JOURNAL_ACTUAL_COLOR)})
+        st.info("Turn on a rule under **What-if rules** to replay these trades with it.")
+
+    st.subheader("Where the P&L comes from")
+    by_label = st.selectbox("Break down by", list(JOURNAL_BREAKDOWNS), key="journal_breakdown")
+    column = JOURNAL_BREAKDOWNS[by_label]
+    source = valid if whatif is not None and not valid.empty else closed
+    table = journal_breakdown(source, column)
+    has_whatif = source is not closed
+    if has_whatif:
+        table["What-if net P&L"] = journal_breakdown(source, column, "What-if P&L")["Net P&L"]
+    chart_table = table
+    if column == "Symbol" and len(table) > 24:
+        chart_table = pd.concat([table.head(12), table.tail(12)])
+        title = "12 worst and 12 best stocks"
+    else:
+        title = by_label
+    journal_breakdown_chart(chart_table, has_whatif, title)
+    st.dataframe(table.style.format(JOURNAL_FORMATS, na_rep="-"), width="stretch",
+                 height=min(420, 38 + 35 * len(table)))
+
+    st.subheader("Trades")
+    shown = (valid if has_whatif else closed).sort_values("Entry date", ascending=False)
+    columns = JOURNAL_TABLE_COLUMNS + (JOURNAL_WHATIF_COLUMNS if has_whatif else [])
+    st.caption("Click a column header to sort; select a row to see that trade's fills and chart.")
+    event = st.dataframe(shown[columns].style.format(JOURNAL_FORMATS, na_rep="-"), hide_index=True, width="stretch",
+                         height=420, on_select="rerun", selection_mode="single-row", key="journal_trades_table")
+    selected = event.selection.rows if event is not None and hasattr(event, "selection") else []
+    st.download_button("Download trades (CSV)", shown[columns].to_csv(index=False).encode("utf-8"),
+                       file_name=f"round_trips_{pd.Timestamp(date.today()):%Y%m%d}.csv", mime="text/csv")
+    if selected and selected[0] < len(shown):
+        render_journal_trip(shown.iloc[selected[0]], fills, bars_by_symbol, rules)
+
+
+# ============================================================
 # Main application
 # ============================================================
 
@@ -5012,6 +5444,8 @@ if check_password():
                 render_stock_fundamentals()
             elif label == SUPPLY_CHAIN_TAB:
                 render_supply_chain(main_index_prices)
+            elif label == JOURNAL_TAB:
+                render_trade_journal()
             else:
                 strategy = strategy_settings(label)
                 if strategy is None:
