@@ -241,6 +241,9 @@ def test_market_and_industry_tabs(offline, monkeypatch):
     assert app.sidebar.header[0].value == "Market Analysis"
     # Index trends come from the data preloaded at start; breadth waits for its button.
     assert any("Market filter" in element.value for element in list(app.success) + list(app.error))
+    assert any(header.value == "Volatility (VIX)" for header in app.subheader)
+    assert any(metric.label == "VIX" for metric in app.metric)
+    assert any("VIX, last year" in chart.proto.spec for chart in app.get("plotly_chart"))
     next(box for box in app.selectbox if box.key == "market_index").select("Dow Jones")
     open_tab(app, "Market Analysis")
     next(button for button in app.button if button.key == "market_load_btn").click()

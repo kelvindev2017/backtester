@@ -164,3 +164,17 @@ def test_members_table_with_footnoted_headers():
     members = members_from_tables([table], min_rows=2)
     assert members.loc[0, "Sector"] == "Technology"
     assert members.loc[1, "Industry"] == "Semiconductors"
+
+
+def test_vix_summary_and_gate():
+    from analysis.screener import vix_level, vix_summary
+    closes = list(np.linspace(12, 30, 252)) + [18.0]
+    frame = pd.DataFrame({"Close": closes}, index=pd.bdate_range("2025-01-01", periods=len(closes)))
+    summary = vix_summary(frame)
+    assert summary["Close"] == 18.0 and summary["Level"] == "Normal"
+    assert round(summary["Change"], 6) == -12.0
+    assert 30 < summary["Percentile"] < 40
+    assert [vix_level(v) for v in (12, 16, 25, 35)] == ["Calm", "Normal", "Nervous", "Fear"]
+    assert market_gate({}, None, {"max_vix": (20.0, 18.0)}) == (True, [("VIX below 20 (now 18.0)", True)])
+    assert market_gate({}, None, {"max_vix": (16.0, 18.0)})[0] is False
+    assert market_gate({}, None, {"max_vix": (16.0, None)})[1] == [("VIX below 16", None)]

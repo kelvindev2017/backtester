@@ -81,6 +81,7 @@ from analysis.screener import (
     screen_stocks,
     snapshot_table,
     stock_snapshot,
+    vix_summary,
 )
 from analysis.scoring import COMPONENT_WEIGHTS
 from analysis.supply_chain import (
@@ -2614,7 +2615,9 @@ MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
 TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart")
 TRANSIENT_KEYS = {"main_tab", "password_correct"}
-MAIN_INDEX_SYMBOLS = list(dict.fromkeys(list(SCREENER_MARKETS["US"]["indexes"].values()) + list(INDUSTRY_INDEXES.values())))
+VIX_SYMBOL = "^VIX"
+MAIN_INDEX_SYMBOLS = list(dict.fromkeys(
+    list(SCREENER_MARKETS["US"]["indexes"].values()) + list(INDUSTRY_INDEXES.values()) + [VIX_SYMBOL]))
 
 # Writing a widget's own value back into Session State is how its setting survives a tab switch (see
 # keep_settings_across_tabs); Streamlit logs a warning for every such widget that also has a default.
@@ -2883,6 +2886,42 @@ def render_economic_analysis():
 MARKET_BREADTH_UNIVERSES = {"S&P 500": "S&P 500", "Nasdaq-100": "Nasdaq-100", "Dow Jones": "Dow Jones 30"}
 
 
+# VIX chart bands: (from, to, colour, label); the labels match vix_level.
+VIX_BANDS = [(0, 16, "rgba(46,139,87,0.10)", "Calm"), (16, 20, "rgba(128,128,128,0.08)", "Normal"),
+             (20, 30, "rgba(255,165,0,0.12)", "Nervous"), (30, 200, "rgba(205,92,92,0.14)", "Fear")]
+
+
+def render_vix(frame, vix):
+    """VIX tiles and a one-year chart with its 20-day average over calm / normal / nervous / fear bands."""
+
+    st.subheader("Volatility (VIX)")
+    if not vix:
+        st.info("No VIX data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
+        return
+    tiles = st.columns(4)
+    tiles[0].metric("VIX", f"{vix['Close']:.1f}", None if pd.isna(vix["Change"]) else f"{vix['Change']:+.1f}",
+                    delta_color="inverse")
+    tiles[1].metric("Level", vix["Level"])
+    tiles[2].metric("20-day average", f"{vix['Average']:.1f}")
+    tiles[3].metric("Higher than, past year", f"{vix['Percentile']:.0f}% of days")
+    view = frame["Close"].dropna().iloc[-TRADING_DAYS_PER_YEAR:]
+    average = frame["Close"].rolling(20, min_periods=20).mean().iloc[-TRADING_DAYS_PER_YEAR:]
+    fig = go.Figure()
+    top = max(35.0, float(view.max()) * 1.05)
+    for low, high, color, label in VIX_BANDS:
+        if low < top:
+            fig.add_hrect(y0=low, y1=min(high, top), fillcolor=color, line_width=0, layer="below",
+                          annotation_text=label, annotation_position="top left", annotation_font_size=10)
+    fig.add_trace(go.Scatter(x=view.index, y=view, name="VIX", line=dict(color="gray", width=1.4)))
+    fig.add_trace(go.Scatter(x=average.index, y=average, name="20-day average", line=dict(color="orange", width=1.2)))
+    fig.update_layout(title="VIX, last year", height=340, margin=dict(l=10, r=10, t=40, b=10),
+                      hovermode="x unified", yaxis=dict(range=[min(10.0, float(view.min()) * 0.95), top]))
+    show_chart(fig, width="stretch")
+    st.caption("VIX is the market's expected S&P 500 swing over the next 30 days, from option prices, as a yearly %. "
+               "Divide by 16 for the expected daily move (VIX 16 is about 1% a day). Low VIX usually means calm, "
+               "steady markets; high VIX means bigger, choppier swings.")
+
+
 def render_market_analysis(index_prices):
     """US index trends, market breadth and the market filter. Stores the filter verdict for the screener."""
 
@@ -2914,6 +2953,9 @@ def render_market_analysis(index_prices):
         breadth_threshold = st.number_input("% above", 0.0, 100.0, 50.0, 5.0, key="market_gate_breadth_pct", disabled=not use_breadth)
         use_highs = st.checkbox(f"Minimum % of stocks with a new 52w high in the last {recent_days} days", value=False, key="market_gate_highs")
         highs_threshold = st.number_input("% with new highs", 0.0, 100.0, 5.0, 1.0, key="market_gate_highs_pct", disabled=not use_highs)
+        use_vix = st.checkbox("VIX below a level", value=False, key="market_gate_vix",
+                              help="Passes while the latest VIX close is below this level. Calm markets are usually below 16-20.")
+        vix_threshold = st.number_input("VIX below", 5.0, 80.0, 20.0, 1.0, key="market_gate_vix_level", disabled=not use_vix)
 
     st.caption(
         "The US market as a whole: index trends (loaded when the app starts) and the breadth of an index's members "
@@ -2936,6 +2978,9 @@ def render_market_analysis(index_prices):
             show_chart(price_lines_chart(index_prices[indexes[chart_index]], chart_index, ma_periods), width="stretch")
     else:
         st.warning("No index data was returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
+
+    vix = vix_summary(index_prices[VIX_SYMBOL]) if VIX_SYMBOL in index_prices else {}
+    render_vix(index_prices.get(VIX_SYMBOL), vix)
 
     # Prices are kept per universe, so switching index shows that index's breadth. Once any breadth
     # has been loaded this session, picking another index downloads its members without the button.
@@ -2990,6 +3035,8 @@ def render_market_analysis(index_prices):
         market_rules["min_pct_above_ma"] = (ma_slow, float(breadth_threshold))
     if use_highs:
         market_rules["min_pct_new_highs"] = (f"% new 52w high in last {recent_days}d", float(highs_threshold))
+    if use_vix:
+        market_rules["max_vix"] = (float(vix_threshold), vix.get("Close"))
     market_ok, market_checks = market_gate(index_rows, breadth_latest, market_rules)
     check_lines = "\n".join(
         f"- {'✅' if ok else ('⚠️ no data:' if ok is None else '❌')} {text}" for text, ok in market_checks

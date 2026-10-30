@@ -227,7 +227,8 @@ def market_gate(index_rows, breadth_latest, rules):
     ``rules``: dict with optional keys ``index`` (name), ``index_ma`` (period,
     close must be above that SMA), ``index_ma_order`` ((fast, slow), fast SMA
     must be above slow SMA), ``min_pct_above_ma`` ((period, pct)) and
-    ``min_pct_new_highs`` ((column, pct)).
+    ``min_pct_new_highs`` ((column, pct)) and ``max_vix`` ((threshold, latest
+    VIX close or None)).
 
     Returns (passed, list of (description, passed or None when no data)).
     """
@@ -262,9 +263,43 @@ def market_gate(index_rows, breadth_latest, rules):
             f"At least {threshold:g}% of stocks with a {column[2:]}",
             None if pd.isna(value) else value >= threshold,
         ))
+    if rules.get("max_vix"):
+        threshold, value = rules["max_vix"]
+        missing = value is None or pd.isna(value)
+        checks.append((
+            f"VIX below {threshold:g}" + ("" if missing else f" (now {value:.1f})"),
+            None if missing else value < threshold,
+        ))
     checks = [(text, None if ok is None else bool(ok)) for text, ok in checks]
     passed = all(ok is True for _, ok in checks)
     return passed, checks
+
+
+# VIX levels as traders usually read them: (upper bound, label).
+VIX_LEVELS = [(16, "Calm"), (20, "Normal"), (30, "Nervous"), (float("inf"), "Fear")]
+
+
+def vix_level(value):
+    """Plain-word reading of a VIX value."""
+
+    return next(label for bound, label in VIX_LEVELS if value < bound)
+
+
+def vix_summary(df, average_days=20):
+    """Latest VIX close, daily change, its ``average_days`` average, where it sits in the last year and its level."""
+
+    close = df["Close"].dropna()
+    if close.empty:
+        return {}
+    last = float(close.iloc[-1])
+    year = close.iloc[-TRADING_DAYS_PER_YEAR:]
+    return {
+        "Close": last,
+        "Change": float(last - close.iloc[-2]) if len(close) > 1 else float("nan"),
+        "Average": float(close.iloc[-average_days:].mean()),
+        "Percentile": float((year < last).mean() * 100),
+        "Level": vix_level(last),
+    }
 
 
 # ============================================================

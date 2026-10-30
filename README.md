@@ -82,7 +82,9 @@ downloaded as CSV; select a row to open that stock in Signal Analysis.
 
 **Market Analysis** (US): trend of the main indexes (close vs short/medium/long SMAs, % from the 52-week high,
 returns) and breadth of the S&P 500, Nasdaq-100 or Dow 30 (% of stocks above their medium/long SMA, % that set
-a new 52-week high or low in the last N days). A market filter turns these into a PASS/FAIL verdict.
+a new 52-week high or low in the last N days), plus the VIX (latest close, level from calm to fear, 20-day
+average, rank over the past year and a one-year chart). A market filter turns these into a PASS/FAIL verdict,
+optionally requiring the VIX to be below a chosen level.
 
 **Industry Analysis** (US): overlays the main index of each chosen industry (e.g. ^SOX for semiconductors, sector
 SPDR ETFs such as XLK / XLF, ^NBI, ^BKX, ^DJT), optionally normalized to 100 at the start of the period (1M to
