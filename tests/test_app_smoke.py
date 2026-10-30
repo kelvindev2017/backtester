@@ -607,3 +607,34 @@ def test_first_bar_day_trade_is_a_backtest_rule(offline):
     next(box for box in app.selectbox if box.label == "Signal rule").select("Moving-average rule")
     open_tab(app, "Backtest")
     assert next(box for box in app.selectbox if box.label == "Timeframe").value == "Daily"
+
+
+def test_stacked_charts_get_a_toolbar_above_every_panel_on_mobile(offline, monkeypatch):
+    # Plotly has one toolbar per figure, at the top; on phones each panel gets a copy above its title
+    # (CHART_PANEL_TOOLBARS_JS), in room show_chart adds above each panel.
+    monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
+
+    def fundamentals_layout(mode):
+        app = start_app()
+        app.session_state["layout_mode"] = mode
+        app = open_tab(app, "Stock Fundamentals")
+        layouts = [json.loads(chart.proto.spec)["layout"] for chart in app.get("plotly_chart")]
+        return next(layout for layout in layouts if "Daily OHLC" in json.dumps(layout))
+
+    desktop, mobile = fundamentals_layout("Desktop"), fundamentals_layout("Mobile")
+    assert not desktop.get("meta", {}).get("panel_toolbars")
+    assert mobile["meta"]["panel_toolbars"] is True
+
+    def panels(layout):
+        plot = layout["height"] - layout["margin"]["t"] - layout["margin"]["b"]
+        domains = sorted({tuple(value["domain"]) for key, value in layout.items()
+                          if key.startswith("yaxis") and "domain" in value and not value.get("overlaying")}, reverse=True)
+        return [((high - low) * plot, low * plot, high * plot) for low, high in domains]
+
+    rows = len(panels(mobile))
+    assert rows > 2 and mobile["height"] - desktop["height"] >= 30 * rows - 1
+    # Panels keep their height; every gap between them grows by the toolbar's room.
+    for before, after in zip(panels(desktop), panels(mobile)):
+        assert abs(before[0] - after[0]) < 1
+    gaps = lambda layout: [upper[1] - lower[2] for upper, lower in zip(panels(layout), panels(layout)[1:])]
+    assert all(abs(after - before - 30) < 1 for before, after in zip(gaps(desktop), gaps(mobile)))
