@@ -119,6 +119,7 @@ from analysis.valuation_chart import (
     growth_price_correlation,
     pe_summary,
     pe_summary_text,
+    peg_gap_reasons,
     peg_summary_text,
     price_yoy,
     quarterly_eps,
@@ -3484,6 +3485,7 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
         )
         st.markdown(f"**{ticker} fundamentals: growth, revenue, EPS and valuation, last {years} years**")
         peg = trailing_peg(valuation).loc[history_start:]
+        peg_gaps = peg_gap_reasons(valuation).loc[history_start:]
         trailing_pe = valuation["Trailing_PE"].loc[history_start:]
         forward_pe = load_fundamental_snapshot(ticker).get("forwardPE")
         estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])
@@ -3498,10 +3500,11 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
         show_chart(revenue_pe_figure(revenue, trailing_pe, estimates, peg=peg, eps=eps, eps_estimates=eps_estimates,
                                      price_change=price_change, growth=growth,
                                      close=valuation["Close"].loc[history_start:], log_price=log_price,
-                                     ohlcv=prices.loc[history_start:] if not prices.empty else None),
+                                     ohlcv=prices.loc[history_start:] if not prices.empty else None,
+                                     peg_gaps=peg_gaps),
                    width="stretch")
         st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
-        st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker)))
+        st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker), peg_gaps))
         st.caption(
             "YoY change: the price daily, revenue and EPS by quarter, left empty when the year-ago value is zero or "
             "negative. Revenue is in billions of the reporting currency. EPS is Yahoo's reported (adjusted) EPS per "
@@ -3510,7 +3513,9 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
             "daily volume on its right-hand axis. The gray line on the right-hand axis of every other panel is that "
             "close, for comparison; where it crosses a panel's own line depends only on the axis scales. Trailing "
             "P/E is price / last 4 quarters' EPS, so it can differ from GAAP P/E; a spike usually means earnings "
-            "fell, not that the price ran. PEG is that P/E / EPS growth %, blank while growth is zero or negative. Hatched bars are analyst "
+            "fell, not that the price ran. PEG is that P/E / EPS growth %. It is blank, and shaded, while EPS is a "
+            "loss, while the year-ago EPS was a loss (growth from a loss has no %), or while EPS is below a year ago. "
+            "Hatched bars are analyst "
             "estimates, not results."
         )
     else:
