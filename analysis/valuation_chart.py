@@ -19,6 +19,7 @@ ACTUAL_COLOR = "royalblue"
 ESTIMATE_COLOR = "rgba(65, 105, 225, 0.35)"
 PE_COLOR = "goldenrod"
 PEG_COLOR = "seagreen"
+FORWARD_COLOR = "mediumpurple"
 PEG_AXIS_CAP = 4
 EPS_COLOR = "darkorange"
 EPS_ESTIMATE_COLOR = "rgba(255, 140, 0, 0.35)"
@@ -81,7 +82,7 @@ def pe_summary_text(summary, forward_pe=None):
     if forward_pe is not None and np.isfinite(forward_pe) and forward_pe > 0:
         text += (
             f" Forward P/E today is {forward_pe:.1f}x (Yahoo, on next fiscal year's estimated EPS). "
-            "It has no free history, so it is not comparable to the line."
+            "The chart's forward P/E uses the next four quarters instead, so the two can differ."
         )
     return text
 
@@ -125,6 +126,86 @@ def trailing_peg(valuation):
         return pd.Series(dtype=float)
     _, _, growth = _ttm_eps_growth(valuation)
     return (valuation["Trailing_PE"] / growth.where(growth > 0)).replace([np.inf, -np.inf], np.nan)
+
+
+def _later_quarter_estimates(next_quarter, next_year):
+    """Two quarters after ``next_quarter`` (the +1q estimate), on a steady quarterly growth path whose
+    four quarters after +1q add up to ``next_year`` (the +1y estimate). Empty when no such path exists.
+
+    Yahoo gives no estimate past +1q, so this is an approximation; it assumes +1y is the four quarters after +1q.
+    """
+
+    if not (np.isfinite(next_quarter) and np.isfinite(next_year)) or next_quarter <= 0 or next_year <= 0:
+        return []
+    low, high = 0.2, 5.0
+    total = lambda rate: sum(next_quarter * rate ** k for k in range(1, 5))
+    if not total(low) <= next_year <= total(high):
+        return []
+    for _ in range(60):
+        middle = (low + high) / 2
+        low, high = (middle, high) if total(middle) < next_year else (low, middle)
+    rate = (low + high) / 2
+    return [next_quarter * rate, next_quarter * rate ** 2]
+
+
+def forward_eps(earnings, estimates=None, quarter_days=91):
+    """EPS of the next four quarters to be reported, as of each announcement date.
+
+    ``earnings`` is indexed by announcement date with ``Reported EPS``. Quarters already
+    reported use the EPS later reported (hindsight: not what analysts expected then); quarters
+    not yet reported use Yahoo's analyst averages (``estimates`` rows 0q, +1q, +1y). Returns a
+    frame with ``Forward_EPS`` and ``Estimated`` (True when any of the four quarters is an
+    estimate), NaN where the four quarters are not all known.
+    """
+
+    if earnings is None or earnings.empty or "Reported EPS" not in earnings.columns:
+        return pd.DataFrame(columns=["Forward_EPS", "Estimated"])
+    reported = pd.to_numeric(earnings["Reported EPS"], errors="coerce").dropna().sort_index()
+    if reported.empty:
+        return pd.DataFrame(columns=["Forward_EPS", "Estimated"])
+    ahead = []
+    if estimates is not None and not getattr(estimates, "empty", True) and "avg" in estimates.columns:
+        average = lambda period: (float(pd.to_numeric(estimates.at[period, "avg"], errors="coerce"))
+                                  if period in estimates.index else np.nan)
+        for period in ["0q", "+1q"]:
+            if not np.isfinite(average(period)):
+                break
+            ahead.append(average(period))
+        if len(ahead) == 2:
+            ahead += _later_quarter_estimates(ahead[1], average("+1y"))
+    last = reported.index[-1]
+    future = pd.Series(ahead, index=[last + pd.Timedelta(days=quarter_days * (k + 1)) for k in range(len(ahead))],
+                       dtype=float)
+    quarters = pd.concat([reported, future])
+    estimated = pd.Series([False] * len(reported) + [True] * len(future), index=quarters.index)
+    # On each announcement date the next four quarters are the four rows after it.
+    next_four = quarters[::-1].rolling(4, min_periods=4).sum()[::-1].shift(-1)
+    uses_estimate = estimated[::-1].astype(float).rolling(4, min_periods=4).max()[::-1].shift(-1) > 0
+    frame = pd.DataFrame({"Forward_EPS": next_four, "Estimated": uses_estimate}).loc[reported.index]
+    return frame
+
+
+def forward_valuation(valuation, forward):
+    """Daily forward P/E and forward PEG from :func:`forward_eps`.
+
+    Forward P/E = close / next four quarters' EPS. Forward PEG = forward P/E / EPS growth (%)
+    from the trailing four quarters to the next four. Each is NaN where its ratio has no meaning
+    (forward EPS a loss, or growth zero or negative). ``Estimated`` marks days that use analyst estimates.
+    """
+
+    columns = ["Forward_EPS", "Forward_PE", "Forward_PEG", "Estimated"]
+    if valuation is None or valuation.empty or forward is None or forward.empty:
+        return pd.DataFrame(columns=columns)
+    combined = valuation.index.union(forward.index).sort_values()
+    daily = forward.reindex(combined).ffill().reindex(valuation.index)
+    eps = pd.to_numeric(daily["Forward_EPS"], errors="coerce")
+    pe = (valuation["Close"] / eps.where(eps > 0)).replace([np.inf, -np.inf], np.nan)
+    ttm = valuation["TTM_Reported_EPS"]
+    growth = (eps / ttm.where(ttm > 0) - 1) * 100
+    peg = (pe / growth.where(growth > 0)).replace([np.inf, -np.inf], np.nan)
+    estimated = daily["Estimated"].astype("boolean").fillna(False).astype(bool)
+    return pd.DataFrame({"Forward_EPS": eps, "Forward_PE": pe, "Forward_PEG": peg, "Estimated": estimated},
+                        index=valuation.index)
 
 
 def break_long_gaps(series, days=7):
@@ -387,15 +468,37 @@ def legends_under_panels(fig, rows, height, gap_px=6, dates_every_row=False):
                                          bgcolor="rgba(0,0,0,0)")
 
 
+def add_forward_line(fig, values, estimated, name, row, hover):
+    """A forward measure as a dashed line, turning dotted where it rests on analyst estimates."""
+
+    values = values.dropna()
+    if values.empty:
+        return
+    estimated = estimated.reindex(values.index).fillna(False).astype(bool)
+    known, guessed = values[~estimated], values[estimated]
+    if not guessed.empty and not known.empty:
+        guessed = pd.concat([known.iloc[-1:], guessed])  # join the two styles without a gap
+    # One legend entry for both styles keeps the legend to two lines on a phone; the caption explains the dots.
+    for part, label, dash in [(known, name, "dash"), (guessed, f"{name}, estimates", "dot")]:
+        if part.empty:
+            continue
+        line = break_long_gaps(part)
+        fig.add_trace(go.Scatter(x=line.index, y=line, mode="lines", name=label, connectgaps=False,
+                                 showlegend=part is known or known.empty,
+                                 line=dict(color=FORWARD_COLOR, width=2, dash=dash),
+                                 hovertemplate=f"%{{x|%Y-%m-%d}}: {hover}<extra>{label}</extra>"), row=row, col=1)
+
+
 def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
                       price_change=None, growth=None, close=None, log_price=False, height=None, ohlcv=None,
-                      peg_gaps=None):
+                      peg_gaps=None, forward=None):
     """Daily price, growth vs price, revenue, EPS, trailing P/E and PEG panels, top to bottom, on one date axis.
 
     ``ohlcv`` (optional, daily Open/High/Low/Close/Volume) turns the price panel into candlesticks with
     volume on a right-hand axis; with only ``close`` it is a line.
 
     ``peg_gaps`` (optional, from :func:`peg_gap_reasons`) shades the days PEG is blank, by reason.
+    ``forward`` (optional, from :func:`forward_valuation`) adds forward P/E and forward PEG lines.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -404,6 +507,8 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     """
 
     peg = peg.dropna() if peg is not None else pd.Series(dtype=float)
+    forward = forward if forward is not None else pd.DataFrame(columns=["Forward_PE", "Forward_PEG", "Estimated"])
+    forward_pe, forward_peg = forward["Forward_PE"].dropna(), forward["Forward_PEG"].dropna()
     eps = eps.dropna() if eps is not None else pd.Series(dtype=float)
     price_change = price_change.dropna() if price_change is not None else pd.Series(dtype=float)
     # Pass ``growth`` when revenue or EPS is trimmed to the window shown, so the first year still has growth.
@@ -429,9 +534,11 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     panels["revenue"] = ("Revenue by quarter, billions", 0.3)
     if not eps.empty:
         panels["eps"] = ("EPS by quarter (adjusted)", 0.22)
-    panels["pe"] = ("Trailing P/E", 0.3)
-    if not peg.empty:
-        panels["peg"] = ("Trailing PEG" + (f" (capped at {PEG_AXIS_CAP})" if peg.max() > PEG_AXIS_CAP else ""), 0.22)
+    panels["pe"] = ("P/E, trailing and forward" if not forward_pe.empty else "Trailing P/E", 0.3)
+    peg_values = pd.concat([peg, forward_peg])
+    if not peg_values.empty:
+        panels["peg"] = (("PEG, trailing and forward" if not forward_peg.empty else "Trailing PEG")
+                         + (f" (capped at {PEG_AXIS_CAP})" if peg_values.max() > PEG_AXIS_CAP else ""), 0.22)
     row = {key: number for number, key in enumerate(panels, start=1)}
     rows = len(panels)
     heights = [weight for _, weight in panels.values()]
@@ -462,7 +569,8 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
         median = float(pe.median())
         fig.add_hline(y=median, line=dict(color="gray", width=1, dash="dash"), row=row["pe"], col=1,
                       annotation_text=f"median {median:.1f}x", annotation_position="top left")
-    else:
+    add_forward_line(fig, forward_pe, forward["Estimated"], "Forward P/E", row["pe"], "%{y:.1f}x")
+    if pe.empty:
         axis = "" if row["pe"] == 1 else row["pe"]
         fig.add_annotation(x=0.5, y=0.5, xref=f"x{axis} domain", yref=f"y{axis} domain", showarrow=False,
                            text="No trailing P/E (no reported EPS, or EPS was negative)", font=dict(color="gray"))
@@ -475,8 +583,10 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
                                  hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}<extra></extra>"), row=row["peg"], col=1)
         fig.add_hline(y=1, line=dict(color="gray", width=1, dash="dash"), row=row["peg"], col=1,
                       annotation_text="PEG 1", annotation_position="top left")
+    if "peg" in row:
+        add_forward_line(fig, forward_peg, forward["Estimated"], "Forward PEG", row["peg"], "%{y:.2f}")
         # Right after earnings turn up, growth is tiny and PEG spikes; capping keeps the usual range readable.
-        fig.update_yaxes(range=[0, min(PEG_AXIS_CAP, float(peg.max()) * 1.1)], row=row["peg"], col=1)
+        fig.update_yaxes(range=[0, min(PEG_AXIS_CAP, float(peg_values.max()) * 1.1)], row=row["peg"], col=1)
 
     # Shade why PEG (and, for losses, P/E) is blank, with one legend entry per reason.
     spans = gap_spans(peg_gaps.loc[peg_gaps.index >= peg.index.min()] if peg_gaps is not None and not peg.empty
