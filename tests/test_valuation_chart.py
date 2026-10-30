@@ -8,6 +8,8 @@ from analysis.valuation_chart import (
     price_yoy,
     yoy_change,
     eps_estimate_quarters,
+    forward_eps,
+    forward_valuation,
     quarterly_eps,
     break_long_gaps,
     gap_spans,
@@ -277,3 +279,40 @@ def test_lines_break_only_across_long_gaps():
     series = pd.Series(1.0, index=pd.to_datetime(["2025-12-24", "2025-12-26", "2026-01-02", "2026-03-02"]))
     line = break_long_gaps(series)
     assert line.isna().sum() == 1 and line.index[line.isna()][0] == pd.Timestamp("2026-03-01")
+
+
+def test_forward_eps_sums_the_next_four_quarters_and_fills_the_end_with_estimates():
+    dates = pd.to_datetime(["2025-02-20", "2025-05-20", "2025-08-20", "2025-11-20", "2026-02-20", "2026-05-20"])
+    earnings = pd.DataFrame({"Reported EPS": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]}, index=dates)
+    estimates = pd.DataFrame({"avg": [1.6, 1.7, 6.0, 8.0]}, index=pd.Index(["0q", "+1q", "0y", "+1y"]))
+    forward = forward_eps(earnings, estimates)
+    assert forward.loc["2025-02-20", "Forward_EPS"] == pytest.approx(1.1 + 1.2 + 1.3 + 1.4)
+    assert not forward.loc["2025-02-20", "Estimated"]
+    assert forward.loc["2025-08-20", "Forward_EPS"] == pytest.approx(1.3 + 1.4 + 1.5 + 1.6)
+    assert forward.loc["2025-08-20", "Estimated"]
+    # Latest: 0q + +1q + two quarters on the growth path whose next four quarters sum to +1y.
+    later = forward.loc["2026-05-20", "Forward_EPS"] - 1.6 - 1.7
+    assert 2 * 1.7 < later < 8.0 / 2
+    assert np.isnan(forward_eps(earnings).loc["2026-05-20", "Forward_EPS"])  # no estimates: unknown
+
+
+def test_forward_valuation_and_lines_on_the_pe_and_peg_panels():
+    index = pd.bdate_range("2025-01-02", "2025-12-31")
+    valuation = pd.DataFrame({"Close": 100.0, "TTM_Reported_EPS": 2.0}, index=index)
+    valuation["Trailing_PE"] = valuation["Close"] / valuation["TTM_Reported_EPS"]
+    forward = pd.DataFrame({"Forward_EPS": [2.5, -1.0], "Estimated": [False, True]},
+                           index=pd.to_datetime(["2024-12-01", "2025-07-01"]))
+    daily = forward_valuation(valuation, forward)
+    assert daily.loc["2025-03-03", "Forward_PE"] == pytest.approx(40.0)
+    assert daily.loc["2025-03-03", "Forward_PEG"] == pytest.approx(40.0 / 25.0)  # +25% EPS growth
+    assert daily.loc["2025-08-01"].isna()[["Forward_PE", "Forward_PEG"]].all()  # a forward loss: no ratio
+    assert daily.loc["2025-08-01", "Estimated"]
+
+    daily.loc["2025-10-01":, ["Forward_PE", "Forward_PEG"]] = [45.0, 1.8]
+    revenue = pd.Series([1e9], index=pd.to_datetime(["2025-03-31"]))
+    fig = revenue_pe_figure(revenue, valuation["Trailing_PE"], peg=trailing_peg(valuation), forward=daily)
+    names = [trace.name for trace in fig.data]
+    for name in ["Forward P/E", "Forward P/E, estimates", "Forward PEG", "Forward PEG, estimates"]:
+        assert name in names
+    titles = [annotation.text for annotation in fig.layout.annotations]
+    assert "P/E, trailing and forward" in titles and "PEG, trailing and forward" in titles
