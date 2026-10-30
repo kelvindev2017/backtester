@@ -406,6 +406,81 @@ CHART_FIT_Y_JS = """
 })();
 """
 
+# Plotly gives a figure one toolbar, at its top right, so on a phone the panels further down a stacked
+# chart are out of its reach. Charts whose layout has meta={"panel_toolbars": True} (show_chart sets it in
+# the mobile layout for charts of several panels) get a copy of the toolbar above every panel's title,
+# and the original is hidden. A button on a copy presses the same button on the original; the panels
+# share their dates, so zoom, pan and reset act on the whole chart either way.
+CHART_PANEL_TOOLBARS_JS = """
+(function () {
+  const style = document.createElement("style");
+  style.textContent = ".panel-toolbars .modebar-container{display:none}"
+    + ".js-plotly-plot .plotly .modebar.panel-toolbar{top:auto;right:2px;z-index:6}";
+  document.head.appendChild(style);
+
+  function panelTops(gd) {
+    const layout = gd._fullLayout, tops = new Set();
+    for (const key of Object.keys(layout)) {
+      if (/^yaxis[0-9]*$/.test(key) && !layout[key].overlaying && layout[key]._length) tops.add(Math.round(layout[key]._offset));
+    }
+    return Array.from(tops).sort(function (a, b) { return a - b; });
+  }
+  function sync(gd) {
+    const original = gd.querySelectorAll(".modebar-container .modebar-btn");
+    gd.querySelectorAll(".panel-toolbar").forEach(function (copy) {
+      copy.querySelectorAll(".modebar-btn").forEach(function (button, i) {
+        if (original[i]) button.className = original[i].className;
+      });
+    });
+  }
+  function build(gd) {
+    const bar = gd.querySelector(".modebar-container .modebar"), holder = gd.querySelector(".plotly");
+    if (!bar || !holder || !gd._fullLayout) return;
+    const tops = panelTops(gd);
+    const key = tops.join(",") + "|" + bar.querySelectorAll(".modebar-btn").length + "|" + gd.clientWidth;
+    if (gd.dataset.panelToolbars === key) { sync(gd); return; }
+    gd.dataset.panelToolbars = key;
+    gd.querySelectorAll(".panel-toolbar").forEach(function (copy) { copy.remove(); });
+    gd.classList.add("panel-toolbars");
+    const box = gd.getBoundingClientRect();
+    const titles = Array.from(gd.querySelectorAll(".annotation")).map(function (el) {
+      const r = el.getBoundingClientRect();
+      return { top: r.top - box.top, bottom: r.bottom - box.top };
+    });
+    for (const top of tops) {
+      // The panel's title, if any, sits just above its plot area: the toolbar goes above the title.
+      let above = top;
+      for (const title of titles) {
+        if (title.bottom <= top + 4 && title.bottom > top - 40) above = Math.min(above, title.top);
+      }
+      const copy = bar.cloneNode(true);
+      copy.classList.add("panel-toolbar");
+      copy.removeAttribute("id");
+      copy.style.top = Math.max(0, above - 28) + "px";
+      copy.addEventListener("click", function (event) {
+        const button = event.target.closest(".modebar-btn");
+        if (!button) return;
+        const i = Array.from(copy.querySelectorAll(".modebar-btn")).indexOf(button);
+        const twin = gd.querySelectorAll(".modebar-container .modebar-btn")[i];
+        if (twin) twin.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+        sync(gd);
+      });
+      holder.appendChild(copy);
+    }
+    sync(gd);
+  }
+  function attach(gd) {
+    if (gd.dataset.panelToolbarsOn || !gd.layout || !gd.layout.meta || !gd.layout.meta.panel_toolbars || !gd.on) return;
+    gd.dataset.panelToolbarsOn = "1";
+    gd.on("plotly_afterplot", function () { build(gd); });
+    build(gd);
+  }
+  function scan() { document.querySelectorAll(".js-plotly-plot").forEach(attach); }
+  new MutationObserver(scan).observe(document.body, { childList: true, subtree: true });
+  scan();
+})();
+"""
+
 # Charts whose layout has meta={"axis_hover": True} drop Plotly's hover box, which covers the lines, for
 # TradingView-style labels: each hovered value sits on its own y-axis (left or right) in the series' colour,
 # with a dashed line across the panel at that level, and the date sits on the x-axis.
@@ -561,7 +636,7 @@ components.html(
   app.head.appendChild(script);
 })();
 </script>
-""" % json.dumps(CHART_TOUCH_JS + CHART_AXIS_HOVER_JS + CHART_FIT_Y_JS),
+""" % json.dumps(CHART_TOUCH_JS + CHART_AXIS_HOVER_JS + CHART_FIT_Y_JS + CHART_PANEL_TOOLBARS_JS),
     height=0,
 )
 
@@ -2699,6 +2774,63 @@ def slider_with_input(label, min_value, max_value, value, step=1, key=None, help
     return result
 
 
+PANEL_TOOLBAR_PX = 30
+
+
+def panel_domains(fig):
+    """The vertical domains of a figure's panels (overlay axes share their panel's)."""
+
+    layout = fig.layout.to_plotly_json()
+    return {tuple(value.get("domain", (0, 1))) for key, value in layout.items()
+            if key.startswith("yaxis") and isinstance(value, dict) and not value.get("overlaying")} or {(0, 1)}
+
+
+def make_room_above_panels(fig, room_px):
+    """Add ``room_px`` pixels of height above every panel of a stacked figure except the top one.
+
+    Panels keep their own height: the figure grows instead. Paper-positioned legends, annotations and
+    shapes move with the panel they belong to; in the gap between two panels, one anchored by its
+    bottom (a panel title) belongs to the panel below, anything else (a legend) to the panel above.
+    """
+
+    layout = fig.layout
+    panels = sorted(panel_domains(fig), key=lambda domain: -domain[1])
+    if len(panels) < 2 or layout.height is None:
+        return
+    top_margin = layout.margin.t if layout.margin.t is not None else 100
+    bottom_margin = layout.margin.b if layout.margin.b is not None else 80
+    plot = layout.height - top_margin - bottom_margin
+    new_plot = plot + room_px * (len(panels) - 1)
+
+    def owner(y, anchored_bottom):
+        for i, (low, high) in enumerate(panels):
+            if low - 1e-9 <= y <= high + 1e-9:
+                return i
+            if y > high:  # in the gap above panel i (or above the top panel)
+                return i if anchored_bottom or i == 0 else i - 1
+        return len(panels) - 1
+
+    def move(y, anchored_bottom=False, panel=None):
+        if y is None:
+            return None
+        panel = owner(y, anchored_bottom) if panel is None else panel
+        return (y * plot + room_px * (len(panels) - 1 - panel)) / new_plot
+
+    for key, value in layout.to_plotly_json().items():
+        if key.startswith("yaxis") and "domain" in value and not value.get("overlaying"):
+            panel = panels.index(tuple(value["domain"]))
+            layout[key].domain = [move(value["domain"][0], panel=panel), move(value["domain"][1], panel=panel)]
+        elif key.startswith("legend") and value.get("y") is not None and value.get("yref", "paper") == "paper":
+            layout[key].y = move(value["y"], value.get("yanchor") == "bottom")
+    for annotation in layout.annotations:
+        if annotation.yref == "paper" and annotation.y is not None:
+            annotation.y = move(annotation.y, annotation.yanchor == "bottom")
+    for shape in layout.shapes:
+        if shape.yref == "paper":
+            shape.y0, shape.y1 = move(shape.y0), move(shape.y1)
+    layout.height = layout.height + room_px * (len(panels) - 1)
+
+
 def show_chart(fig, **kwargs):
     """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width.
 
@@ -2726,6 +2858,12 @@ def show_chart(fig, **kwargs):
                 legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0, **compact),
                 margin=dict(l=5, r=5),
             )
+        if len(panel_domains(fig)) > 1 and fig.layout.height is not None:
+            # A toolbar above every panel (CHART_PANEL_TOOLBARS_JS), in room made above each one.
+            make_room_above_panels(fig, PANEL_TOOLBAR_PX)
+            margin_top = fig.layout.margin.t if fig.layout.margin.t is not None else 100
+            fig.update_layout(meta={**(fig.layout.meta or {}), "panel_toolbars": True},
+                              margin=dict(t=margin_top + PANEL_TOOLBAR_PX), height=fig.layout.height + PANEL_TOOLBAR_PX)
     st.plotly_chart(fig, **kwargs)
 
 
