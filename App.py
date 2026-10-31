@@ -1782,6 +1782,7 @@ def fetch_fundamental_snapshot(symbol):
     keys = [
         "trailingPE", "forwardPE", "pegRatio", "trailingPegRatio", "earningsGrowth",
         "revenueGrowth", "profitMargins", "priceToBook", "debtToEquity", "sector", "industry", "shortName",
+        "nextFiscalYearEnd",
     ]
     info = yf.Ticker(symbol).info or {}
     snapshot = {key: info.get(key) for key in keys if info.get(key) is not None}
@@ -3485,7 +3486,7 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
     return fig
 
 
-def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
+def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, link_dates=False):
     """Growth vs price, revenue, EPS, trailing P/E and PEG for one ticker, with their captions.
 
     Returns False, after a warning, when there is no price history for the ticker.
@@ -3517,7 +3518,11 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
         st.markdown(f"**{ticker} fundamentals: growth, revenue, EPS and valuation, last {years} years**")
         peg = trailing_peg(valuation).loc[history_start:]
         peg_gaps = peg_gap_reasons(valuation).loc[history_start:]
-        forward = forward_valuation(valuation, forward_eps(earnings, load_earnings_estimates(ticker))).loc[history_start:]
+        # Yahoo's nextFiscalYearEnd is the end of the fiscal year in progress (its "0y").
+        fiscal_year_end = load_fundamental_snapshot(ticker).get("nextFiscalYearEnd")
+        fiscal_year_end = pd.to_datetime(fiscal_year_end, unit="s") if fiscal_year_end else None
+        forward = forward_valuation(valuation, forward_eps(earnings, load_earnings_estimates(ticker),
+                                                           fiscal_year_end=fiscal_year_end)).loc[history_start:]
         trailing_pe = valuation["Trailing_PE"].loc[history_start:]
         forward_pe = load_fundamental_snapshot(ticker).get("forwardPE")
         estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])
@@ -3533,7 +3538,7 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
                                      price_change=price_change, growth=growth,
                                      close=valuation["Close"].loc[history_start:], log_price=log_price,
                                      ohlcv=prices.loc[history_start:] if not prices.empty else None,
-                                     peg_gaps=peg_gaps, forward=forward),
+                                     peg_gaps=peg_gaps, forward=forward, link_dates=link_dates),
                    width="stretch")
         st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
         st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker), peg_gaps))
@@ -3613,6 +3618,9 @@ def render_stock_fundamentals():
                                  key="fundamentals_years")
         log_price = st.checkbox("Log scale for the price", value=False, key="fundamentals_log_price",
                                 help="Equal % moves look the same size, so early years aren't flattened.")
+        link_dates = st.checkbox("Zoom all panels together", value=False, key="fundamentals_link_dates",
+                                 help="Off: a zoom or pan on one panel leaves the others as they are. On: every "
+                                      "panel follows, and a tap shows the values of all panels on the same date.")
     with settings_panel("What happened next"):
         frequency = st.radio("Check every", list(CHECK_FREQUENCIES), index=2, horizontal=True, key="next_frequency",
                              help="How often a dot is taken. Daily gives more dots, not more independent evidence.")
@@ -3631,7 +3639,7 @@ def render_stock_fundamentals():
         return
     name = load_fundamental_snapshot(ticker).get("shortName")
     st.subheader(f"{ticker} · {name}" if name else ticker)
-    if render_fundamentals(ticker, years, log_price) is False:
+    if render_fundamentals(ticker, years, log_price, link_dates) is False:
         return
     render_what_happened_next(ticker, years, frequency, look_ahead, lookback_years, band)
 
