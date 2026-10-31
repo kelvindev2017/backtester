@@ -484,11 +484,12 @@ def panel_legend(row):
     return "legend" if row == 1 else f"legend{row}"
 
 
-def legends_under_panels(fig, rows, height, gap_px=6, dates_every_row=False):
+def legends_under_panels(fig, rows, height, gap_px=6, dates_every_row=False, dated_rows=()):
     """Give each subplot row its own horizontal legend, placed right under that row.
 
     Traces are assigned by their y-axis; overlay axes count for the row they overlay. With
-    ``dates_every_row`` every row shows its date tick labels, and each legend goes below them.
+    ``dates_every_row`` every row shows its date tick labels, and each legend goes below them;
+    ``dated_rows`` names single rows that do.
     """
 
     layout = fig.layout
@@ -509,7 +510,7 @@ def legends_under_panels(fig, rows, height, gap_px=6, dates_every_row=False):
     for row in used:
         bottom = fig.get_subplot(row, 1).yaxis.domain[0]
         # The bottom row carries the date tick labels, so its legend goes below them.
-        offset = (gap_px + (28 if row == rows or dates_every_row else 0)) / height
+        offset = (gap_px + (28 if row == rows or dates_every_row or row in dated_rows else 0)) / height
         layout[panel_legend(row)] = dict(orientation="h", yanchor="top", y=bottom - offset, xanchor="left", x=0,
                                          bgcolor="rgba(0,0,0,0)")
 
