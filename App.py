@@ -119,6 +119,7 @@ from analysis.valuation_chart import (
     forward_eps,
     forward_valuation,
     growth_price_correlation,
+    legends_under_panels,
     pe_summary,
     pe_summary_text,
     peg_gap_reasons,
@@ -4266,6 +4267,11 @@ def strategy_settings(tab="Backtest"):
 # Backtest tab
 # ============================================================
 
+# Seven stacked panels, each with its legend under it.
+BACKTEST_CHART_HEIGHT = 2200
+BACKTEST_PANEL_GAP_PX = 120
+
+
 def render_backtest(s):
     """Moving-average / signal-rule backtest of the chosen ticker with EPS, fundamentals, P/E and benchmark panels."""
 
@@ -4415,8 +4421,9 @@ def render_backtest(s):
         rows=7,
         cols=1,
         shared_xaxes=True,
-        # The day trade's price panel has its own time labels, which need room above the next title.
-        vertical_spacing=0.035 if setup == "opening_bar" else 0.025,
+        # Room under each panel for its legend and the next title; the day trade's price panel also has its
+        # own time labels.
+        vertical_spacing=BACKTEST_PANEL_GAP_PX / BACKTEST_CHART_HEIGHT,
         subplot_titles=(
             f"{ticker} Price, Indicators and Trade Signals",
             f"{ticker} Quarterly and TTM EPS",
@@ -4763,12 +4770,13 @@ def render_backtest(s):
     chart_revision = hashlib.sha256(chart_state_text.encode("utf-8")).hexdigest()[:16]
 
     fig.update_layout(
-        height=1725,
+        height=BACKTEST_CHART_HEIGHT,
         margin=dict(l=20, r=70, t=50, b=20),
         showlegend=True,
         hovermode="x unified",
         barmode="group",
     )
+    legends_under_panels(fig, 7, BACKTEST_CHART_HEIGHT, dated_rows=(1,) if setup == "opening_bar" else ())
 
     show_chart(
         fig,
