@@ -1782,6 +1782,7 @@ def fetch_fundamental_snapshot(symbol):
     keys = [
         "trailingPE", "forwardPE", "pegRatio", "trailingPegRatio", "earningsGrowth",
         "revenueGrowth", "profitMargins", "priceToBook", "debtToEquity", "sector", "industry", "shortName",
+        "nextFiscalYearEnd",
     ]
     info = yf.Ticker(symbol).info or {}
     snapshot = {key: info.get(key) for key in keys if info.get(key) is not None}
@@ -3517,7 +3518,11 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, 
         st.markdown(f"**{ticker} fundamentals: growth, revenue, EPS and valuation, last {years} years**")
         peg = trailing_peg(valuation).loc[history_start:]
         peg_gaps = peg_gap_reasons(valuation).loc[history_start:]
-        forward = forward_valuation(valuation, forward_eps(earnings, load_earnings_estimates(ticker))).loc[history_start:]
+        # Yahoo's nextFiscalYearEnd is the end of the fiscal year in progress (its "0y").
+        fiscal_year_end = load_fundamental_snapshot(ticker).get("nextFiscalYearEnd")
+        fiscal_year_end = pd.to_datetime(fiscal_year_end, unit="s") if fiscal_year_end else None
+        forward = forward_valuation(valuation, forward_eps(earnings, load_earnings_estimates(ticker),
+                                                           fiscal_year_end=fiscal_year_end)).loc[history_start:]
         trailing_pe = valuation["Trailing_PE"].loc[history_start:]
         forward_pe = load_fundamental_snapshot(ticker).get("forwardPE")
         estimates = revenue_estimate_quarters(load_revenue_estimates(ticker), revenue.index[-1])

@@ -8,6 +8,8 @@ from analysis.valuation_chart import (
     price_yoy,
     yoy_change,
     eps_estimate_quarters,
+    fiscal_quarters_reported,
+    later_quarter_estimates,
     forward_eps,
     forward_valuation,
     quarterly_eps,
@@ -326,3 +328,18 @@ def test_panels_zoom_on_their_own_unless_linked():
     assert fig.layout.xaxis.showticklabels and tuple(fig.layout.xaxis.range) == tuple(fig.layout.xaxis2.range)
     linked = revenue_pe_figure(revenue, pe, link_dates=True)
     assert linked.layout.xaxis.matches == "x2"
+
+
+def test_later_quarters_follow_where_the_fiscal_year_ends():
+    reported = pd.Series([0.29, 0.42, 0.52], index=pd.to_datetime(["2026-04-23", "2026-07-23", "2026-10-29"]))
+    # INTC, Oct 2026: three quarters of the year reported, so 0q ends it and +1q starts +1y.
+    assert fiscal_quarters_reported(reported, 1.48, 0.243, 0.376) == 3
+    assert fiscal_quarters_reported(reported, 1.48, 0.243, 0.376, pd.Timestamp("2026-12-27"),
+                                    pd.Timestamp("2026-09-24")) == 3
+    q2, q3 = later_quarter_estimates(0.243, 0.376, 1.48, 2.0985, reported)
+    assert 0.376 < q2 < q3 and 0.376 + q2 + q3 < 2.0985  # +1q, +2q, +3q leave room for the year's last quarter
+    # NVDA, Oct 2026: two quarters reported, the year ends with +1q, so +2q and +3q start +1y.
+    nvda = pd.Series([1.87, 2.22], index=pd.to_datetime(["2026-05-20", "2026-08-26"]))
+    assert fiscal_quarters_reported(nvda, 9.31, 2.47, 2.75) == 2
+    q2, q3 = later_quarter_estimates(2.47, 2.75, 9.31, 15.91, nvda)
+    assert 2.75 < q2 < q3 and q2 + q3 < 15.91 / 2

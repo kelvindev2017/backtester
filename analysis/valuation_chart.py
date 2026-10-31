@@ -128,34 +128,78 @@ def trailing_peg(valuation):
     return (valuation["Trailing_PE"] / growth.where(growth > 0)).replace([np.inf, -np.inf], np.nan)
 
 
-def _later_quarter_estimates(next_quarter, next_year):
-    """Two quarters after ``next_quarter`` (the +1q estimate), on a steady quarterly growth path whose
-    four quarters after +1q add up to ``next_year`` (the +1y estimate). Empty when no such path exists.
+def _growth_path(first, total, steps):
+    """The quarterly growth rate at which ``first * rate**k`` for ``k`` in ``steps`` adds up to ``total``,
+    or None when no rate between 0.2 and 5 fits."""
 
-    Yahoo gives no estimate past +1q, so this is an approximation; it assumes +1y is the four quarters after +1q.
-    """
-
-    if not (np.isfinite(next_quarter) and np.isfinite(next_year)) or next_quarter <= 0 or next_year <= 0:
-        return []
+    if not (np.isfinite(first) and np.isfinite(total)) or first <= 0 or total <= 0:
+        return None
     low, high = 0.2, 5.0
-    total = lambda rate: sum(next_quarter * rate ** k for k in range(1, 5))
-    if not total(low) <= next_year <= total(high):
-        return []
+    sum_at = lambda rate: sum(first * rate ** k for k in steps)
+    if not sum_at(low) <= total <= sum_at(high):
+        return None
     for _ in range(60):
         middle = (low + high) / 2
-        low, high = (middle, high) if total(middle) < next_year else (low, middle)
-    rate = (low + high) / 2
-    return [next_quarter * rate, next_quarter * rate ** 2]
+        low, high = (middle, high) if sum_at(middle) < total else (low, middle)
+    return (low + high) / 2
 
 
-def forward_eps(earnings, estimates=None, quarter_days=91):
+def fiscal_quarters_reported(reported, this_year, this_quarter, next_quarter, fiscal_year_end=None,
+                             last_quarter_end=None):
+    """How many quarters of the current fiscal year (Yahoo's 0y) are already reported: 0 to 3.
+
+    From the fiscal year end when given; otherwise from which count makes the 0y estimate add up
+    (it equals the reported quarters plus 0q, plus +1q when the year ends with +1q). None when unknown.
+    """
+
+    if fiscal_year_end is not None and last_quarter_end is not None and pd.notna(fiscal_year_end):
+        months = (pd.Timestamp(fiscal_year_end) - pd.Timestamp(last_quarter_end)).days / 30.44
+        left = int(round(months / 3)) % 4 or 4  # quarters of the fiscal year after the last reported one
+        return 4 - left if left < 4 else 0
+    recent = list(reported.iloc[::-1])
+    if not np.isfinite(this_year) or this_year == 0:
+        return None
+    errors = {}
+    if len(recent) >= 3:
+        errors[3] = abs(sum(recent[:3]) + this_quarter - this_year)
+    if len(recent) >= 2:
+        errors[2] = abs(sum(recent[:2]) + this_quarter + next_quarter - this_year)
+    best = min(errors, key=errors.get) if errors else None
+    return best if best is not None and errors[best] <= 0.03 * abs(this_year) else None
+
+
+def later_quarter_estimates(this_quarter, next_quarter, this_year, next_year, reported, fiscal_year_end=None,
+                            last_quarter_end=None):
+    """Estimates for the two quarters after +1q, which Yahoo doesn't give, from its fiscal-year averages.
+
+    Yahoo's 0y is the current fiscal year and +1y the next one, so which quarters each covers depends
+    on how much of the year is reported. The quarters a year estimate leaves open follow a steady
+    quarterly growth path from +1q. An approximation; empty when the numbers don't fit one.
+    """
+
+    done = fiscal_quarters_reported(reported, this_year, this_quarter, next_quarter, fiscal_year_end,
+                                    last_quarter_end)
+    if done == 3:  # 0q ends the year: +1q, +2q, +3q and one more make up +1y
+        rate = _growth_path(next_quarter, next_year - next_quarter, [1, 2, 3])
+    elif done == 2 or done is None:  # +1q ends the year: +2q to +5q make up +1y
+        rate = _growth_path(next_quarter, next_year, [1, 2, 3, 4])
+    elif done == 1:  # +2q ends the year: what 0y leaves is +2q; +3q starts +1y
+        known = float(reported.iloc[-1]) + this_quarter + next_quarter
+        rate = _growth_path(next_quarter, this_year - known, [1])
+    else:  # the year has just begun: what 0y leaves is +2q and +3q
+        rate = _growth_path(next_quarter, this_year - this_quarter - next_quarter, [1, 2])
+    return [] if rate is None else [next_quarter * rate, next_quarter * rate ** 2]
+
+
+def forward_eps(earnings, estimates=None, quarter_days=91, fiscal_year_end=None):
     """EPS of the next four quarters to be reported, as of each announcement date.
 
     ``earnings`` is indexed by announcement date with ``Reported EPS``. Quarters already
     reported use the EPS later reported (hindsight: not what analysts expected then); quarters
-    not yet reported use Yahoo's analyst averages (``estimates`` rows 0q, +1q, +1y). Returns a
-    frame with ``Forward_EPS`` and ``Estimated`` (True when any of the four quarters is an
-    estimate), NaN where the four quarters are not all known.
+    not yet reported use Yahoo's analyst averages (``estimates`` rows 0q, +1q, 0y, +1y; see
+    :func:`later_quarter_estimates`). ``fiscal_year_end`` (optional) is the end of the current
+    fiscal year. Returns a frame with ``Forward_EPS`` and ``Estimated`` (True when any of the four
+    quarters is an estimate), NaN where the four quarters are not all known.
     """
 
     if earnings is None or earnings.empty or "Reported EPS" not in earnings.columns:
@@ -172,7 +216,9 @@ def forward_eps(earnings, estimates=None, quarter_days=91):
                 break
             ahead.append(average(period))
         if len(ahead) == 2:
-            ahead += _later_quarter_estimates(ahead[1], average("+1y"))
+            # A quarter ends roughly five weeks before it is reported.
+            ahead += later_quarter_estimates(ahead[0], ahead[1], average("0y"), average("+1y"), reported,
+                                             fiscal_year_end, reported.index[-1] - pd.Timedelta(days=35))
     last = reported.index[-1]
     future = pd.Series(ahead, index=[last + pd.Timedelta(days=quarter_days * (k + 1)) for k in range(len(ahead))],
                        dtype=float)
