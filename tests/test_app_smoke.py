@@ -653,3 +653,26 @@ def test_trade_journal_tab(offline):
     app = open_tab(app, "Trade Journal")
     assert any("no adding to a losing position" in element.value for element in app.subheader)
     assert any(set(frame.value.index) == {"AAPL", "MSFT"} for frame in app.dataframe)
+
+
+def test_trade_journal_notes_and_improvement_summary(offline):
+    from analysis.trade_journal import SKIP_ACTION, STOP_ACTION, load_ibkr_trades, round_trips
+
+    trades, notes = load_ibkr_trades(journal_export())
+    fills, trips = round_trips(trades)
+    keys = dict(zip(trips["Trip"], trips["Key"]))
+    app = start_app()
+    app.session_state["journal_data"] = {"id": "test", "name": "test.csv", "notes": notes, "fills": fills, "trips": trips}
+    app.session_state["journal_notes"] = {
+        keys["MSFT #1"]: {"Action": STOP_ACTION, "Comment": "added to a loser, no stop", "Estimate $": float("nan")},
+        keys["AAPL #2"]: {"Action": SKIP_ACTION, "Comment": "chased the open", "Estimate $": float("nan")},
+    }
+    app = open_tab(app, "Trade Journal")
+    assert "Improvement notes" in [element.value for element in app.subheader]
+    trades_table = next(frame.value for frame in app.dataframe if "Comment" in frame.value.columns
+                        and "Trip" in frame.value.columns and "Net P&L" in frame.value.columns)
+    assert trades_table.columns[-3:].tolist() == ["Action", "Comment", "Estimate $"]
+    assert trades_table.set_index("Trip").loc["MSFT #1", "Comment"] == "added to a loser, no stop"
+    summary = next(frame.value for frame in app.dataframe if "Improvement" in frame.value.columns)
+    assert summary["Action"].tolist()[-1] == "All noted trades" and summary["Trades"].tolist()[-1] == 2
+    assert set(summary["Action"]) >= {STOP_ACTION, SKIP_ACTION}

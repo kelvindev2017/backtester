@@ -154,7 +154,10 @@ from analysis.trade_journal import (
     BREAKDOWNS as JOURNAL_BREAKDOWNS,
     CASH_LIKE as JOURNAL_CASH_LIKE,
     CHART_TIMEFRAMES,
+    ESTIMATED_ACTIONS,
+    IMPROVEMENT_ACTIONS,
     INTRADAY_CHART_INTERVALS,
+    NO_ACTION,
     WhatIfRules,
     apply_filters as journal_filter,
     breakdown as journal_breakdown,
@@ -162,8 +165,12 @@ from analysis.trade_journal import (
     chart_timeframes,
     chart_window,
     equity_curve as journal_equity,
+    action_rules,
     fill_bar_positions,
+    improvement_summary,
     load_ibkr_trades,
+    notes_frame,
+    notes_from_csv,
     prepare as journal_prepare,
     round_trips,
     simulate as journal_simulate,
@@ -2637,7 +2644,8 @@ TAB_NAMES = [ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_T
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
-TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart", "_upload")  # a file uploader's value cannot be set
+# A file uploader's value cannot be set; "_draft" keys are unsaved trade notes.
+TRANSIENT_KEY_SUFFIXES = ("_btn", "_table", "_chart", "_upload", "_draft")
 TRANSIENT_KEYS = {"main_tab", "password_correct"}
 VIX_SYMBOL = "^VIX"
 MAIN_INDEX_SYMBOLS = list(dict.fromkeys(
@@ -5014,12 +5022,14 @@ JOURNAL_BAR_CHOICES = {
 JOURNAL_TABLE_COLUMNS = ["Trip", "Side", "Entry date", "Exit date", "Days held", "Shares", "Avg entry", "Avg exit",
                          "Cost $", "Net P&L", "Return %", "Last exit type", "Entry orders", "Added to loser"]
 JOURNAL_WHATIF_COLUMNS = ["What-if P&L", "What-if exit", "What-if exit date", "Change", "Skipped buys"]
+JOURNAL_NOTE_COLUMNS = ["Action", "Comment", "Estimate $"]
 JOURNAL_FORMATS = {"Entry date": "{:%Y-%m-%d}", "Exit date": "{:%Y-%m-%d}", "What-if exit date": "{:%Y-%m-%d}",
                    "Days held": "{:.0f}", "Shares": "{:,.0f}", "Avg entry": "{:,.2f}", "Avg exit": "{:,.2f}",
                    "Cost $": "${:,.0f}", "Net P&L": "${:+,.0f}", "Return %": "{:+.2f}", "What-if P&L": "${:+,.0f}",
                    "Change": "${:+,.0f}", "Skipped buys": "{:.0f}", "Trades": "{:,.0f}", "Win rate %": "{:.0f}",
                    "Avg win": "${:,.0f}", "Avg loss": "${:,.0f}", "Profit factor": "{:.2f}",
-                   "What-if net P&L": "${:+,.0f}"}
+                   "What-if net P&L": "${:+,.0f}", "Estimate $": "${:+,.0f}", "Your P&L": "${:+,.0f}",
+                   "P&L with the action": "${:+,.0f}", "Improvement": "${:+,.0f}"}
 JOURNAL_ACTUAL_COLOR, JOURNAL_WHATIF_COLOR = "gray", "royalblue"
 
 
@@ -5302,6 +5312,102 @@ def render_journal_trip(trip, fills, rules):
         st.caption(f"Each marker sits on the {'day' if interval == '1d' else 'week'} of its fill.")
 
 
+def journal_load_notes(upload):
+    """Merge notes from an uploaded CSV into Session State (once per file)."""
+
+    if upload is None:
+        return
+    file_id = f"{upload.name}:{upload.size}"
+    if st.session_state.get("journal_notes_file") == file_id:
+        return
+    try:
+        loaded = notes_from_csv(upload)
+    except Exception as error:
+        st.error(f"Could not read notes from {upload.name}: {error}")
+        return
+    notes = dict(st.session_state.get("journal_notes", {}))
+    notes.update(loaded)
+    st.session_state["journal_notes"] = notes
+    st.session_state["journal_notes_file"] = file_id
+    st.session_state["journal_notes_version"] = st.session_state.get("journal_notes_version", 0) + 1
+    st.caption(f"Loaded {len(loaded)} notes from {upload.name}.")
+
+
+def with_notes(trips, notes):
+    """``trips`` with the Action, Comment and Estimate $ of each trade's note as its last columns."""
+
+    out = trips.copy()
+    out["Action"] = out["Key"].map(lambda key: notes.get(key, {}).get("Action", "")).replace(NO_ACTION, "")
+    out["Comment"] = out["Key"].map(lambda key: notes.get(key, {}).get("Comment", ""))
+    out["Estimate $"] = pd.to_numeric(out["Key"].map(lambda key: notes.get(key, {}).get("Estimate $")), errors="coerce")
+    return out
+
+
+def render_journal_note(trip):
+    """The note form under a trade's chart: what would have improved it, a comment and, for actions the replay
+    cannot test, an estimate of the gain."""
+
+    notes = st.session_state.get("journal_notes", {})
+    note = notes.get(trip["Key"], {})
+    # Keys carry the trade and the notes version, so each trade (and freshly loaded notes) starts from its saved note.
+    suffix = f"{trip['Key']}_{st.session_state.get('journal_notes_version', 0)}_draft"
+    with st.form(f"journal_note_form_{suffix}", border=True):
+        st.markdown(f"**Your note on {trip['Trip']}**")
+        action = st.selectbox("What would have improved it?", IMPROVEMENT_ACTIONS,
+                              index=IMPROVEMENT_ACTIONS.index(note.get("Action", NO_ACTION)),
+                              key=f"journal_note_action_{suffix}",
+                              help="Stops, targets, sizes and time limits are tested with the values under What-if "
+                              "rules when the improvement summary is worked out.")
+        comment = st.text_area("Comment", value=note.get("Comment", ""), key=f"journal_note_comment_{suffix}",
+                               placeholder="What happened, and what you would do differently")
+        saved_estimate = note.get("Estimate $")
+        estimate = st.number_input(
+            "Your estimate of the improvement ($), used for \"Hold the winner longer\" and \"Other\"",
+            value=None if saved_estimate is None or pd.isna(saved_estimate) else float(saved_estimate),
+            step=50.0, key=f"journal_note_estimate_{suffix}", placeholder="optional")
+        saved = st.form_submit_button("Save note", type="primary")
+    if saved:
+        notes = dict(notes)
+        if action == NO_ACTION and not comment.strip() and estimate is None:
+            notes.pop(trip["Key"], None)
+        else:
+            notes[trip["Key"]] = {"Action": action, "Comment": comment.strip(),
+                                  "Estimate $": np.nan if estimate is None else float(estimate)}
+        st.session_state["journal_notes"] = notes
+        st.rerun()
+    if note:
+        st.caption("Saved. Notes are kept while the app is open; use **Download notes** below to keep them.")
+
+
+def render_journal_improvements(data, closed, fills, rules, bar_choice):
+    """Summary of the notes: how much each kind of change would have improved the trades noted with it."""
+
+    notes = st.session_state.get("journal_notes", {})
+    if not notes:
+        return
+    st.subheader("Improvement notes")
+    noted = closed[closed["Key"].isin(notes)]
+    actions = {notes[key].get("Action") for key in noted["Key"]}
+    prepared = None
+    if any(action_rules(action, rules) is not None for action in actions):
+        prepared, _ = journal_prepared(data, bar_choice)
+    summary = improvement_summary(closed, notes, fills, prepared, rules)
+    if summary.empty:
+        st.caption("None of the trades shown has a note with an action yet.")
+    else:
+        st.dataframe(summary.style.format(JOURNAL_FORMATS, na_rep="-"), hide_index=True, width="stretch")
+        st.caption(
+            "Each action is tested only on the trades you noted with it: stops, targets, sizes and time limits are "
+            "replayed with the values under What-if rules (even when the rule is not ticked there); \"Skip the trade\" "
+            "removes the trade's P&L; \"Hold the winner longer\" and \"Other\" add up your own estimates.")
+    table = notes_frame(notes, data["trips"])
+    with st.expander(f"All {len(table)} notes"):
+        st.dataframe(table.drop(columns="Key").style.format(JOURNAL_FORMATS, na_rep="-"), hide_index=True,
+                     width="stretch")
+    st.download_button("Download notes (CSV)", table.to_csv(index=False).encode("utf-8"),
+                       file_name=f"trade_notes_{pd.Timestamp(date.today()):%Y%m%d}.csv", mime="text/csv")
+
+
 def render_trade_journal():
     """Trade Journal tab: import IBKR trades (US dollars), see where the P&L comes from, replay with other rules."""
 
@@ -5315,6 +5421,11 @@ def render_trade_journal():
             data = journal_load_upload(upload, data)
         elif data is not None:
             st.caption(f"Using **{data['name']}**. Upload another file to replace it.")
+        if data is not None:
+            journal_load_notes(st.file_uploader(
+                "Saved trade notes (.csv), optional", type=["csv"], key="journal_notes_upload",
+                help="The trades or notes CSV downloaded from this tab. Notes are kept while the app is open; "
+                "download them to keep them and load them here next time."))
 
     st.caption("Import your IBKR trades, see where the profit and loss comes from, then replay the same trades with "
                "different rules (a stop, a target, no adding to losers, a fixed size or a time limit). US-dollar trades "
@@ -5430,16 +5541,21 @@ def render_trade_journal():
                  height=min(420, 38 + 35 * len(table)))
 
     st.subheader("Trades")
-    shown = (valid if has_whatif else closed).sort_values("Entry date", ascending=False)
-    columns = JOURNAL_TABLE_COLUMNS + (JOURNAL_WHATIF_COLUMNS if has_whatif else [])
+    notes = st.session_state.get("journal_notes", {})
+    shown = with_notes((valid if has_whatif else closed).sort_values("Entry date", ascending=False), notes)
+    columns = JOURNAL_TABLE_COLUMNS + (JOURNAL_WHATIF_COLUMNS if has_whatif else []) + JOURNAL_NOTE_COLUMNS
     st.caption("Click a column header to sort; select a row to see that trade's fills and chart.")
     event = st.dataframe(shown[columns].style.format(JOURNAL_FORMATS, na_rep="-"), hide_index=True, width="stretch",
                          height=420, on_select="rerun", selection_mode="single-row", key="journal_trades_table")
     selected = event.selection.rows if event is not None and hasattr(event, "selection") else []
-    st.download_button("Download trades (CSV)", shown[columns].to_csv(index=False).encode("utf-8"),
+    st.download_button("Download trades (CSV)", shown[columns + ["Key"]].to_csv(index=False).encode("utf-8"),
                        file_name=f"round_trips_{pd.Timestamp(date.today()):%Y%m%d}.csv", mime="text/csv")
     if selected and selected[0] < len(shown):
-        render_journal_trip(shown.iloc[selected[0]], fills, rules)
+        trip = shown.iloc[selected[0]]
+        render_journal_trip(trip, fills, rules)
+        render_journal_note(trip)
+
+    render_journal_improvements(data, closed, fills, rules, bar_choice)
 
 
 # ============================================================

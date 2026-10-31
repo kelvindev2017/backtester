@@ -288,3 +288,52 @@ def test_chart_window_for_intraday_bars_adds_a_day_either_side():
                                                    "2026-05-06", "2026-05-07"]])
     window = chart_window(bars, "2026-05-04", "2026-05-05", "60m")
     assert sorted(set(window.index.normalize().strftime("%m-%d"))) == ["05-01", "05-04", "05-05", "05-06"]
+
+
+# ------------------------------------------------------------------ notes
+
+def test_trips_have_a_key_that_survives_a_shorter_export():
+    rows = [("A", 20260504, "BUY", 10, 10.0, 0, "LMT"), ("A", 20260504, "SELL", 10, 11.0, 0, "LMT"),
+            ("A", 20260508, "BUY", 10, 10.0, 0, "LMT"), ("A", 20260508, "SELL", 10, 10.5, 0, "LMT")]
+    _, trips = trip_fills(ibkr_frame(rows))
+    assert trips["Key"].tolist() == ["A-1000", "A-1002"]
+    _, later = trip_fills(ibkr_frame(rows).iloc[2:])     # an export that starts later renumbers the trips...
+    assert later["Trip"].tolist() == ["A #1"] and later["Key"].tolist() == ["A-1002"]   # ...but not the key
+
+
+def test_notes_round_trip_through_csv():
+    from analysis.trade_journal import STOP_ACTION, notes_frame, notes_from_csv
+
+    notes = {"X-1000": {"Action": STOP_ACTION, "Comment": "no stop, hoped", "Estimate $": np.nan},
+             "Y-7": {"Action": "Other", "Comment": "", "Estimate $": 120.0}}
+    _, trips = trip_fills(ibkr_frame(LOSER))
+    frame = notes_frame(notes, trips)
+    assert frame.columns.tolist() == ["Key", "Trip", "Action", "Comment", "Estimate $"]
+    assert frame.loc[frame["Key"] == "X-1000", "Trip"].item() == "X #1"
+    loaded = notes_from_csv(io.StringIO(frame.to_csv(index=False)))
+    assert loaded["X-1000"]["Action"] == STOP_ACTION and loaded["X-1000"]["Comment"] == "no stop, hoped"
+    assert loaded["Y-7"]["Estimate $"] == 120.0
+    with pytest.raises(ValueError, match="Key"):
+        notes_from_csv(io.StringIO("Trip,Comment\nX #1,hi\n"))
+
+
+def test_improvement_summary_replays_skips_and_adds_estimates():
+    from analysis.trade_journal import (HOLD_ACTION, SKIP_ACTION, STOP_ACTION, improvement_summary, prepare)
+
+    rows = LOSER + [("Y", 20260504, "BUY", 100, 100.0, 0, "LMT"), ("Y", 20260505, "SELL", 100, 98.0, 0, "LMT"),
+                    ("Z", 20260504, "BUY", 100, 100.0, 0, "LMT"), ("Z", 20260505, "SELL", 100, 101.0, 0, "LMT")]
+    fills, trips = trip_fills(ibkr_frame(rows))
+    day_bars = pd.concat([hourly("2026-05-04", DAY1), hourly("2026-05-05", DAY2)])
+    prepared = prepare(fills, trips, {"X": day_bars, "Y": day_bars, "Z": day_bars})
+    keys = dict(zip(trips["Symbol"], trips["Key"]))
+    notes = {keys["X"]: {"Action": STOP_ACTION, "Comment": ""},
+             keys["Y"]: {"Action": SKIP_ACTION, "Comment": "chased"},
+             keys["Z"]: {"Action": HOLD_ACTION, "Comment": "sold too early", "Estimate $": 300.0}}
+    table = improvement_summary(trips, notes, fills, prepared, WhatIfRules(stop_pct=3, slippage_bps=0)).set_index("Action")
+    stop_gain = (97 - 90) * 100 - order_costs(100, 97, sell=True) + 1.0  # stop fill at the gap open, own sale fee saved
+    assert table.loc[STOP_ACTION, "Improvement"] == pytest.approx(stop_gain)
+    assert table.loc[SKIP_ACTION, "Improvement"] == pytest.approx(200.0)
+    assert table.loc[HOLD_ACTION, "Improvement"] == pytest.approx(300.0)
+    assert table.loc["All noted trades", "Trades"] == 3
+    assert table.loc["All noted trades", "Improvement"] == pytest.approx(stop_gain + 500.0)
+    assert table.index[0] == STOP_ACTION   # largest improvement first

@@ -52,7 +52,14 @@ tab shows the headline numbers (win rate against the break-even win rate, averag
 factor), cumulative P&L, a breakdown by holding time, exit order type, stock, month, long or short, adding to a losing
 position, number of buys, position size or weekday, and the trade list; select a trade to see its fills on its price
 bars, with a choice of 1, 5, 15 or 30-minute, hourly, daily or weekly bars (only those Yahoo still keeps for the
-trade's dates: about 30 days of 1-minute bars, 60 days of 5 to 30-minute bars, two years of hourly bars). Filters: entry dates, stocks, side (cash-like funds such as SGOV are left out by default).
+trade's dates: about 30 days of 1-minute bars, 60 days of 5 to 30-minute bars, two years of hourly bars). Under the
+chart, a note records what would have improved the trade (place a stop with the entry, don't add to a losing position,
+sell by the close, sell sooner, take profit at the target, use the standard size, skip the trade, hold the winner
+longer, good trade, other), a comment and an optional dollar estimate; the notes are the last columns of the trade list.
+**Improvement notes** totals them by action: stops, targets, sizes and time limits are replayed on the noted trades
+with the values under What-if rules, "skip the trade" removes its P&L, and "hold the winner longer" / "other" add up
+your estimates. Notes last while the app is open: download them as CSV and load them back next time (they are matched
+to trades by stock and IBKR TradeID, so they also fit a newer export). Filters: entry dates, stocks, side (cash-like funds such as SGOV are left out by default).
 
 **What-if rules** replay your own buys and sells on Yahoo's hourly bars (about two years) or 5-minute bars (about 60
 days, hourly before that), with any of: a stop placed with the first buy (filled at the stop, or the open on a gap,
