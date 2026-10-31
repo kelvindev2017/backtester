@@ -20,6 +20,7 @@ ESTIMATE_COLOR = "rgba(65, 105, 225, 0.35)"
 PE_COLOR = "goldenrod"
 PEG_COLOR = "seagreen"
 FORWARD_COLOR = "mediumpurple"
+FORWARD_ESTIMATE_COLOR = "rgba(147, 112, 219, 0.45)"
 PEG_AXIS_CAP = 4
 EPS_COLOR = "darkorange"
 EPS_ESTIMATE_COLOR = "rgba(255, 140, 0, 0.35)"
@@ -516,7 +517,7 @@ def legends_under_panels(fig, rows, height, gap_px=6, dates_every_row=False, dat
 
 
 def add_forward_line(fig, values, estimated, name, row, hover):
-    """A forward measure as a dashed line, turning dotted where it rests on analyst estimates."""
+    """A forward measure as a solid line, fading where it rests on analyst estimates."""
 
     values = values.dropna()
     if values.empty:
@@ -525,14 +526,14 @@ def add_forward_line(fig, values, estimated, name, row, hover):
     known, guessed = values[~estimated], values[estimated]
     if not guessed.empty and not known.empty:
         guessed = pd.concat([known.iloc[-1:], guessed])  # join the two styles without a gap
-    # One legend entry for both styles keeps the legend to two lines on a phone; the caption explains the dots.
-    for part, label, dash in [(known, name, "dash"), (guessed, f"{name}, estimates", "dot")]:
+    # One legend entry for both styles keeps the legend to two lines on a phone; the caption explains the faded end.
+    for part, label, color in [(known, name, FORWARD_COLOR), (guessed, f"{name}, estimates", FORWARD_ESTIMATE_COLOR)]:
         if part.empty:
             continue
         line = break_long_gaps(part)
         fig.add_trace(go.Scatter(x=line.index, y=line, mode="lines", name=label, connectgaps=False,
                                  showlegend=part is known or known.empty,
-                                 line=dict(color=FORWARD_COLOR, width=2, dash=dash),
+                                 line=dict(color=color, width=2),
                                  hovertemplate=f"%{{x|%Y-%m-%d}}: {hover}<extra>{label}</extra>"), row=row, col=1)
 
 

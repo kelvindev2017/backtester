@@ -676,3 +676,22 @@ def test_trade_journal_notes_and_improvement_summary(offline):
     summary = next(frame.value for frame in app.dataframe if "Improvement" in frame.value.columns)
     assert summary["Action"].tolist()[-1] == "All noted trades" and summary["Trades"].tolist()[-1] == 2
     assert set(summary["Action"]) >= {STOP_ACTION, SKIP_ACTION}
+
+
+def test_time_charts_get_axis_value_labels():
+    import ast
+    import re
+    from datetime import date
+
+    import numpy as np
+    import pandas as pd
+    import plotly.graph_objects as go
+
+    source = open("App.py").read()
+    node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "has_date_axis")
+    scope = {"pd": pd, "np": np, "re": re, "date": date}
+    exec(compile(ast.Module([node], []), "App.py", "exec"), scope)
+    has_date_axis = scope["has_date_axis"]
+    assert has_date_axis(go.Figure(go.Scatter(x=pd.date_range("2025-01-01", periods=3), y=[1, 2, 3])))
+    assert not has_date_axis(go.Figure(go.Bar(x=["a", "b"], y=[1, 2])))
+    assert not has_date_axis(go.Figure(go.Scatter(x=[0.1, 0.2], y=[1, 2])))

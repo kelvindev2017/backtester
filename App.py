@@ -463,7 +463,7 @@ CHART_AXIS_HOVER_JS = """
     overlay.appendChild(el);
     return el;
   }
-  function show(gd, points) {
+  function show(gd, points, xvals) {
     let overlay = gd.querySelector(".axis-hover-overlay");
     if (!overlay) {
       overlay = document.createElement("div");
@@ -478,11 +478,15 @@ CHART_AXIS_HOVER_JS = """
       // A candle is labelled at its close.
       const value = typeof point.y === "number" ? point.y : point.close;
       if (!xa || !ya || typeof value !== "number" || !isFinite(value)) continue;
+      const trace = point.fullData || point.data;  // the full trace has the default colours filled in
+      // A line with no point near the hovered date (a gap, or a line that starts later) gets no label: Plotly
+      // offers its nearest point, which can be months away.
+      if (xvals && xvals.length && trace.mode === "lines" && xa.type === "date"
+          && Math.abs(pixel(xa, point.x) - pixel(xa, xvals[0])) > 6) continue;
       const bottom = ya._offset + ya._length;
       if (!dates.has(xa) || dates.get(xa).bottom < bottom) dates.set(xa, { bottom: bottom, x: point.x });
       const y = pixel(ya, value);
       if (y < ya._offset - 1 || y > ya._offset + ya._length + 1) continue;  // off the visible range
-      const trace = point.fullData || point.data;  // the full trace has the default colours filled in
       let color = trace.type === "candlestick"
         ? ((point.close >= point.open ? trace.increasing : trace.decreasing) || {}).line
         : null;
@@ -524,9 +528,9 @@ CHART_AXIS_HOVER_JS = """
     if (gd.dataset.axisHover || !gd.layout || !gd.layout.meta || !gd.layout.meta.axis_hover || !gd.on) return;
     gd.dataset.axisHover = "1";
     gd.classList.add("axis-hover");
-    gd.on("plotly_hover", function (event) { show(gd, event.points); });
+    gd.on("plotly_hover", function (event) { show(gd, event.points, event.xvals); });
     // A tap on a touch screen hovers without a hover event; Plotly reports it as a click instead.
-    gd.on("plotly_click", function (event) { show(gd, event.points); });
+    gd.on("plotly_click", function (event) { show(gd, event.points, event.xvals); });
     gd.on("plotly_unhover", function () { const o = gd.querySelector(".axis-hover-overlay"); if (o) o.textContent = ""; });
     gd.on("plotly_relayout", function () { const o = gd.querySelector(".axis-hover-overlay"); if (o) o.textContent = ""; });
   }
@@ -2732,6 +2736,21 @@ def slider_with_input(label, min_value, max_value, value, step=1, key=None, help
     return result
 
 
+def has_date_axis(fig):
+    """True when a trace of ``fig`` is drawn against dates (a time chart rather than a scatter or a bar by label)."""
+
+    for trace in fig.data:
+        x = getattr(trace, "x", None)
+        if x is None or len(x) == 0:
+            continue
+        first = next((value for value in x if value is not None), None)
+        if isinstance(first, (pd.Timestamp, np.datetime64, date)):
+            return True
+        if isinstance(first, str) and re.match(r"^\d{4}-\d{2}-\d{2}", first):
+            return True
+    return False
+
+
 def show_chart(fig, **kwargs):
     """``st.plotly_chart`` that, on mobile, moves the legend under the plot so the plot gets the full width.
 
@@ -2742,7 +2761,10 @@ def show_chart(fig, **kwargs):
     desktop still scrolls the page.
     """
 
-    # Time charts (one hover line across the panels) get the TradingView-style value labels on the axes.
+    # Time charts (one hover line across the panels) get the TradingView-style value labels on the axes; a
+    # chart over dates that doesn't pick its own hover gets them too, like Market Analysis.
+    if fig.layout.hovermode is None and has_date_axis(fig):
+        fig.update_layout(hovermode="x unified")
     if fig.layout.hovermode == "x unified" and fig.layout.meta is None:
         fig.update_layout(meta=dict(axis_hover=True))
     if MOBILE:
@@ -3553,10 +3575,10 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, 
             "P/E is price / last 4 quarters' EPS, so it can differ from GAAP P/E; a spike usually means earnings "
             "fell, not that the price ran. PEG is that P/E / EPS growth %. It is blank, and shaded, while EPS is a "
             "loss, while the year-ago EPS was a loss (growth from a loss has no %), or while EPS is below a year ago. "
-            "The purple dashed lines are forward P/E (price / next four quarters' EPS) and forward PEG (that P/E / "
+            "The purple lines are forward P/E (price / next four quarters' EPS) and forward PEG (that P/E / "
             "EPS growth % from the last four quarters to the next four). Past points use the EPS later reported, "
             "which nobody knew on the day, so they show how cheap the stock really was, not what it looked like then. "
-            "The dotted end uses analyst estimates for quarters not yet reported (Yahoo gives two quarters and next "
+            "The faded end uses analyst estimates for quarters not yet reported (Yahoo gives two quarters and next "
             "fiscal year; the quarters between are filled on a steady growth path). Hatched bars are analyst "
             "estimates, not results."
         )
