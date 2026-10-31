@@ -491,7 +491,7 @@ def add_forward_line(fig, values, estimated, name, row, hover):
 
 def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
                       price_change=None, growth=None, close=None, log_price=False, height=None, ohlcv=None,
-                      peg_gaps=None, forward=None):
+                      peg_gaps=None, forward=None, link_dates=False):
     """Daily price, growth vs price, revenue, EPS, trailing P/E and PEG panels, top to bottom, on one date axis.
 
     ``ohlcv`` (optional, daily Open/High/Low/Close/Volume) turns the price panel into candlesticks with
@@ -499,6 +499,7 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
 
     ``peg_gaps`` (optional, from :func:`peg_gap_reasons`) shades the days PEG is blank, by reason.
     ``forward`` (optional, from :func:`forward_valuation`) adds forward P/E and forward PEG lines.
+    With ``link_dates`` a zoom on one panel zooms them all; otherwise each panel zooms on its own and shows its own dates.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -543,8 +544,9 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     rows = len(panels)
     heights = [weight for _, weight in panels.values()]
     height = height or {2: 560, 3: 740, 4: 920, 5: 1120}.get(rows, 1320)
-    # Room between panels for the legend under each panel and the next panel's title.
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.12, 80 / height),
+    # Room between panels for the legend under each panel and the next panel's title (and its dates when unlinked).
+    gap = 80 if link_dates else 108
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=min(0.15, gap / height),
                         row_heights=[h / sum(heights) for h in heights],
                         subplot_titles=[title for title, _ in panels.values()])
     if not candles.empty:
@@ -661,5 +663,11 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=row["revenue"], col=1)
     fig.update_xaxes(rangeslider_visible=False)
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60), bargap=0.15)
-    legends_under_panels(fig, rows, height)
+    if not link_dates:
+        # Panels start on one date range, but a zoom or pan on one leaves the others where they are.
+        dates = pd.to_datetime(pd.Series([x for trace in fig.data if trace.x is not None for x in trace.x]),
+                               errors="coerce").dropna()
+        span = dict(range=[dates.min() - pd.Timedelta(days=30), dates.max() + pd.Timedelta(days=30)]) if len(dates) else {}
+        fig.update_xaxes(matches=None, showticklabels=True, **span)
+    legends_under_panels(fig, rows, height, dates_every_row=not link_dates)
     return fig

@@ -316,3 +316,13 @@ def test_forward_valuation_and_lines_on_the_pe_and_peg_panels():
         assert name in names
     titles = [annotation.text for annotation in fig.layout.annotations]
     assert "P/E, trailing and forward" in titles and "PEG, trailing and forward" in titles
+
+
+def test_panels_zoom_on_their_own_unless_linked():
+    revenue = pd.Series([1e9, 2e9], index=pd.to_datetime(["2025-03-31", "2025-06-30"]))
+    pe = pd.Series([20.0, 25.0], index=pd.to_datetime(["2025-01-02", "2025-12-31"]))
+    fig = revenue_pe_figure(revenue, pe)
+    assert fig.layout.xaxis.matches is None and fig.layout.xaxis2.matches is None
+    assert fig.layout.xaxis.showticklabels and tuple(fig.layout.xaxis.range) == tuple(fig.layout.xaxis2.range)
+    linked = revenue_pe_figure(revenue, pe, link_dates=True)
+    assert linked.layout.xaxis.matches == "x2"

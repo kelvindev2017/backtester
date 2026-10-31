@@ -3485,7 +3485,7 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
     return fig
 
 
-def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
+def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, link_dates=False):
     """Growth vs price, revenue, EPS, trailing P/E and PEG for one ticker, with their captions.
 
     Returns False, after a warning, when there is no price history for the ticker.
@@ -3533,7 +3533,7 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False):
                                      price_change=price_change, growth=growth,
                                      close=valuation["Close"].loc[history_start:], log_price=log_price,
                                      ohlcv=prices.loc[history_start:] if not prices.empty else None,
-                                     peg_gaps=peg_gaps, forward=forward),
+                                     peg_gaps=peg_gaps, forward=forward, link_dates=link_dates),
                    width="stretch")
         st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
         st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker), peg_gaps))
@@ -3613,6 +3613,9 @@ def render_stock_fundamentals():
                                  key="fundamentals_years")
         log_price = st.checkbox("Log scale for the price", value=False, key="fundamentals_log_price",
                                 help="Equal % moves look the same size, so early years aren't flattened.")
+        link_dates = st.checkbox("Zoom all panels together", value=False, key="fundamentals_link_dates",
+                                 help="Off: a zoom or pan on one panel leaves the others as they are. On: every "
+                                      "panel follows, and a tap shows the values of all panels on the same date.")
     with settings_panel("What happened next"):
         frequency = st.radio("Check every", list(CHECK_FREQUENCIES), index=2, horizontal=True, key="next_frequency",
                              help="How often a dot is taken. Daily gives more dots, not more independent evidence.")
@@ -3631,7 +3634,7 @@ def render_stock_fundamentals():
         return
     name = load_fundamental_snapshot(ticker).get("shortName")
     st.subheader(f"{ticker} · {name}" if name else ticker)
-    if render_fundamentals(ticker, years, log_price) is False:
+    if render_fundamentals(ticker, years, log_price, link_dates) is False:
         return
     render_what_happened_next(ticker, years, frequency, look_ahead, lookback_years, band)
 
