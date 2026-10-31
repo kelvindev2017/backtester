@@ -250,3 +250,41 @@ def test_missing_bars_leave_the_trip_unsimulated_and_sweep_runs():
     assert sweep["Stop %"].tolist() == ["None", "2%", "3%"]
     assert sweep["Net P&L"].iloc[0] == pytest.approx(trips["Net P&L"].iloc[0])
     assert sweep["Net P&L"].iloc[1] > sweep["Net P&L"].iloc[0]
+
+
+# ------------------------------------------------------------------ trade chart
+
+def test_chart_timeframes_follow_what_yahoo_keeps():
+    from analysis.trade_journal import chart_timeframes
+
+    today = pd.Timestamp("2026-10-31")
+    assert chart_timeframes("2026-10-27", "2026-10-28", today) == [
+        "1 min", "5 min", "15 min", "30 min", "1 hour", "1 day", "1 week"]
+    # Three weeks held: too long for one 1-minute request.
+    assert chart_timeframes("2026-10-05", "2026-10-26", today)[0] == "5 min"
+    assert chart_timeframes("2026-07-24", "2026-07-29", today) == ["1 hour", "1 day", "1 week"]
+    assert chart_timeframes("2024-03-04", "2024-03-05", today) == ["1 day", "1 week"]
+
+
+def test_chart_window_and_markers_on_daily_and_weekly_bars():
+    from analysis.trade_journal import chart_window, fill_bar_positions
+
+    fills, trips = trip_fills(ibkr_frame(LOSER))   # buy 2026-05-04, sell 2026-05-05
+    daily = pd.DataFrame({"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": 1.5, "Volume": 1.0},
+                         index=pd.bdate_range("2026-01-02", "2026-08-31"))
+    window = chart_window(daily, "2026-05-04", "2026-05-05", "1d")
+    assert len(window) == 40 + 2 + 20 and window.index[40] == pd.Timestamp("2026-05-04")
+    positions = fill_bar_positions(fills, window)
+    assert [window.index[p] for p in positions] == [pd.Timestamp("2026-05-04"), pd.Timestamp("2026-05-05")]
+    weekly = daily.resample("W-MON", label="left", closed="left").first()
+    positions = fill_bar_positions(fills, chart_window(weekly, "2026-05-04", "2026-05-05", "1wk"))
+    assert positions[0] == positions[1]   # same week
+
+
+def test_chart_window_for_intraday_bars_adds_a_day_either_side():
+    from analysis.trade_journal import chart_window
+
+    bars = pd.concat([hourly(day, DAY1) for day in ["2026-04-30", "2026-05-01", "2026-05-04", "2026-05-05",
+                                                   "2026-05-06", "2026-05-07"]])
+    window = chart_window(bars, "2026-05-04", "2026-05-05", "60m")
+    assert sorted(set(window.index.normalize().strftime("%m-%d"))) == ["05-01", "05-04", "05-05", "05-06"]

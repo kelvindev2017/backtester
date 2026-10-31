@@ -51,7 +51,8 @@ buy, or short sale, to the sale that leaves no shares; a fill through zero is sp
 tab shows the headline numbers (win rate against the break-even win rate, average win against average loss, profit
 factor), cumulative P&L, a breakdown by holding time, exit order type, stock, month, long or short, adding to a losing
 position, number of buys, position size or weekday, and the trade list; select a trade to see its fills on its price
-bars. Filters: entry dates, stocks, side (cash-like funds such as SGOV are left out by default).
+bars, with a choice of 1, 5, 15 or 30-minute, hourly, daily or weekly bars (only those Yahoo still keeps for the
+trade's dates: about 30 days of 1-minute bars, 60 days of 5 to 30-minute bars, two years of hourly bars). Filters: entry dates, stocks, side (cash-like funds such as SGOV are left out by default).
 
 **What-if rules** replay your own buys and sells on Yahoo's hourly bars (about two years) or 5-minute bars (about 60
 days, hourly before that), with any of: a stop placed with the first buy (filled at the stop, or the open on a gap,
