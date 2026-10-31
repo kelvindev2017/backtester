@@ -418,12 +418,84 @@ def _locate_fills(fills, index, days, low, high):
 
 
 def fill_bar_positions(fills, bars):
-    """Bar number (in ``bars``) of each fill, placed as the what-if replay places it; None without bars that day."""
+    """Bar number (in ``bars``) of each fill, or None without bars on a fill's day.
+
+    Intraday bars: placed as the what-if replay places them. Daily or weekly bars (timestamps at midnight): the bar
+    whose period contains the fill's date.
+    """
 
     if bars is None or bars.empty:
         return None
-    return _locate_fills(fills.reset_index(drop=True), bars.index.values, bars.index.normalize().values,
+    fills = fills.reset_index(drop=True)
+    index = bars.index
+    if (index == index.normalize()).all():
+        positions = np.searchsorted(index.values, fills["Date"].values, side="right") - 1
+        return None if (positions < 0).any() else [int(position) for position in positions]
+    return _locate_fills(fills, index.values, index.normalize().values,
                          bars["Low"].to_numpy(float), bars["High"].to_numpy(float))[0]
+
+
+# Chart bar lengths: label -> (Yahoo interval, how many days back Yahoo keeps them; None = all history).
+CHART_TIMEFRAMES = {
+    "1 min": ("1m", 29),
+    "5 min": ("5m", 59),
+    "15 min": ("15m", 59),
+    "30 min": ("30m", 59),
+    "1 hour": ("60m", 729),
+    "1 day": ("1d", None),
+    "1 week": ("1wk", None),
+}
+INTRADAY_CHART_INTERVALS = {"1m", "5m", "15m", "30m", "60m"}
+
+
+def chart_request(entry_date, exit_date, interval):
+    """Start and end dates (end exclusive) to download for a trade's chart: one trading day either side for
+    intraday bars, about two months before for daily bars and a year before for weekly bars."""
+
+    entry_date, exit_date = pd.Timestamp(entry_date), pd.Timestamp(exit_date)
+    if interval in INTRADAY_CHART_INTERVALS:
+        return entry_date - pd.offsets.BDay(1), exit_date + pd.offsets.BDay(1) + pd.Timedelta(days=1)
+    if interval == "1d":
+        return entry_date - pd.Timedelta(days=90), exit_date + pd.Timedelta(days=45)
+    return entry_date - pd.Timedelta(days=400), exit_date + pd.Timedelta(days=120)
+
+
+def chart_timeframes(entry_date, exit_date, today):
+    """Bar lengths Yahoo can supply for a trade's chart, finest first.
+
+    Yahoo keeps about 30 days of 1-minute bars (and serves at most 8 days of them per request), about 60 days of
+    5-, 15- and 30-minute bars, about two years of hourly bars, and all daily and weekly bars.
+    """
+
+    today = pd.Timestamp(today).normalize()
+    available = []
+    for label, (interval, kept_days) in CHART_TIMEFRAMES.items():
+        start, end = chart_request(entry_date, exit_date, interval)
+        if kept_days is not None and start < today - pd.Timedelta(days=kept_days):
+            continue
+        if interval == "1m" and (end - start).days > 8:
+            continue
+        available.append(label)
+    return available
+
+
+def chart_window(bars, entry_date, exit_date, interval):
+    """The bars to draw around a trade: from the trading day before the entry to the one after the exit for
+    intraday bars, 40 bars before and 20 after for daily bars, 52 before and 12 after for weekly bars."""
+
+    if bars is None or bars.empty:
+        return bars
+    entry_date, exit_date = pd.Timestamp(entry_date), pd.Timestamp(exit_date)
+    if interval in INTRADAY_CHART_INTERVALS:
+        days = bars.index.normalize()
+        trading_days = days.unique()
+        first = trading_days[max(0, int(np.searchsorted(trading_days, entry_date)) - 1)]
+        last = trading_days[min(len(trading_days) - 1, int(np.searchsorted(trading_days, exit_date)) + 1)]
+        return bars.loc[(days >= first) & (days <= last)]
+    before, after = (40, 20) if interval == "1d" else (52, 12)
+    entry_bar = max(0, int(np.searchsorted(bars.index.values, np.datetime64(entry_date), side="right")) - 1)
+    exit_bar = max(0, int(np.searchsorted(bars.index.values, np.datetime64(exit_date), side="right")) - 1)
+    return bars.iloc[max(0, entry_bar - before): exit_bar + after + 1]
 
 
 def prepare_trip(fills, bars):

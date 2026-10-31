@@ -153,9 +153,14 @@ from analysis.universe import (
 from analysis.trade_journal import (
     BREAKDOWNS as JOURNAL_BREAKDOWNS,
     CASH_LIKE as JOURNAL_CASH_LIKE,
+    CHART_TIMEFRAMES,
+    INTRADAY_CHART_INTERVALS,
     WhatIfRules,
     apply_filters as journal_filter,
     breakdown as journal_breakdown,
+    chart_request,
+    chart_timeframes,
+    chart_window,
     equity_curve as journal_equity,
     fill_bar_positions,
     load_ibkr_trades,
@@ -5210,8 +5215,26 @@ def journal_breakdown_chart(table, has_whatif, title):
     show_chart(fig, width="stretch", key="journal_breakdown_chart")
 
 
-def render_journal_trip(trip, fills, bars_by_symbol, rules):
-    """One round trip: its fills, and its price bars with the buys, sells and what-if stop/target."""
+def journal_chart_ticks(index, interval):
+    """Short x-axis labels for a category axis: the date at the first bar of each day for intraday bars, about six
+    dates for daily bars and six months for weekly bars."""
+
+    index = pd.DatetimeIndex(index)
+    if interval in INTRADAY_CHART_INTERVALS:
+        labels = bar_labels(index)
+        starts = np.flatnonzero(np.r_[True, index.normalize()[1:] != index.normalize()[:-1]])
+        step = max(1, int(np.ceil(len(starts) / 8)))
+        starts = starts[::step]
+        return [labels[i] for i in starts], [f"{index[i]:%b %d}" for i in starts]
+    labels = list(index.strftime("%Y-%m-%d"))
+    picks = np.unique(np.linspace(0, len(index) - 1, min(6, len(index))).round().astype(int))
+    text_format = "%b %d" if interval == "1d" else "%b %Y"
+    return [labels[i] for i in picks], [f"{index[i]:{text_format}}" for i in picks]
+
+
+def render_journal_trip(trip, fills, rules):
+    """One round trip: its fills, and its price bars (a choice of bar lengths) with the buys, sells and what-if
+    stop/target."""
 
     trip_fills = fills[fills["Trip"] == trip["Trip"]].reset_index(drop=True)
     line = (f"**{trip['Trip']}** - {trip['Side'].lower()}, {trip['Entry date']:%Y-%m-%d} to {trip['Exit date']:%Y-%m-%d}: "
@@ -5219,14 +5242,6 @@ def render_journal_trip(trip, fills, bars_by_symbol, rules):
     if "What-if P&L" in trip and pd.notna(trip.get("What-if P&L")):
         line += f"; what-if {journal_money(trip['What-if P&L'])} ({trip['What-if exit']})"
     st.markdown(line)
-
-    frames = bars_by_symbol.get(trip["Symbol"]) if bars_by_symbol else None
-    if frames is None:
-        start, end = trip["Entry date"] - pd.Timedelta(days=5), trip["Exit date"] + pd.Timedelta(days=5)
-        frames = load_journal_bars((trip["Symbol"],), f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}", "60m").get(trip["Symbol"])
-    frames = frames if isinstance(frames, list) else [frames]
-    bars = next((frame for frame in frames if frame is not None and not frame.empty
-                 and frame.index[0].normalize() <= trip["Entry date"]), None)
     table = trip_fills[["Date", "Time", "Quantity", "Price", "OrderType", "Cost"]].rename(
         columns={"OrderType": "Order type", "Cost": "Fees"})
     table.insert(2, "Action", np.where(trip_fills["Quantity"] > 0, "BUY", "SELL"))
@@ -5234,17 +5249,28 @@ def render_journal_trip(trip, fills, bars_by_symbol, rules):
         table = table.drop(columns="Time")
     st.dataframe(table.style.format({"Date": "{:%Y-%m-%d}", "Quantity": "{:+,.0f}", "Price": "{:,.2f}",
                                      "Fees": "${:,.2f}"}, na_rep="-"), hide_index=True, width="stretch")
-    if bars is None:
-        st.caption("Yahoo has no price bars for this stock and period.")
+
+    # Only the bar lengths Yahoo still keeps for this trade's dates are offered; the last choice is remembered.
+    options = chart_timeframes(trip["Entry date"], trip["Exit date"], date.today())
+    preferred = st.session_state.get("journal_trip_timeframe_pref", "1 hour")
+    if preferred not in options:
+        preferred = "1 hour" if "1 hour" in options else "1 day"
+    timeframe = st.radio("Bars", options, index=options.index(preferred), horizontal=True,
+                         help="Yahoo keeps about 30 days of 1-minute bars, 60 days of 5- to 30-minute bars and two "
+                         "years of hourly bars, so older trades offer fewer choices.")
+    st.session_state["journal_trip_timeframe_pref"] = timeframe
+    interval = CHART_TIMEFRAMES[timeframe][0]
+    start, end = chart_request(trip["Entry date"], trip["Exit date"], interval)
+    end = min(end, pd.Timestamp(date.today()) + pd.Timedelta(days=1))
+    bars = load_journal_bars((trip["Symbol"],), f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}", interval).get(trip["Symbol"])
+    window = chart_window(bars, trip["Entry date"], trip["Exit date"], interval)
+    if window is None or window.empty:
+        st.caption(f"Yahoo has no {timeframe} bars for {trip['Symbol']} around this trade.")
         return
 
-    days = bars.index.normalize()
-    trading_days = days.unique()
-    first_no = max(0, int(np.searchsorted(trading_days, trip["Entry date"])) - 1)
-    last_no = min(len(trading_days) - 1, int(np.searchsorted(trading_days, trip["Exit date"])) + 1)
-    window = bars.loc[(days >= trading_days[first_no]) & (days <= trading_days[last_no])]
+    intraday = interval in INTRADAY_CHART_INTERVALS
+    labels = list(bar_labels(window.index)) if intraday else list(window.index.strftime("%Y-%m-%d"))
     positions = fill_bar_positions(trip_fills, window)
-    labels = bar_labels(window.index)
     fig = go.Figure(go.Candlestick(x=labels, open=window["Open"], high=window["High"], low=window["Low"],
                                    close=window["Close"], name=trip["Symbol"], showlegend=False))
     if positions is not None:
@@ -5263,15 +5289,17 @@ def render_journal_trip(trip, fills, bars_by_symbol, rules):
     if rules.target_pct:
         fig.add_hline(y=first_price * (1 + sign * rules.target_pct / 100), line_dash="dash", line_color="green",
                       annotation_text=f"target {rules.target_pct:g}%", annotation_position="top left")
-    bar_minutes = int(round(pd.Series(window.index).diff().dt.total_seconds().div(60).mode().iloc[0])) \
-        if len(window) > 1 else 60
+    tick_values, tick_text = journal_chart_ticks(window.index, interval)
     fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False,
-                      title=f"{trip['Symbol']}, {bar_minutes}-minute bars", legend=dict(orientation="h", y=1.1),
-                      xaxis=dict(type="category", nticks=8))
+                      title=f"{trip['Symbol']}, {timeframe} bars", legend=dict(orientation="h", y=1.1),
+                      xaxis=dict(type="category", tickmode="array", tickvals=tick_values, ticktext=tick_text,
+                                 tickangle=0))
     show_chart(fig, width="stretch", key="journal_trip_chart")
-    if trip_fills["Time"].isna().all():
+    if trip_fills["Time"].isna().all() and intraday:
         st.caption("The export has no trade times, so each marker sits on the first bar of its day that traded at "
                    "its price.")
+    elif not intraday:
+        st.caption(f"Each marker sits on the {'day' if interval == '1d' else 'week'} of its fill.")
 
 
 def render_trade_journal():
@@ -5331,9 +5359,9 @@ def render_trade_journal():
         st.info("No closed trades match the filters.")
         return
 
-    whatif, prepared, bars_by_symbol = None, None, None
+    whatif, prepared = None, None
     if rules.active():
-        prepared, bars_by_symbol = journal_prepared(data, bar_choice)
+        prepared, _ = journal_prepared(data, bar_choice)
         whatif = journal_simulate(fills, closed, None, rules, prepared=prepared)
 
     st.subheader("Your results")
@@ -5411,7 +5439,7 @@ def render_trade_journal():
     st.download_button("Download trades (CSV)", shown[columns].to_csv(index=False).encode("utf-8"),
                        file_name=f"round_trips_{pd.Timestamp(date.today()):%Y%m%d}.csv", mime="text/csv")
     if selected and selected[0] < len(shown):
-        render_journal_trip(shown.iloc[selected[0]], fills, bars_by_symbol, rules)
+        render_journal_trip(shown.iloc[selected[0]], fills, rules)
 
 
 # ============================================================
