@@ -66,7 +66,7 @@ BREAKDOWNS = {
     "Weekday of the entry": "Entry weekday",
 }
 SIZE_BUCKETS = [0, 5_000, 10_000, 20_000, 40_000, np.inf]
-TRIP_COLUMNS = ["Trip", "Symbol", "Side", "Entry date", "Exit date", "Days held", "Held", "Shares", "Avg entry",
+TRIP_COLUMNS = ["Trip", "Key", "Symbol", "Side", "Entry date", "Exit date", "Days held", "Held", "Shares", "Avg entry",
                 "Avg exit", "Cost $", "Gross P&L", "Fees", "Net P&L", "Return %", "Entry orders", "Exit orders",
                 "Last exit type", "Exit types", "Added to loser", "Status"]
 
@@ -208,6 +208,20 @@ def split_fills(trades):
     return fills.sort_values("Sequence", kind="stable").drop(columns="Sequence").reset_index(drop=True)
 
 
+def trade_key(symbol, trade_id):
+    """A round trip's lasting name: its stock and IBKR's TradeID of its first fill (``MU-889118556``).
+
+    Unlike "MU #151", it stays the same when a later export starts earlier or later, so notes saved against it can
+    be loaded back onto a new export.
+    """
+
+    try:
+        trade_id = int(float(trade_id))
+    except (TypeError, ValueError):
+        pass
+    return f"{symbol}-{trade_id}"
+
+
 def _worse_than_first(price, first_price, sign, tolerance=0.002):
     """A buy more than 0.2% below the first buy (a short sale above it): adding to a losing position."""
 
@@ -246,7 +260,8 @@ def round_trips(trades):
         days = int(np.busday_count(entry_date.date(), exit_date.date()))
         exit_types = sorted(set(closing["OrderType"]))
         records.append({
-            "Trip": trip, "Symbol": first["Symbol"], "Side": side, "Entry date": entry_date,
+            "Trip": trip, "Key": trade_key(first["Symbol"], first["TradeID"]), "Symbol": first["Symbol"], "Side": side,
+            "Entry date": entry_date,
             "Exit date": exit_date if status == "Closed" else pd.NaT, "Days held": days if status == "Closed" else np.nan,
             "Held": _hold_bucket(days) if status == "Closed" else "Still open",
             "Shares": float(group["Position"].abs().max()), "Avg entry": entry_cost / shares_in,
@@ -684,3 +699,130 @@ def stop_sweep(fills, trips, bars_by_symbol, rules, stops=(1, 1.5, 2, 3, 4, 5, 7
                      "Win rate %": (valid["What-if P&L"] > 0).mean() * 100 if len(valid) else np.nan,
                      "Stopped %": valid["What-if exit"].str.startswith("Stop").mean() * 100 if len(valid) else np.nan})
     return pd.DataFrame(rows)
+
+
+# ============================================================
+# Notes: what would have improved each trade
+# ============================================================
+
+NO_ACTION = "(no note)"
+STOP_ACTION = "Place a stop with the entry"
+NO_ADDS_ACTION = "Don't add to a losing position"
+SAME_DAY_ACTION = "Sell by the close (no overnight hold)"
+TIME_LIMIT_ACTION = "Sell sooner (the time limit)"
+TARGET_ACTION = "Take profit at the target"
+SIZE_ACTION = "Use the standard position size"
+SKIP_ACTION = "Skip the trade (wrong entry)"
+HOLD_ACTION = "Hold the winner longer"
+GOOD_ACTION = "Good trade, no change"
+OTHER_ACTION = "Other"
+IMPROVEMENT_ACTIONS = [NO_ACTION, STOP_ACTION, NO_ADDS_ACTION, SAME_DAY_ACTION, TIME_LIMIT_ACTION, TARGET_ACTION,
+                       SIZE_ACTION, SKIP_ACTION, HOLD_ACTION, GOOD_ACTION, OTHER_ACTION]
+# Actions the replay cannot test: their improvement is the estimate typed with the note.
+ESTIMATED_ACTIONS = {HOLD_ACTION, OTHER_ACTION}
+NOTE_COLUMNS = ["Key", "Trip", "Action", "Comment", "Estimate $"]
+
+
+def action_rules(action, settings):
+    """The what-if rule that tests ``action``, using the distances and sizes in ``settings`` (a WhatIfRules);
+    None for actions the replay cannot test."""
+
+    base = dict(slippage_bps=settings.slippage_bps, commission_plan=settings.commission_plan)
+    if action == STOP_ACTION:
+        return WhatIfRules(stop_pct=settings.stop_pct or 3.0, **base)
+    if action == NO_ADDS_ACTION:
+        return WhatIfRules(no_averaging_down=True, **base)
+    if action == SAME_DAY_ACTION:
+        return WhatIfRules(max_days=0, **base)
+    if action == TIME_LIMIT_ACTION:
+        return WhatIfRules(max_days=settings.max_days if settings.max_days is not None else 1, **base)
+    if action == TARGET_ACTION:
+        return WhatIfRules(target_pct=settings.target_pct or 6.0, **base)
+    if action == SIZE_ACTION:
+        return WhatIfRules(fixed_size=settings.fixed_size or 10_000.0, **base)
+    return None
+
+
+def _estimate(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    return value if np.isfinite(value) else np.nan
+
+
+def notes_frame(notes, trips=None):
+    """The notes as a table (NOTE_COLUMNS), with each trade's Trip name when ``trips`` is given."""
+
+    rows = [{"Key": key, "Action": note.get("Action", NO_ACTION), "Comment": note.get("Comment", ""),
+             "Estimate $": _estimate(note.get("Estimate $"))} for key, note in notes.items()]
+    frame = pd.DataFrame(rows, columns=["Key", "Action", "Comment", "Estimate $"])
+    names = dict(zip(trips["Key"], trips["Trip"])) if trips is not None else {}
+    frame.insert(1, "Trip", frame["Key"].map(names))
+    return frame
+
+
+def notes_from_csv(source):
+    """Read notes back from a CSV downloaded from the Trade Journal (the trades CSV or the notes CSV)."""
+
+    frame = pd.read_csv(source)
+    if "Key" not in frame.columns:
+        raise ValueError("The file has no Key column. Load the trades or notes CSV downloaded from the Trade Journal.")
+    notes = {}
+    for row in frame.to_dict("records"):
+        action = row.get("Action")
+        comment = row.get("Comment")
+        action = action if isinstance(action, str) and action in IMPROVEMENT_ACTIONS else NO_ACTION
+        comment = comment if isinstance(comment, str) else ""
+        estimate = _estimate(row.get("Estimate $"))
+        if action != NO_ACTION or comment.strip() or pd.notna(estimate):
+            notes[str(row["Key"])] = {"Action": action, "Comment": comment, "Estimate $": estimate}
+    return notes
+
+
+def improvement_summary(trips, notes, fills, prepared, settings):
+    """How much each noted action would have changed the noted trades.
+
+    Testable actions are replayed (only on the trades noted with them) with the distances and sizes in
+    ``settings``; "Skip the trade" removes the trade's P&L; the other actions use the estimate typed with the note.
+    Returns one row per action, plus a total, with Trades, Your P&L, P&L with the action, Improvement and How.
+    """
+
+    columns = ["Action", "Trades", "Your P&L", "P&L with the action", "Improvement", "How"]
+    closed = trips[(trips["Status"] == "Closed") & trips["Key"].isin(notes)]
+    if closed.empty:
+        return pd.DataFrame(columns=columns)
+    actions = closed["Key"].map(lambda key: notes[key].get("Action", NO_ACTION))
+    rows = []
+    for action in IMPROVEMENT_ACTIONS:
+        group = closed[actions == action]
+        if group.empty or action == NO_ACTION:
+            continue
+        actual = group["Net P&L"]
+        rules = action_rules(action, settings)
+        if rules is not None:
+            result = simulate(fills, group, None, rules, prepared=prepared or {})
+            replayed = result["What-if P&L"].notna()
+            improvement = float((result["What-if P&L"] - result["Net P&L"])[replayed].sum())
+            missing = int((~replayed).sum())
+            how = f"Replay: {rules.describe()}" + (f" ({missing} without price bars counted as no change)"
+                                                   if missing else "")
+        elif action == SKIP_ACTION:
+            improvement, how = float(-actual.sum()), "The trade is not taken"
+        elif action == GOOD_ACTION:
+            improvement, how = 0.0, "No change"
+        else:
+            estimates = group["Key"].map(lambda key: _estimate(notes[key].get("Estimate $")))
+            improvement = float(estimates.fillna(0).sum())
+            missing = int(estimates.isna().sum())
+            how = "Your estimates" + (f" ({missing} without one counted as 0)" if missing else "")
+        rows.append({"Action": action, "Trades": len(group), "Your P&L": float(actual.sum()),
+                     "P&L with the action": float(actual.sum()) + improvement, "Improvement": improvement, "How": how})
+    table = pd.DataFrame(rows, columns=columns)
+    if not table.empty:
+        table = table.sort_values("Improvement", ascending=False, kind="stable")
+        total = {"Action": "All noted trades", "Trades": int(table["Trades"].sum()), "Your P&L": table["Your P&L"].sum(),
+                 "P&L with the action": table["P&L with the action"].sum(), "Improvement": table["Improvement"].sum(),
+                 "How": ""}
+        table = pd.concat([table, pd.DataFrame([total])], ignore_index=True)
+    return table
