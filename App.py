@@ -26,6 +26,7 @@ from analysis.opening_bar import (
     CustomExit,
     COMMISSION_PLANS as OPENING_BAR_COMMISSIONS,
     OpeningBarSettings,
+    order_costs,
     run_opening_bar,
     summarize_opening_bar,
 )
@@ -1683,6 +1684,49 @@ def load_benchmark_data(start_date_str, end_date_str, timeframe):
 # ============================================================
 # Position engine
 # ============================================================
+
+def trading_cost_settings():
+    """Broker fees and slippage, charged on every buy and every sell of every Backtest rule."""
+
+    with settings_panel("Trading costs"):
+        plan_label = st.selectbox(
+            "Broker fees", list(OPENING_BAR_COMMISSIONS), key="cost_commissions",
+            help="IBKR Pro Tiered: $0.0035 a share (min $0.35 an order) plus exchange (~$0.003 a share for a market "
+            "order), clearing and pass-through fees. Fixed: $0.005 a share, min $1 an order. Sales also pay the SEC "
+            "and FINRA fees. On a $10,000 position Tiered comes to about $1.30 a round trip.")
+        slippage = float(st.number_input(
+            "Slippage per share, each buy and sell ($)", min_value=0.0, max_value=5.0, value=0.01, step=0.01,
+            format="%.2f", key="cost_slippage",
+            help="How much worse than the chart price each order fills. About 1 cent is typical for liquid large "
+            "caps; use more for thinner stocks or fast markets."))
+        st.caption("Charged on every buy and every sell, for every signal rule.")
+    return OPENING_BAR_COMMISSIONS[plan_label], slippage
+
+
+def equity_with_costs(df, account_size, commission_plan="tiered", slippage=0.01):
+    """Equity of a full-position backtest (``Position``, ``Buy_Signal``, ``Sell_Signal`` from the position engine),
+    paying broker fees and ``slippage`` $ a share on every buy and sell at the signal bar's close.
+
+    Returns (equity series, total costs $, number of orders).
+    """
+
+    closes = df["Close"].to_numpy(dtype=float)
+    returns = (df["Position"] * df["Close"].pct_change().fillna(0.0)).to_numpy(dtype=float)
+    buys, sells = df["Buy_Signal"].to_numpy(dtype=bool), df["Sell_Signal"].to_numpy(dtype=bool)
+    equity, shares, total_costs, orders = float(account_size), 0.0, 0.0, 0
+    values = []
+    for row in range(len(df)):
+        equity *= 1.0 + returns[row]
+        if buys[row] or sells[row]:
+            if buys[row]:
+                shares = equity / closes[row]
+            cost = order_costs(shares, closes[row], sell=bool(sells[row]), plan=commission_plan) + slippage * shares
+            equity -= cost
+            total_costs += cost
+            orders += 1
+        values.append(equity)
+    return pd.Series(values, index=df.index), total_costs, orders
+
 
 def run_position_engine(price_df, buy_condition, sell_condition, max_hold=0, stop_pct=0.0, cooldown=0):
     """Generate long-only positions and entry/exit markers.
@@ -4103,6 +4147,7 @@ def strategy_settings(tab="Backtest"):
     keep_fraction = 2 / 3
     exit_ma, max_hold_bars = 200, 0
     macd_ma, macd_stop_pct, macd_exit_on_ma_down, macd_cooldown = 20, 3.0, False, 1
+    macd_widen_days, macd_widen_pct = 5, 10.0
     opening_bar = None
 
     with settings_panel("Signal"):
@@ -4157,6 +4202,14 @@ def strategy_settings(tab="Backtest"):
         elif setup == "macd_bollinger":
             macd_ma = int(st.number_input("Moving average and Bollinger period (days)", min_value=5, max_value=100,
                                           value=20, step=1, key="macd_ma"))
+            widen_columns = st.columns(2)
+            macd_widen_pct = float(widen_columns[0].number_input(
+                "Bands at least this % wider", min_value=0.0, max_value=200.0, value=10.0, step=5.0,
+                key="macd_widen_pct", help="Band width = (upper - lower) / SMA. 0% means just wider."))
+            macd_widen_days = int(widen_columns[1].number_input(
+                "than this many days before", min_value=1, max_value=20, value=5, step=1, key="macd_widen_days",
+                help="1 day and 0% is the loosest reading: any uptick in width, even while the bands are still "
+                "narrowing overall."))
             macd_stop_pct = float(st.number_input("Stop: sell when the close is this % below the entry (0 = off)",
                                                   min_value=0.0, max_value=30.0, value=3.0, step=0.5,
                                                   key="macd_stop_pct"))
@@ -4166,7 +4219,8 @@ def strategy_settings(tab="Backtest"):
                                                 max_value=20, value=1, step=1, key="macd_cooldown"))
             st.caption(
                 f"Buy at the close when, on the same day, the MACD (12, 26, 9) histogram turns from negative to "
-                f"positive, the Bollinger Bands ({macd_ma}, 2) are wider than the day before, and the close is above "
+                f"positive, the Bollinger Bands ({macd_ma}, 2) are at least {macd_widen_pct:g}% wider than {macd_widen_days} "
+                f"day(s) before, and the close is above "
                 f"the SMA {macd_ma}, which is rising. Sell / exit: the first close below the SMA {macd_ma}"
                 + (f", or a close {macd_stop_pct:g}% below the entry" if macd_stop_pct else "")
                 + (f", or the SMA {macd_ma} turning down" if macd_exit_on_ma_down else "")
@@ -4216,7 +4270,7 @@ def strategy_settings(tab="Backtest"):
         elif setup == "reversal":
             diagram = reversal_figure(breakout_lookback, trend_mid, trend_slow, max_hold_bars)
         elif setup == "macd_bollinger":
-            diagram = macd_bollinger_figure(macd_ma, macd_stop_pct, macd_exit_on_ma_down)
+            diagram = macd_bollinger_figure(macd_ma, macd_stop_pct, macd_exit_on_ma_down, macd_widen_pct, macd_widen_days)
         elif setup == "opening_bar":
             diagram = opening_bar_figure(opening_bar.min_move, opening_bar.skip_bars, opening_bar.exit_mode,
                                          opening_bar.bar_minutes, opening_bar.custom_exit)
@@ -4232,6 +4286,12 @@ def strategy_settings(tab="Backtest"):
                                       key="allow_short")
         elif setup in ("reversal", "day_breakout", "macd_bollinger", "opening_bar"):
             allow_short = False
+
+    commission_plan, slippage = "tiered", 0.01
+    if tab == "Backtest":
+        commission_plan, slippage = trading_cost_settings()
+        if opening_bar is not None:
+            opening_bar.commission_plan, opening_bar.slippage = commission_plan, slippage
 
     if setup == "opening_bar" and tab != "Backtest":
         st.info("The first-bar day trade trades on 5-minute bars, so it runs in the Backtest tab only.")
@@ -4288,6 +4348,8 @@ def strategy_settings(tab="Backtest"):
         macd_ma=macd_ma,
         macd_stop_pct=macd_stop_pct,
         macd_exit_on_ma_down=macd_exit_on_ma_down,
+        macd_widen_days=macd_widen_days,
+        macd_widen_pct=macd_widen_pct,
     )
     risk_settings = RiskSettings(
         account_equity=float(account_size),
@@ -4316,7 +4378,7 @@ def strategy_settings(tab="Backtest"):
         sell_left=sell_left, sell_operator=sell_operator, sell_right=sell_right, breakout_lookback=breakout_lookback,
         volume_multiple=volume_multiple, ma_rule=ma_rule, signal_settings=signal_settings, risk_settings=risk_settings,
         max_hold_bars=max_hold_bars, opening_bar=opening_bar, macd_ma=macd_ma, macd_stop_pct=macd_stop_pct,
-        macd_cooldown=macd_cooldown,
+        macd_cooldown=macd_cooldown, commission_plan=commission_plan, slippage=slippage,
     )
 
 
@@ -4454,7 +4516,7 @@ def render_backtest(s):
                 f"**BUY / SELL:** {setup_label} on {timeframe.lower()} bars, buying and selling at the close. "
                 f"Sells on the first close below the SMA {s.macd_ma}"
                 + (f" or a close {s.macd_stop_pct:g}% below the entry" if s.macd_stop_pct else "")
-                + f", then waits {s.macd_cooldown} day(s). Full position, no costs."
+                + f", then waits {s.macd_cooldown} day(s). Full position."
             )
     if setup != "opening_bar":
         macd_rule = setup == "macd_bollinger"
@@ -4463,8 +4525,11 @@ def render_backtest(s):
                                  cooldown=s.macd_cooldown if macd_rule else 0)
 
         df["Returns"] = df["Close"].pct_change().fillna(0.0)
-        df["Strat_Returns"] = df["Position"] * df["Returns"]
-        df["Equity"] = float(account_size) * (1.0 + df["Strat_Returns"]).cumprod()
+        df["Equity"], total_costs, orders = equity_with_costs(df, account_size, s.commission_plan, s.slippage)
+        df["Strat_Returns"] = df["Equity"].pct_change().fillna(0.0).where(df["Position"].eq(1) | df["Sell_Signal"]
+                                                                           | df["Buy_Signal"], 0.0)
+        rule_text += (f"\n\n**Costs:** ${total_costs:,.2f} over {orders} orders (broker fees + "
+                      f"${s.slippage:.2f} a share slippage on each buy and sell).")
         df["Peak"] = df["Equity"].cummax()
         df["Drawdown"] = df["Equity"] / df["Peak"] - 1.0
 
@@ -4946,20 +5011,9 @@ def opening_bar_settings(capital, bar_minutes=5):
             help="The close below the pullback is only known when its bar ends, so a market order fills near "
             "that close. Filling at the pullback price itself is the rule as written but is optimistic.")
         exit_fill = OPENING_BAR_FILLS[fill_label]
-    cost_columns = st.columns(2)
-    plan_label = cost_columns[0].selectbox(
-        "Commissions", list(OPENING_BAR_COMMISSIONS), key="opening_bar_commissions",
-        help="IBKR Pro Tiered: $0.0035 a share (min $0.35 an order) plus exchange (~$0.003 a share for a market "
-        "order), clearing and pass-through fees. Fixed: $0.005 a share, min $1 an order. Sales also pay the SEC and "
-        "FINRA fees. On a $10,000 position Tiered comes to about $1.30 a round trip.")
-    slippage = float(cost_columns[1].number_input(
-        "Slippage per share ($)", min_value=0.0, max_value=1.0, value=0.01, step=0.01, format="%.2f",
-        key="opening_bar_slippage",
-        help="How much worse than the bar price each market or stop order fills. About 1 cent is typical for "
-        "liquid large caps; use more for thinner stocks or fast opens."))
+    # Commissions and slippage come from the Trading costs section (see trading_cost_settings).
     return OpeningBarSettings(min_move=min_move, skip_bars=skip_bars, exit_mode=exit_mode, risk_pct=risk_pct,
                               capital=float(capital), cap_at_capital=cap_at_capital, exit_fill=exit_fill,
-                              commission_plan=OPENING_BAR_COMMISSIONS[plan_label], slippage=slippage,
                               allow_short=allow_short, bar_minutes=int(bar_minutes), custom_exit=custom_exit)
 
 

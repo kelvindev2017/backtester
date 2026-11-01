@@ -41,3 +41,7 @@ def test_macd_bollinger_labels_follow_the_settings():
     text = texts(macd_bollinger_figure(30, 5.0, True))
     assert "SMA 30" in text and "Stop 5% below entry" in text and "turns down" in text
     assert "Stop" not in texts(macd_bollinger_figure(20, 0.0))
+
+
+def test_macd_bollinger_shows_the_widening_setting():
+    assert "Bands 15% wider<br>than 3 day(s) before" in texts(macd_bollinger_figure(20, 3.0, False, 15, 3))

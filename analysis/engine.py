@@ -70,6 +70,8 @@ class AnalysisSettings:
     macd_ma: int = 20
     macd_stop_pct: float = 3.0
     macd_exit_on_ma_down: bool = False
+    macd_widen_days: int = 5
+    macd_widen_pct: float = 10.0
 
     def detector_kwargs(self):
         """Keyword arguments for ``detect_signals`` beyond setup, lookback and volume multiple."""
@@ -87,6 +89,8 @@ class AnalysisSettings:
             "macd_ma": self.macd_ma,
             "macd_stop_pct": self.macd_stop_pct,
             "macd_exit_on_ma_down": self.macd_exit_on_ma_down,
+            "macd_widen_days": self.macd_widen_days,
+            "macd_widen_pct": self.macd_widen_pct,
         }
 
 
@@ -208,7 +212,8 @@ def analyze(
         elif settings.setup == "macd_bollinger":
             report.headline = (
                 f"No MACD + Bollinger buy in the last {settings.signal_window} bars. A BUY needs, on the same day, the "
-                f"MACD histogram turning positive, the Bollinger Bands widening, and a close above the rising "
+                f"MACD histogram turning positive, the Bollinger Bands at least {settings.macd_widen_pct:g}% wider than "
+                f"{settings.macd_widen_days} day(s) before, and a close above the rising "
                 f"{settings.macd_ma}-day SMA (currently {last['SMA']:,.2f})."
             )
         elif settings.setup == "pullback":
