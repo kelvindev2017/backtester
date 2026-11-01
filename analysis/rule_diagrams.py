@@ -305,3 +305,47 @@ def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback", bar_minu
              LEVEL, ax=-10, ay=-40)
         note(fig, exit_bar + 1, exit_price, "Next close below the<br>pullback: SELL all", DOWN, ax=-15, ay=50)
     return finish(fig, [97.6, 105.6], title=f"How the rule trades (illustration, {bar_minutes}-minute bars)")
+
+
+def macd_bollinger_figure(ma_period=20, stop_pct=3.0, exit_on_ma_down=False):
+    """MACD + Bollinger breakout: buy when the MACD histogram turns positive, the bands widen and the close is
+    above a rising SMA; sell at the first close below the SMA (or at the stop)."""
+
+    # An uptrend, a shallow dip that turns the MACD histogram negative, then the push that turns it positive.
+    closes = np.r_[np.linspace(96, 101, 8), [101.6, 101.2, 101.0, 101.1, 102.6],
+                   [104.4, 106.0, 107.2, 108.2, 108.8, 108.4, 107.0, 105.2, 103.6]]
+    frame = bars_from_closes(closes, wick=0.5)
+    period = 6  # short so the lines react within the bars shown
+    sma = frame["Close"].rolling(period, min_periods=1).mean()
+    spread = frame["Close"].rolling(period, min_periods=2).std().bfill() * 2
+    upper, lower = sma + spread, sma - spread
+    close = frame["Close"]
+    macd = close.ewm(span=4, adjust=False).mean() - close.ewm(span=9, adjust=False).mean()
+    hist = (macd - macd.ewm(span=3, adjust=False).mean()).to_numpy()
+    entry = next(i for i in range(8, len(frame))
+                 if hist[i] > 0 >= hist[i - 1] and close.iloc[i] > sma.iloc[i] > sma.iloc[i - 1])
+    exit_index = next((i for i in range(entry + 1, len(frame)) if close.iloc[i] < sma.iloc[i]), len(frame) - 1)
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
+    candles(fig, frame, row=1, col=1)
+    line(fig, sma, AVERAGE, row=1, col=1)
+    line(fig, upper, LEVEL, dash="dot", row=1, col=1)
+    line(fig, lower, LEVEL, dash="dot", row=1, col=1)
+    note(fig, 3, sma.iloc[2], f"SMA {ma_period}", AVERAGE, arrow=False, yshift=-14, row=1, col=1)
+    note(fig, entry + 3, upper.iloc[entry + 2], "Bollinger Bands<br>widen", LEVEL, ax=-55, ay=-25, row=1, col=1)
+    note(fig, entry + 1, close.iloc[entry], f"BUY at the close: MACD turns up,<br>bands widen, above rising SMA {ma_period}",
+         UP, ax=-40, ay=55, row=1, col=1)
+    if stop_pct:
+        stop = close.iloc[entry] * (1 - stop_pct / 100)
+        fig.add_shape(type="line", x0=entry + 0.6, x1=len(frame) + 0.5, y0=stop, y1=stop,
+                      line=dict(color=DOWN, dash="dash"), row=1, col=1)
+        note(fig, len(frame) - 1, stop, f"Stop {stop_pct:g}% below entry", DOWN, arrow=False, yshift=-10, row=1, col=1)
+    exit_text = f"First close below<br>the SMA {ma_period}: sell"
+    if exit_on_ma_down:
+        exit_text += f"<br>(or SMA {ma_period} turns down)"
+    note(fig, exit_index + 1, close.iloc[exit_index], exit_text, DOWN, ax=10, ay=-60, row=1, col=1)
+
+    fig.add_trace(go.Bar(x=list(range(1, len(hist) + 1)), y=hist, showlegend=False, hoverinfo="skip",
+                         marker_color=[UP if v > 0 else DOWN for v in hist]), row=2, col=1)
+    note(fig, entry + 1, 0, "MACD histogram<br>turns positive", UP, ax=-60, ay=-18, row=2, col=1)
+    return finish(fig, height=340)

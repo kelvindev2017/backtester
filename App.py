@@ -64,6 +64,7 @@ from analysis.rule_diagrams import (
     breakout_figure,
     day_breakout_figure,
     ma_rule_figure,
+    macd_bollinger_figure,
     opening_bar_figure,
     pullback_figure,
     reversal_figure,
@@ -1683,27 +1684,34 @@ def load_benchmark_data(start_date_str, end_date_str, timeframe):
 # Position engine
 # ============================================================
 
-def run_position_engine(price_df, buy_condition, sell_condition, max_hold=0):
+def run_position_engine(price_df, buy_condition, sell_condition, max_hold=0, stop_pct=0.0, cooldown=0):
     """Generate long-only positions and entry/exit markers.
 
-    ``max_hold`` (bars, 0 = no limit) also sells a position that has been held that long.
+    ``max_hold`` (bars, 0 = no limit) also sells a position that has been held that long. ``stop_pct`` (0 = off)
+    sells at the first close at least that % below the entry close. ``cooldown`` bars must pass after a sell
+    before the next buy.
     """
 
     positions, buy_markers, sell_markers = [], [], []
     in_trade = False
     entry_row = 0
+    exit_row = -10**9
+    closes = price_df["Close"].to_numpy(dtype=float)
 
     for row_number in range(len(price_df)):
         buy_signal = False
         sell_signal = False
-        if not in_trade and bool(buy_condition.iloc[row_number]):
+        if (not in_trade and bool(buy_condition.iloc[row_number])
+                and row_number - exit_row > cooldown):
             in_trade = True
             buy_signal = True
             entry_row = row_number
         elif in_trade and (bool(sell_condition.iloc[row_number])
-                           or (max_hold and row_number - entry_row >= max_hold)):
+                           or (max_hold and row_number - entry_row >= max_hold)
+                           or (stop_pct and closes[row_number] <= closes[entry_row] * (1 - stop_pct / 100))):
             in_trade = False
             sell_signal = True
+            exit_row = row_number
 
         positions.append(1 if in_trade else 0)
         buy_markers.append(buy_signal)
@@ -4037,6 +4045,7 @@ SETUP_OPTIONS = {
     "Pullback in trend (dip to the EMA, then reversal)": "pullback",
     "Reversal (buy a breakdown in an uptrend)": "reversal",
     "Day breakout (above the N-day high, hold on a top-third close)": "day_breakout",
+    "MACD + Bollinger breakout (MACD turns up, bands widen, above a rising SMA)": "macd_bollinger",
     "First-bar day trade (the first five-minute bar decides the day)": "opening_bar",
 }
 OPENING_BAR_RULE = next(label for label, setup in SETUP_OPTIONS.items() if setup == "opening_bar")
@@ -4093,6 +4102,7 @@ def strategy_settings(tab="Backtest"):
     swing_bars, pullback_bars, min_depth_atr = 20, 5, 1.5
     keep_fraction = 2 / 3
     exit_ma, max_hold_bars = 200, 0
+    macd_ma, macd_stop_pct, macd_exit_on_ma_down, macd_cooldown = 20, 3.0, False, 1
     opening_bar = None
 
     with settings_panel("Signal"):
@@ -4144,6 +4154,25 @@ def strategy_settings(tab="Backtest"):
                 f"within {(1 - keep_fraction) * 100:.0f}% of the day's range from its high. Sell / exit: the first close "
                 "further below the high than that. Long only. The Day Breakout Rule tab runs it on many tickers with fixed $ size."
             )
+        elif setup == "macd_bollinger":
+            macd_ma = int(st.number_input("Moving average and Bollinger period (days)", min_value=5, max_value=100,
+                                          value=20, step=1, key="macd_ma"))
+            macd_stop_pct = float(st.number_input("Stop: sell when the close is this % below the entry (0 = off)",
+                                                  min_value=0.0, max_value=30.0, value=3.0, step=0.5,
+                                                  key="macd_stop_pct"))
+            macd_exit_on_ma_down = st.checkbox(f"Also sell when the SMA {macd_ma} turns down", value=False,
+                                               key="macd_exit_on_ma_down")
+            macd_cooldown = int(st.number_input("Days to wait after a sell before buying again", min_value=0,
+                                                max_value=20, value=1, step=1, key="macd_cooldown"))
+            st.caption(
+                f"Buy at the close when, on the same day, the MACD (12, 26, 9) histogram turns from negative to "
+                f"positive, the Bollinger Bands ({macd_ma}, 2) are wider than the day before, and the close is above "
+                f"the SMA {macd_ma}, which is rising. Sell / exit: the first close below the SMA {macd_ma}"
+                + (f", or a close {macd_stop_pct:g}% below the entry" if macd_stop_pct else "")
+                + (f", or the SMA {macd_ma} turning down" if macd_exit_on_ma_down else "")
+                + f". Then wait {macd_cooldown} day(s) before the next buy. Long only, full position (the post's KD "
+                "add-on and 20% sizing are not simulated here)."
+            )
         elif setup == "opening_bar":
             opening_bar = opening_bar_settings(account_size, bar_minutes)
         elif setup == "pullback":
@@ -4186,6 +4215,8 @@ def strategy_settings(tab="Backtest"):
             diagram = pullback_figure(pullback_ema, trend_mid, trend_slow, min_depth_atr, swing_bars, pullback_bars)
         elif setup == "reversal":
             diagram = reversal_figure(breakout_lookback, trend_mid, trend_slow, max_hold_bars)
+        elif setup == "macd_bollinger":
+            diagram = macd_bollinger_figure(macd_ma, macd_stop_pct, macd_exit_on_ma_down)
         elif setup == "opening_bar":
             diagram = opening_bar_figure(opening_bar.min_move, opening_bar.skip_bars, opening_bar.exit_mode,
                                          opening_bar.bar_minutes, opening_bar.custom_exit)
@@ -4196,10 +4227,10 @@ def strategy_settings(tab="Backtest"):
         # The Backtest is long only and the reversal and day-breakout rules have no short side. The first-bar day
         # trade has its own short setting.
         allow_short = bool(st.session_state.get("allow_short", False))
-        if tab != "Backtest" and setup not in ("reversal", "day_breakout", "opening_bar"):
+        if tab != "Backtest" and setup not in ("reversal", "day_breakout", "macd_bollinger", "opening_bar"):
             allow_short = st.checkbox("Allow short trades (otherwise sell signals mean exit)", value=False,
                                       key="allow_short")
-        elif setup in ("reversal", "day_breakout", "opening_bar"):
+        elif setup in ("reversal", "day_breakout", "macd_bollinger", "opening_bar"):
             allow_short = False
 
     if setup == "opening_bar" and tab != "Backtest":
@@ -4254,6 +4285,9 @@ def strategy_settings(tab="Backtest"):
         min_depth_atr=min_depth_atr,
         keep_fraction=keep_fraction,
         exit_ma=exit_ma,
+        macd_ma=macd_ma,
+        macd_stop_pct=macd_stop_pct,
+        macd_exit_on_ma_down=macd_exit_on_ma_down,
     )
     risk_settings = RiskSettings(
         account_equity=float(account_size),
@@ -4281,7 +4315,8 @@ def strategy_settings(tab="Backtest"):
         slow_period=slow_period, buy_left=buy_left, buy_operator=buy_operator, buy_right=buy_right,
         sell_left=sell_left, sell_operator=sell_operator, sell_right=sell_right, breakout_lookback=breakout_lookback,
         volume_multiple=volume_multiple, ma_rule=ma_rule, signal_settings=signal_settings, risk_settings=risk_settings,
-        max_hold_bars=max_hold_bars, opening_bar=opening_bar,
+        max_hold_bars=max_hold_bars, opening_bar=opening_bar, macd_ma=macd_ma, macd_stop_pct=macd_stop_pct,
+        macd_cooldown=macd_cooldown,
     )
 
 
@@ -4414,8 +4449,18 @@ def render_backtest(s):
             "its exit (see the rule's settings). Stops and targets are not simulated here; the **Validate** tab replays the "
             "full trade plan."
         )
+        if setup == "macd_bollinger":
+            rule_text = (
+                f"**BUY / SELL:** {setup_label} on {timeframe.lower()} bars, buying and selling at the close. "
+                f"Sells on the first close below the SMA {s.macd_ma}"
+                + (f" or a close {s.macd_stop_pct:g}% below the entry" if s.macd_stop_pct else "")
+                + f", then waits {s.macd_cooldown} day(s). Full position, no costs."
+            )
     if setup != "opening_bar":
-        df = run_position_engine(df, buy_condition, sell_condition, max_hold=s.max_hold_bars if setup == "reversal" else 0)
+        macd_rule = setup == "macd_bollinger"
+        df = run_position_engine(df, buy_condition, sell_condition, max_hold=s.max_hold_bars if setup == "reversal" else 0,
+                                 stop_pct=s.macd_stop_pct if macd_rule else 0.0,
+                                 cooldown=s.macd_cooldown if macd_rule else 0)
 
         df["Returns"] = df["Close"].pct_change().fillna(0.0)
         df["Strat_Returns"] = df["Position"] * df["Returns"]
@@ -4477,6 +4522,12 @@ def render_backtest(s):
         ), row=1, col=1)
     else:
         fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gray", width=1)), row=1, col=1)
+    if setup == "macd_bollinger":
+        rule_sma = df["Close"].rolling(s.macd_ma).mean()
+        rule_band = 2 * df["Close"].rolling(s.macd_ma).std()
+        fig.add_trace(go.Scatter(x=df.index, y=rule_sma, name=f"SMA {s.macd_ma}", line=dict(color="orange", width=1.5)), row=1, col=1)
+        for band, label in [(rule_sma + rule_band, "Upper band"), (rule_sma - rule_band, "Lower band")]:
+            fig.add_trace(go.Scatter(x=df.index, y=band, name=label, line=dict(color="royalblue", width=1, dash="dot")), row=1, col=1)
     if setup == "ma_rule":
         fig.add_trace(go.Scatter(x=df.index, y=df["Fast_MA"], name=f"{fast_type} {fast_period}", line=dict(color="orange", width=1.5)), row=1, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=df["Slow_MA"], name=f"{slow_type} {slow_period}", line=dict(color="blue", width=1.5)), row=1, col=1)
