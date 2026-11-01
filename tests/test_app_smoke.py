@@ -416,7 +416,9 @@ def test_stock_fundamentals_tab(offline, monkeypatch):
     # Earnings releases: a next-date note, markers on the chart and the table of the latest 8.
     assert any(element.value.startswith(("Next earnings", "**Next earnings")) for element in app.markdown)
     assert any('"earnings":true' in chart.proto.spec.replace(" ", "") for chart in app.get("plotly_chart"))
-    assert any("NVDA earnings releases, latest 8" in element.value for element in app.markdown)
+    assert any("NVDA earnings releases: surprise and P/E change" in element.value for element in app.markdown)
+    assert any("EPS surprise %" in chart.proto.spec and "% since release" in chart.proto.spec
+               for chart in app.get("plotly_chart"))
     assert any(list(frame.value.columns[:3]) == ["Date", "When", "Quarter to"] and len(frame.value) == 8
                for frame in app.dataframe)
 

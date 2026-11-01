@@ -50,6 +50,7 @@ from analysis.economy import (
 )
 from analysis.earnings_dates import (
     EASTERN,
+    change_since_release,
     describe_release,
     merge_releases,
     next_release_text,
@@ -58,6 +59,8 @@ from analysis.earnings_dates import (
     release_table,
     releases_with_reaction,
     sec_releases,
+    surprise_held,
+    with_valuation_changes,
     yahoo_releases,
 )
 from analysis.engine import AnalysisSettings, analyze, report_to_dict, report_to_markdown
@@ -129,6 +132,7 @@ from analysis.signal_groups import (
 from analysis.valuation_chart import (
     VALUATION_HISTORY_YEARS,
     correlation_text,
+    earnings_signal_figure,
     eps_estimate_quarters,
     forward_eps,
     forward_valuation,
@@ -3650,6 +3654,7 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, 
         return False
     valuation, _ = build_valuation_data(prices, earnings)
     trend = fundamental_trend(fundamentals)
+    forward = None
     past_releases, upcoming = next_earnings(ticker)
     quarter_ends = fundamentals.index if "Revenue" in fundamentals else None
     reactions = releases_with_reaction(past_releases, prices["Close"], quarter_ends)
@@ -3716,20 +3721,48 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, 
         )
     else:
         st.caption("No quarterly revenue was available for this company.")
-    render_earnings_table(ticker, reactions)
+    forward_pe = forward["Forward_PE"] if forward is not None and not forward.empty else None
+    render_earnings_signals(ticker, with_valuation_changes(reactions, valuation["Trailing_PE"], forward_pe),
+                            valuation, forward_pe, history_start, log_price)
 
 
-def render_earnings_table(ticker, reactions, count=8):
-    """The latest earnings releases with their EPS surprise and the price move after 1 and 5 sessions."""
+def render_earnings_signals(ticker, releases, valuation, forward_pe, start, log_price=False, count=8):
+    """Each earnings release on the price chart, with its EPS surprise and the P/E change from the release before."""
 
-    st.markdown(f"**{ticker} earnings releases, latest {count}**")
-    if reactions.empty:
+    st.markdown(f"**{ticker} earnings releases: surprise and P/E change**")
+    if releases.empty:
         st.caption("No earnings release dates were available (Yahoo may be rate limiting; foreign filers have no "
                    "SEC 8-K to fall back on). Try again in a few minutes.")
         return
-    summary = reaction_summary(reactions, count)
+    summary = reaction_summary(releases, count)
     if summary:
         st.caption(summary)
+    # The release before the window is kept for the first change, then dropped from the chart.
+    start = pd.Timestamp(start)
+    shown = releases[releases["Release"] >= start]
+    days = valuation.loc[start:].index
+    show_chart(earnings_signal_figure(
+        valuation["Close"].loc[start:], shown,
+        surprise=surprise_held(releases, days),
+        pe_change=change_since_release(valuation["Trailing_PE"], releases).loc[start:],
+        forward_change=change_since_release(forward_pe, releases).loc[start:] if forward_pe is not None else None,
+        log_price=log_price, height=600 if MOBILE else None), width="stretch")
+    st.caption(
+        "Bold lines mark each earnings release, on the first session that could react (the next day for a release "
+        "after the close). Top: the daily close, with a dot at each release (green = EPS beat the analysts' average "
+        "estimate, red = missed; a bigger dot is a bigger surprise). Bottom, daily: the last release's EPS surprise %, "
+        "held until the next release, and how far the trailing and forward P/E have moved since the close just before "
+        "the last release (0 going into each release). On the release the trailing P/E jumps by the new quarter's "
+        "EPS replacing the oldest one plus the price reaction; between releases both P/E lines move only with the "
+        "price, so they run parallel. Forward P/E uses the EPS later reported (hindsight) where it is known."
+    )
+    with st.expander("Show as table"):
+        render_earnings_table(releases, count)
+
+
+def render_earnings_table(reactions, count=8):
+    """The latest earnings releases with their EPS surprise, the price move after 1 and 5 sessions and the P/E change."""
+
     table = release_table(reactions, count)
     if MOBILE:
         # Keep the surprise and the price moves on screen; the tap box on the chart has the rest.
@@ -3741,6 +3774,8 @@ def render_earnings_table(ticker, reactions, count=8):
         "Surprise %": st.column_config.NumberColumn(format="%+.1f"),
         "1-day %": st.column_config.NumberColumn(format="%+.1f"),
         "5-day %": st.column_config.NumberColumn(format="%+.1f"),
+        "P/E chg %": st.column_config.NumberColumn(format="%+.1f"),
+        "Fwd P/E chg %": st.column_config.NumberColumn(format="%+.1f"),
     })
     st.caption(
         "Dates and EPS are Yahoo's (reported EPS is adjusted, as companies headline it); a release Yahoo is "

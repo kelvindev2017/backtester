@@ -222,7 +222,9 @@ def release_table(reactions, count=8):
         "1-day %": latest["1-day %"].to_numpy(),
         "5-day %": latest["5-day %"].to_numpy(),
         "Source": latest["Source"].to_numpy(),
-    })
+    } | {label: latest[column].to_numpy() for label, column in [("P/E chg %", "P/E change %"),
+                                                                ("Fwd P/E chg %", "Forward P/E change %")]
+         if column in latest})
 
 
 def reaction_summary(reactions, count=8):
@@ -241,3 +243,57 @@ def reaction_summary(reactions, count=8):
         return ""
     text = " and ".join(parts)
     return f"Last {len(latest)} releases: {text}."
+
+
+def value_on(series, day):
+    """The last value of a daily ``series`` on or before ``day``, or NaN."""
+
+    if series is None or pd.isna(day):
+        return np.nan
+    series = series.dropna()
+    before = series.loc[:day]
+    return float(before.iloc[-1]) if len(before) else np.nan
+
+
+def with_valuation_changes(reactions, trailing_pe=None, forward_pe=None):
+    """Add the P/E and forward P/E at each release's reaction-day close, and their % change from the release before.
+
+    At the reaction day the trailing P/E already uses the EPS just reported, so the change from one release to
+    the next combines the new quarter's EPS and the price move in between.
+    """
+
+    out = reactions.sort_values("Release").reset_index(drop=True).copy()
+    for column, series in [("P/E", trailing_pe), ("Forward P/E", forward_pe)]:
+        values = pd.Series([value_on(series, day) for day in out["Reaction day"]], index=out.index, dtype=float)
+        out[column] = values
+        previous = values.shift(1)
+        out[f"{column} change %"] = ((values / previous - 1) * 100).where((values > 0) & (previous > 0))
+    return out
+
+
+def change_since_release(series, releases):
+    """Daily % change of ``series`` from its value on the session before the latest release's reaction day.
+
+    So it is 0 going into each release, jumps on the reaction day (for the trailing P/E: the new quarter's EPS
+    plus the price reaction), then moves with the price until the next release. NaN before the first release.
+    """
+
+    series = series.dropna() if series is not None else pd.Series(dtype=float)
+    days = pd.DatetimeIndex(releases["Reaction day"].dropna()).unique().sort_values() if len(releases) else pd.DatetimeIndex([])
+    if series.empty or days.empty:
+        return pd.Series(np.nan, index=series.index, dtype=float)
+    base = pd.Series([value_on(series, day - pd.Timedelta(days=1)) for day in days], index=days)
+    base = base.where(base > 0)
+    anchor = base.reindex(series.index.union(days)).ffill().reindex(series.index)
+    return ((series / anchor - 1) * 100).where(series > 0)
+
+
+def surprise_held(releases, index):
+    """Each day, the EPS surprise % of the latest release that could have moved the price by then."""
+
+    marked = releases.dropna(subset=["Reaction day"]).sort_values("Reaction day")
+    if marked.empty:
+        return pd.Series(np.nan, index=index, dtype=float)
+    surprise = pd.Series(marked["Surprise(%)"].to_numpy(dtype=float), index=pd.DatetimeIndex(marked["Reaction day"]))
+    surprise = surprise[~surprise.index.duplicated(keep="last")]
+    return surprise.reindex(pd.DatetimeIndex(index).union(surprise.index)).ffill().reindex(index)
