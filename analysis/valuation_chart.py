@@ -789,7 +789,7 @@ def earnings_signal_figure(close, releases, surprise=None, pe_change=None, forwa
     height = height or 640
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=110 / height, row_heights=[0.5, 0.5],
                         subplot_titles=["Daily close and earnings releases",
-                                        "EPS surprise, and P/E change since just before the last release, %"])
+                                        "EPS surprise and P/E change since release, %"])
     fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close", line=dict(color=PRICE_COLOR, width=1.3),
                              hovertemplate="%{x|%Y-%m-%d}: %{y:,.2f}<extra></extra>"), row=1, col=1)
     marked = releases.dropna(subset=["Reaction day"])
