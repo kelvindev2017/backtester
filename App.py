@@ -4147,7 +4147,7 @@ def strategy_settings(tab="Backtest"):
     keep_fraction = 2 / 3
     exit_ma, max_hold_bars = 200, 0
     macd_ma, macd_stop_pct, macd_exit_on_ma_down, macd_cooldown = 20, 3.0, False, 1
-    macd_widen_days, macd_widen_pct = 5, 10.0
+    macd_widen_days, macd_widen_pct, macd_bb_std = 5, 10.0, 2.0
     opening_bar = None
 
     with settings_panel("Signal"):
@@ -4202,6 +4202,12 @@ def strategy_settings(tab="Backtest"):
         elif setup == "macd_bollinger":
             macd_ma = int(st.number_input("Moving average and Bollinger period (days)", min_value=5, max_value=100,
                                           value=20, step=1, key="macd_ma"))
+            macd_bb_std = float(st.number_input(
+                "Bollinger band width (standard deviations)", min_value=0.5, max_value=5.0, value=2.0, step=0.1,
+                key="macd_bb_std",
+                help="The bands sit this many standard deviations of the close above and below the SMA. 2 is the "
+                "usual setting. Wider bands are drawn further out, but the widening test compares band width with "
+                "itself N days before, so it gives the same buys at any setting."))
             widen_columns = st.columns(2)
             macd_widen_pct = float(widen_columns[0].number_input(
                 "Bands at least this % wider", min_value=0.0, max_value=200.0, value=10.0, step=5.0,
@@ -4219,7 +4225,7 @@ def strategy_settings(tab="Backtest"):
                                                 max_value=20, value=1, step=1, key="macd_cooldown"))
             st.caption(
                 f"Buy at the close when, on the same day, the MACD (12, 26, 9) histogram turns from negative to "
-                f"positive, the Bollinger Bands ({macd_ma}, 2) are at least {macd_widen_pct:g}% wider than {macd_widen_days} "
+                f"positive, the Bollinger Bands ({macd_ma}, {macd_bb_std:g}) are at least {macd_widen_pct:g}% wider than {macd_widen_days} "
                 f"day(s) before, and the close is above "
                 f"the SMA {macd_ma}, which is rising. Sell / exit: the first close below the SMA {macd_ma}"
                 + (f", or a close {macd_stop_pct:g}% below the entry" if macd_stop_pct else "")
@@ -4350,6 +4356,7 @@ def strategy_settings(tab="Backtest"):
         macd_exit_on_ma_down=macd_exit_on_ma_down,
         macd_widen_days=macd_widen_days,
         macd_widen_pct=macd_widen_pct,
+        macd_bb_std=macd_bb_std,
     )
     risk_settings = RiskSettings(
         account_equity=float(account_size),
@@ -4378,7 +4385,7 @@ def strategy_settings(tab="Backtest"):
         sell_left=sell_left, sell_operator=sell_operator, sell_right=sell_right, breakout_lookback=breakout_lookback,
         volume_multiple=volume_multiple, ma_rule=ma_rule, signal_settings=signal_settings, risk_settings=risk_settings,
         max_hold_bars=max_hold_bars, opening_bar=opening_bar, macd_ma=macd_ma, macd_stop_pct=macd_stop_pct,
-        macd_cooldown=macd_cooldown, commission_plan=commission_plan, slippage=slippage,
+        macd_cooldown=macd_cooldown, macd_bb_std=macd_bb_std, commission_plan=commission_plan, slippage=slippage,
     )
 
 
@@ -4589,7 +4596,7 @@ def render_backtest(s):
         fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gray", width=1)), row=1, col=1)
     if setup == "macd_bollinger":
         rule_sma = df["Close"].rolling(s.macd_ma).mean()
-        rule_band = 2 * df["Close"].rolling(s.macd_ma).std()
+        rule_band = s.macd_bb_std * df["Close"].rolling(s.macd_ma).std()
         fig.add_trace(go.Scatter(x=df.index, y=rule_sma, name=f"SMA {s.macd_ma}", line=dict(color="orange", width=1.5)), row=1, col=1)
         for band, label in [(rule_sma + rule_band, "Upper band"), (rule_sma - rule_band, "Lower band")]:
             fig.add_trace(go.Scatter(x=df.index, y=band, name=label, line=dict(color="royalblue", width=1, dash="dot")), row=1, col=1)
