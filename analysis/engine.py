@@ -72,6 +72,7 @@ class AnalysisSettings:
     macd_exit_on_ma_down: bool = False
     macd_widen_days: int = 5
     macd_widen_pct: float = 10.0
+    macd_bb_std: float = 2.0
 
     def detector_kwargs(self):
         """Keyword arguments for ``detect_signals`` beyond setup, lookback and volume multiple."""
@@ -91,6 +92,7 @@ class AnalysisSettings:
             "macd_exit_on_ma_down": self.macd_exit_on_ma_down,
             "macd_widen_days": self.macd_widen_days,
             "macd_widen_pct": self.macd_widen_pct,
+            "macd_bb_std": self.macd_bb_std,
         }
 
 

@@ -704,6 +704,9 @@ def test_macd_bollinger_signal_rule(offline):
     open_tab(app, "Backtest")
     assert not app.exception, app.exception
     assert any(box.key == "macd_stop_pct" for box in app.number_input)
+    next(box for box in app.number_input if box.key == "macd_bb_std").set_value(2.5).run()
+    assert not app.exception, app.exception
+    assert any("Bollinger Bands (20, 2.5)" in caption.value for caption in app.caption)
     assert any("MACD + Bollinger" in element.value for element in app.info)
     assert any(box.key == "cost_commissions" for box in app.selectbox)
     assert any("**Costs:**" in element.value for element in app.info)

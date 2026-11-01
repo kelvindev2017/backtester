@@ -614,3 +614,19 @@ def test_backtest_pays_fees_and_slippage_on_every_buy_and_sell():
     paid, costs, _ = equity_with_costs(traded, 10_000, "tiered", 0.01)
     # 100 shares: $1 + $1 slippage plus broker fees on the buy and the sell.
     assert costs > 2.0 and paid.iloc[-1] == pytest.approx(11_000 - costs, rel=1e-3)
+
+
+def test_macd_bollinger_band_width_setting():
+    import numpy as np
+    import pandas as pd
+    from analysis.patterns import detect_signals
+
+    rng = np.random.default_rng(5)
+    closes = 100 * np.exp(np.cumsum(rng.normal(0.0005, 0.02, 400)))
+    bars = pd.DataFrame({"Open": closes, "High": closes * 1.01, "Low": closes * 0.99, "Close": closes, "Volume": 1e6},
+                        index=pd.bdate_range("2020-01-01", periods=len(closes)))
+    two = detect_signals(bars, "macd_bollinger", macd_bb_std=2.0)
+    three = detect_signals(bars, "macd_bollinger", macd_bb_std=3.0)
+    assert three["BB_Width"].iloc[-1] == pytest.approx(two["BB_Width"].iloc[-1] * 1.5)
+    # The widening test is relative, so the buys do not depend on the band width.
+    assert (two["Signal_Up"] == three["Signal_Up"]).all()

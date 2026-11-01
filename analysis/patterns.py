@@ -521,6 +521,7 @@ def detect_signals(
     macd_exit_on_ma_down=False,
     macd_widen_days=5,
     macd_widen_pct=10.0,
+    macd_bb_std=2.0,
 ):
     """Dispatch to the detector for ``setup`` ("breakout", "pullback", "reversal", "day_breakout",
     "macd_bollinger" or "ma_rule").
@@ -547,7 +548,8 @@ def detect_signals(
         return detect_day_breakouts(df, lookback, keep_fraction=keep_fraction, volume_period=volume_period)
     if setup == "macd_bollinger":
         return detect_macd_bollinger(df, macd_ma, stop_pct=macd_stop_pct, exit_on_ma_down=macd_exit_on_ma_down,
-                                     widen_days=macd_widen_days, widen_pct=macd_widen_pct, volume_period=volume_period)
+                                     widen_days=macd_widen_days, widen_pct=macd_widen_pct, bb_std=macd_bb_std,
+                                     volume_period=volume_period)
     if setup == "reversal":
         return detect_reversals(df, lookback, mid=trend_mid, slow=trend_slow, volume_period=volume_period)
     return detect_breakouts(df, lookback, volume_period=volume_period, volume_multiple=volume_multiple,
