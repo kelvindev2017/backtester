@@ -537,9 +537,54 @@ def add_forward_line(fig, values, estimated, name, row, hover):
                                  hovertemplate=f"%{{x|%Y-%m-%d}}: {hover}<extra>{label}</extra>"), row=row, col=1)
 
 
+EARNINGS_LINE_COLOR = "rgba(120, 120, 120, 0.45)"
+EARNINGS_MARKER_COLOR = "rgba(90, 90, 90, 0.85)"
+NEXT_EARNINGS_COLOR = "crimson"
+
+
+def add_earnings_markers(fig, rows, releases=None, next_release=None):
+    """A dotted vertical line at every earnings release in each subplot row, with a small marker to tap.
+
+    ``releases`` holds ``Release`` (timestamp) and ``Text`` (the tap box text) columns; ``next_release`` is
+    ``(timestamp, text)``. The markers sit at the bottom of each panel on a hidden 0-1 axis, so they land in
+    the same place whatever the panel's own scale; trace meta ``earnings`` tells the axis-hover script to
+    show the text in a box instead of a value label.
+    """
+
+    points = []
+    if releases is not None and len(releases):
+        points += [(when, text, False) for when, text in zip(releases["Release"], releases["Text"])]
+    if next_release is not None:
+        points.append((next_release[0], next_release[1], True))
+    if not points:
+        return
+    for row in range(1, rows + 1):
+        subplot = fig.get_subplot(row, 1)
+        x_axis, y_axis = subplot.xaxis.plotly_name.replace("axis", ""), subplot.yaxis.plotly_name.replace("axis", "")
+        taken = [int(key[5:] or 1) for key in fig.layout.to_plotly_json() if key.startswith("yaxis")]
+        number = max(taken) + 1
+        fig.layout[f"yaxis{number}"] = dict(overlaying=y_axis, anchor=x_axis, range=[0, 1], fixedrange=True,
+                                            visible=False)
+        for when, _, upcoming in points:
+            fig.add_shape(type="line", x0=when, x1=when, y0=0, y1=1, xref=x_axis, yref=f"{y_axis} domain",
+                          layer="below", line=dict(color=NEXT_EARNINGS_COLOR if upcoming else EARNINGS_LINE_COLOR,
+                                                   width=1, dash="dash" if upcoming else "dot"))
+        for upcoming in (False, True):
+            part = [(when, text) for when, text, is_next in points if is_next == upcoming]
+            if not part:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[when for when, _ in part], y=[0.03] * len(part), yaxis=f"y{number}", xaxis=x_axis,
+                mode="markers", name="Next earnings" if upcoming else "Earnings release",
+                text=[text for _, text in part], meta=dict(earnings=True), showlegend=row == 1,
+                marker=dict(symbol="triangle-up", size=9 if upcoming else 7,
+                            color=NEXT_EARNINGS_COLOR if upcoming else EARNINGS_MARKER_COLOR),
+                hovertemplate="%{text}<extra></extra>"))
+
+
 def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
                       price_change=None, growth=None, close=None, log_price=False, height=None, ohlcv=None,
-                      peg_gaps=None, forward=None, link_dates=False):
+                      peg_gaps=None, forward=None, link_dates=False, releases=None, next_release=None):
     """Daily price, growth vs price, revenue, EPS, trailing P/E and PEG panels, top to bottom, on one date axis.
 
     ``ohlcv`` (optional, daily Open/High/Low/Close/Volume) turns the price panel into candlesticks with
@@ -548,6 +593,7 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     ``peg_gaps`` (optional, from :func:`peg_gap_reasons`) shades the days PEG is blank, by reason.
     ``forward`` (optional, from :func:`forward_valuation`) adds forward P/E and forward PEG lines.
     With ``link_dates`` a zoom on one panel zooms them all; otherwise each panel zooms on its own and shows its own dates.
+    ``releases`` and ``next_release`` (optional, see :func:`add_earnings_markers`) mark earnings release dates.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -706,6 +752,9 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     for key, number in row.items():
         if key != "price":
             add_close_overlay(fig, close, number, log_price)
+    if releases is not None and len(releases) and not close.empty:
+        releases = releases[releases["Release"] >= close.index.min()]
+    add_earnings_markers(fig, rows, releases, next_release)
 
     fig.update_yaxes(ticksuffix="x", rangemode="tozero", row=row["pe"], col=1)
     fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=row["revenue"], col=1)
