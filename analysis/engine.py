@@ -28,6 +28,7 @@ from analysis.patterns import (
     assess_volume,
     breakout_quality,
     day_breakout_quality,
+    macd_bollinger_quality,
     detect_breakouts,
     detect_signals,
     historical_edge_score,
@@ -66,6 +67,9 @@ class AnalysisSettings:
     min_depth_atr: float = 1.5
     keep_fraction: float = 2 / 3
     exit_ma: int = 200
+    macd_ma: int = 20
+    macd_stop_pct: float = 3.0
+    macd_exit_on_ma_down: bool = False
 
     def detector_kwargs(self):
         """Keyword arguments for ``detect_signals`` beyond setup, lookback and volume multiple."""
@@ -80,6 +84,9 @@ class AnalysisSettings:
             "min_depth_atr": self.min_depth_atr,
             "keep_fraction": self.keep_fraction,
             "exit_ma": self.exit_ma,
+            "macd_ma": self.macd_ma,
+            "macd_stop_pct": self.macd_stop_pct,
+            "macd_exit_on_ma_down": self.macd_exit_on_ma_down,
         }
 
 
@@ -112,6 +119,7 @@ SETUP_NAMES = {
     "pullback": ("pullback entry above", "bounce-failure entry below"),
     "reversal": ("reversal buy after breakdown at", "-"),
     "day_breakout": ("day breakout above", "-"),
+    "macd_bollinger": ("MACD + Bollinger buy at", "-"),
     "ma_rule": ("MA rule buy at", "MA rule sell at"),
 }
 
@@ -197,6 +205,12 @@ def analyze(
                 f"{settings.breakout_lookback}-day high (currently {last['Prior_High']:,.2f}) and close in the top "
                 f"{(1 - settings.keep_fraction) * 100:.0f}% of the day's range; otherwise the rule sells at the close."
             )
+        elif settings.setup == "macd_bollinger":
+            report.headline = (
+                f"No MACD + Bollinger buy in the last {settings.signal_window} bars. A BUY needs, on the same day, the "
+                f"MACD histogram turning positive, the Bollinger Bands widening, and a close above the rising "
+                f"{settings.macd_ma}-day SMA (currently {last['SMA']:,.2f})."
+            )
         elif settings.setup == "pullback":
             report.headline = (
                 f"No pullback entry in the last {settings.signal_window} bars. A BUY needs an uptrend ({settings.trend_mid}-bar "
@@ -256,6 +270,13 @@ def analyze(
             f"invalidated below the day's low {signal['invalidation']:,.2f}."
         )
         quality_metrics = {"Close location": float(signal_row["Close_Location"]), "RVOL": float(signal_row["RVOL"])}
+    elif settings.setup == "macd_bollinger":
+        quality, quality_details, trigger = macd_bollinger_quality(signal_row, signal_close, direction, settings.macd_ma)
+        signal_text = (
+            f"MACD + Bollinger buy on {signal['date']:%Y-%m-%d} ({signal['bars_ago']} bar(s) ago) at "
+            f"{trigger:,.2f}, invalidated below {signal['invalidation']:,.2f}."
+        )
+        quality_metrics = {"Band width": float(signal_row["BB_Width"]), "RVOL": float(signal_row["RVOL"])}
     elif settings.setup == "pullback":
         quality, quality_details, trigger = pullback_quality(signal_row, signal_close, direction)
         signal_text = (
@@ -375,7 +396,7 @@ def analyze(
         entry = float(daily["Close"].iloc[-1])
         entry_basis = "last daily close (indicative - final entry comes from the intraday trigger)"
 
-    if settings.setup in ("pullback", "reversal", "day_breakout", "ma_rule"):
+    if settings.setup in ("pullback", "reversal", "day_breakout", "macd_bollinger", "ma_rule"):
         # The pullback / signal-bar extreme is the level that invalidates the setup.
         invalidation = signal["invalidation"]
         broken_level = PriceZone(

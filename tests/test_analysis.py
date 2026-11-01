@@ -546,3 +546,37 @@ def test_position_engine_max_hold():
     sell = pd.Series(False, index=df.index)
     result = run_position_engine(df, buy, sell, max_hold=3)
     assert list(result["Raw_Position"])[:5] == [1, 1, 1, 0, 0]
+
+
+def test_macd_bollinger_buys_when_all_three_line_up_and_sells_below_the_sma():
+    import numpy as np
+    import pandas as pd
+    from analysis.patterns import detect_signals
+
+    # Uptrend, a shallow dip that turns the MACD histogram negative, then a push that turns it positive.
+    closes = np.r_[np.linspace(80, 101, 40), [101.6, 101.2, 100.9, 100.8, 101.0], np.linspace(103, 112, 6),
+                   np.linspace(111, 95, 6)]
+    bars = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes, "Volume": 1e6},
+                        index=pd.bdate_range("2024-01-01", periods=len(closes)))
+    signals = detect_signals(bars, "macd_bollinger", macd_ma=20, macd_stop_pct=3.0)
+    buys = signals.index[signals["Signal_Up"]]
+    assert len(buys) == 1
+    day = buys[0]
+    assert signals.at[day, "MACD_Hist"] > 0 and signals["MACD_Hist"].shift(1)[day] <= 0
+    assert bars.at[day, "Close"] > signals.at[day, "SMA"]
+    assert signals.at[day, "Invalidation_Up"] == pytest.approx(bars.at[day, "Close"] * 0.97)
+    assert signals["Exit_Long"].iloc[-1] and not signals["Exit_Long"].loc[day]
+    assert not signals["Signal_Down"].any()
+
+
+def test_position_engine_stop_and_cooldown():
+    import pandas as pd
+    from App import run_position_engine
+
+    df = pd.DataFrame({"Close": [100, 101, 97, 98, 99, 100]}, index=pd.bdate_range("2021-01-01", periods=6))
+    buy = pd.Series([True, False, False, True, True, False], index=df.index)
+    sell = pd.Series(False, index=df.index)
+    # 97 is 3% below the 100 entry: stop out, skip the next day's buy, buy the day after.
+    result = run_position_engine(df, buy, sell, stop_pct=3.0, cooldown=1)
+    assert list(result["Raw_Position"]) == [1, 1, 0, 0, 1, 1]
+    assert list(result["Raw_Position"]) != list(run_position_engine(df, buy, sell, stop_pct=3.0)["Raw_Position"])

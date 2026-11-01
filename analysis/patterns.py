@@ -322,6 +322,67 @@ def day_breakout_quality(row, close, direction, lookback=10, keep_fraction=2 / 3
     return 0.0, details, float(row["Trigger_Up"])
 
 
+def macd_histogram(close, fast=12, slow=26, signal=9):
+    """MACD histogram: (EMA fast - EMA slow) minus its own ``signal``-bar EMA."""
+
+    macd = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    return macd - macd.ewm(span=signal, adjust=False).mean()
+
+
+def detect_macd_bollinger(df, ma_period=20, bb_std=2.0, stop_pct=3.0, exit_on_ma_down=False, volume_period=50,
+                          atr_period=14):
+    """MACD + Bollinger breakout (a swing rule from a Threads post, 2026-11), long only.
+
+    Buy at the close when all three hold on the same daily bar: the MACD(12, 26, 9) histogram turns from
+    negative (or zero) to positive, the Bollinger Bands (``ma_period``, ``bb_std``) are wider than the day before,
+    and the close is above a rising ``ma_period``-day SMA. ``Exit_Long`` marks a close below that SMA (and, with
+    ``exit_on_ma_down``, the SMA turning down). The ``stop_pct`` stop below the entry is applied by the
+    Backtest's position engine; here it sets the invalidation level.
+    """
+
+    close = df["Close"]
+    sma = close.rolling(ma_period, min_periods=ma_period).mean()
+    width = 2 * bb_std * close.rolling(ma_period, min_periods=ma_period).std() / sma
+    hist = macd_histogram(close)
+    macd_turns_up = (hist > 0) & (hist.shift(1) <= 0)
+    bands_widen = width > width.shift(1)
+    ma_rising = sma > sma.shift(1)
+    above_ma = close > sma
+
+    result = pd.DataFrame(index=df.index)
+    result["Signal_Up"] = (macd_turns_up & bands_widen & above_ma & ma_rising).fillna(False)
+    result["Signal_Down"] = False
+    exit_long = close < sma
+    if exit_on_ma_down:
+        exit_long = exit_long | (sma < sma.shift(1))
+    result["Exit_Long"] = exit_long.fillna(False)
+    result["Trigger_Up"] = close
+    result["Trigger_Down"] = np.nan
+    result["Invalidation_Up"] = close * (1 - stop_pct / 100) if stop_pct else sma
+    result["Invalidation_Down"] = np.nan
+    result["MACD_Hist"] = hist
+    result["BB_Width"] = width
+    result["SMA"] = sma
+    result["RVOL"] = relative_volume(df["Volume"], volume_period)
+    result["ATR"] = atr(df, atr_period)
+    result["Volume_Confirmed"] = True
+    return result
+
+
+def macd_bollinger_quality(row, close, direction, ma_period=20):
+    """Describe a MACD + Bollinger entry. Scored neutrally: the rule takes every qualifying day."""
+
+    details = [
+        f"MACD histogram turned positive ({row['MACD_Hist']:+.2f}), the Bollinger Bands widened to "
+        f"{row['BB_Width'] * 100:.1f}% of price, and the close {close:,.2f} is above the rising {ma_period}-day SMA "
+        f"{row['SMA']:,.2f}.",
+        f"Rule: sell at the first close below the {ma_period}-day SMA or at the stop {row['Invalidation_Up']:,.2f}.",
+    ]
+    if np.isfinite(row["RVOL"]):
+        details.append(f"Volume was {row['RVOL']:.1f}x its 50-bar average.")
+    return 0.0, details, float(row["Trigger_Up"])
+
+
 # ============================================================
 # Moving-average rule (the Backtest tab's buy/sell rule)
 # ============================================================
@@ -452,8 +513,12 @@ def detect_signals(
     min_depth_atr=1.5,
     keep_fraction=2 / 3,
     exit_ma=200,
+    macd_ma=20,
+    macd_stop_pct=3.0,
+    macd_exit_on_ma_down=False,
 ):
-    """Dispatch to the detector for ``setup`` ("breakout", "pullback", "reversal", "day_breakout" or "ma_rule").
+    """Dispatch to the detector for ``setup`` ("breakout", "pullback", "reversal", "day_breakout",
+    "macd_bollinger" or "ma_rule").
 
     ``lookback`` is the breakout range and the reversal breakdown range;
     ``trend_mid`` / ``trend_slow`` are the trend-filter moving averages of the
@@ -475,6 +540,9 @@ def detect_signals(
         )
     if setup == "day_breakout":
         return detect_day_breakouts(df, lookback, keep_fraction=keep_fraction, volume_period=volume_period)
+    if setup == "macd_bollinger":
+        return detect_macd_bollinger(df, macd_ma, stop_pct=macd_stop_pct, exit_on_ma_down=macd_exit_on_ma_down,
+                                     volume_period=volume_period)
     if setup == "reversal":
         return detect_reversals(df, lookback, mid=trend_mid, slow=trend_slow, volume_period=volume_period)
     return detect_breakouts(df, lookback, volume_period=volume_period, volume_multiple=volume_multiple,

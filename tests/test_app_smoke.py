@@ -695,3 +695,17 @@ def test_time_charts_get_axis_value_labels():
     assert has_date_axis(go.Figure(go.Scatter(x=pd.date_range("2025-01-01", periods=3), y=[1, 2, 3])))
     assert not has_date_axis(go.Figure(go.Bar(x=["a", "b"], y=[1, 2])))
     assert not has_date_axis(go.Figure(go.Scatter(x=[0.1, 0.2], y=[1, 2])))
+
+
+def test_macd_bollinger_signal_rule(offline):
+    app = open_tab(start_app(), "Backtest")
+    next(box for box in app.selectbox if box.label == "Signal rule").select(
+        "MACD + Bollinger breakout (MACD turns up, bands widen, above a rising SMA)")
+    open_tab(app, "Backtest")
+    assert not app.exception, app.exception
+    assert any(box.key == "macd_stop_pct" for box in app.number_input)
+    assert any("MACD + Bollinger" in element.value for element in app.info)
+    open_tab(app, "Signal Analysis & Trade Plan")
+    assert not app.exception, app.exception
+    open_tab(app, "Validate")
+    assert not app.exception, app.exception

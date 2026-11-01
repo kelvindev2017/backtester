@@ -1,13 +1,15 @@
 import pytest
 
-from analysis.rule_diagrams import breakout_figure, day_breakout_figure, ma_rule_figure, pullback_figure, reversal_figure
+from analysis.rule_diagrams import (
+    breakout_figure, day_breakout_figure, ma_rule_figure, macd_bollinger_figure, pullback_figure, reversal_figure,
+)
 
 
 def texts(fig):
     return " ".join(annotation.text for annotation in fig.layout.annotations)
 
 
-@pytest.mark.parametrize("make", [ma_rule_figure, breakout_figure, pullback_figure, reversal_figure])
+@pytest.mark.parametrize("make", [ma_rule_figure, breakout_figure, pullback_figure, reversal_figure, macd_bollinger_figure])
 def test_every_rule_has_a_buy_illustration(make):
     fig = make()
     assert "BUY" in texts(fig)
@@ -33,3 +35,9 @@ def test_pullback_shows_every_setting():
     text = texts(pullback_figure(21, 40, 150, 2.0, 30, 7))
     for label in ["Fast MA 40", "Slow MA 150", "Pullback EMA 21", "lookback: 30 bars", "last 7 bars", "2 ATR"]:
         assert label in text, label
+
+
+def test_macd_bollinger_labels_follow_the_settings():
+    text = texts(macd_bollinger_figure(30, 5.0, True))
+    assert "SMA 30" in text and "Stop 5% below entry" in text and "turns down" in text
+    assert "Stop" not in texts(macd_bollinger_figure(20, 0.0))
