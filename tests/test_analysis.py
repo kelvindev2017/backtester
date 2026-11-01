@@ -558,7 +558,7 @@ def test_macd_bollinger_buys_when_all_three_line_up_and_sells_below_the_sma():
                    np.linspace(111, 95, 6)]
     bars = pd.DataFrame({"Open": closes, "High": closes + 0.5, "Low": closes - 0.5, "Close": closes, "Volume": 1e6},
                         index=pd.bdate_range("2024-01-01", periods=len(closes)))
-    signals = detect_signals(bars, "macd_bollinger", macd_ma=20, macd_stop_pct=3.0)
+    signals = detect_signals(bars, "macd_bollinger", macd_ma=20, macd_stop_pct=3.0, macd_widen_days=1, macd_widen_pct=0)
     buys = signals.index[signals["Signal_Up"]]
     assert len(buys) == 1
     day = buys[0]
@@ -580,3 +580,37 @@ def test_position_engine_stop_and_cooldown():
     result = run_position_engine(df, buy, sell, stop_pct=3.0, cooldown=1)
     assert list(result["Raw_Position"]) == [1, 1, 0, 0, 1, 1]
     assert list(result["Raw_Position"]) != list(run_position_engine(df, buy, sell, stop_pct=3.0)["Raw_Position"])
+
+
+def test_macd_bollinger_needs_bands_clearly_wider_than_days_before():
+    import numpy as np
+    import pandas as pd
+    from analysis.patterns import detect_macd_bollinger
+
+    rng = np.random.default_rng(3)
+    closes = 100 * np.exp(np.cumsum(rng.normal(0.0005, 0.02, 600)))
+    bars = pd.DataFrame({"Open": closes, "High": closes * 1.01, "Low": closes * 0.99, "Close": closes, "Volume": 1e6},
+                        index=pd.bdate_range("2020-01-01", periods=len(closes)))
+    strict = detect_macd_bollinger(bars, widen_days=5, widen_pct=10)
+    loose = detect_macd_bollinger(bars, widen_days=1, widen_pct=0)
+    buys = strict[strict["Signal_Up"]]
+    assert len(buys) and (buys["BB_Width"] > buys["BB_Width_Before"] * 1.1).all()
+    # The one-day reading also buys on upticks while the bands are still narrower than a week before.
+    assert loose["Signal_Up"].sum() > strict["Signal_Up"].sum()
+    assert (loose["Signal_Up"] & ~strict["Signal_Up"] & (loose["BB_Width"] < strict["BB_Width_Before"])).any()
+
+
+def test_backtest_pays_fees_and_slippage_on_every_buy_and_sell():
+    import pandas as pd
+    from App import equity_with_costs, run_position_engine
+
+    df = pd.DataFrame({"Close": [100.0, 110.0, 110.0, 100.0]}, index=pd.bdate_range("2021-01-01", periods=4))
+    buy = pd.Series([True, False, False, False], index=df.index)
+    sell = pd.Series([False, False, True, False], index=df.index)
+    traded = run_position_engine(df, buy, sell)
+    free, free_costs, orders = equity_with_costs(traded, 10_000, "none", 0.0)
+    # No commission still pays the SEC / FINRA fees on the sale (a few cents).
+    assert free.iloc[-1] == pytest.approx(11_000, abs=1) and free_costs < 1 and orders == 2
+    paid, costs, _ = equity_with_costs(traded, 10_000, "tiered", 0.01)
+    # 100 shares: $1 + $1 slippage plus broker fees on the buy and the sell.
+    assert costs > 2.0 and paid.iloc[-1] == pytest.approx(11_000 - costs, rel=1e-3)

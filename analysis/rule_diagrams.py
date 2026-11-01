@@ -307,7 +307,7 @@ def opening_bar_figure(min_move=0.0, skip_bars=2, exit_mode="pullback", bar_minu
     return finish(fig, [97.6, 105.6], title=f"How the rule trades (illustration, {bar_minutes}-minute bars)")
 
 
-def macd_bollinger_figure(ma_period=20, stop_pct=3.0, exit_on_ma_down=False):
+def macd_bollinger_figure(ma_period=20, stop_pct=3.0, exit_on_ma_down=False, widen_pct=10.0, widen_days=5):
     """MACD + Bollinger breakout: buy when the MACD histogram turns positive, the bands widen and the close is
     above a rising SMA; sell at the first close below the SMA (or at the stop)."""
 
@@ -332,7 +332,7 @@ def macd_bollinger_figure(ma_period=20, stop_pct=3.0, exit_on_ma_down=False):
     line(fig, upper, LEVEL, dash="dot", row=1, col=1)
     line(fig, lower, LEVEL, dash="dot", row=1, col=1)
     note(fig, 3, sma.iloc[2], f"SMA {ma_period}", AVERAGE, arrow=False, yshift=-14, row=1, col=1)
-    note(fig, entry + 3, upper.iloc[entry + 2], "Bollinger Bands<br>widen", LEVEL, ax=-55, ay=-25, row=1, col=1)
+    note(fig, entry + 3, upper.iloc[entry + 2], f"Bands {widen_pct:g}% wider<br>than {widen_days} day(s) before", LEVEL, ax=-55, ay=-25, row=1, col=1)
     note(fig, entry + 1, close.iloc[entry], f"BUY at the close: MACD turns up,<br>bands widen, above rising SMA {ma_period}",
          UP, ax=-40, ay=55, row=1, col=1)
     if stop_pct:

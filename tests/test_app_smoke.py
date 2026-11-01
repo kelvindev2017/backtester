@@ -571,7 +571,7 @@ def test_first_bar_day_trade_is_a_backtest_rule(offline):
     assert "Date Range" not in labels()
     assert any(box.label == "Account size ($)" for box in app.number_input)
     assert any(box.key == "opening_bar_fill" for box in app.selectbox)
-    assert any(box.key == "opening_bar_commissions" for box in app.selectbox)
+    assert any(box.key == "cost_commissions" for box in app.selectbox)
     assert any("long days" in block.value for block in app.markdown)
     # The usual Backtest chart, with the day trades as its signals.
     spec = next(chart.proto.spec for chart in app.get("plotly_chart") if "Price, Indicators and Trade Signals" in chart.proto.spec)
@@ -705,6 +705,8 @@ def test_macd_bollinger_signal_rule(offline):
     assert not app.exception, app.exception
     assert any(box.key == "macd_stop_pct" for box in app.number_input)
     assert any("MACD + Bollinger" in element.value for element in app.info)
+    assert any(box.key == "cost_commissions" for box in app.selectbox)
+    assert any("**Costs:**" in element.value for element in app.info)
     open_tab(app, "Signal Analysis & Trade Plan")
     assert not app.exception, app.exception
     open_tab(app, "Validate")
