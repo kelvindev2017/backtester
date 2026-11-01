@@ -4493,19 +4493,19 @@ def render_backtest(s):
         vertical_spacing=BACKTEST_PANEL_GAP_PX / BACKTEST_CHART_HEIGHT,
         subplot_titles=(
             f"{ticker} Price, Indicators and Trade Signals",
+            "Portfolio Equity Curve ($)",
+            "Drawdown Profile (%)",
             f"{ticker} Quarterly and TTM EPS",
             f"{ticker} Quarterly Revenue, OpEx, Total Expense, CapEx and Net Income",
             f"{ticker} Trailing P/E and Estimate-Based P/E Proxy",
             "Market Benchmark Performance, Normalized to 100",
-            "Portfolio Equity Curve ($)",
-            "Drawdown Profile (%)",
         ),
-        row_heights=[0.27, 0.14, 0.16, 0.13, 0.12, 0.11, 0.07],
+        row_heights=[0.27, 0.11, 0.07, 0.14, 0.16, 0.13, 0.12],
         specs=[
             [{"secondary_y": False}],
+            [{"secondary_y": False}],
+            [{"secondary_y": False}],
             [{"secondary_y": True}],
-            [{"secondary_y": False}],
-            [{"secondary_y": False}],
             [{"secondary_y": False}],
             [{"secondary_y": False}],
             [{"secondary_y": False}],
@@ -4553,7 +4553,7 @@ def render_backtest(s):
             ), row=1, col=1
         )
 
-    # Row 2: quarterly and TTM EPS
+    # Row 4: quarterly and TTM EPS
     eps_trace_added = False
     eps_trace_definitions = [
         ("Reported EPS", "Quarterly Reported EPS", "bar", "royalblue", False),
@@ -4579,17 +4579,17 @@ def render_backtest(s):
                     line=dict(color=color, width=2, dash="dot" if "Estimate" in trace_name else "solid"),
                     marker=dict(size=7, color=color),
                 )
-            fig.add_trace(trace, row=2, col=1, secondary_y=use_secondary)
+            fig.add_trace(trace, row=4, col=1, secondary_y=use_secondary)
 
     if not eps_trace_added:
         fig.add_annotation(
-            x=0.5, y=0.5, xref="x2 domain", yref="y2 domain",
+            x=0.5, y=0.5, xref="x domain", yref="y domain", row=4, col=1,
             text="No quarterly EPS event falls within the selected display period",
             showarrow=False, font=dict(color="gray", size=12)
         )
-    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray", row=2, col=1, secondary_y=False)
+    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray", row=4, col=1, secondary_y=False)
 
-    # Row 3: quarterly fundamentals   
+    # Row 5: quarterly fundamentals   
     fundamentals_trace_added = False
 
     scale_divisor, fundamentals_axis_title = (
@@ -4687,7 +4687,7 @@ def render_backtest(s):
                     "<extra></extra>"
                 ),
             ),
-            row=3,
+            row=5,
             col=1,
         )
 
@@ -4696,8 +4696,10 @@ def render_backtest(s):
         fig.add_annotation(
             x=0.5,
             y=0.5,
-            xref="x3 domain",
-            yref="y3 domain",
+            xref="x domain",
+            yref="y domain",
+            row=5,
+            col=1,
             text=(
                 "Quarterly revenue, total expenses, "
                 "net income, operating expenses and "
@@ -4716,46 +4718,46 @@ def render_backtest(s):
         line_width=1,
         line_dash="dot",
         line_color="gray",
-        row=3,
+        row=5,
         col=1,
     )
 
-    # Row 4: P/E
+    # Row 6: P/E
     trailing_pe = valuation_df["Trailing_PE"].dropna()
     estimate_based_pe = valuation_df["Estimate_Based_PE_Proxy"].dropna()
 
     if not trailing_pe.empty:
         fig.add_trace(
             go.Scatter(x=trailing_pe.index, y=trailing_pe, mode="lines", name="Trailing P/E", line=dict(color="gold", width=2)),
-            row=4, col=1
+            row=6, col=1
         )
         median_value = trailing_pe.median()
         fig.add_hline(
             y=median_value, line_width=1, line_dash="dash", line_color="goldenrod",
             annotation_text=f"Median trailing P/E: {median_value:.1f}x",
-            annotation_position="top left", row=4, col=1
+            annotation_position="top left", row=6, col=1
         )
 
     if not estimate_based_pe.empty:
         fig.add_trace(
             go.Scatter(x=estimate_based_pe.index, y=estimate_based_pe, mode="lines", name="Estimate-Based P/E Proxy", line=dict(color="cyan", width=2, dash="dot")),
-            row=4, col=1
+            row=6, col=1
         )
         median_value = estimate_based_pe.median()
         fig.add_hline(
             y=median_value, line_width=1, line_dash="dash", line_color="darkcyan",
             annotation_text=f"Median estimate-based P/E: {median_value:.1f}x",
-            annotation_position="bottom left", row=4, col=1
+            annotation_position="bottom left", row=6, col=1
         )
 
     if trailing_pe.empty and estimate_based_pe.empty:
         fig.add_annotation(
-            x=0.5, y=0.5, xref="x4 domain", yref="y4 domain",
+            x=0.5, y=0.5, xref="x domain", yref="y domain", row=6, col=1,
             text="Insufficient historical EPS data to calculate P/E",
             showarrow=False, font=dict(color="gray", size=12)
         )
 
-    # Row 5: benchmarks
+    # Row 7: benchmarks
     benchmark_trace_added = False
     for column, color in [("S&P 500", "deepskyblue"), ("Nasdaq-100", "magenta")]:
         if not benchmark_df.empty and column in benchmark_df.columns:
@@ -4764,42 +4766,42 @@ def render_backtest(s):
                 benchmark_trace_added = True
                 fig.add_trace(
                     go.Scatter(x=series.index, y=series, name=column, line=dict(color=color, width=2)),
-                    row=5, col=1
+                    row=7, col=1
                 )
 
     if not benchmark_trace_added:
         fig.add_annotation(
-            x=0.5, y=0.5, xref="x5 domain", yref="y5 domain",
+            x=0.5, y=0.5, xref="x domain", yref="y domain", row=7, col=1,
             text="Benchmark data is unavailable", showarrow=False,
             font=dict(color="gray", size=12)
         )
-    fig.add_hline(y=100, line_width=1, line_dash="dot", line_color="gray", row=5, col=1)
+    fig.add_hline(y=100, line_width=1, line_dash="dot", line_color="gray", row=7, col=1)
 
-    # Row 6: equity
+    # Row 2: equity
     fig.add_trace(
         go.Scatter(
             x=df.index, y=df["Equity"], name="Strategy Equity", line=dict(color="green", width=2),
             hovertemplate="Strategy Equity<br>Date: %{x|%Y-%m-%d}<br>Equity: $%{y:,.2f}<extra></extra>",
-        ), row=6, col=1
+        ), row=2, col=1
     )
 
-    # Row 7: drawdown
+    # Row 3: drawdown
     fig.add_trace(
         go.Scatter(
             x=df.index, y=df["Drawdown"] * 100, name="Drawdown %", fill="tozeroy",
             line=dict(color="red", width=1),
             hovertemplate="Drawdown<br>Date: %{x|%Y-%m-%d}<br>Drawdown: %{y:.2f}%<extra></extra>",
-        ), row=7, col=1
+        ), row=3, col=1
     )
 
     fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Quarterly EPS", row=2, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="TTM EPS", row=2, col=1, secondary_y=True)
-    fig.update_yaxes(title_text=fundamentals_axis_title, row=3, col=1)
-    fig.update_yaxes(title_text="P/E (x)", row=4, col=1)
-    fig.update_yaxes(title_text="Indexed", row=5, col=1)
-    fig.update_yaxes(title_text="Equity ($)", row=6, col=1)
-    fig.update_yaxes(title_text="DD (%)", row=7, col=1)
+    fig.update_yaxes(title_text="Quarterly EPS", row=4, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="TTM EPS", row=4, col=1, secondary_y=True)
+    fig.update_yaxes(title_text=fundamentals_axis_title, row=5, col=1)
+    fig.update_yaxes(title_text="P/E (x)", row=6, col=1)
+    fig.update_yaxes(title_text="Indexed", row=7, col=1)
+    fig.update_yaxes(title_text="Equity ($)", row=2, col=1)
+    fig.update_yaxes(title_text="DD (%)", row=3, col=1)
 
     # Apply the exact same time range to every subplot.
     common_x_start = pd.Timestamp(df.index.min())
