@@ -537,9 +537,54 @@ def add_forward_line(fig, values, estimated, name, row, hover):
                                  hovertemplate=f"%{{x|%Y-%m-%d}}: {hover}<extra>{label}</extra>"), row=row, col=1)
 
 
+EARNINGS_LINE_COLOR = "rgba(120, 120, 120, 0.45)"
+EARNINGS_MARKER_COLOR = "rgba(90, 90, 90, 0.85)"
+NEXT_EARNINGS_COLOR = "crimson"
+
+
+def add_earnings_markers(fig, rows, releases=None, next_release=None):
+    """A dotted vertical line at every earnings release in each subplot row, with a small marker to tap.
+
+    ``releases`` holds ``Release`` (timestamp) and ``Text`` (the tap box text) columns; ``next_release`` is
+    ``(timestamp, text)``. The markers sit at the bottom of each panel on a hidden 0-1 axis, so they land in
+    the same place whatever the panel's own scale; trace meta ``earnings`` tells the axis-hover script to
+    show the text in a box instead of a value label.
+    """
+
+    points = []
+    if releases is not None and len(releases):
+        points += [(when, text, False) for when, text in zip(releases["Release"], releases["Text"])]
+    if next_release is not None:
+        points.append((next_release[0], next_release[1], True))
+    if not points:
+        return
+    for row in range(1, rows + 1):
+        subplot = fig.get_subplot(row, 1)
+        x_axis, y_axis = subplot.xaxis.plotly_name.replace("axis", ""), subplot.yaxis.plotly_name.replace("axis", "")
+        taken = [int(key[5:] or 1) for key in fig.layout.to_plotly_json() if key.startswith("yaxis")]
+        number = max(taken) + 1
+        fig.layout[f"yaxis{number}"] = dict(overlaying=y_axis, anchor=x_axis, range=[0, 1], fixedrange=True,
+                                            visible=False)
+        for when, _, upcoming in points:
+            fig.add_shape(type="line", x0=when, x1=when, y0=0, y1=1, xref=x_axis, yref=f"{y_axis} domain",
+                          layer="below", line=dict(color=NEXT_EARNINGS_COLOR if upcoming else EARNINGS_LINE_COLOR,
+                                                   width=1, dash="dash" if upcoming else "dot"))
+        for upcoming in (False, True):
+            part = [(when, text) for when, text, is_next in points if is_next == upcoming]
+            if not part:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[when for when, _ in part], y=[0.03] * len(part), yaxis=f"y{number}", xaxis=x_axis,
+                mode="markers", name="Next earnings" if upcoming else "Earnings release",
+                text=[text for _, text in part], meta=dict(earnings=True), showlegend=row == 1,
+                marker=dict(symbol="triangle-up", size=9 if upcoming else 7,
+                            color=NEXT_EARNINGS_COLOR if upcoming else EARNINGS_MARKER_COLOR),
+                hovertemplate="%{text}<extra></extra>"))
+
+
 def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
                       price_change=None, growth=None, close=None, log_price=False, height=None, ohlcv=None,
-                      peg_gaps=None, forward=None, link_dates=False):
+                      peg_gaps=None, forward=None, link_dates=False, releases=None, next_release=None):
     """Daily price, growth vs price, revenue, EPS, trailing P/E and PEG panels, top to bottom, on one date axis.
 
     ``ohlcv`` (optional, daily Open/High/Low/Close/Volume) turns the price panel into candlesticks with
@@ -548,6 +593,7 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     ``peg_gaps`` (optional, from :func:`peg_gap_reasons`) shades the days PEG is blank, by reason.
     ``forward`` (optional, from :func:`forward_valuation`) adds forward P/E and forward PEG lines.
     With ``link_dates`` a zoom on one panel zooms them all; otherwise each panel zooms on its own and shows its own dates.
+    ``releases`` and ``next_release`` (optional, see :func:`add_earnings_markers`) mark earnings release dates.
 
     ``revenue`` is indexed by fiscal quarter end, in reporting currency units.
     ``revenue_estimates`` (optional) holds analyst averages for coming quarters
@@ -706,6 +752,9 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
     for key, number in row.items():
         if key != "price":
             add_close_overlay(fig, close, number, log_price)
+    if releases is not None and len(releases) and not close.empty:
+        releases = releases[releases["Release"] >= close.index.min()]
+    add_earnings_markers(fig, rows, releases, next_release)
 
     fig.update_yaxes(ticksuffix="x", rangemode="tozero", row=row["pe"], col=1)
     fig.update_yaxes(tickformat=",.0f", rangemode="tozero", row=row["revenue"], col=1)
@@ -718,4 +767,70 @@ def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, ep
         span = dict(range=[dates.min() - pd.Timedelta(days=30), dates.max() + pd.Timedelta(days=30)]) if len(dates) else {}
         fig.update_xaxes(matches=None, showticklabels=True, **span)
     legends_under_panels(fig, rows, height, dates_every_row=not link_dates)
+    return fig
+
+
+SIGNAL_AXIS_CAP = 100
+SURPRISE_COLOR = "teal"
+RELEASE_LINE_COLOR = "rgba(40, 40, 40, 0.5)"
+
+
+def earnings_signal_figure(close, releases, surprise=None, pe_change=None, forward_change=None, log_price=False,
+                           height=None):
+    """Daily close over daily earnings signals, with a bold line at every earnings release.
+
+    Bottom panel, all daily: ``surprise`` (the latest release's EPS surprise %, held until the next release),
+    ``pe_change`` and ``forward_change`` (trailing and forward P/E, % change since the latest release; see
+    :func:`analysis.earnings_dates.change_since_release`). The price marker at each release sits on the
+    reaction day's close, green for a beat and red for a miss.
+    """
+
+    close = close.dropna() if close is not None else pd.Series(dtype=float)
+    height = height or 640
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=110 / height, row_heights=[0.5, 0.5],
+                        subplot_titles=["Daily close and earnings releases",
+                                        "EPS surprise and P/E change since release, %"])
+    fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close", line=dict(color=PRICE_COLOR, width=1.3),
+                             hovertemplate="%{x|%Y-%m-%d}: %{y:,.2f}<extra></extra>"), row=1, col=1)
+    marked = releases.dropna(subset=["Reaction day"])
+    if not marked.empty:
+        prices = [close.loc[:day].iloc[-1] if len(close.loc[:day]) else np.nan for day in marked["Reaction day"]]
+        beat = marked["Surprise(%)"]
+        colors = np.where(beat.isna(), "gray", np.where(beat >= 0, UP_COLOR, DOWN_COLOR))
+        size = 8 + np.clip(beat.abs().fillna(0), 0, 30) / 2
+        text = [f"Release {when:%Y-%m-%d}: surprise {value:+.1f}%" if pd.notna(value) else f"Release {when:%Y-%m-%d}"
+                for when, value in zip(marked["Release"], beat)]
+        fig.add_trace(go.Scatter(x=marked["Reaction day"], y=prices, mode="markers", name="Release (green beat, red miss)",
+                                 text=text, marker=dict(color=colors, size=size, line=dict(color="white", width=1)),
+                                 hovertemplate="%{text}<extra></extra>"), row=1, col=1)
+    fig.update_yaxes(tickformat=",.0f", type="log" if log_price else "linear", row=1, col=1)
+
+    values = []
+    for series, name, color, shape in [(surprise, "EPS surprise % (last release)", SURPRISE_COLOR, "hv"),
+                                       (pe_change, "P/E % since release", PE_COLOR, "linear"),
+                                       (forward_change, "Forward P/E % since release", FORWARD_COLOR, "linear")]:
+        series = series.dropna() if series is not None else pd.Series(dtype=float)
+        if series.empty:
+            continue
+        values.append(series)
+        line = break_long_gaps(series)
+        fig.add_trace(go.Scatter(x=line.index, y=line.clip(-SIGNAL_AXIS_CAP, SIGNAL_AXIS_CAP), mode="lines", name=name,
+                                 connectgaps=False, line=dict(color=color, width=2 if shape == "hv" else 1.6, shape=shape),
+                                 customdata=line, hovertemplate=f"%{{x|%Y-%m-%d}} {name}: %{{customdata:+.1f}}%<extra></extra>"),
+                      row=2, col=1)
+    fig.add_hline(y=0, line=dict(color="gray", width=1), row=2, col=1)
+    if values and float(pd.concat(values).abs().max()) > SIGNAL_AXIS_CAP:
+        fig.layout.annotations[1].text += f" (capped at ±{SIGNAL_AXIS_CAP})"
+    fig.update_yaxes(ticksuffix="%", row=2, col=1)
+
+    # A bold line at every release, across both panels, on the first session that could react.
+    for day in marked["Reaction day"] if not marked.empty else []:
+        for row in (1, 2):
+            subplot = fig.get_subplot(row, 1)
+            fig.add_shape(type="line", x0=day, x1=day, y0=0, y1=1, xref=subplot.xaxis.plotly_name.replace("axis", ""),
+                          yref=f"{subplot.yaxis.plotly_name.replace('axis', '')} domain", layer="below",
+                          line=dict(color=RELEASE_LINE_COLOR, width=2))
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60))
+    legends_under_panels(fig, 2, height)
     return fig

@@ -33,7 +33,8 @@ def fake_daily(start, end):
 
 def fake_intraday():
     frames = []
-    for day in pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=3):
+    # Sessions up to yesterday: before the US open, today's session would still be in the future.
+    for day in pd.bdate_range(end=pd.Timestamp.today().normalize() - pd.Timedelta(days=1), periods=3):
         index = pd.date_range(f"{day:%Y-%m-%d} 09:30", periods=78, freq="5min", tz="America/New_York")
         frames.append(make_bars(np.linspace(140, 146, 78), index=index, spread=0.001, seed=day.day))
     return pd.concat(frames)
@@ -413,6 +414,14 @@ def test_stock_fundamentals_tab(offline, monkeypatch):
     assert app.subheader[0].value == "NVDA"
     assert any("Price YoY" in chart.proto.spec and "Daily OHLC" in chart.proto.spec and "Trailing P" in chart.proto.spec
                for chart in app.get("plotly_chart"))
+    # Earnings releases: a next-date note, markers on the chart and the table of the latest 8.
+    assert any(element.value.startswith(("Next earnings", "**Next earnings")) for element in app.markdown)
+    assert any('"earnings":true' in chart.proto.spec.replace(" ", "") for chart in app.get("plotly_chart"))
+    assert any("NVDA earnings releases: surprise and P/E change" in element.value for element in app.markdown)
+    assert any("EPS surprise %" in chart.proto.spec and "% since release" in chart.proto.spec
+               for chart in app.get("plotly_chart"))
+    assert any(list(frame.value.columns[:3]) == ["Date", "When", "Quarter to"] and len(frame.value) == 8
+               for frame in app.dataframe)
 
     # Any ticker and history length.
     next(box for box in app.text_input if box.key == "fundamentals_ticker").input(" msft ")
@@ -714,3 +723,16 @@ def test_macd_bollinger_signal_rule(offline):
     assert not app.exception, app.exception
     open_tab(app, "Validate")
     assert not app.exception, app.exception
+
+
+def test_stock_fundamentals_without_earnings_dates(offline, monkeypatch):
+    # Yahoo rate limits the earnings calendar and the SEC is unreachable: a note instead of a table, no crash.
+    class NoEarningsDates(FakeTickerWithRevenue):
+        def get_earnings_dates(self, limit=100):
+            raise RuntimeError("Too Many Requests")
+
+    monkeypatch.setattr(yf, "Ticker", NoEarningsDates)
+    st.cache_data.clear()  # earlier tests cached NVDA's earnings dates
+    app = open_tab(start_app(), "Stock Fundamentals")
+    assert any("No earnings release dates were available" in element.value for element in app.caption)
+    assert any("Next earnings: no date published yet." in element.value for element in app.markdown)

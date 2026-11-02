@@ -48,6 +48,21 @@ from analysis.economy import (
     rebase,
     window_start,
 )
+from analysis.earnings_dates import (
+    EASTERN,
+    change_since_release,
+    describe_release,
+    merge_releases,
+    next_release_text,
+    past_and_next,
+    reaction_summary,
+    release_table,
+    releases_with_reaction,
+    sec_releases,
+    surprise_held,
+    with_valuation_changes,
+    yahoo_releases,
+)
 from analysis.engine import AnalysisSettings, analyze, report_to_dict, report_to_markdown
 from analysis.indicators import resample_ohlcv
 from analysis.notify import send_webhook, short_summary
@@ -117,6 +132,7 @@ from analysis.signal_groups import (
 from analysis.valuation_chart import (
     VALUATION_HISTORY_YEARS,
     correlation_text,
+    earnings_signal_figure,
     eps_estimate_quarters,
     forward_eps,
     forward_valuation,
@@ -267,15 +283,20 @@ CHART_TOUCH_JS = """
     return xa && ya && !xa.fixedrange && !ya.fixedrange ? { x: xa, y: ya } : null;
   }
   function axisRange(axis) { return axis.range.map(axis.r2l); }
-  // Zoom one axis about the fingers' centre by how far apart the fingers moved along it.
+  // Zoom one axis by how far apart the fingers moved along it, and pan it as their centre moves: the value under
+  // the fingers when they landed stays under their centre, so both fingers moving the same way pan.
   function zoomAxis(gesture, touches) {
-    const axis = gesture.axes[gesture.axis], rect = gesture.gd.getBoundingClientRect();
-    const c = centre(touches);
-    const pixel = gesture.axis === "x" ? c.x - rect.left - axis._offset : c.y - rect.top - axis._offset;
-    const factor = gesture.span / Math.max(span(touches, gesture.axis), 1);
-    const start = gesture.start, at = axis.p2l(pixel);
+    const axis = gesture.axes[gesture.axis], rect = gesture.gd.getBoundingClientRect(), length = axis._length;
+    function along(c) {  // 0 at the axis's range[0] end, 1 at range[1]
+      const pixel = (gesture.axis === "x" ? c.x - rect.left : c.y - rect.top) - axis._offset;
+      return gesture.axis === "x" ? pixel / length : 1 - pixel / length;
+    }
+    const start = gesture.start, width = start[1] - start[0];
+    const at = start[0] + along(gesture.centre) * width;
+    const newWidth = width * gesture.span / Math.max(span(touches, gesture.axis), 1);
+    const low = at - along(centre(touches)) * newWidth;
     const update = {};
-    update[axis._name + ".range"] = start.map(function (v) { return axis.l2r(at + (v - at) * factor); });
+    update[axis._name + ".range"] = [low, low + newWidth].map(function (v) { return axis.l2r(v); });
     if (gesture.frame) cancelAnimationFrame(gesture.frame);
     gesture.frame = requestAnimationFrame(function () { window.Plotly.relayout(gesture.gd, update); });
   }
@@ -299,7 +320,7 @@ CHART_TOUCH_JS = """
       const c = centre(event.touches);
       const target = gesture && gesture.gd === gd && gesture.target.closest(".drag") ? gesture.target : event.target;
       if (gesture && gesture.mode === "pan") mouse("mouseup", gesture.target, c.x, c.y, 0);
-      // Fingers side by side zoom the time only, one above the other the values only (within 30 degrees).
+      // Fingers side by side zoom and pan the time only, one above the other the values only (within 30 degrees).
       const axis = pinchAxis(event.touches);
       const axes = axis && axesOf(gd, target);
       if (axes) {
@@ -474,13 +495,18 @@ CHART_AXIS_HOVER_JS = """
       gd.appendChild(overlay);
     }
     overlay.textContent = "";
-    const labels = { left: [], right: [] }, dates = new Map();
+    const labels = { left: [], right: [] }, dates = new Map(), notes = [];
     for (const point of points) {
       const xa = point.xaxis, ya = point.yaxis;
       // A candle is labelled at its close.
       const value = typeof point.y === "number" ? point.y : point.close;
       if (!xa || !ya || typeof value !== "number" || !isFinite(value)) continue;
       const trace = point.fullData || point.data;  // the full trace has the default colours filled in
+      // Earnings release markers show their text in a box near the top of the panel instead of a value label.
+      if (trace.meta && trace.meta.earnings) {
+        if (!xvals || !xvals.length || Math.abs(pixel(xa, point.x) - pixel(xa, xvals[0])) <= 12) notes.push(point);
+        continue;
+      }
       // A line with no point near the hovered date (a gap, or a line that starts later) gets no label: Plotly
       // offers its nearest point, which can be months away.
       if (xvals && xvals.length && trace.mode === "lines" && xa.type === "date"
@@ -514,6 +540,17 @@ CHART_AXIS_HOVER_JS = """
         else css.left = (label.xa._offset + label.xa._length + 1) + "px";
         box(overlay, css, label.text);
       }
+    }
+    for (const point of notes) {
+      const xa = point.xaxis, ya = point.yaxis, x = pixel(xa, point.x), width = 210;
+      const text = String(point.text || (point.data && point.data.name) || "");
+      // Beside the line, on whichever side has room, kept inside the panel.
+      const left = x + 8 + width <= xa._offset + xa._length ? x + 8 : Math.max(xa._offset, x - 8 - width);
+      box(overlay, { left: left + "px", top: (ya._offset + 4) + "px", width: width + "px", whiteSpace: "pre-wrap",
+                     background: "rgba(35,35,35,0.88)", color: "#fff", padding: "3px 6px", borderRadius: "3px",
+                     boxSizing: "border-box" }, text);
+      box(overlay, { left: x + "px", top: ya._offset + "px", height: ya._length + "px",
+                     borderLeft: "1px dashed " + ((point.fullData.marker || {}).color || "#555") });
     }
     for (const [xa, date] of dates) {
       const x = pixel(xa, date.x);
@@ -747,14 +784,21 @@ def load_data(symbol, start_date_str, end_date_str, timeframe):
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def fetch_earnings_dates(symbol):
+    """Yahoo's earnings dates (past and scheduled), as Yahoo returns them; raises when empty so failures are not cached."""
+
+    earnings = yf.Ticker(symbol).get_earnings_dates(limit=100)
+    if earnings is None or earnings.empty:
+        raise ValueError(f"Yahoo returned no earnings dates for {symbol}")
+    return earnings
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_earnings_data(symbol, start_date_str, end_date_str):
     """Retrieve historical earnings dates and EPS values."""
 
     try:
-        earnings = yf.Ticker(symbol).get_earnings_dates(limit=100)
-        if earnings is None or earnings.empty:
-            return pd.DataFrame()
-
+        earnings = fetch_earnings_dates(symbol)
         earnings = earnings.copy().reset_index()
         date_column = earnings.columns[0]
         earnings[date_column] = pd.to_datetime(
@@ -926,6 +970,39 @@ def sec_request_json(url):
 
     with urlopen(request, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_sec_submissions(cik):
+    """A company's SEC filing index (the latest 1,000 filings), downloaded once a day."""
+
+    return sec_request_json(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json")
+
+
+def load_earnings_releases(symbol):
+    """Earnings releases from Yahoo, plus SEC 8-K (item 2.02) releases Yahoo is missing, by US/Eastern time.
+
+    Either source may fail (Yahoo rate limits, foreign filers have no 8-K); what is left is returned.
+    """
+
+    try:
+        yahoo = yahoo_releases(fetch_earnings_dates(symbol))
+    except Exception:
+        yahoo = None
+    try:
+        cik = get_sec_cik(symbol)
+        sec = sec_releases(fetch_sec_submissions(cik)) if cik else None
+    except Exception:
+        sec = None
+    return merge_releases(yahoo_releases(None) if yahoo is None else yahoo, sec)
+
+
+def next_earnings(symbol, releases=None):
+    """``(past releases, next release)`` for a ticker; see :func:`past_and_next`."""
+
+    releases = load_earnings_releases(symbol) if releases is None else releases
+    now = pd.Timestamp.now(tz=EASTERN).tz_localize(None)
+    return past_and_next(releases, now, load_fundamental_snapshot(symbol))
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -1839,7 +1916,7 @@ def fetch_fundamental_snapshot(symbol):
     keys = [
         "trailingPE", "forwardPE", "pegRatio", "trailingPegRatio", "earningsGrowth",
         "revenueGrowth", "profitMargins", "priceToBook", "debtToEquity", "sector", "industry", "shortName",
-        "nextFiscalYearEnd",
+        "nextFiscalYearEnd", "earningsTimestamp", "earningsTimestampStart", "isEarningsDateEstimate",
     ]
     info = yf.Ticker(symbol).info or {}
     snapshot = {key: info.get(key) for key in keys if info.get(key) is not None}
@@ -3561,10 +3638,11 @@ def supply_chain_figure(chain, table, metric, focus, highlight):
     return fig
 
 
-def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, link_dates=False):
+def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, link_dates=False, next_note=True):
     """Growth vs price, revenue, EPS, trailing P/E and PEG for one ticker, with their captions.
 
-    Returns False, after a warning, when there is no price history for the ticker.
+    Returns False, after a warning, when there is no price history for the ticker. ``next_note`` shows the
+    next earnings date above the chart (the supply chain panel shows it higher up itself).
     """
 
     today = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
@@ -3581,6 +3659,14 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, 
         return False
     valuation, _ = build_valuation_data(prices, earnings)
     trend = fundamental_trend(fundamentals)
+    forward = None
+    past_releases, upcoming = next_earnings(ticker)
+    quarter_ends = fundamentals.index if "Revenue" in fundamentals else None
+    reactions = releases_with_reaction(past_releases, prices["Close"], quarter_ends)
+    reactions["Text"] = [describe_release(row) for _, row in reactions.iterrows()]
+    next_text = next_release_text(upcoming, today)
+    if next_note:
+        st.markdown(f"**{next_text}**" if upcoming else next_text)
     if trend and "Revenue" in fundamentals:
         revenue = fundamentals["Revenue"].dropna()
         yoy = trend.get("Revenue YoY %")
@@ -3613,7 +3699,9 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, 
                                      price_change=price_change, growth=growth,
                                      close=valuation["Close"].loc[history_start:], log_price=log_price,
                                      ohlcv=prices.loc[history_start:] if not prices.empty else None,
-                                     peg_gaps=peg_gaps, forward=forward, link_dates=link_dates),
+                                     peg_gaps=peg_gaps, forward=forward, link_dates=link_dates,
+                                     releases=reactions.loc[reactions["Release"] >= pd.Timestamp(history_start)],
+                                     next_release=(upcoming[0], next_text) if upcoming else None),
                    width="stretch")
         st.caption(pe_summary_text(pe_summary(trailing_pe), forward_pe))
         st.caption(peg_summary_text(peg, forward_pe, next_year_eps_growth(ticker), peg_gaps))
@@ -3632,10 +3720,74 @@ def render_fundamentals(ticker, years=VALUATION_HISTORY_YEARS, log_price=False, 
             "which nobody knew on the day, so they show how cheap the stock really was, not what it looked like then. "
             "The faded end uses analyst estimates for quarters not yet reported (Yahoo gives two quarters and next "
             "fiscal year; the quarters between are filled on a steady growth path). Hatched bars are analyst "
-            "estimates, not results."
+            "estimates, not results. Dotted vertical lines are earnings releases (tap the small triangle at the "
+            "bottom of a panel for the quarter, EPS against the estimate and the price move); the red dashed line "
+            "is the next one."
         )
     else:
         st.caption("No quarterly revenue was available for this company.")
+    forward_pe = forward["Forward_PE"] if forward is not None and not forward.empty else None
+    render_earnings_signals(ticker, with_valuation_changes(reactions, valuation["Trailing_PE"], forward_pe),
+                            valuation, forward_pe, history_start, log_price)
+
+
+def render_earnings_signals(ticker, releases, valuation, forward_pe, start, log_price=False, count=8):
+    """Each earnings release on the price chart, with its EPS surprise and the P/E change from the release before."""
+
+    st.markdown(f"**{ticker} earnings releases: surprise and P/E change**")
+    if releases.empty:
+        st.caption("No earnings release dates were available (Yahoo may be rate limiting; foreign filers have no "
+                   "SEC 8-K to fall back on). Try again in a few minutes.")
+        return
+    summary = reaction_summary(releases, count)
+    if summary:
+        st.caption(summary)
+    # The release before the window is kept for the first change, then dropped from the chart.
+    start = pd.Timestamp(start)
+    shown = releases[releases["Release"] >= start]
+    days = valuation.loc[start:].index
+    show_chart(earnings_signal_figure(
+        valuation["Close"].loc[start:], shown,
+        surprise=surprise_held(releases, days),
+        pe_change=change_since_release(valuation["Trailing_PE"], releases).loc[start:],
+        forward_change=change_since_release(forward_pe, releases).loc[start:] if forward_pe is not None else None,
+        log_price=log_price, height=600 if MOBILE else None), width="stretch")
+    st.caption(
+        "Bold lines mark each earnings release, on the first session that could react (the next day for a release "
+        "after the close). Top: the daily close, with a dot at each release (green = EPS beat the analysts' average "
+        "estimate, red = missed; a bigger dot is a bigger surprise). Bottom, daily: the last release's EPS surprise %, "
+        "held until the next release, and how far the trailing and forward P/E have moved since the close just before "
+        "the last release (0 going into each release). On the release the trailing P/E jumps by the new quarter's "
+        "EPS replacing the oldest one plus the price reaction; between releases both P/E lines move only with the "
+        "price, so they run parallel. Forward P/E uses the EPS later reported (hindsight) where it is known."
+    )
+    with st.expander("Show as table"):
+        render_earnings_table(releases, count)
+
+
+def render_earnings_table(reactions, count=8):
+    """The latest earnings releases with their EPS surprise, the price move after 1 and 5 sessions and the P/E change."""
+
+    table = release_table(reactions, count)
+    if MOBILE:
+        # Keep the surprise and the price moves on screen; the tap box on the chart has the rest.
+        table = table.drop(columns=["Quarter to", "EPS est.", "Source"])
+        table["When"] = table["When"].str.replace(" close", "").str.replace(" open", "").str.replace(" market", "")
+    st.dataframe(table, hide_index=True, width="stretch", column_config={
+        "EPS est.": st.column_config.NumberColumn(format="%.2f"),
+        "EPS": st.column_config.NumberColumn(format="%.2f"),
+        "Surprise %": st.column_config.NumberColumn(format="%+.1f"),
+        "1-day %": st.column_config.NumberColumn(format="%+.1f"),
+        "5-day %": st.column_config.NumberColumn(format="%+.1f"),
+        "P/E chg %": st.column_config.NumberColumn(format="%+.1f"),
+        "Fwd P/E chg %": st.column_config.NumberColumn(format="%+.1f"),
+    })
+    st.caption(
+        "Dates and EPS are Yahoo's (reported EPS is adjusted, as companies headline it); a release Yahoo is "
+        "missing comes from the company's SEC 8-K filing, which has the time but no EPS. The price moves run from "
+        "the close before the first session that could react: the next day for a release after the close, the "
+        "same day for one before the open, so they include the overnight gap. 5-day is the close 5 sessions in."
+    )
 
 
 
@@ -3719,6 +3871,17 @@ def render_stock_fundamentals():
     render_what_happened_next(ticker, years, frequency, look_ahead, lookback_years, band)
 
 
+def quoted_next_earnings(symbol):
+    """The next earnings date from Yahoo's quote (one cached call), or None when Yahoo has none in the future."""
+
+    try:
+        _, upcoming = past_and_next(yahoo_releases(None), pd.Timestamp.now(tz=EASTERN).tz_localize(None),
+                                    load_fundamental_snapshot(symbol))
+    except Exception:
+        return None
+    return upcoming[0] if upcoming else None
+
+
 def render_company_detail(chain, ticker, table, prices, index_prices):
     name, role = SUPPLY_COMPANIES[ticker]
     st.subheader(f"{ticker} · {name}")
@@ -3730,14 +3893,23 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
         value = table.at[ticker, column]
         tile.metric(column.replace(" %", ""), f"{value:+.1f}%" if pd.notna(value) else "n/a")
     tiles[3].metric("Trend", table.at[ticker, "Trend"])
+    _, upcoming = next_earnings(ticker)
+    st.markdown(f"**{next_release_text(upcoming, date.today())}**" if upcoming else next_release_text(upcoming, date.today()))
 
     suppliers, customers = neighbors(chain, ticker)
+    # One at a time: Yahoo rejects parallel quote requests ("Invalid Crumb"). Each is cached for an hour.
+    reports = {other: quoted_next_earnings(other) for other in sorted({other for other, _ in suppliers + customers})}
     columns = st.columns(2)
     for column, title, links in [(columns[0], "Buys from", suppliers), (columns[1], "Sells to", customers)]:
         with column:
             st.markdown(f"**{title}**")
-            st.markdown("\n".join(f"- **{other}** ({SUPPLY_COMPANIES[other][0]}): {note}" for other, note in links)
+            st.markdown("\n".join(f"- **{other}** ({SUPPLY_COMPANIES[other][0]}): {note}"
+                                   + (f" · _reports {reports[other]:%d %b}_" if reports.get(other) is not None else "")
+                                   for other, note in links)
                         if links else "_None in this chain._")
+    if any(when is not None for when in reports.values()):
+        st.caption("\"Reports\" is the next earnings date Yahoo lists for each supplier and customer, so you can see "
+                   "who reports first in the chain.")
 
     if ticker in prices:
         lines = {ticker: prices[ticker]}
@@ -3752,7 +3924,7 @@ def render_company_detail(chain, ticker, table, prices, index_prices):
                           margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
         show_chart(fig, width="stretch")
 
-    render_fundamentals(ticker)
+    render_fundamentals(ticker, next_note=False)
 
 
 def render_supply_chain(index_prices):
