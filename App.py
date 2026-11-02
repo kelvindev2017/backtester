@@ -283,15 +283,20 @@ CHART_TOUCH_JS = """
     return xa && ya && !xa.fixedrange && !ya.fixedrange ? { x: xa, y: ya } : null;
   }
   function axisRange(axis) { return axis.range.map(axis.r2l); }
-  // Zoom one axis about the fingers' centre by how far apart the fingers moved along it.
+  // Zoom one axis by how far apart the fingers moved along it, and pan it as their centre moves: the value under
+  // the fingers when they landed stays under their centre, so both fingers moving the same way pan.
   function zoomAxis(gesture, touches) {
-    const axis = gesture.axes[gesture.axis], rect = gesture.gd.getBoundingClientRect();
-    const c = centre(touches);
-    const pixel = gesture.axis === "x" ? c.x - rect.left - axis._offset : c.y - rect.top - axis._offset;
-    const factor = gesture.span / Math.max(span(touches, gesture.axis), 1);
-    const start = gesture.start, at = axis.p2l(pixel);
+    const axis = gesture.axes[gesture.axis], rect = gesture.gd.getBoundingClientRect(), length = axis._length;
+    function along(c) {  // 0 at the axis's range[0] end, 1 at range[1]
+      const pixel = (gesture.axis === "x" ? c.x - rect.left : c.y - rect.top) - axis._offset;
+      return gesture.axis === "x" ? pixel / length : 1 - pixel / length;
+    }
+    const start = gesture.start, width = start[1] - start[0];
+    const at = start[0] + along(gesture.centre) * width;
+    const newWidth = width * gesture.span / Math.max(span(touches, gesture.axis), 1);
+    const low = at - along(centre(touches)) * newWidth;
     const update = {};
-    update[axis._name + ".range"] = start.map(function (v) { return axis.l2r(at + (v - at) * factor); });
+    update[axis._name + ".range"] = [low, low + newWidth].map(function (v) { return axis.l2r(v); });
     if (gesture.frame) cancelAnimationFrame(gesture.frame);
     gesture.frame = requestAnimationFrame(function () { window.Plotly.relayout(gesture.gd, update); });
   }
@@ -315,7 +320,7 @@ CHART_TOUCH_JS = """
       const c = centre(event.touches);
       const target = gesture && gesture.gd === gd && gesture.target.closest(".drag") ? gesture.target : event.target;
       if (gesture && gesture.mode === "pan") mouse("mouseup", gesture.target, c.x, c.y, 0);
-      // Fingers side by side zoom the time only, one above the other the values only (within 30 degrees).
+      // Fingers side by side zoom and pan the time only, one above the other the values only (within 30 degrees).
       const axis = pinchAxis(event.touches);
       const axes = axis && axesOf(gd, target);
       if (axes) {
