@@ -33,7 +33,8 @@ def fake_daily(start, end):
 
 def fake_intraday():
     frames = []
-    for day in pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=3):
+    # Sessions up to yesterday: before the US open, today's session would still be in the future.
+    for day in pd.bdate_range(end=pd.Timestamp.today().normalize() - pd.Timedelta(days=1), periods=3):
         index = pd.date_range(f"{day:%Y-%m-%d} 09:30", periods=78, freq="5min", tz="America/New_York")
         frames.append(make_bars(np.linspace(140, 146, 78), index=index, spread=0.001, seed=day.day))
     return pd.concat(frames)
