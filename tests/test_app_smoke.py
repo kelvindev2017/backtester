@@ -485,11 +485,21 @@ def test_screener_market_cap_filter_and_sparklines(offline, monkeypatch):
     next(button for button in app.button if button.key == "screener_load_btn").click().run()
     table = app.dataframe[0].value
     assert "Pass" not in table.columns and "Last 3 months" in table.columns
+    # The sector leads each row (from Yahoo for a custom list), then the ticker.
+    assert list(table.columns[:2]) == ["Sector", "Ticker"] and set(table["Sector"]) == {"Tech"}
     assert all(len(line) > 0 for line in table["Last 3 months"])
     next(box for box in app.multiselect if box.label == "Market cap").set_value(["Mega (over $200B)"]).run()
     assert not app.exception, app.exception
     table = app.dataframe[0].value
     assert list(table.index) == ["AAPL"] and "Mkt cap ($B)" in table.columns
+
+    # Sort by any column, either way.
+    next(box for box in app.selectbox if box.label == "Sort by").select("Ticker").run()
+    tickers = list(app.dataframe[0].value["Ticker"])
+    assert tickers == sorted(tickers)
+    app.session_state["screener_sort_order_Ticker"] = "↓ High"
+    app.run()
+    assert list(app.dataframe[0].value["Ticker"]) == sorted(tickers, reverse=True)
 
     # A picked stock splits the table: its chart sits right under its row, the rows after it below the chart.
     next(box for box in app.multiselect if box.label == "Market cap").set_value([]).run()
@@ -503,6 +513,24 @@ def test_screener_market_cap_filter_and_sparklines(offline, monkeypatch):
     next(button for button in app.button if button.key == "screener_close_chart_btn").click().run()
     assert len(app.dataframe) == 1
     st.cache_resource.clear()
+
+
+def test_screener_pages_of_ten(offline):
+    app = open_tab(start_app(), "Stock Screener")
+    next(box for box in app.selectbox if box.label == "Universe").select("Custom list").run()
+    tickers = [f"T{number:02d}" for number in range(23)]
+    next(area for area in app.text_area if area.key == "screener_custom").set_value(" ".join(tickers)).run()
+    next(box for box in app.selectbox if box.label == "Signal group").select("Price").run()
+    for button in [button for button in app.button if button.key and button.key.endswith("_remove_btn")][1:]:
+        button.click().run()
+    next(button for button in app.button if button.key == "screener_load_btn").click().run()
+    assert not app.exception, app.exception
+    passing = int(next(element.value for element in app.success).split("**")[1].split(" of ")[0])
+    assert passing > 10
+    assert len(app.dataframe[0].value) == 10
+    next(button for button in app.button if button.key == "screener_next_btn").click().run()
+    assert len(app.dataframe[0].value) == min(10, passing - 10)
+    assert any("page 2/" in element.value for element in app.markdown)
 
 
 def test_screener_candles_figure():
