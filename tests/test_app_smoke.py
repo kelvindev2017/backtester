@@ -512,7 +512,13 @@ def test_screener_candles_figure():
     bars = make_bars(np.linspace(50, 150, 400))
     fig = screener_candles_figure(bars, "TEST", (20, 50), bars=126)
     kinds = [trace.type for trace in fig.data]
-    assert kinds[0] == "candlestick" and kinds.count("bar") == 1 and len(fig.data[0].x) == 126
+    # The whole history is there to zoom out to; the chart opens on the last 126 days, prices fitted to them.
+    assert kinds[0] == "candlestick" and kinds.count("bar") == 1 and len(fig.data[0].x) == 400
+    start, end = (pd.Timestamp(value) for value in fig.layout.xaxis.range)
+    assert bars.index[-127] < start < bars.index[-126] and end > bars.index[-1]
+    low, high = fig.layout.yaxis.range
+    view = bars.iloc[-126:]
+    assert low < view["Low"].min() and high > view["High"].max() and low > bars["Low"].min()
 
 
 def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):

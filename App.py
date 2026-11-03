@@ -2719,33 +2719,39 @@ def price_lines_chart(frame, title, ma_periods=(), bars=TRADING_DAYS_PER_YEAR, h
     return fig
 
 
-SCREENER_CHART_PERIODS = {"3M": 63, "6M": 126, "1Y": TRADING_DAYS_PER_YEAR, "3Y": 3 * TRADING_DAYS_PER_YEAR}
+SCREENER_CHART_BARS = 126  # about 6 months of trading days in view when the chart opens
 
 
-def screener_candles_figure(frame, ticker, ma_periods=(), bars=126, height=460):
-    """Daily OHLC candles for the last ``bars`` days, with SMAs (computed on the full history) and volume
-    on a right-hand axis, like the Stock Fundamentals price panel."""
+def screener_candles_figure(frame, ticker, ma_periods=(), bars=SCREENER_CHART_BARS, height=460):
+    """Daily OHLC candles over the whole loaded history, with SMAs and volume on a right-hand axis (like the
+    Stock Fundamentals price panel). It opens on the last ``bars`` days, with the price scale fitted to
+    them; zooming out shows the rest."""
 
-    view = frame.iloc[-bars:]
     fig = make_subplots(rows=1, cols=1)
-    fig.add_trace(go.Candlestick(x=view.index, open=view["Open"], high=view["High"], low=view["Low"], close=view["Close"],
-                                 name="OHLC", increasing_line_color=UP_COLOR, decreasing_line_color=DOWN_COLOR,
-                                 line=dict(width=1)), row=1, col=1)
+    fig.add_trace(go.Candlestick(x=frame.index, open=frame["Open"], high=frame["High"], low=frame["Low"],
+                                 close=frame["Close"], name="OHLC", increasing_line_color=UP_COLOR,
+                                 decreasing_line_color=DOWN_COLOR, line=dict(width=1)), row=1, col=1)
+    lines = []
     for color, period in zip(["orange", "royalblue", "purple"], ma_periods):
-        moving = frame["Close"].rolling(period, min_periods=period).mean().iloc[-bars:]
+        moving = frame["Close"].rolling(period, min_periods=period).mean()
         if moving.notna().any():
+            lines.append(moving)
             fig.add_trace(go.Scatter(x=moving.index, y=moving, name=f"SMA {period}", mode="lines",
                                      line=dict(color=color, width=1.2)), row=1, col=1)
-    if "Volume" in view:
-        add_volume_overlay(fig, view, 1)
-    # The title is written above the chart by the caller (a Plotly title would sit under the toolbar on phones).
-    fig.update_layout(
-        height=height, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
-        legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0),
-    )
+    if "Volume" in frame:
+        add_volume_overlay(fig, frame, 1)
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                      legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0))
+    # Open on the last ``bars`` days, the price scale fitted to the candles and averages in that window.
+    view = frame.iloc[-bars:]
+    low = min([float(view["Low"].min())] + [float(line.loc[view.index].min()) for line in lines if line.loc[view.index].notna().any()])
+    high = max([float(view["High"].max())] + [float(line.loc[view.index].max()) for line in lines if line.loc[view.index].notna().any()])
+    pad = (high - low) * 0.05 or 1.0
+    half_day = pd.Timedelta(hours=12)
     # No weekend gaps, and no range slider under the candles.
-    fig.update_xaxes(rangeslider_visible=False, rangebreaks=[dict(bounds=["sat", "mon"])])
-    fig.update_yaxes(tickformat=",.2f", row=1, col=1)
+    fig.update_xaxes(rangeslider_visible=False, rangebreaks=[dict(bounds=["sat", "mon"])],
+                     range=[view.index[0] - half_day, view.index[-1] + half_day])
+    fig.update_yaxes(tickformat=",.2f", range=[low - pad, high + pad], row=1, col=1)
     return fig
 
 
@@ -4121,24 +4127,18 @@ def open_in_signal_analysis(ticker):
 def render_screener_pick(picked, shown, prices, ma_periods):
     """Daily candle chart of the picked stock, shown right under its row in the results table."""
 
-    # Keep the title and the close button on one line on phones too.
+    # Keep the Analyze and close buttons on one line on phones too.
     st.html("<style>.st-key-screener_pick_box [data-testid='stHorizontalBlock'] {flex-wrap: nowrap}"
             ".st-key-screener_pick_box [data-testid='stColumn'] {min-width: 0}"
             ".st-key-screener_pick_box [data-testid='stColumn']:last-child {flex: 0 0 3rem}</style>")
     with st.container(border=True, key="screener_pick_box"):
-        top = st.columns([4, 1], vertical_alignment="center")
-        name = shown.at[picked, "Name"] if "Name" in shown else ""
-        last = prices[picked].iloc[-1]
-        top[0].markdown(f"**{picked}** {name} daily, {prices[picked].index[-1]:%d %b %Y}: O {last['Open']:,.2f} · "
-                        f"H {last['High']:,.2f} · L {last['Low']:,.2f} · C {last['Close']:,.2f}")
-        top[1].button("✕", key="screener_close_chart_btn", help="Close the chart",
-                      on_click=lambda: st.session_state.update(screener_picked=None))
-        period = st.segmented_control("Chart period", list(SCREENER_CHART_PERIODS), default="6M",
-                                      key="screener_chart_period") or "6M"
-        show_chart(screener_candles_figure(prices[picked], picked, ma_periods, bars=SCREENER_CHART_PERIODS[period]),
-                   width="stretch", key="screener_candles_chart")
-        st.button(f"Analyze {picked} in Signal Analysis", type="primary", key="screener_open_btn",
-                  on_click=open_in_signal_analysis, args=(picked,))
+        show_chart(screener_candles_figure(prices[picked], picked, ma_periods), width="stretch",
+                   key="screener_candles_chart")
+        buttons = st.columns([4, 1], vertical_alignment="center")
+        buttons[0].button(f"Analyze {picked} in Signal Analysis", type="primary", key="screener_open_btn",
+                          on_click=open_in_signal_analysis, args=(picked,))
+        buttons[1].button("✕", key="screener_close_chart_btn", help="Close the chart",
+                          on_click=lambda: st.session_state.update(screener_picked=None))
     if st.session_state.pop("screener_scroll_to_chart", False):
         # Bring the picked row and its chart into view (the old chart above may have moved them up).
         components.html(f"""<script>
