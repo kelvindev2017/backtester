@@ -88,8 +88,10 @@ from analysis.rule_diagrams import (
 from analysis.screener import (
     LINE_KINDS as SCREEN_LINE_KINDS,
     OPERATORS as SCREEN_OPERATORS,
+    MARKET_CAP_BUCKETS,
     TRADING_DAYS_PER_YEAR,
     breadth_history,
+    close_sparkline,
     condition_label,
     fundamental_trend,
     index_trend,
@@ -130,7 +132,10 @@ from analysis.signal_groups import (
     period_start,
 )
 from analysis.valuation_chart import (
+    DOWN_COLOR,
+    UP_COLOR,
     VALUATION_HISTORY_YEARS,
+    add_volume_overlay,
     correlation_text,
     earnings_signal_figure,
     eps_estimate_quarters,
@@ -2714,6 +2719,42 @@ def price_lines_chart(frame, title, ma_periods=(), bars=TRADING_DAYS_PER_YEAR, h
     return fig
 
 
+SCREENER_CHART_BARS = 126  # about 6 months of trading days in view when the chart opens
+
+
+def screener_candles_figure(frame, ticker, ma_periods=(), bars=SCREENER_CHART_BARS, height=460):
+    """Daily OHLC candles over the whole loaded history, with SMAs and volume on a right-hand axis (like the
+    Stock Fundamentals price panel). It opens on the last ``bars`` days, with the price scale fitted to
+    them; zooming out shows the rest."""
+
+    fig = make_subplots(rows=1, cols=1)
+    fig.add_trace(go.Candlestick(x=frame.index, open=frame["Open"], high=frame["High"], low=frame["Low"],
+                                 close=frame["Close"], name="OHLC", increasing_line_color=UP_COLOR,
+                                 decreasing_line_color=DOWN_COLOR, line=dict(width=1)), row=1, col=1)
+    lines = []
+    for color, period in zip(["orange", "royalblue", "purple"], ma_periods):
+        moving = frame["Close"].rolling(period, min_periods=period).mean()
+        if moving.notna().any():
+            lines.append(moving)
+            fig.add_trace(go.Scatter(x=moving.index, y=moving, name=f"SMA {period}", mode="lines",
+                                     line=dict(color=color, width=1.2)), row=1, col=1)
+    if "Volume" in frame:
+        add_volume_overlay(fig, frame, 1)
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                      legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0))
+    # Open on the last ``bars`` days, the price scale fitted to the candles and averages in that window.
+    view = frame.iloc[-bars:]
+    low = min([float(view["Low"].min())] + [float(line.loc[view.index].min()) for line in lines if line.loc[view.index].notna().any()])
+    high = max([float(view["High"].max())] + [float(line.loc[view.index].max()) for line in lines if line.loc[view.index].notna().any()])
+    pad = (high - low) * 0.05 or 1.0
+    half_day = pd.Timedelta(hours=12)
+    # No weekend gaps, and no range slider under the candles.
+    fig.update_xaxes(rangeslider_visible=False, rangebreaks=[dict(bounds=["sat", "mon"])],
+                     range=[view.index[0] - half_day, view.index[-1] + half_day])
+    fig.update_yaxes(tickformat=",.2f", range=[low - pad, high + pad], row=1, col=1)
+    return fig
+
+
 @st.cache_resource(show_spinner=False)
 def fundamentals_store():
     """Yahoo quote-summary rows shared across reruns: {ticker: (fetched at, row)}."""
@@ -4083,6 +4124,32 @@ def open_in_signal_analysis(ticker):
     st.session_state["main_tab"] = SIGNAL_TAB
 
 
+def render_screener_pick(picked, shown, prices, ma_periods):
+    """Daily candle chart of the picked stock, shown right under its row in the results table."""
+
+    # Keep the Analyze and close buttons on one line on phones too.
+    st.html("<style>.st-key-screener_pick_box [data-testid='stHorizontalBlock'] {flex-wrap: nowrap}"
+            ".st-key-screener_pick_box [data-testid='stColumn'] {min-width: 0}"
+            ".st-key-screener_pick_box [data-testid='stColumn']:last-child {flex: 0 0 3rem}</style>")
+    with st.container(border=True, key="screener_pick_box"):
+        show_chart(screener_candles_figure(prices[picked], picked, ma_periods), width="stretch",
+                   key="screener_candles_chart")
+        buttons = st.columns([4, 1], vertical_alignment="center")
+        buttons[0].button(f"Analyze {picked} in Signal Analysis", type="primary", key="screener_open_btn",
+                          on_click=open_in_signal_analysis, args=(picked,))
+        buttons[1].button("✕", key="screener_close_chart_btn", help="Close the chart",
+                          on_click=lambda: st.session_state.update(screener_picked=None))
+    if st.session_state.pop("screener_scroll_to_chart", False):
+        # Bring the picked row and its chart into view (the old chart above may have moved them up).
+        components.html(f"""<script>
+            const doc = window.parent.document;
+            const box = doc.querySelector('.st-key-screener_pick_box');
+            // Leave the picked row (just above the chart) in view.
+            if (box) {{ box.style.scrollMarginTop = "160px"; box.scrollIntoView({{block: "start"}}); }}
+            // {picked} {time.time()}
+            </script>""", height=0)
+
+
 def render_stock_screener():
     """Stock screen over a US index's members, with conditions picked by signal group."""
 
@@ -4096,6 +4163,9 @@ def render_stock_screener():
             members_error = ""
         else:
             members, members_error = load_universe_members(market, universe)
+        market_caps = st.multiselect("Market cap", list(MARKET_CAP_BUCKETS), key="screener_market_caps",
+                                     placeholder="Any size",
+                                     help="Only list stocks of these sizes (market cap from Yahoo Finance). Empty = any size.")
         load_clicked = st.button(f"Load data for {len(members)} stocks", type="primary", key="screener_load_btn",
                                  disabled=members.empty)
 
@@ -4119,7 +4189,7 @@ def render_stock_screener():
     extra = extra.fillna("").replace("nan", "")
     fundamentals_note = fundamentals_warning = ""
     if is_loaded and prices:
-        wants_yahoo = any(SIGNAL_GROUPS[group].get("fundamental") for group in groups_in_use) or (
+        wants_yahoo = bool(market_caps) or any(SIGNAL_GROUPS[group].get("fundamental") for group in groups_in_use) or (
             bool(groups_in_use & {"Sector", "Industry"}) and (extra["Sector"].eq("") | extra["Industry"].eq("")).any())
         if wants_yahoo:
             progress = st.progress(0.0, text="Loading fundamentals from Yahoo...")
@@ -4207,6 +4277,7 @@ def render_stock_screener():
         ma_periods=ma_periods,
         recent_days=recent_days,
         extra=extra,
+        market_caps=market_caps,
     )
     if results.empty:
         st.warning("No stocks to screen.")
@@ -4222,30 +4293,57 @@ def render_stock_screener():
             return
     st.success(f"**{len(passing)} of {len(results)} stocks pass** "
                + ", ".join(condition_label(condition) for condition in conditions)
-               + (f", within {max_from_high:g}% of the 52w high" if use_high else ""))
-    show_all = st.checkbox("Show stocks that fail too", value=False, key="screener_show_all")
-    shown = (results if show_all else passing).copy()
+               + (f", within {max_from_high:g}% of the 52w high" if use_high else "")
+               # "$" starts LaTeX in Markdown.
+               + (f", market cap {', '.join(market_caps)}".replace("$", "\\$") if market_caps else ""))
+    shown = passing.copy()
     if "Index" in shown:
         shown["Index"] = shown["Index"].apply(lambda value: ", ".join(value) if isinstance(value, list) else "")
+    # A small chart of the last 3 months of daily closes takes the place of the Pass column.
+    shown["Last 3 months"] = [close_sparkline(prices.get(ticker)) for ticker in shown.index]
     # The columns after Close / Change % follow the signal groups in use.
     group_columns = [condition_column(condition) for condition in conditions if condition["group"] != MOVING_AVERAGE]
-    base_columns = ["Pass", "Name", "Close", "Change %"]
+    base_columns = ["Last 3 months", "Name", "Close", "Change %"] + (["Mkt cap ($B)"] if market_caps else [])
     display_columns = list(dict.fromkeys(base_columns + group_columns + [f"Close vs SMA {p} %" for p in ma_periods] + [
         "% from 52w high", f"New 52w high in last {recent_days}d", "Volume / avg", "Return 1m %", "Return 3m %"]))
-    display_columns = [column for column in display_columns if column in results.columns]
-    condition_columns = [column for column in results.columns if column not in display_columns and results[column].dtype == bool]
-    st.caption("Select a row to analyze that stock in Signal Analysis.")
-    event = st.dataframe(shown[display_columns + condition_columns].style.format(precision=2), width="stretch", height=420,
-                         on_select="rerun", selection_mode="single-row", key="screener_results_table")
-    selected = event.selection.rows if event is not None and hasattr(event, "selection") else []
-    action_columns = st.columns([2, 1])
-    if selected and selected[0] < len(shown):
-        picked = shown.index[selected[0]]
-        action_columns[0].button(f"Analyze {picked} in Signal Analysis", type="primary", key="screener_open_btn",
-                                 on_click=open_in_signal_analysis, args=(picked,))
-    action_columns[1].download_button(
+    display_columns = [column for column in display_columns if column in shown.columns]
+    st.caption("Select a row to see its daily chart right under it; select it again to close the chart.")
+    number_columns = [column for column in display_columns if pd.api.types.is_float_dtype(shown[column])]
+    column_config = {column: st.column_config.NumberColumn(format="%.2f") for column in number_columns}
+    column_config["Last 3 months"] = st.column_config.LineChartColumn("3 months", width="small", color="auto",
+                                                                      help="Daily close over the last 3 months; green when "
+                                                                           "it ended higher than it started, red when lower.")
+    picked = st.session_state.get("screener_picked")
+    if picked not in shown.index or picked not in prices:
+        picked = None
+    # The chart opens under the picked row: the table is split into the rows down to it and the rows after.
+    # Tables are full height (no scrolling inside them), so the page scrolls and the chart stays next to its row.
+    # Their keys follow the pick, so each new layout starts with nothing selected; the picked row is highlighted.
+    if picked is None:
+        parts = [("all", shown)]
+    else:
+        position = shown.index.get_loc(picked)
+        parts = [("top", shown.iloc[:position + 1]), ("bottom", shown.iloc[position + 1:])]
+    for part, rows in parts:
+        if rows.empty:
+            continue
+        table = rows[display_columns]
+        if picked is not None and part == "top":
+            table = table.style.apply(
+                lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if row.name == picked else "" for _ in row], axis=1)
+        event = st.dataframe(table, width="stretch", height=38 + 35 * len(rows), column_config=column_config,
+                             on_select="rerun", selection_mode="single-row", key=f"screener_{part}_{picked}_table")
+        selected = event.selection.rows if event is not None and hasattr(event, "selection") else []
+        if selected and selected[0] < len(rows):
+            ticker = rows.index[selected[0]]
+            st.session_state["screener_picked"] = None if ticker == picked else ticker
+            st.session_state["screener_scroll_to_chart"] = ticker != picked
+            st.rerun()
+        if part != "bottom" and picked is not None:
+            render_screener_pick(picked, shown, prices, ma_periods)
+    st.download_button(
         "Download results (CSV)",
-        shown.to_csv().encode("utf-8"),
+        shown.drop(columns="Last 3 months").to_csv().encode("utf-8"),
         file_name=f"screener_{market}_{pd.Timestamp(date.today()):%Y%m%d}.csv",
         mime="text/csv",
     )

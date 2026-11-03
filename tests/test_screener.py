@@ -2,7 +2,10 @@ import numpy as np
 import pandas as pd
 
 from analysis.screener import (
+    MARKET_CAP_BUCKETS,
     breadth_history,
+    close_sparkline,
+    in_market_cap_buckets,
     evaluate_condition,
     fundamental_trend,
     index_trend,
@@ -178,3 +181,24 @@ def test_vix_summary_and_gate():
     assert market_gate({}, None, {"max_vix": (20.0, 18.0)}) == (True, [("VIX below 20 (now 18.0)", True)])
     assert market_gate({}, None, {"max_vix": (16.0, 18.0)})[0] is False
     assert market_gate({}, None, {"max_vix": (16.0, None)})[1] == [("VIX below 16", None)]
+
+
+def test_market_cap_buckets_cover_every_size_once():
+    caps = pd.Series([0.1, 0.3, 5.0, 10.0, 199.9, 3000.0, np.nan], index=list("abcdefg"))
+    hits = sum(in_market_cap_buckets(caps, [name]).astype(int) for name in MARKET_CAP_BUCKETS)
+    assert hits.tolist() == [1, 1, 1, 1, 1, 1, 0]
+    assert in_market_cap_buckets(caps, ["Large ($10B-200B)"]).tolist() == [False, False, False, True, True, False, False]
+
+
+def test_screen_stocks_market_cap_filter():
+    prices = {"BIG": rising(seed=1), "SMALL": rising(seed=2), "NONE": rising(seed=3)}
+    extra = pd.DataFrame({"Mkt cap ($B)": [500.0, 1.0, np.nan]}, index=["BIG", "SMALL", "NONE"])
+    table = screen_stocks(prices, [], extra=extra, market_caps=["Mega (over $200B)"])
+    assert table.loc["BIG", "Pass"] and not table.loc["SMALL", "Pass"] and not table.loc["NONE", "Pass"]
+
+
+def test_close_sparkline_is_last_3_months():
+    bars = rising()
+    line = close_sparkline(bars)
+    assert len(line) == 63 and line[-1] == round(float(bars["Close"].iloc[-1]), 4)
+    assert close_sparkline(None) == []

@@ -376,6 +376,41 @@ def leaders_health(snapshots, ma_periods=(50, 200)):
 # Stock screen
 # ============================================================
 
+# Market cap size buckets in $ billions: label -> (low inclusive, high exclusive).
+MARKET_CAP_BUCKETS = {
+    "Mega (over $200B)": (200.0, np.inf),
+    "Large ($10B-200B)": (10.0, 200.0),
+    "Mid ($2B-10B)": (2.0, 10.0),
+    "Small ($300M-2B)": (0.3, 2.0),
+    "Micro (under $300M)": (0.0, 0.3),
+}
+
+
+def in_market_cap_buckets(caps, buckets):
+    """Boolean Series: market cap ($B) inside any of the named buckets (missing caps are False)."""
+
+    caps = pd.to_numeric(caps, errors="coerce")
+    inside = pd.Series(False, index=caps.index)
+    for name in buckets:
+        low, high = MARKET_CAP_BUCKETS[name]
+        inside |= (caps >= low) & (caps < high)
+    return inside
+
+
+def market_cap_label(buckets):
+    """Short label for a market cap filter, e.g. 'Mkt cap Mega/Large'."""
+
+    return "Mkt cap " + "/".join(name.split(" ")[0] for name in MARKET_CAP_BUCKETS if name in buckets)
+
+
+def close_sparkline(frame, bars=63):
+    """The last ``bars`` daily closes (about 3 months) as a list, for a table line-chart cell."""
+
+    if frame is None or frame.empty or "Close" not in frame:
+        return []
+    return [round(float(value), 4) for value in frame["Close"].dropna().iloc[-bars:]]
+
+
 def screen_stocks(
     prices,
     conditions,
@@ -388,6 +423,7 @@ def screen_stocks(
     recent_days=20,
     extra=None,
     today=None,
+    market_caps=None,
 ):
     """Apply the stock filters to every ticker.
 
@@ -399,6 +435,9 @@ def screen_stocks(
     Returns the snapshot table with one boolean column per condition and a
     ``Pass`` column (all filters met), sorted with passing stocks first and
     nearest-to-52w-high first.
+
+    ``market_caps`` names size buckets from ``MARKET_CAP_BUCKETS``; a stock passes when its market cap
+    (``Mkt cap ($B)``, from ``extra``) falls in any of them. Stocks without a market cap fail it.
     """
 
     table = snapshot_table(prices, ma_periods=ma_periods, recent_days=recent_days)
@@ -428,5 +467,9 @@ def screen_stocks(
         passes &= table[volume_column] >= min_avg_volume
     if min_volume_ratio is not None:
         passes &= table["Volume / avg"] >= min_volume_ratio
+    if market_caps:
+        caps = pd.to_numeric(table["Mkt cap ($B)"], errors="coerce") if "Mkt cap ($B)" in table else pd.Series(np.nan, index=table.index)
+        table[market_cap_label(market_caps)] = in_market_cap_buckets(caps, market_caps)
+        passes &= table[market_cap_label(market_caps)]
     table.insert(0, "Pass", passes.fillna(False).astype(bool))
     return table.sort_values(["Pass", "% from 52w high"], ascending=[False, False])

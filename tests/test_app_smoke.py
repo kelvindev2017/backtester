@@ -471,6 +471,56 @@ def test_mobile_charts_keep_their_zoom_for_touch_gestures(offline):
     assert not json.loads(app.get("plotly_chart")[0].proto.config or "{}").get("scrollZoom")
 
 
+def test_screener_market_cap_filter_and_sparklines(offline, monkeypatch):
+    class SizedTicker(FakeTicker):
+        def __init__(self, symbol):
+            super().__init__(symbol)
+            self.info = {**self.info, "marketCap": 3e12 if symbol == "AAPL" else 5e9}
+
+    monkeypatch.setattr(yf, "Ticker", SizedTicker)
+    st.cache_resource.clear()
+    app = open_tab(start_app(), "Stock Screener")
+    assert not any(box.label == "Show stocks that fail too" for box in app.checkbox)
+    next(box for box in app.selectbox if box.label == "Universe").select("Custom list").run()
+    next(button for button in app.button if button.key == "screener_load_btn").click().run()
+    table = app.dataframe[0].value
+    assert "Pass" not in table.columns and "Last 3 months" in table.columns
+    assert all(len(line) > 0 for line in table["Last 3 months"])
+    next(box for box in app.multiselect if box.label == "Market cap").set_value(["Mega (over $200B)"]).run()
+    assert not app.exception, app.exception
+    table = app.dataframe[0].value
+    assert list(table.index) == ["AAPL"] and "Mkt cap ($B)" in table.columns
+
+    # A picked stock splits the table: its chart sits right under its row, the rows after it below the chart.
+    next(box for box in app.multiselect if box.label == "Market cap").set_value([]).run()
+    rows = list(app.dataframe[0].value.index)
+    app.session_state["screener_picked"] = rows[1]
+    app.run()
+    assert not app.exception, app.exception
+    assert [len(frame.value.index) for frame in app.dataframe] == [2, len(rows) - 2]
+    assert any(button.key == "screener_close_chart_btn" for button in app.button)
+    assert any(f"Analyze {rows[1]}" in button.label for button in app.button)
+    next(button for button in app.button if button.key == "screener_close_chart_btn").click().run()
+    assert len(app.dataframe) == 1
+    st.cache_resource.clear()
+
+
+def test_screener_candles_figure():
+    from App import screener_candles_figure
+    from tests.conftest import make_bars
+
+    bars = make_bars(np.linspace(50, 150, 400))
+    fig = screener_candles_figure(bars, "TEST", (20, 50), bars=126)
+    kinds = [trace.type for trace in fig.data]
+    # The whole history is there to zoom out to; the chart opens on the last 126 days, prices fitted to them.
+    assert kinds[0] == "candlestick" and kinds.count("bar") == 1 and len(fig.data[0].x) == 400
+    start, end = (pd.Timestamp(value) for value in fig.layout.xaxis.range)
+    assert bars.index[-127] < start < bars.index[-126] and end > bars.index[-1]
+    low, high = fig.layout.yaxis.range
+    view = bars.iloc[-126:]
+    assert low < view["Low"].min() and high > view["High"].max() and low > bars["Low"].min()
+
+
 def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
     class BlockedTicker(FakeTicker):
         @property
