@@ -4174,18 +4174,25 @@ def render_conditions_table(rows, category_options):
             conditions.append(condition)
     if hidden:
         st.html("<style>" + ", ".join(hidden) + " {display: none}</style>")
-    table = pd.DataFrame({"Condition": labels})
+    # The first column is a remove button: a tap on its ✕ removes that condition.
+    table = pd.DataFrame({" ": ["✕"] * len(labels), "Condition": labels})
     styled = table.style.apply(
         lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if list(rows)[row.name] == open_row else ""
                      for _ in row], axis=1)
     with table_area:
         event = st.dataframe(styled, hide_index=True, width="stretch", height=38 + 35 * max(1, len(table)),
-                             on_select="rerun", selection_mode="single-cell", key=f"screen_conditions_{open_row}_table")
+                             column_config={" ": st.column_config.TextColumn(" ", width=36, help="Remove this condition"),
+                                            "Condition": st.column_config.TextColumn("Condition", width=1000)},
+                             on_select="rerun", selection_mode="single-cell",
+                             key=f"screen_conditions_{len(rows)}_{open_row}_table")
     selection = getattr(event, "selection", None) if event is not None else None
     cells = list(getattr(selection, "cells", None) or (selection or {}).get("cells", []) or [])
     if cells and cells[0][0] < len(rows):
         row_id = list(rows)[cells[0][0]]
-        st.session_state["screen_open_row"] = None if row_id == open_row else row_id
+        if cells[0][1] in (" ", 0):
+            remove_screen_row(row_id)
+        else:
+            st.session_state["screen_open_row"] = None if row_id == open_row else row_id
         st.rerun()
     return conditions
 
@@ -4394,7 +4401,7 @@ def render_stock_screener():
     }
 
     with settings_panel("Conditions"):
-        st.caption("A stock must meet every condition. Tap a condition to change or remove it.")
+        st.caption("A stock must meet every condition. Tap a condition to change it, or its ✕ to remove it.")
         conditions = render_conditions_table(rows, category_options)
     with settings_panel("More filters", expanded=False):
         use_high = st.checkbox("Within % of 52w high", value=True, key="screener_use_high")

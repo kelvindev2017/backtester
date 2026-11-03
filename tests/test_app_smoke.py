@@ -226,6 +226,7 @@ def test_screener_tab_scans_a_custom_list(offline):
     app.run()
     next(button for button in app.button if button.key == "screen_0_done_btn").click().run()
     assert app.session_state["screen_open_row"] is None
+    assert list(conditions[" "]) == ["✕"] * 3
 
     # Switching a row's group swaps the inputs after it.
     next(box for box in app.selectbox if box.label == "Signal group").select("P/E").run()
