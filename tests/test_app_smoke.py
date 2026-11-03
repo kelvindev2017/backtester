@@ -490,6 +490,18 @@ def test_screener_market_cap_filter_and_sparklines(offline, monkeypatch):
     assert not app.exception, app.exception
     table = app.dataframe[0].value
     assert list(table.index) == ["AAPL"] and "Mkt cap ($B)" in table.columns
+
+    # A picked stock splits the table: its chart sits right under its row, the rows after it below the chart.
+    next(box for box in app.multiselect if box.label == "Market cap").set_value([]).run()
+    rows = list(app.dataframe[0].value.index)
+    app.session_state["screener_picked"] = rows[1]
+    app.run()
+    assert not app.exception, app.exception
+    assert [len(frame.value.index) for frame in app.dataframe] == [2, len(rows) - 2]
+    assert any(button.key == "screener_close_chart_btn" for button in app.button)
+    assert any(f"Analyze {rows[1]}" in button.label for button in app.button)
+    next(button for button in app.button if button.key == "screener_close_chart_btn").click().run()
+    assert len(app.dataframe) == 1
     st.cache_resource.clear()
 
 

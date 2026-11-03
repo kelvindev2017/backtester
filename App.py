@@ -4118,6 +4118,38 @@ def open_in_signal_analysis(ticker):
     st.session_state["main_tab"] = SIGNAL_TAB
 
 
+def render_screener_pick(picked, shown, prices, ma_periods):
+    """Daily candle chart of the picked stock, shown right under its row in the results table."""
+
+    # Keep the title and the close button on one line on phones too.
+    st.html("<style>.st-key-screener_pick_box [data-testid='stHorizontalBlock'] {flex-wrap: nowrap}"
+            ".st-key-screener_pick_box [data-testid='stColumn'] {min-width: 0}"
+            ".st-key-screener_pick_box [data-testid='stColumn']:last-child {flex: 0 0 3rem}</style>")
+    with st.container(border=True, key="screener_pick_box"):
+        top = st.columns([4, 1], vertical_alignment="center")
+        name = shown.at[picked, "Name"] if "Name" in shown else ""
+        last = prices[picked].iloc[-1]
+        top[0].markdown(f"**{picked}** {name} daily, {prices[picked].index[-1]:%d %b %Y}: O {last['Open']:,.2f} · "
+                        f"H {last['High']:,.2f} · L {last['Low']:,.2f} · C {last['Close']:,.2f}")
+        top[1].button("✕", key="screener_close_chart_btn", help="Close the chart",
+                      on_click=lambda: st.session_state.update(screener_picked=None))
+        period = st.segmented_control("Chart period", list(SCREENER_CHART_PERIODS), default="6M",
+                                      key="screener_chart_period") or "6M"
+        show_chart(screener_candles_figure(prices[picked], picked, ma_periods, bars=SCREENER_CHART_PERIODS[period]),
+                   width="stretch", key="screener_candles_chart")
+        st.button(f"Analyze {picked} in Signal Analysis", type="primary", key="screener_open_btn",
+                  on_click=open_in_signal_analysis, args=(picked,))
+    if st.session_state.pop("screener_scroll_to_chart", False):
+        # Bring the picked row and its chart into view (the old chart above may have moved them up).
+        components.html(f"""<script>
+            const doc = window.parent.document;
+            const box = doc.querySelector('.st-key-screener_pick_box');
+            // Leave the picked row (just above the chart) in view.
+            if (box) {{ box.style.scrollMarginTop = "160px"; box.scrollIntoView({{block: "start"}}); }}
+            // {picked} {time.time()}
+            </script>""", height=0)
+
+
 def render_stock_screener():
     """Stock screen over a US index's members, with conditions picked by signal group."""
 
@@ -4275,33 +4307,41 @@ def render_stock_screener():
     display_columns = list(dict.fromkeys(base_columns + group_columns + [f"Close vs SMA {p} %" for p in ma_periods] + [
         "% from 52w high", f"New 52w high in last {recent_days}d", "Volume / avg", "Return 1m %", "Return 3m %"]))
     display_columns = [column for column in display_columns if column in shown.columns]
-    st.caption("Select a row to see its daily chart below the table.")
+    st.caption("Select a row to see its daily chart right under it; select it again to close the chart.")
     number_columns = [column for column in display_columns if pd.api.types.is_float_dtype(shown[column])]
     column_config = {column: st.column_config.NumberColumn(format="%.2f") for column in number_columns}
     column_config["Last 3 months"] = st.column_config.LineChartColumn("3 months", width="small", color="auto",
                                                                       help="Daily close over the last 3 months; green when "
                                                                            "it ended higher than it started, red when lower.")
-    # Short lists don't leave a block of empty rows; long ones scroll inside the table.
-    table_height = min(420, 38 + 35 * max(1, len(shown)))
-    event = st.dataframe(shown[display_columns], width="stretch", height=table_height, column_config=column_config,
-                         on_select="rerun", selection_mode="single-row", key="screener_results_table")
-    selected = event.selection.rows if event is not None and hasattr(event, "selection") else []
-    picked = shown.index[selected[0]] if selected and selected[0] < len(shown) else None
-    if picked is not None and picked in prices:
-        period = st.segmented_control("Chart period", list(SCREENER_CHART_PERIODS), default="6M",
-                                      key="screener_chart_period") or "6M"
-        name = shown.at[picked, "Name"] if "Name" in shown else ""
-        last = prices[picked].iloc[-1]
-        st.markdown(f"**{picked}** {name} daily, {prices[picked].index[-1]:%d %b %Y}: O {last['Open']:,.2f} · "
-                    f"H {last['High']:,.2f} · L {last['Low']:,.2f} · C {last['Close']:,.2f}")
-        show_chart(screener_candles_figure(prices[picked], picked, ma_periods,
-                                           bars=SCREENER_CHART_PERIODS[period]),
-                   width="stretch", key="screener_candles_chart")
-    action_columns = st.columns([2, 1])
-    if picked is not None:
-        action_columns[0].button(f"Analyze {picked} in Signal Analysis", type="primary", key="screener_open_btn",
-                                 on_click=open_in_signal_analysis, args=(picked,))
-    action_columns[1].download_button(
+    picked = st.session_state.get("screener_picked")
+    if picked not in shown.index or picked not in prices:
+        picked = None
+    # The chart opens under the picked row: the table is split into the rows down to it and the rows after.
+    # Tables are full height (no scrolling inside them), so the page scrolls and the chart stays next to its row.
+    # Their keys follow the pick, so each new layout starts with nothing selected; the picked row is highlighted.
+    if picked is None:
+        parts = [("all", shown)]
+    else:
+        position = shown.index.get_loc(picked)
+        parts = [("top", shown.iloc[:position + 1]), ("bottom", shown.iloc[position + 1:])]
+    for part, rows in parts:
+        if rows.empty:
+            continue
+        table = rows[display_columns]
+        if picked is not None and part == "top":
+            table = table.style.apply(
+                lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if row.name == picked else "" for _ in row], axis=1)
+        event = st.dataframe(table, width="stretch", height=38 + 35 * len(rows), column_config=column_config,
+                             on_select="rerun", selection_mode="single-row", key=f"screener_{part}_{picked}_table")
+        selected = event.selection.rows if event is not None and hasattr(event, "selection") else []
+        if selected and selected[0] < len(rows):
+            ticker = rows.index[selected[0]]
+            st.session_state["screener_picked"] = None if ticker == picked else ticker
+            st.session_state["screener_scroll_to_chart"] = ticker != picked
+            st.rerun()
+        if part != "bottom" and picked is not None:
+            render_screener_pick(picked, shown, prices, ma_periods)
+    st.download_button(
         "Download results (CSV)",
         shown.drop(columns="Last 3 months").to_csv().encode("utf-8"),
         file_name=f"screener_{market}_{pd.Timestamp(date.today()):%Y%m%d}.csv",
