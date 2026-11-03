@@ -4135,11 +4135,59 @@ def screen_rows():
 
 def add_screen_row():
     rows = screen_rows()
-    rows[max(rows, default=-1) + 1] = {"group": MOVING_AVERAGE}
+    row_id = max(rows, default=-1) + 1
+    rows[row_id] = {"group": MOVING_AVERAGE}
+    st.session_state["screen_open_row"] = row_id  # a new condition opens for editing
 
 
 def remove_screen_row(row_id):
     screen_rows().pop(row_id, None)
+    if st.session_state.get("screen_open_row") == row_id:
+        st.session_state["screen_open_row"] = None
+
+
+def render_conditions_table(rows, category_options):
+    """The conditions as a compact table, one line each; a tap on a line opens its inputs below the table.
+
+    Every condition's inputs still run (the closed ones are hidden with CSS), so their values count and are kept.
+    Returns the complete conditions.
+    """
+
+    open_row = st.session_state.get("screen_open_row")
+    if open_row not in rows:
+        open_row = None
+    labels, conditions = [], []
+    hidden = []
+    table_area = st.container()
+    st.button("+ Add condition", on_click=add_screen_row, key="screen_add_row_btn")
+    editors = st.container()
+    for row_id, seed in list(rows.items()):
+        if row_id != open_row:
+            hidden.append(f".st-key-screen_edit_{row_id}")
+        with editors.container(key=f"screen_edit_{row_id}"):
+            condition = render_condition_row(row_id, seed, category_options)
+            if open_row == row_id:
+                st.button("Done", key=f"screen_{row_id}_done_btn", type="primary",
+                          on_click=lambda: st.session_state.update(screen_open_row=None))
+        labels.append(condition_label(condition) if condition is not None else f"{row_group(row_id, seed)}: not complete")
+        if condition is not None:
+            conditions.append(condition)
+    if hidden:
+        st.html("<style>" + ", ".join(hidden) + " {display: none}</style>")
+    table = pd.DataFrame({"Condition": labels})
+    styled = table.style.apply(
+        lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if list(rows)[row.name] == open_row else ""
+                     for _ in row], axis=1)
+    with table_area:
+        event = st.dataframe(styled, hide_index=True, width="stretch", height=38 + 35 * max(1, len(table)),
+                             on_select="rerun", selection_mode="single-cell", key=f"screen_conditions_{open_row}_table")
+    selection = getattr(event, "selection", None) if event is not None else None
+    cells = list(getattr(selection, "cells", None) or (selection or {}).get("cells", []) or [])
+    if cells and cells[0][0] < len(rows):
+        row_id = list(rows)[cells[0][0]]
+        st.session_state["screen_open_row"] = None if row_id == open_row else row_id
+        st.rerun()
+    return conditions
 
 
 def row_group(row_id, seed):
@@ -4346,13 +4394,8 @@ def render_stock_screener():
     }
 
     with settings_panel("Conditions"):
-        st.caption("A stock must meet every condition. Pick a signal group first; the inputs below it follow the group.")
-        conditions = []
-        for row_id, seed in list(rows.items()):
-            condition = render_condition_row(row_id, seed, category_options)
-            if condition is not None:
-                conditions.append(condition)
-        st.button("+ Add condition", on_click=add_screen_row, key="screen_add_row_btn")
+        st.caption("A stock must meet every condition. Tap a condition to change or remove it.")
+        conditions = render_conditions_table(rows, category_options)
     with settings_panel("More filters", expanded=False):
         use_high = st.checkbox("Within % of 52w high", value=True, key="screener_use_high")
         max_from_high = st.number_input("Max % below 52w high", 0.0, 100.0, 25.0, 1.0,

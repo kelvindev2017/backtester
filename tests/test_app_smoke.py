@@ -205,6 +205,12 @@ def test_setup_periods_are_editable(offline):
     assert any("prior 10-bar low" in element.value for element in app.caption)
 
 
+def result_tables(app):
+    """The screener's results tables (the conditions table is a dataframe too)."""
+
+    return [frame for frame in app.dataframe if "Ticker" in frame.value.columns]
+
+
 def test_screener_tab_scans_a_custom_list(offline):
     app = open_tab(start_app(), "Stock Screener")
     assert app.sidebar.header[0].value == "Stock Screener"
@@ -213,6 +219,13 @@ def test_screener_tab_scans_a_custom_list(offline):
     assert not app.exception, app.exception
     assert "stocks pass" in " ".join(element.value for element in app.success)
     assert [box.value for box in app.selectbox if box.label == "Signal group"] == ["Moving average"] * 3
+    conditions = next(frame.value for frame in app.dataframe if "Condition" in frame.value.columns)
+    assert list(conditions["Condition"]) == ["Close > SMA 50", "SMA 50 > SMA 200", "Close > SMA 200"]
+    assert not any(button.key == "screen_0_done_btn" for button in app.button)
+    app.session_state["screen_open_row"] = 0
+    app.run()
+    next(button for button in app.button if button.key == "screen_0_done_btn").click().run()
+    assert app.session_state["screen_open_row"] is None
 
     # Switching a row's group swaps the inputs after it.
     next(box for box in app.selectbox if box.label == "Signal group").select("P/E").run()
@@ -483,35 +496,35 @@ def test_screener_market_cap_filter_and_sparklines(offline, monkeypatch):
     assert not any(box.label == "Show stocks that fail too" for box in app.checkbox)
     next(box for box in app.selectbox if box.label == "Universe").select("Custom list").run()
     next(button for button in app.button if button.key == "screener_load_btn").click().run()
-    table = app.dataframe[0].value
+    table = result_tables(app)[0].value
     assert "Pass" not in table.columns and "Last 3 months" in table.columns
     # The sector leads each row (from Yahoo for a custom list), then the ticker.
     assert list(table.columns[:2]) == ["Sector", "Ticker"] and set(table["Sector"]) == {"Tech"}
     assert all(len(line) > 0 for line in table["Last 3 months"])
     next(box for box in app.multiselect if box.label == "Market cap").set_value(["Mega (over $200B)"]).run()
     assert not app.exception, app.exception
-    table = app.dataframe[0].value
+    table = result_tables(app)[0].value
     assert list(table.index) == ["AAPL"] and "Mkt cap ($B)" in table.columns
 
     # Sort by any column, either way.
     next(box for box in app.selectbox if box.label == "Sort by").select("Ticker").run()
-    tickers = list(app.dataframe[0].value["Ticker"])
+    tickers = list(result_tables(app)[0].value["Ticker"])
     assert tickers == sorted(tickers)
     app.session_state["screener_sort_order_Ticker"] = "↓ High"
     app.run()
-    assert list(app.dataframe[0].value["Ticker"]) == sorted(tickers, reverse=True)
+    assert list(result_tables(app)[0].value["Ticker"]) == sorted(tickers, reverse=True)
 
     # A picked stock splits the table: its chart sits right under its row, the rows after it below the chart.
     next(box for box in app.multiselect if box.label == "Market cap").set_value([]).run()
-    rows = list(app.dataframe[0].value.index)
+    rows = list(result_tables(app)[0].value.index)
     app.session_state["screener_picked"] = rows[1]
     app.run()
     assert not app.exception, app.exception
-    assert [len(frame.value.index) for frame in app.dataframe] == [2, len(rows) - 2]
+    assert [len(frame.value.index) for frame in result_tables(app)] == [2, len(rows) - 2]
     assert any(button.key == "screener_close_chart_btn" for button in app.button)
     assert any(f"Analyze {rows[1]}" in button.label for button in app.button)
     next(button for button in app.button if button.key == "screener_close_chart_btn").click().run()
-    assert len(app.dataframe) == 1
+    assert len(result_tables(app)) == 1
     st.cache_resource.clear()
 
 
@@ -527,9 +540,9 @@ def test_screener_pages_of_ten(offline):
     assert not app.exception, app.exception
     passing = int(next(element.value for element in app.success).split("**")[1].split(" of ")[0])
     assert passing > 10
-    assert len(app.dataframe[0].value) == 10
+    assert len(result_tables(app)[0].value) == 10
     next(button for button in app.button if button.key == "screener_next_btn").click().run()
-    assert len(app.dataframe[0].value) == min(10, passing - 10)
+    assert len(result_tables(app)[0].value) == min(10, passing - 10)
     assert any("page 2/" in element.value for element in app.markdown)
 
 
