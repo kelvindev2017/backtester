@@ -2813,6 +2813,13 @@ def price_lines_chart(frame, title, ma_periods=(), bars=TRADING_DAYS_PER_YEAR, h
     return fig
 
 
+# Short sector names for the first column of the screener table (narrow on phones).
+SHORT_SECTORS = {
+    "Communication Services": "Comm.", "Consumer Discretionary": "Cons. disc.",
+    "Consumer Staples": "Staples", "Information Technology": "Tech", "Health Care": "Health care",
+    "Real Estate": "Real estate",
+}
+SCREENER_PAGE_SIZE = 10
 SCREENER_CHART_BARS = 126  # about 6 months of trading days in view when the chart opens
 
 
@@ -4223,6 +4230,26 @@ def open_in_signal_analysis(ticker):
     st.session_state["main_tab"] = SIGNAL_TAB
 
 
+def set_screener_page(page):
+    st.session_state["screener_page"] = page
+    st.session_state["screener_picked"] = None
+
+
+def render_screener_pager(page, pages, count):
+    """Previous / next buttons under the results table, with where you are."""
+
+    st.html("<style>.st-key-screener_pager [data-testid='stHorizontalBlock'] {flex-wrap: nowrap}"
+            ".st-key-screener_pager [data-testid='stColumn'] {min-width: 0}</style>")
+    cells = st.container(key="screener_pager").columns([1, 2, 1], vertical_alignment="center")
+    cells[0].button("‹ Prev", key="screener_prev_btn", disabled=page <= 1, on_click=set_screener_page, args=(page - 1,),
+                    width="stretch")
+    first = (page - 1) * SCREENER_PAGE_SIZE + 1
+    cells[1].markdown(f"<div style='text-align:center'>{first}-{min(count, first + SCREENER_PAGE_SIZE - 1)} of {count} "
+                      f"· page {page}/{pages}</div>", unsafe_allow_html=True)
+    cells[2].button("Next ›", key="screener_next_btn", disabled=page >= pages, on_click=set_screener_page,
+                    args=(page + 1,), width="stretch")
+
+
 def render_screener_pick(picked, shown, prices, ma_periods):
     """Daily candle chart of the picked stock, shown right under its row in the results table."""
 
@@ -4288,7 +4315,9 @@ def render_stock_screener():
     extra = extra.fillna("").replace("nan", "")
     fundamentals_note = fundamentals_warning = ""
     if is_loaded and prices:
-        wants_yahoo = bool(market_caps) or any(SIGNAL_GROUPS[group].get("fundamental") for group in groups_in_use) or (
+        # The results table leads with each stock's sector; fill missing ones from Yahoo for short lists.
+        sectors_missing = extra["Sector"].eq("").any() and len(scanned) <= 150
+        wants_yahoo = bool(market_caps) or sectors_missing or any(SIGNAL_GROUPS[group].get("fundamental") for group in groups_in_use) or (
             bool(groups_in_use & {"Sector", "Industry"}) and (extra["Sector"].eq("") | extra["Industry"].eq("")).any())
         if wants_yahoo:
             progress = st.progress(0.0, text="Loading fundamentals from Yahoo...")
@@ -4366,18 +4395,25 @@ def render_stock_screener():
     elif fundamentals_note:
         st.caption(fundamentals_note)
 
-    results = screen_stocks(
-        prices,
-        conditions,
+    screen_settings = dict(
         max_pct_from_high=float(max_from_high) if use_high else None,
         min_price=float(min_price) if min_price > 0 else None,
         min_avg_volume=float(min_volume) if min_volume > 0 else None,
         cross_window=cross_window,
         ma_periods=ma_periods,
         recent_days=recent_days,
-        extra=extra,
         market_caps=market_caps,
     )
+    # Screening a full index takes a couple of seconds; a tap on the table, a sort or a page turn reruns the
+    # page with the same screen, so the last result is kept and reused until the data or a setting changes.
+    screen_key = json.dumps([data_key, conditions, screen_settings, date.today().isoformat(),
+                             int(pd.util.hash_pandas_object(extra.astype(str), index=True).sum())], default=str)
+    cached = st.session_state.get("screener_results_cache")
+    if cached and cached[0] == screen_key:
+        results = cached[1]
+    else:
+        results = screen_stocks(prices, conditions, extra=extra, **screen_settings)
+        st.session_state["screener_results_cache"] = (screen_key, results)
     if results.empty:
         st.warning("No stocks to screen.")
         return
@@ -4406,12 +4442,46 @@ def render_stock_screener():
     display_columns = list(dict.fromkeys(base_columns + group_columns + [f"Close vs SMA {p} %" for p in ma_periods] + [
         "% from 52w high", f"New 52w high in last {recent_days}d", "Volume / avg", "Return 1m %", "Return 3m %"]))
     display_columns = [column for column in display_columns if column in shown.columns]
-    st.caption("Select a row to see its daily chart right under it; select it again to close the chart.")
+    st.caption("Tap a stock to see its daily chart right under it; tap it again to close the chart.")
     number_columns = [column for column in display_columns if pd.api.types.is_float_dtype(shown[column])]
     column_config = {column: st.column_config.NumberColumn(format="%.2f") for column in number_columns}
     column_config["Last 3 months"] = st.column_config.LineChartColumn("3 months", width="small", color="auto",
                                                                       help="Daily close over the last 3 months; green when "
                                                                            "it ended higher than it started, red when lower.")
+    column_config["Sector"] = st.column_config.TextColumn("Sector", width="small")
+    # The sector leads each row, where a row checkbox used to be; a tap on any cell picks the stock.
+    sectors = shown["Sector"] if "Sector" in shown else pd.Series("", index=shown.index)
+    table_rows = shown[[column for column in display_columns if column != "Sector"]].copy()
+    table_rows.insert(0, "Ticker", table_rows.index)
+    table_rows.insert(0, "Sector", sectors.fillna("").map(lambda value: SHORT_SECTORS.get(value, value)))
+    all_shown = shown
+    # Sorting happens here, not in the table's own headers: a header sort would only reorder one half of a
+    # table split around an open chart.
+    sort_options = ["Sector", "Ticker"] + [column for column in display_columns
+                                           if column in number_columns or column in ("Name",)]
+    st.html("<style>.st-key-screener_sort [data-testid='stHorizontalBlock'] {flex-wrap: nowrap}"
+            ".st-key-screener_sort [data-testid='stColumn'] {min-width: 0}</style>")
+    sort_cells = st.container(key="screener_sort").columns([1, 1], vertical_alignment="bottom")
+    sort_by = sort_cells[0].selectbox("Sort by", sort_options,
+                                      index=sort_options.index("% from 52w high") if "% from 52w high" in sort_options else 0,
+                                      key="screener_sort_by", on_change=set_screener_page, args=(1,))
+    direction = sort_cells[1].segmented_control("Order", ["↑ Low", "↓ High"],
+                                                default="↑ Low" if sort_by in ("Sector", "Ticker", "Name") else "↓ High",
+                                                key=f"screener_sort_order_{sort_by}", on_change=set_screener_page,
+                                                args=(1,)) or "↓ High"
+    ascending = direction.startswith("↑")
+    # Ties (e.g. stocks in one sector) keep the screen's own order, nearest the 52-week high first.
+    table_rows = table_rows.iloc[np.lexsort([np.arange(len(table_rows)),
+                                             table_rows[sort_by].rank(method="dense", ascending=ascending,
+                                                                      na_option="bottom").to_numpy()])]
+    shown = shown.loc[table_rows.index]
+    # 10 stocks a page keeps the page quick on phones.
+    pages = max(1, -(-len(table_rows) // SCREENER_PAGE_SIZE))
+    page = min(max(1, int(st.session_state.get("screener_page", 1))), pages)
+    st.session_state["screener_page"] = page
+    first = (page - 1) * SCREENER_PAGE_SIZE
+    table_rows = table_rows.iloc[first:first + SCREENER_PAGE_SIZE]
+    shown = shown.loc[table_rows.index]
     picked = st.session_state.get("screener_picked")
     if picked not in shown.index or picked not in prices:
         picked = None
@@ -4419,30 +4489,36 @@ def render_stock_screener():
     # Tables are full height (no scrolling inside them), so the page scrolls and the chart stays next to its row.
     # Their keys follow the pick, so each new layout starts with nothing selected; the picked row is highlighted.
     if picked is None:
-        parts = [("all", shown)]
+        parts = [("all", table_rows)]
     else:
         position = shown.index.get_loc(picked)
-        parts = [("top", shown.iloc[:position + 1]), ("bottom", shown.iloc[position + 1:])]
+        parts = [("top", table_rows.iloc[:position + 1]), ("bottom", table_rows.iloc[position + 1:])]
     for part, rows in parts:
         if rows.empty:
             continue
-        table = rows[display_columns]
+        table = rows
         if picked is not None and part == "top":
             table = table.style.apply(
-                lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if row.name == picked else "" for _ in row], axis=1)
+                lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if row["Ticker"] == picked else "" for _ in row],
+                axis=1)
         event = st.dataframe(table, width="stretch", height=38 + 35 * len(rows), column_config=column_config,
-                             on_select="rerun", selection_mode="single-row", key=f"screener_{part}_{picked}_table")
-        selected = event.selection.rows if event is not None and hasattr(event, "selection") else []
-        if selected and selected[0] < len(rows):
-            ticker = rows.index[selected[0]]
+                             hide_index=True, on_select="rerun", selection_mode="single-cell",
+                             key=f"screener_{part}_{picked}_table")
+        selection = getattr(event, "selection", None) if event is not None else None
+        cells = list(getattr(selection, "cells", None) or (selection or {}).get("cells", []) or [])
+        row_number = cells[0][0] if cells else None
+        if row_number is not None and row_number < len(rows):
+            ticker = rows["Ticker"].iloc[row_number]
             st.session_state["screener_picked"] = None if ticker == picked else ticker
             st.session_state["screener_scroll_to_chart"] = ticker != picked
             st.rerun()
         if part != "bottom" and picked is not None:
             render_screener_pick(picked, shown, prices, ma_periods)
+    if pages > 1:
+        render_screener_pager(page, pages, len(passing))
     st.download_button(
         "Download results (CSV)",
-        shown.drop(columns="Last 3 months").to_csv().encode("utf-8"),
+        all_shown.drop(columns="Last 3 months").to_csv().encode("utf-8"),
         file_name=f"screener_{market}_{pd.Timestamp(date.today()):%Y%m%d}.csv",
         mime="text/csv",
     )
