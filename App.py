@@ -30,6 +30,7 @@ from analysis.opening_bar import (
     run_opening_bar,
     summarize_opening_bar,
 )
+from analysis.chart_fit import fit_y_axes
 from analysis.economy import (
     ASSETS,
     BENCHMARK as ECONOMY_BENCHMARK,
@@ -214,7 +215,7 @@ st.set_page_config(
 # - a swipe over a chart scrolls the page, like anywhere else;
 # - a tap shows the values under the finger, and a double-tap resets the zoom;
 # - holding a finger still for HOLD_MS and then moving it moves the hover line with the finger;
-# - two fingers zoom (pinch) and pan the chart, dates and values both;
+# - two fingers zoom (pinch) and pan the dates; the values fit themselves to the dates in view (CHART_FIT_Y_JS);
 # - after a tap on the chart's own Pan button, one finger pans the chart instead of scrolling the page,
 #   until the Zoom button is tapped.
 # The gestures reach Plotly as the mouse and wheel events it already understands (wheel zoom needs the
@@ -265,22 +266,18 @@ CHART_TOUCH_JS = """
     const gd = button && button.closest(".js-plotly-plot");
     if (gd) gd.dataset.chosenDrag = button.getAttribute("data-val");
   }, true);
-  function pinchAxis(touches) {
-    const dx = Math.abs(touches[0].clientX - touches[1].clientX), dy = Math.abs(touches[0].clientY - touches[1].clientY);
-    const angle = Math.atan2(dy, dx) * 180 / Math.PI;
-    return angle < 30 ? "x" : angle > 60 ? "y" : null;
-  }
   function span(touches, axis) {
     return axis === "x" ? Math.abs(touches[0].clientX - touches[1].clientX) : Math.abs(touches[0].clientY - touches[1].clientY);
   }
-  // The x and y axes of the panel under a touch, from its drag box ("x2y3" names xaxis2 and yaxis3).
+  // The x and y axes of the panel under a touch, from its drag box ("x2y3" names xaxis2 and yaxis3). The y-axis
+  // may be fixed (it fits itself to the dates in view); the dates must not be.
   function axesOf(gd, target) {
     const box = target.closest && target.closest(".drag");
     const subplot = box && box.getAttribute("data-subplot");
     const layout = gd._fullLayout, match = subplot && /^(x\\d*)(y\\d*)$/.exec(subplot);
     if (!match || !window.Plotly) return null;
     const xa = layout[match[1].replace("x", "xaxis")], ya = layout[match[2].replace("y", "yaxis")];
-    return xa && ya && !xa.fixedrange && !ya.fixedrange ? { x: xa, y: ya } : null;
+    return xa && ya && !xa.fixedrange ? { x: xa, y: ya } : null;
   }
   function axisRange(axis) { return axis.range.map(axis.r2l); }
   // Zoom one axis by how far apart the fingers moved along it, and pan it as their centre moves: the value under
@@ -320,16 +317,17 @@ CHART_TOUCH_JS = """
       const c = centre(event.touches);
       const target = gesture && gesture.gd === gd && gesture.target.closest(".drag") ? gesture.target : event.target;
       if (gesture && gesture.mode === "pan") mouse("mouseup", gesture.target, c.x, c.y, 0);
-      // Fingers side by side zoom and pan the time only, one above the other the values only (within 30 degrees).
-      const axis = pinchAxis(event.touches);
-      const axes = axis && axesOf(gd, target);
+      // Two fingers zoom and pan the time only, however they are held: the values fit themselves to it.
+      const axis = "x";
+      const axes = axesOf(gd, target);
       if (axes) {
         gesture = { gd: gd, target: target, mode: "axis-pinch", axis: axis, axes: axes, centre: c,
                     span: Math.max(span(event.touches, axis), 1), start: axisRange(axes[axis]) };
         return;
       }
       modebar(gd, "dragmode", ["pan"]);
-      // At an angle: zoom and pan through the touched panel's plot area, so the values zoom with the dates.
+      // Not on a panel's plot area (e.g. on an axis): zoom and pan through Plotly's own wheel zoom and pan, which
+      // leave the fixed y-axes alone.
       gesture = { gd: gd, target: target, mode: "pinch", centre: c, spread: spread(event.touches) };
       mouse("mousedown", target, c.x, c.y, 1);
       return;
@@ -425,33 +423,129 @@ CHART_TOUCH_JS = """
 })();
 """
 
-# Charts whose layout has meta={"fit_y": True} refit the first panel's price scale to the candles in view whenever
-# that panel's time range changes (a pinch or drag), so bars of another day are not left off the screen.
+# Every chart zooms its dates (x) only; show_chart (analysis.chart_fit.fit_y_axes) fixes the y-axes and lists them
+# in layout meta "fit_y". After each zoom or pan of the dates, each listed y-axis is refitted to the lowest and
+# highest value drawn in view on it (candles by their low and high). An axis whose range the chart chose itself
+# ("cap") stays inside that range and opens on it; volume bars ("volume") keep to the bottom quarter of their panel.
+# When the dates are back where the chart opened (double-tap, reset button), every axis goes back to its first range.
 CHART_FIT_Y_JS = """
 (function () {
-  function fit(gd) {
-    const layout = gd._fullLayout, range = layout.xaxis && layout.xaxis.range;
-    if (!range || !window.Plotly) return;
-    let low = Infinity, high = -Infinity;
-    for (const trace of gd._fullData) {
-      if (trace.type !== "candlestick" || (trace.xaxis || "x") !== "x") continue;
-      // One slot per bar: the bars in view are the slots inside the range.
-      const first = Math.max(0, Math.ceil(range[0])), last = Math.min(trace.low.length - 1, Math.floor(range[1]));
-      for (let i = first; i <= last; i++) {
-        if (trace.low[i] < low) low = trace.low[i];
-        if (trace.high[i] > high) high = trace.high[i];
-      }
+  const PAD = 0.05;
+  function near(a, b) {
+    const scale = Math.max(Math.abs(a[1] - a[0]), 1e-9);
+    return Math.abs(a[0] - b[0]) / scale < 1e-6 && Math.abs(a[1] - b[1]) / scale < 1e-6;
+  }
+  function rangeOf(axis) { return axis.range.map(axis.r2l); }
+  // A trace's x values in the axis's linear units (dates as milliseconds, categories as slots), worked out once.
+  function xValues(gd, index, trace, xa) {
+    const cache = gd._fitXCache || (gd._fitXCache = {});
+    const hit = cache[index];
+    if (hit && hit.source === trace.x && hit.axis === xa.type) return hit.values;
+    const n = (trace.x || trace.y || trace.low || []).length, values = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = trace.x ? xa.d2l(trace.x[i]) : i;
+      values[i] = typeof v === "number" ? v : NaN;
     }
-    if (!isFinite(low)) return;
-    const pad = (high - low) * 0.05 || 1;
-    window.Plotly.relayout(gd, { "yaxis.range": [low - pad, high + pad] });
+    cache[index] = { source: trace.x, axis: xa.type, values: values };
+    return values;
+  }
+  // Lowest and highest value (in the y-axis's linear units: log10 on a log axis) drawn in view on each fitted axis.
+  function visibleExtents(gd, specs) {
+    const layout = gd._fullLayout, out = {};
+    gd._fullData.forEach(function (trace, index) {
+      if (trace.visible !== true) return;
+      const yname = (trace.yaxis || "y").replace("y", "yaxis"), xname = (trace.xaxis || "x").replace("x", "xaxis");
+      if (!(yname in specs)) return;
+      const xa = layout[xname], ya = layout[yname];
+      if (!xa || !ya || !xa.range) return;
+      const r = rangeOf(xa), lo = Math.min(r[0], r[1]), hi = Math.max(r[0], r[1]);
+      const xs = xValues(gd, index, trace, xa);
+      const candle = trace.type === "candlestick" || trace.type === "ohlc";
+      const lows = candle ? trace.low : trace.y, highs = candle ? trace.high : trace.y;
+      if (!lows) return;
+      const e = out[yname] || (out[yname] = { low: Infinity, high: -Infinity, zero: false });
+      if (trace.type === "bar" || trace.fill === "tozeroy") e.zero = true;
+      for (let i = 0; i < xs.length; i++) {
+        const x = xs[i];
+        if (!(x >= lo && x <= hi)) continue;
+        const a = ya.c2l(+lows[i]), b = ya.c2l(+highs[i]);
+        if (isFinite(a) && a < e.low) e.low = a;
+        if (isFinite(b) && b > e.high) e.high = b;
+      }
+    });
+    return out;
+  }
+  function capture(gd) {
+    const layout = gd._fullLayout, start = {};
+    for (const key of Object.keys(layout)) {
+      if (/^[xy]axis\\d*$/.test(key) && layout[key] && layout[key].range) start[key] = rangeOf(layout[key]).slice();
+    }
+    gd._fitStart = start;
+    gd._fitMeta = gd.layout.meta;
+    gd._fitXCache = {};
+  }
+  function fit(gd) {
+    const meta = gd.layout && gd.layout.meta, specs = meta && meta.fit_y;
+    if (!specs || !window.Plotly || !gd._fullLayout) return;
+    if (gd._fitMeta !== meta) capture(gd);  // a new figure (the app reran)
+    const layout = gd._fullLayout, start = gd._fitStart, extents = visibleExtents(gd, specs), update = {};
+    // The x-axes of each fitted y-axis, from its traces.
+    const xsOf = {};
+    for (const trace of gd._fullData) {
+      const yname = (trace.yaxis || "y").replace("y", "yaxis");
+      (xsOf[yname] = xsOf[yname] || new Set()).add((trace.xaxis || "x").replace("x", "xaxis"));
+    }
+    for (const yname of Object.keys(specs)) {
+      const ya = layout[yname], spec = specs[yname] || {};
+      if (!ya || !ya.range) continue;
+      const xnames = Array.from(xsOf[yname] || []);
+      const atStart = xnames.every(function (x) { return layout[x] && start[x] && near(rangeOf(layout[x]), start[x]); });
+      // Dates where the chart opened: an axis the chart sized itself keeps that size, and so does one opened on
+      // every date (Plotly already fitted it). A chart that opens on part of its dates gets the other axes fitted.
+      const openedOnAll = xnames.every(function (x) { const a = gd.layout[x]; return !a || !a.range; });
+      let target = null;
+      if (atStart && (spec.cap || spec.volume || openedOnAll)) {
+        target = start[yname];
+      } else {
+        const e = extents[yname];
+        if (!e || !isFinite(e.low) || !isFinite(e.high)) continue;
+        let low = e.low, high = e.high;
+        if (e.zero && ya.type !== "log") { low = Math.min(low, 0); high = Math.max(high, 0); }
+        if (spec.volume) {
+          target = [0, (high || 1) * 4];
+        } else {
+          const pad = (high - low) * PAD || Math.abs(high) * PAD || 1;
+          low = e.zero && low === 0 ? 0 : low - pad;
+          high = e.zero && high === 0 ? 0 : high + pad;
+          if (spec.cap) {
+            const capLow = Math.min(spec.cap[0], spec.cap[1]), capHigh = Math.max(spec.cap[0], spec.cap[1]);
+            low = Math.max(low, capLow);
+            high = Math.min(high, capHigh);
+            if (!(high > low)) { low = capLow; high = capHigh; }
+          }
+          target = [low, high];
+        }
+      }
+      if (!target) continue;
+      const now = rangeOf(ya), reversed = now[0] > now[1];
+      const wanted = reversed ? [target[1], target[0]] : target;
+      if (!near(now, wanted)) update[yname + ".range"] = wanted.map(ya.l2r);
+    }
+    if (Object.keys(update).length) window.Plotly.relayout(gd, update);
   }
   function attach(gd) {
-    if (gd.dataset.fitY || !gd.layout || !gd.layout.meta || !gd.layout.meta.fit_y || !gd.on) return;
+    if (gd.dataset.fitY || !gd.on) return;
     gd.dataset.fitY = "1";
     gd.on("plotly_relayout", function (event) {
-      if (Object.keys(event).some(function (key) { return key.indexOf("xaxis.range") === 0 || key === "xaxis.autorange"; })) fit(gd);
+      if (Object.keys(event).some(function (key) { return /^xaxis\\d*\\.(range|autorange)/.test(key) || /^xaxis\\d*$/.test(key); })) fit(gd);
     });
+    // A new figure (first draw or a rerun) that opens on part of its dates: fit its axes to them.
+    gd.on("plotly_afterplot", function () {
+      const meta = gd.layout && gd.layout.meta;
+      if (meta && meta.fit_y && gd._fitMeta !== meta) { capture(gd); fit(gd); }
+    });
+    const meta = gd.layout && gd.layout.meta;
+    if (meta && meta.fit_y && gd._fullLayout) { capture(gd); fit(gd); }
   }
   function scan() { document.querySelectorAll(".js-plotly-plot").forEach(attach); }
   new MutationObserver(scan).observe(document.body, { childList: true, subtree: true });
@@ -2885,6 +2979,9 @@ def show_chart(fig, **kwargs):
 
     Charts with a unified x hover show the hovered values as labels on their axes (see CHART_AXIS_HOVER_JS).
 
+    Charts zoom and pan along x only, and every y-axis fits the data in view (see analysis.chart_fit and
+    CHART_FIT_Y_JS).
+
     On touch screens a swipe over a chart scrolls the page and two fingers zoom it (see CHART_TOUCH_JS),
     which needs Plotly's scroll zoom; it is only turned on in the mobile layout, so a mouse wheel on
     desktop still scrolls the page.
@@ -2896,6 +2993,8 @@ def show_chart(fig, **kwargs):
         fig.update_layout(hovermode="x unified")
     if fig.layout.hovermode == "x unified" and fig.layout.meta is None:
         fig.update_layout(meta=dict(axis_hover=True))
+    # Zoom the dates only; each y-axis fits the values in view (CHART_FIT_Y_JS).
+    fit_y_axes(fig)
     if MOBILE:
         kwargs["config"] = {**kwargs.get("config", {}), "scrollZoom": True}
         compact = dict(font=dict(size=10), entrywidth=0.5, entrywidthmode="fraction")
@@ -5072,11 +5171,10 @@ def render_backtest(s):
             tickangle=0, showgrid=False, range=[-0.5, len(df) - 0.5], row=1, col=1,
         )
         fig.update_yaxes(range=[df["Low"].min() - pad, df["High"].max() + pad], row=1, col=1)
-        fig.update_layout(meta=dict(axis_hover=True, fit_y=True))
+        fig.update_layout(meta=dict(axis_hover=True))
         st.caption(f"The price panel shows every {s.opening_bar.bar_minutes}-minute bar. Pinch with two fingers "
-                   "side by side to zoom the time only, one above the other to zoom the price only, or at an angle "
-                   "for both; drag with two fingers to move (double-tap resets). After a time zoom or move the "
-                   "price scale fits the bars in view.")
+                   "to zoom the time, drag with two fingers to move (double-tap resets); the price scale fits "
+                   "the bars in view.")
 
     chart_state_text = "|".join(
         [
