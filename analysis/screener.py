@@ -14,6 +14,8 @@ from analysis.signal_groups import MOVING_AVERAGE, evaluate_group_condition, gro
 TRADING_DAYS_PER_YEAR = 252
 OPERATORS = [">", "<", ">=", "<=", "Cross Above", "Cross Below"]
 LINE_KINDS = ["Close", "SMA", "EMA", "Value"]
+# A line's percentage change over the last N bars (e.g. "SMA 200 rose over the last 20 days").
+RATE_OF_CHANGE = "Rate of change"
 
 
 # ============================================================
@@ -43,7 +45,37 @@ def line_label(kind, period=None):
     return f"{kind} {int(period)}"
 
 
+def rate_of_change(df, condition):
+    """% change of the condition's line over its last ``days`` bars (NaN when the history is too short)."""
+
+    line = line_series(df, condition["line_kind"], condition.get("line_period")).dropna()
+    days = int(condition["days"])
+    if len(line) <= days or line.iloc[-1 - days] == 0:
+        return float("nan")
+    return (float(line.iloc[-1]) / float(line.iloc[-1 - days]) - 1) * 100
+
+
+def evaluate_rate_of_change(df, condition):
+    """True when the line's % change over ``days`` bars meets the operator and value(s)."""
+
+    change = rate_of_change(df, condition)
+    if np.isnan(change):
+        return False
+    value, operator = float(condition["value"]), condition["operator"]
+    if operator == "Between":
+        low, high = sorted([value, float(condition["value2"])])
+        return low <= change <= high
+    return {">": change > value, "<": change < value, ">=": change >= value, "<=": change <= value}[operator]
+
+
 def condition_label(condition):
+    if condition.get("group") == RATE_OF_CHANGE:
+        line = line_label(condition["line_kind"], condition.get("line_period"))
+        if condition["operator"] == "Between":
+            target = f"{condition['value']:g}% to {condition['value2']:g}%"
+        else:
+            target = f"{condition['operator']} {condition['value']:g}%"
+        return f"{line} change over {int(condition['days'])}d {target}"
     if condition.get("group", MOVING_AVERAGE) != MOVING_AVERAGE:
         return group_condition_label(condition)
     return (
@@ -451,7 +483,9 @@ def screen_stocks(
         label = condition_label(condition)
         if label in table.columns:
             label = f"{label} "
-        if condition.get("group", MOVING_AVERAGE) == MOVING_AVERAGE:
+        if condition.get("group") == RATE_OF_CHANGE:
+            table[label] = [evaluate_rate_of_change(prices[ticker], condition) for ticker in table.index]
+        elif condition.get("group", MOVING_AVERAGE) == MOVING_AVERAGE:
             table[label] = [evaluate_condition(prices[ticker], condition, cross_window) for ticker in table.index]
         else:
             table[label] = [evaluate_group_condition(table.loc[ticker], condition, today) for ticker in table.index]

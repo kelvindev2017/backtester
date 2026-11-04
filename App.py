@@ -86,10 +86,18 @@ from analysis.rule_diagrams import (
     pullback_figure,
     reversal_figure,
 )
+from analysis.condition_table import (
+    ALL_OPERATORS as CONDITION_OPERATORS,
+    COLUMNS as CONDITION_COLUMNS,
+    SIGNALS as CONDITION_SIGNALS,
+    default_row as condition_default_row,
+    default_table as default_condition_table,
+    normalize as normalize_condition_table,
+    row_condition,
+)
 from analysis.screener import (
-    LINE_KINDS as SCREEN_LINE_KINDS,
-    OPERATORS as SCREEN_OPERATORS,
     MARKET_CAP_BUCKETS,
+    RATE_OF_CHANGE,
     TRADING_DAYS_PER_YEAR,
     breadth_history,
     close_sparkline,
@@ -118,14 +126,12 @@ from analysis.supply_chain import (
 )
 from analysis.signal_groups import (
     ANALYST_RATINGS,
-    CATEGORY_OPERATORS,
     DEFAULT_INDUSTRIES,
     FUNDAMENTAL_COLUMNS,
     GICS_SECTORS,
     INDUSTRY_INDEXES,
     INDUSTRY_TOP_HOLDINGS,
     MOVING_AVERAGE,
-    NUMBER_OPERATORS,
     SIGNAL_GROUPS,
     condition_column,
     fundamental_row,
@@ -2775,31 +2781,6 @@ def load_universe_members(market, universe):
 # Stock screener: page
 # ============================================================
 
-def editor_conditions(frame):
-    """Valid screen conditions from the data-editor rows (incomplete rows are skipped)."""
-
-    conditions = []
-    for _, row in frame.iterrows():
-        left, operator, right = row.get("Left"), row.get("Operator"), row.get("Right")
-        left_period, right_value = row.get("Left period"), row.get("Right period / value")
-        if left not in ("Close", "SMA", "EMA") or right not in SCREEN_LINE_KINDS or operator not in SCREEN_OPERATORS:
-            continue
-        if left != "Close" and (pd.isna(left_period) or int(left_period) < 1):
-            continue
-        if right != "Close" and pd.isna(right_value):
-            continue
-        if right in ("SMA", "EMA") and int(right_value) < 1:
-            continue
-        conditions.append({
-            "left_kind": left,
-            "left_period": None if left == "Close" else int(left_period),
-            "operator": operator,
-            "right_kind": right,
-            "right_period": None if right == "Close" else (float(right_value) if right == "Value" else int(right_value)),
-        })
-    return conditions
-
-
 def price_lines_chart(frame, title, ma_periods=(), bars=TRADING_DAYS_PER_YEAR, height=380):
     """Last ``bars`` closes with SMAs (computed on the full history so they start filled)."""
 
@@ -4118,164 +4099,59 @@ def render_supply_chain(index_prices):
 # Stock Screener tab
 # ============================================================
 
-DEFAULT_SCREEN_ROWS = [
-    {"group": MOVING_AVERAGE, "left": "Close", "left_period": 0, "operator": ">", "right": "SMA", "right_value": 50.0},
-    {"group": MOVING_AVERAGE, "left": "SMA", "left_period": 50, "operator": ">", "right": "SMA", "right_value": 200.0},
-    {"group": MOVING_AVERAGE, "left": "Close", "left_period": 0, "operator": ">", "right": "SMA", "right_value": 200.0},
-]
+def condition_table():
+    """The screen's conditions, one row each (see analysis.condition_table)."""
+
+    if "screen_table" not in st.session_state:
+        st.session_state["screen_table"] = default_condition_table()
+        st.session_state["screen_table_version"] = 0
+    return st.session_state["screen_table"]
 
 
-def screen_rows():
-    """Condition rows as {row id: seed values}; ids keep widget keys stable when rows are removed."""
-
-    if "screen_rows" not in st.session_state:
-        st.session_state["screen_rows"] = {index: dict(seed) for index, seed in enumerate(DEFAULT_SCREEN_ROWS)}
-    return st.session_state["screen_rows"]
+def store_condition_table(table):
+    st.session_state["screen_table"] = table.reset_index(drop=True)
+    # A new editor key each time, so the grid starts from the stored table rather than replaying old edits.
+    st.session_state["screen_table_version"] = st.session_state.get("screen_table_version", 0) + 1
 
 
-def add_screen_row():
-    rows = screen_rows()
-    row_id = max(rows, default=-1) + 1
-    rows[row_id] = {"group": MOVING_AVERAGE}
-    st.session_state["screen_open_row"] = row_id  # a new condition opens for editing
+def add_condition_row():
+    table = condition_table()
+    store_condition_table(pd.concat([table, pd.DataFrame([condition_default_row(MOVING_AVERAGE)])], ignore_index=True))
 
 
-def remove_screen_row(row_id):
-    screen_rows().pop(row_id, None)
-    if st.session_state.get("screen_open_row") == row_id:
-        st.session_state["screen_open_row"] = None
+def render_condition_editor(category_options):
+    """The conditions as one editable table: a row of inputs per condition, a ✕ to tick for removing it,
+    and a "Reads as" column that spells out each condition (or what it still needs). Returns the complete
+    conditions."""
 
-
-def render_conditions_table(rows, category_options):
-    """The conditions as a compact table, one line each; a tap on a line opens its inputs below the table.
-
-    Every condition's inputs still run (the closed ones are hidden with CSS), so their values count and are kept.
-    Returns the complete conditions.
-    """
-
-    open_row = st.session_state.get("screen_open_row")
-    if open_row not in rows:
-        open_row = None
-    labels, conditions = [], []
-    hidden = []
-    table_area = st.container()
-    st.button("+ Add condition", on_click=add_screen_row, key="screen_add_row_btn")
-    editors = st.container()
-    for row_id, seed in list(rows.items()):
-        if row_id != open_row:
-            hidden.append(f".st-key-screen_edit_{row_id}")
-        with editors.container(key=f"screen_edit_{row_id}"):
-            condition = render_condition_row(row_id, seed, category_options)
-            if open_row == row_id:
-                st.button("Done", key=f"screen_{row_id}_done_btn", type="primary",
-                          on_click=lambda: st.session_state.update(screen_open_row=None))
-        labels.append(condition_label(condition) if condition is not None else f"{row_group(row_id, seed)}: not complete")
-        if condition is not None:
-            conditions.append(condition)
-    if hidden:
-        st.html("<style>" + ", ".join(hidden) + " {display: none}</style>")
-    # The first column is a remove button: a tap on its ✕ removes that condition.
-    table = pd.DataFrame({" ": ["✕"] * len(labels), "Condition": labels})
-    styled = table.style.apply(
-        lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if list(rows)[row.name] == open_row else ""
-                     for _ in row], axis=1)
-    with table_area:
-        event = st.dataframe(styled, hide_index=True, width="stretch", height=38 + 35 * max(1, len(table)),
-                             column_config={" ": st.column_config.TextColumn(" ", width=36, help="Remove this condition"),
-                                            "Condition": st.column_config.TextColumn("Condition", width=1000)},
-                             on_select="rerun", selection_mode="single-cell",
-                             key=f"screen_conditions_{len(rows)}_{open_row}_table")
-    selection = getattr(event, "selection", None) if event is not None else None
-    cells = list(getattr(selection, "cells", None) or (selection or {}).get("cells", []) or [])
-    if cells and cells[0][0] < len(rows):
-        row_id = list(rows)[cells[0][0]]
-        if cells[0][1] in (" ", 0):
-            remove_screen_row(row_id)
-        else:
-            st.session_state["screen_open_row"] = None if row_id == open_row else row_id
+    table = condition_table()
+    checks = [row_condition(row, category_options) for row in table.to_dict("records")]
+    view = table.copy()
+    view["Reads as"] = [condition_label(condition) if condition else f"⚠ {problem}" for condition, problem in checks]
+    edited = st.data_editor(
+        view, hide_index=True, width="stretch", num_rows="fixed",
+        key=f"screen_conditions_{st.session_state.get('screen_table_version', 0)}_table",
+        column_config={
+            "Remove": st.column_config.CheckboxColumn("✕", width=36, help="Tick to remove this condition"),
+            "Signal": st.column_config.SelectboxColumn("Signal", options=CONDITION_SIGNALS, required=True, width=120),
+            "Line": st.column_config.TextColumn("Line", width=70,
+                                                help="Close, SMA 50, EMA 20 (moving average, rate of change); "
+                                                     "1W, 1M, 3M, 6M, YTD, 1Y (Perf %)"),
+            "Op": st.column_config.SelectboxColumn("Op", options=CONDITION_OPERATORS, width=55),
+            "Value": st.column_config.TextColumn("Value", width=80,
+                                                 help="SMA 200, Close or a number; '0 to 30' with Between; a list "
+                                                      "such as 'Tech, Energy' for sector, industry, index, rating"),
+            "Days": st.column_config.NumberColumn("Days", min_value=1, max_value=365, step=1, format="%d", width=56,
+                                                  help="Rate of change look-back, or the earnings-date window"),
+            "Reads as": st.column_config.TextColumn("Reads as", disabled=True, width="large"),
+        },
+    )
+    after = edited[CONDITION_COLUMNS].reset_index(drop=True)
+    if not after.astype(str).equals(table[CONDITION_COLUMNS].astype(str)):
+        store_condition_table(normalize_condition_table(table, after))
         st.rerun()
-    return conditions
-
-
-def row_group(row_id, seed):
-    return st.session_state.get(f"screen_{row_id}_group", seed.get("group", MOVING_AVERAGE))
-
-
-def render_condition_row(row_id, seed, category_options):
-    """One condition row: the signal group first, then inputs that fit the group. Returns a condition dict or None.
-
-    Laid out for a narrow column (the sidebar, or a phone): the group and a remove button on one line, the
-    group's inputs below.
-    """
-
-    groups = list(SIGNAL_GROUPS)
-    with st.container(border=True):
-        top = st.columns([3, 1], vertical_alignment="bottom")
-        group = top[0].selectbox("Signal group", groups, index=groups.index(seed.get("group", MOVING_AVERAGE)),
-                                 key=f"screen_{row_id}_group")
-        top[1].button("✕", key=f"screen_{row_id}_remove_btn", on_click=remove_screen_row, args=(row_id,),
-                      help="Remove this condition")
-        spec = SIGNAL_GROUPS[group]
-        key = f"screen_{row_id}_{group}"
-        kind = spec["kind"]
-
-        if kind == "ma":
-            cells = st.columns([3, 2])
-            left = cells[0].selectbox("Left", ["Close", "SMA", "EMA"], index=["Close", "SMA", "EMA"].index(seed.get("left", "Close")),
-                                      key=f"{key}_left")
-            left_period = cells[1].number_input("Period", min_value=0, max_value=400, value=int(seed.get("left_period", 0)), step=1,
-                                                key=f"{key}_left_period", disabled=left == "Close", help="MA length (ignored for Close).")
-            operator = st.selectbox("Operator", SCREEN_OPERATORS, index=SCREEN_OPERATORS.index(seed.get("operator", ">")),
-                                    key=f"{key}_operator")
-            cells = st.columns([3, 2])
-            right = cells[0].selectbox("Right", SCREEN_LINE_KINDS, index=SCREEN_LINE_KINDS.index(seed.get("right", "SMA")),
-                                       key=f"{key}_right")
-            right_value = cells[1].number_input("Period / value", value=float(seed.get("right_value", 50.0)),
-                                                key=f"{key}_right_value", disabled=right == "Close",
-                                                help="MA length, or the number for Value.")
-            frame = pd.DataFrame([{"Left": left, "Left period": left_period, "Operator": operator, "Right": right,
-                                   "Right period / value": right_value}])
-            conditions = editor_conditions(frame)
-            if not conditions:
-                return None
-            return {"group": MOVING_AVERAGE, **conditions[0]}
-
-        if kind == "number":
-            default = spec.get("default", (">", 0.0))
-            period = None
-            if spec.get("periods"):
-                period = st.selectbox("Period", list(spec["periods"]), index=1, key=f"{key}_period")
-            label = spec["periods"][period] if period else spec["column"]
-            operator = st.selectbox("Operator", NUMBER_OPERATORS, index=NUMBER_OPERATORS.index(default[0]), key=f"{key}_operator")
-            cells = st.columns(2)
-            value = cells[0].number_input(label if operator != "Between" else f"{label} from", value=float(default[1]),
-                                          key=f"{key}_value", help=spec.get("help"))
-            condition = {"group": group, "operator": operator, "value": float(value)}
-            if period:
-                condition["period"] = period
-            if operator == "Between":
-                upper = default[2] if len(default) > 2 else float(default[1]) + 10
-                condition["value2"] = float(cells[1].number_input("to", value=float(upper), key=f"{key}_value2"))
-            return condition
-
-        if kind == "category":
-            operator = st.selectbox("Operator", CATEGORY_OPERATORS, key=f"{key}_operator")
-            options = category_options.get(group, [])
-            if not options:
-                st.caption(f"No {group.lower()} data yet; load the stocks first.")
-                return None
-            chosen = st.session_state.get(f"{key}_values")
-            if chosen and any(value not in options for value in chosen):
-                # Options follow the loaded stocks; drop picks that are no longer offered.
-                st.session_state[f"{key}_values"] = [value for value in chosen if value in options]
-            values = st.multiselect(group, options, key=f"{key}_values")
-            if not values:
-                return None
-            return {"group": group, "operator": operator, "values": values}
-
-        days = st.number_input("Within the last (days)" if kind == "past" else "Within the next (days)",
-                               min_value=1, max_value=365, value=int(spec.get("default", 30)), step=1, key=f"{key}_days")
-        return {"group": group, "days": int(days)}
+    st.button("+ Add condition", on_click=add_condition_row, key="screen_add_row_btn")
+    return [condition for condition, _ in checks if condition]
 
 
 def open_in_signal_analysis(ticker):
@@ -4363,8 +4239,7 @@ def render_stock_screener():
     prices = loaded["prices"] if is_loaded else {}
 
     # Per-ticker columns the signal groups read, beyond the price snapshot.
-    rows = screen_rows()
-    groups_in_use = {row_group(row_id, seed) for row_id, seed in rows.items()}
+    groups_in_use = set(condition_table()["Signal"])
     scanned = [ticker for ticker in tickers if ticker in prices] if is_loaded else tickers
     extra = members.drop_duplicates("Ticker").set_index("Ticker")[["Name", "Sector", "Industry"]].reindex(scanned)
     extra = extra.fillna("").replace("nan", "")
@@ -4372,7 +4247,7 @@ def render_stock_screener():
     if is_loaded and prices:
         # The results table leads with each stock's sector; fill missing ones from Yahoo for short lists.
         sectors_missing = extra["Sector"].eq("").any() and len(scanned) <= 150
-        wants_yahoo = bool(market_caps) or sectors_missing or any(SIGNAL_GROUPS[group].get("fundamental") for group in groups_in_use) or (
+        wants_yahoo = bool(market_caps) or sectors_missing or any(SIGNAL_GROUPS.get(group, {}).get("fundamental") for group in groups_in_use) or (
             bool(groups_in_use & {"Sector", "Industry"}) and (extra["Sector"].eq("") | extra["Industry"].eq("")).any())
         if wants_yahoo:
             progress = st.progress(0.0, text="Loading fundamentals from Yahoo...")
@@ -4401,8 +4276,9 @@ def render_stock_screener():
     }
 
     with settings_panel("Conditions"):
-        st.caption("A stock must meet every condition. Tap a condition to change it, or its ✕ to remove it.")
-        conditions = render_conditions_table(rows, category_options)
+        st.caption("A stock must meet every condition. Tap a cell to change it; tick ✕ to remove a row. "
+                   "\"Reads as\" shows how each row is read.")
+        conditions = render_condition_editor(category_options)
     with settings_panel("More filters", expanded=False):
         use_high = st.checkbox("Within % of 52w high", value=True, key="screener_use_high")
         max_from_high = st.number_input("Max % below 52w high", 0.0, 100.0, 25.0, 1.0,
@@ -4487,7 +4363,7 @@ def render_stock_screener():
     # A small chart of the last 3 months of daily closes takes the place of the Pass column.
     shown["Last 3 months"] = [close_sparkline(prices.get(ticker)) for ticker in shown.index]
     # The columns after Close / Change % follow the signal groups in use.
-    group_columns = [condition_column(condition) for condition in conditions if condition["group"] != MOVING_AVERAGE]
+    group_columns = [condition_column(condition) for condition in conditions if condition["group"] not in (MOVING_AVERAGE, RATE_OF_CHANGE)]
     base_columns = ["Last 3 months", "Name", "Close", "Change %"] + (["Mkt cap ($B)"] if market_caps else [])
     display_columns = list(dict.fromkeys(base_columns + group_columns + [f"Close vs SMA {p} %" for p in ma_periods] + [
         "% from 52w high", f"New 52w high in last {recent_days}d", "Volume / avg", "Return 1m %", "Return 3m %"]))

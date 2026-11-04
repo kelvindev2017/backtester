@@ -218,32 +218,43 @@ def test_screener_tab_scans_a_custom_list(offline):
     next(button for button in app.button if button.key == "screener_load_btn").click().run()
     assert not app.exception, app.exception
     assert "stocks pass" in " ".join(element.value for element in app.success)
-    assert [box.value for box in app.selectbox if box.label == "Signal group"] == ["Moving average"] * 3
-    conditions = next(frame.value for frame in app.dataframe if "Condition" in frame.value.columns)
-    assert list(conditions["Condition"]) == ["Close > SMA 50", "SMA 50 > SMA 200", "Close > SMA 200"]
-    assert not any(button.key == "screen_0_done_btn" for button in app.button)
-    app.session_state["screen_open_row"] = 0
-    app.run()
-    next(button for button in app.button if button.key == "screen_0_done_btn").click().run()
-    assert app.session_state["screen_open_row"] is None
-    assert list(conditions[" "]) == ["✕"] * 3
+    conditions = condition_editor(app)
+    assert list(conditions["Reads as"]) == ["Close > SMA 50", "SMA 50 > SMA 200", "Close > SMA 200"]
 
-    # Switching a row's group swaps the inputs after it.
-    next(box for box in app.selectbox if box.label == "Signal group").select("P/E").run()
+    # Any signal, including the rate of change of a moving average, is one row of the table.
+    set_conditions(app, [{"Signal": "Rate of change", "Line": "SMA 200", "Op": ">", "Value": "0", "Days": 20},
+                         {"Signal": "P/E", "Op": "Between", "Value": "0 to 30"},
+                         {"Signal": "Moving average", "Line": "Close", "Op": ">", "Value": "nonsense"}])
     assert not app.exception, app.exception
-    assert any(box.label.startswith("P/E") for box in app.number_input)
-    assert not any(box.label == "Left" for box in app.selectbox if (box.key or "").startswith("screen_0_"))
+    assert list(condition_editor(app)["Reads as"]) == ["SMA 200 change over 20d > 0%", "P/E 0 to 30",
+                                                       "⚠ Value: Close, SMA 200, EMA 20 or a number"]
+    assert "SMA 200 change over 20d > 0%" in " ".join(element.value for element in app.success)
 
     next(button for button in app.button if button.label == "+ Add condition").click().run()
-    assert [box.label for box in app.selectbox].count("Signal group") == 4
-    next(button for button in app.button if button.key == "screen_0_remove_btn").click().run()
-    assert [box.label for box in app.selectbox].count("Signal group") == 3
+    assert len(condition_editor(app)) == 4
 
     # Conditions and loaded data survive a visit to another tab.
     open_tab(app, "Industry Analysis")
     open_tab(app, "Stock Screener")
-    assert [box.label for box in app.selectbox].count("Signal group") == 3
+    assert len(condition_editor(app)) == 4
     assert "stocks pass" in " ".join(element.value for element in app.success)
+
+
+def condition_editor(app):
+    """The conditions table (a data editor) as a DataFrame."""
+
+    return next(frame.value for frame in app.dataframe if "Reads as" in frame.value.columns)
+
+
+def set_conditions(app, rows):
+    """Replace the screen's conditions, as if typed into the table."""
+
+    from analysis.condition_table import COLUMNS, default_row
+
+    app.session_state["screen_table"] = pd.DataFrame([{**default_row(row["Signal"]), **row} for row in rows],
+                                                     columns=COLUMNS)
+    app.session_state["screen_table_version"] = app.session_state["screen_table_version"] + 1
+    app.run()
 
 
 def test_market_and_industry_tabs(offline, monkeypatch):
@@ -534,9 +545,7 @@ def test_screener_pages_of_ten(offline):
     next(box for box in app.selectbox if box.label == "Universe").select("Custom list").run()
     tickers = [f"T{number:02d}" for number in range(23)]
     next(area for area in app.text_area if area.key == "screener_custom").set_value(" ".join(tickers)).run()
-    next(box for box in app.selectbox if box.label == "Signal group").select("Price").run()
-    for button in [button for button in app.button if button.key and button.key.endswith("_remove_btn")][1:]:
-        button.click().run()
+    set_conditions(app, [{"Signal": "Price", "Op": ">", "Value": "5"}])
     next(button for button in app.button if button.key == "screener_load_btn").click().run()
     assert not app.exception, app.exception
     passing = int(next(element.value for element in app.success).split("**")[1].split(" of ")[0])
@@ -578,8 +587,7 @@ def test_screener_survives_yahoo_blocking_fundamentals(offline, monkeypatch):
     app = open_tab(start_app(), "Stock Screener")
     next(box for box in app.selectbox if box.label == "Universe").select("Custom list").run()
     next(button for button in app.button if button.key == "screener_load_btn").click().run()
-    next(box for box in app.selectbox if box.label == "Signal group").select("Mkt cap").run()
-    next(box for box in app.number_input if box.label.startswith("Mkt cap")).set_value(10.0).run()
+    set_conditions(app, [{"Signal": "Mkt cap", "Op": ">", "Value": "10"}])
     assert not app.exception, app.exception
     assert any("only 0 of" in element.value for element in app.warning)
     st.cache_resource.clear()
