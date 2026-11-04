@@ -880,3 +880,33 @@ def test_parameter_search_with_a_custom_score(offline):
     assert result["start"] == "Random"
     assert any("max DD" in element.value for element in app.latex)
     assert any(box.label == "Heat map across" for box in app.selectbox)
+
+
+def test_optimized_settings_tested_on_other_stocks(offline):
+    app = open_tab(start_app(), "Backtest")
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
+    open_tab(app, "Backtest")
+    next(box for box in app.number_input if box.label == "Trials").set_value(10)
+    next(box for box in app.number_input if box.label == "Min trades in the tuning period").set_value(1)
+    app.button(key="optimizer_run_btn").click()
+    open_tab(app, "Backtest")
+
+    open_tab(app, "Validate")
+    assert app.text_input(key="robustness_tickers").value == "AAPL"
+    app.text_input(key="robustness_tickers").input("AAPL, MSFT, NVDA")
+    app.button(key="robustness_run_btn").click()
+    open_tab(app, "Validate")
+    summary = next(frame.value for frame in app.dataframe if "Median forward score" in frame.value.columns)
+    assert list(summary["Settings"]) == ["Most stable (plateau)", "Best single trial", "Your current settings",
+                                         "Buy & hold"]
+    rows = app.session_state["robustness_result"]["rows"]
+    assert set(rows["Stock"]) == {"AAPL", "MSFT", "NVDA"}
+    assert not app.session_state["robustness_result"]["yearly"].empty
+
+
+def test_validate_without_an_optimization_tests_current_settings(offline):
+    app = open_tab(start_app(), "Validate")
+    app.button(key="robustness_run_btn").click()
+    open_tab(app, "Validate")
+    summary = next(frame.value for frame in app.dataframe if "Median forward score" in frame.value.columns)
+    assert list(summary["Settings"]) == ["Your current settings", "Buy & hold"]

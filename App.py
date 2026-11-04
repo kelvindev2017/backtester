@@ -2540,6 +2540,208 @@ def format_stats_table(frame):
     return formatted
 
 
+def fill_similar_stocks(ticker):
+    """Button callback: the stock plus up to 9 S&P 500 stocks in its sub-industry."""
+
+    peers = sp500_competitors(ticker, 9)
+    if peers:
+        st.session_state["robustness_tickers"] = ", ".join([ticker] + peers)
+    else:
+        st.session_state["robustness_peers_error"] = (
+            f"No S&P 500 sub-industry found for {ticker}; type the stocks to test instead.")
+
+
+def yearly_returns(backtest):
+    """Return of the backtest's equity in each calendar year (rebased at each year's first bar)."""
+
+    equity = backtest["Equity"].astype(float)
+    return equity.groupby(equity.index.year).apply(lambda year: year.iloc[-1] / year.iloc[0] - 1 if len(year) > 1 else np.nan)
+
+
+def robustness_settings(s, space):
+    """The settings to compare: the last Optimization's picks (when it was run on this rule) and the current ones.
+
+    Returns (list of (label, params), the Optimization result or None).
+    """
+
+    current = current_param_values(s, space)
+    result = st.session_state.get("optimizer_result")
+    if result and "weights" in result and json.loads(result["signature"])[4] == s.setup:
+        best, stable = pick_settings(result["trials"], space)
+        if stable is not None:
+            return [("Most stable (plateau)", params_of(stable, space)), ("Best single trial", params_of(best, space)),
+                    ("Your current settings", current)], result
+    return [("Your current settings", current)], None
+
+
+def render_robustness(s):
+    """Validate tab: run the Optimization's picks and the current settings on other stocks, before and after the
+    tuning period's end, and year by year, against buy & hold."""
+
+    space = SEARCH_SPACES.get(s.setup)
+    result = st.session_state.get("optimizer_result")
+    has_result = bool(result and "weights" in result and json.loads(result["signature"])[4] == s.setup)
+    with st.expander("Test optimized settings on other stocks and periods", expanded=has_result):
+        if space is None:
+            st.caption("Works on the daily signal rules, not the first-bar day trade.")
+            return
+        candidates, result = robustness_settings(s, space)
+        if result is None:
+            st.info("No Optimization result for this rule yet: run one on the Backtest tab (Optimization) to compare "
+                    "its picks here. Until then this tests your current settings.")
+            tuned_ticker, tune_end, weights, label = s.ticker, None, {"sharpe": 1.0}, "Sharpe ratio"
+        else:
+            tuned_ticker = json.loads(result["signature"])[0]
+            tune_end, weights, label = result["tune_end"], result["weights"], result["objective_label"]
+        st.caption(
+            f"Runs each set of settings with the Backtest's own engine and costs on every stock below, over the "
+            f"Backtest date range ({s.start_date} to {s.end_date}, {s.timeframe.lower()} bars). The picks were tuned on "
+            f"**{tuned_ticker}**"
+            + (f" up to {tune_end:%Y-%m-%d}" if tune_end is not None else "")
+            + ": every other stock, and every date after that, is data the search never saw. Score: "
+            f"{label}.")
+        st.latex(objective_latex(weights))
+        if "robustness_tickers" not in st.session_state:
+            st.session_state["robustness_tickers"] = tuned_ticker
+        columns = st.columns([3, 1], vertical_alignment="bottom")
+        tickers_text = columns[0].text_input("Stocks to test (comma-separated)", key="robustness_tickers")
+        columns[1].button("Fill with similar stocks", on_click=fill_similar_stocks, args=(tuned_ticker,),
+                          key="robustness_fill_btn",
+                          help=f"{tuned_ticker} plus up to 9 S&P 500 stocks in its sub-industry, largest by trading.")
+        error = st.session_state.pop("robustness_peers_error", None)
+        if error:
+            st.warning(error)
+        run_clicked = st.button("Run test", type="primary", key="robustness_run_btn")
+
+        tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
+        start_str = pd.Timestamp(s.start_date).strftime("%Y-%m-%d")
+        end_str = pd.Timestamp(s.end_date).strftime("%Y-%m-%d")
+        run_key = json.dumps([tickers, start_str, end_str, s.timeframe, s.setup, candidates, weights, str(tune_end)],
+                             default=str)
+        if run_clicked and tickers:
+            periods = PERIODS_PER_YEAR.get(s.timeframe, 252)
+            rows, yearly, failed = [], [], []
+            progress = st.progress(0.0)
+            for number, ticker in enumerate(tickers):
+                progress.progress(number / len(tickers), text=f"Testing {ticker} ({number + 1}/{len(tickers)})...")
+                prices = load_data(ticker, start_str, end_str, s.timeframe)
+                if prices.empty or len(prices) < 50:
+                    failed.append(ticker)
+                    continue
+                prices = prices[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                split = tune_end if tune_end is not None else split_date(prices.index, 0.7)
+                windows = {"Tuning": (prices.index[0], split), "Forward": (split + pd.Timedelta(days=1), prices.index[-1])}
+                buy_hold = prices[["Close"]].assign(Equity=prices["Close"] / prices["Close"].iloc[0], Buy_Signal=False)
+                runs = [(name, rule_backtest(prices, s, params)) for name, params in candidates] + [("Buy & hold", buy_hold)]
+                for name, backtest in runs:
+                    row = {"Stock": ticker, "Settings": name}
+                    for window, (start, end) in windows.items():
+                        metrics = period_metrics(backtest, start, end, periods)
+                        row[f"{window} score"] = objective_score(metrics, weights) if metrics["trades"] or name == "Buy & hold" else np.nan
+                        row[f"{window} return %"] = metrics["return"] * 100
+                        row[f"{window} max DD %"] = -metrics["max_dd_pct"]
+                        row[f"{window} trades"] = metrics["trades"] if name != "Buy & hold" else None
+                    rows.append(row)
+                    yearly.append(yearly_returns(backtest).rename(name).to_frame().assign(Stock=ticker))
+            progress.empty()
+            st.session_state["robustness_result"] = {
+                "key": run_key, "rows": pd.DataFrame(rows), "failed": failed, "tune_end": tune_end,
+                "yearly": pd.concat(yearly) if yearly else pd.DataFrame(), "tickers": tickers,
+                "tuned_ticker": tuned_ticker}
+
+        stored = st.session_state.get("robustness_result")
+        if not stored or stored["key"] != run_key:
+            return
+        render_robustness_results(stored, [name for name, _ in candidates])
+
+
+def render_robustness_results(stored, names):
+    rows, yearly = stored["rows"], stored["yearly"]
+    if stored["failed"]:
+        st.warning("No prices for: " + ", ".join(stored["failed"]))
+    if rows.empty:
+        return
+    by_stock = rows.pivot(index="Stock", columns="Settings", values="Forward score")
+    summary = []
+    for name in names:
+        group = rows.loc[rows["Settings"].eq(name)]
+        others = group.loc[group["Stock"].ne(stored["tuned_ticker"])]
+        forward = by_stock[name]
+        summary.append({
+            "Settings": name,
+            "Median tuning score": group["Tuning score"].median(),
+            "Median forward score": group["Forward score"].median(),
+            "Median forward score, other stocks": others["Forward score"].median(),
+            "Forward: beats buy & hold": (forward > by_stock["Buy & hold"]).mean() * 100,
+            "Forward: beats current settings": ((forward > by_stock["Your current settings"]).mean() * 100
+                                                if name != "Your current settings" else np.nan),
+            "Median forward return %": group["Forward return %"].median(),
+            "Median forward max DD %": group["Forward max DD %"].median(),
+        })
+    bh = rows.loc[rows["Settings"].eq("Buy & hold")]
+    summary.append({"Settings": "Buy & hold", "Median tuning score": bh["Tuning score"].median(),
+                    "Median forward score": bh["Forward score"].median(),
+                    "Median forward score, other stocks": bh.loc[bh["Stock"].ne(stored["tuned_ticker"]), "Forward score"].median(),
+                    "Median forward return %": bh["Forward return %"].median(),
+                    "Median forward max DD %": bh["Forward max DD %"].median()})
+    summary = pd.DataFrame(summary)
+    st.markdown(f"**Across {rows['Stock'].nunique()} stocks**")
+    st.dataframe(summary, hide_index=True, width="stretch", key="robustness_summary_table", column_config={
+        **{column: st.column_config.NumberColumn(format="%.2f") for column in summary.columns if "score" in column or "%" in column},
+        "Forward: beats buy & hold": st.column_config.NumberColumn(format="%.0f%% of stocks"),
+        "Forward: beats current settings": st.column_config.NumberColumn(format="%.0f%% of stocks")})
+    st.caption(
+        "Scores are medians across the stocks (the middle stock, so one outlier can't carry it). \"Other stocks\" "
+        f"leaves out {stored['tuned_ticker']}, the stock the picks were tuned on. Settings that only work on the stock "
+        "they were tuned on, or only before the forward period, did not find a lasting edge.")
+
+    if not yearly.empty:
+        st.markdown("**Year by year**")
+        columns = st.columns(2)
+        shown = columns[0].selectbox("Settings", names, key="robustness_heat_settings")
+        baselines = ["Buy & hold"] + [name for name in names if name != shown and name == "Your current settings"]
+        baseline = columns[1].selectbox("Compared with", baselines, key="robustness_heat_baseline")
+        show_chart(robustness_heatmap(yearly, shown, baseline, stored["tickers"], stored["tune_end"]),
+                   width="stretch", key="robustness_heatmap")
+        st.caption(
+            f"Each cell is the year's return of {shown.lower()} minus {baseline.lower()}, in percentage points: green "
+            "means it did better that year. Rows that stay green across stocks and across the forward years are "
+            "what a lasting edge looks like; green only on one stock or only before the dashed line is not.")
+
+    with st.expander("Every stock"):
+        st.dataframe(rows, hide_index=True, width="stretch", key="robustness_rows_table", column_config={
+            column: st.column_config.NumberColumn(format="%.2f") for column in rows.columns
+            if "score" in column or "%" in column})
+
+
+def robustness_heatmap(yearly, shown, baseline, tickers, tune_end):
+    """Stocks x years: the year's return of ``shown`` minus ``baseline``, in percentage points."""
+
+    table = yearly.reset_index(names="Year")
+    pivot = {}
+    for name in (shown, baseline):
+        pivot[name] = table.dropna(subset=[name]).pivot(index="Stock", columns="Year", values=name)
+    diff = ((pivot[shown] - pivot[baseline]) * 100).reindex([t for t in tickers if t in pivot[shown].index])
+    years = [str(year) for year in diff.columns]
+    # Colour scale to the 95th percentile, so one extreme year (a stock that tripled) doesn't wash out the rest.
+    limit = float(np.nanpercentile(np.abs(diff.to_numpy()), 95)) if diff.notna().any().any() else 1.0
+    limit = limit or 1.0
+    text = [[f"{stock} {year}: {value:+.1f} pp" if np.isfinite(value) else f"{stock} {year}: no data"
+             for year, value in zip(years, values)] for stock, values in zip(diff.index, diff.to_numpy())]
+    fig = go.Figure(go.Heatmap(
+        x=years, y=list(diff.index), z=diff.to_numpy(), text=text, hoverinfo="text", colorscale="RdYlGn",
+        zmid=0, zmin=-limit, zmax=limit, xgap=1, ygap=1,
+        colorbar=dict(title=dict(text="pp", side="right"), thickness=12)))
+    if tune_end is not None:
+        # Between the last tuning year and the first forward year (the split year itself is mixed).
+        position = sum(1 for year in diff.columns if year < tune_end.year) - 0.5 + (tune_end.month - 0.5) / 12
+        fig.add_vline(x=position, line_dash="dash", line_color="black",
+                      annotation_text="forward →", annotation_position="top right")
+    fig.update_layout(height=max(260, 34 * len(diff) + 120), margin=dict(t=60 if MOBILE else 30, b=40, l=60, r=20),
+                      xaxis=dict(type="category", tickangle=-45 if MOBILE else 0), yaxis=dict(autorange="reversed"))
+    return fig
+
+
 def render_validation(signal_settings, risk_settings, default_end):
     """Validate tab: does the engine make money, and does confidence mean anything?"""
 
@@ -6653,4 +6855,5 @@ if check_password():
                 elif label == SIGNAL_TAB:
                     render_signal_analysis(strategy.ticker, strategy.end_date, strategy.signal_settings, strategy.risk_settings)
                 else:
+                    render_robustness(strategy)
                     render_validation(strategy.signal_settings, strategy.risk_settings, strategy.end_date)
