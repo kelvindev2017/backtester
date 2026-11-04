@@ -851,9 +851,32 @@ def test_backtest_parameter_search(offline):
     assert list(tables[0][""]) == ["Most stable (plateau)", "Best single trial", "Your current settings", "Buy & hold"]
     trials = app.session_state["optimizer_result"]["trials"]
     assert len(trials) == 10
+    setup = next(frame.value for frame in app.dataframe if "Range tried" in frame.value.columns)
+    assert list(setup["Setting"]) == ["Breakout lookback (bars)", "Exit SMA (bars)"]
+    assert any("Phase" in frame.value.columns for frame in app.dataframe)
+    assert any("Distance" in frame.value.columns for frame in app.dataframe)
+    assert any(r"\text{score} = \text{Sharpe}" in element.value for element in app.latex)
+    assert app.session_state["optimizer_result"]["start"] == "Latin hypercube"
 
     app.button(key="optimizer_apply_stable_btn").click()
     open_tab(app, "Backtest")
     lookback = next(box for box in app.number_input if box.label == "Breakout lookback (bars)").value
     stable = trials.loc[trials["status"].eq("ok")]
     assert lookback in set(stable["breakout_lookback"])
+
+
+def test_parameter_search_with_a_custom_score(offline):
+    app = open_tab(start_app(), "Backtest")
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
+    open_tab(app, "Backtest")
+    next(box for box in app.number_input if box.label == "Trials").set_value(10)
+    next(box for box in app.number_input if box.label == "Min trades in the tuning period").set_value(1)
+    next(box for box in app.selectbox if box.label == "Score to maximise").select("Custom (weighted)")
+    next(box for box in app.selectbox if box.label == "Starting points").select("Random")
+    app.button(key="optimizer_run_btn").click()
+    open_tab(app, "Backtest")
+    result = app.session_state["optimizer_result"]
+    assert result["weights"] == {"sharpe": 1.0, "sortino": 0.0, "calmar": 0.0, "cagr_pct": 0.0, "max_dd_pct": 0.02}
+    assert result["start"] == "Random"
+    assert any("max DD" in element.value for element in app.latex)
+    assert any(box.label == "Heat map across" for box in app.selectbox)

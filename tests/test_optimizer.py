@@ -87,3 +87,87 @@ def test_stable_pick_prefers_a_plateau_over_a_spike():
     assert stable["x"] <= 20
     assert len(neighbourhood_scores(trials, space)) == len(xs)
     assert params_of(stable, space) == {"x": int(stable["x"])}
+
+
+def test_trials_record_phase_best_so_far_and_importance():
+    from analysis.optimizer import param_importance
+
+    space = SearchSpace((Param("a", "A", "int", 0, 50, 1), Param("b", "B", "int", 0, 50, 1)))
+    index = pd.bdate_range("2020-01-01", periods=300)
+
+    def evaluate(params):
+        # Only a matters.
+        return toy_backtest(index, 0.0005 - abs(params["a"] - 25) / 1e5)
+
+    trials = run_search(evaluate, space, index[0], index[199], objective="cagr", n_trials=30, min_trades=1,
+                        n_startup_trials=5)
+    assert list(trials["phase"].iloc[:6]) == ["Latin hypercube start"] * 5 + ["guided"]
+    assert trials["best_so_far"].is_monotonic_increasing
+    importance = param_importance(trials, space, ["a", "b"])
+    assert set(importance) == {"a", "b"}
+    assert importance["a"] > importance["b"]
+    assert param_importance(trials, space, ["a"]) == {}
+
+
+def test_nearest_trials_excludes_itself_and_sorts_by_distance():
+    from analysis.optimizer import nearest_trials
+
+    space = SearchSpace((Param("x", "X", "int", 0, 100, 1),))
+    trials = pd.DataFrame({"trial": [1, 2, 3, 4], "x": [10, 12, 50, 11], "score": [1.0, 0.9, 0.2, 0.8],
+                           "status": "ok"})
+    neighbours = nearest_trials(trials, space, trials.loc[0], k=2)
+    assert list(neighbours["x"]) == [11, 12]
+    assert list(neighbours["distance"].round(2)) == [0.01, 0.02]
+
+
+def test_repeated_settings_are_not_rerun_or_counted_twice():
+    space = SearchSpace((Param("x", "X", "int", 0, 4, 1),))
+    index = pd.bdate_range("2020-01-01", periods=300)
+    calls = []
+
+    def evaluate(params):
+        calls.append(params["x"])
+        return toy_backtest(index, 0.0001 * (1 + params["x"]))
+
+    trials = run_search(evaluate, space, index[0], index[199], objective="cagr", n_trials=20, min_trades=1)
+    assert len(calls) == len(set(calls)) <= 5
+    repeats = trials.loc[trials["repeat_of"].notna()]
+    assert len(repeats) == 20 - len(calls)
+    best, stable = pick_settings(trials, space)
+    assert pd.isna(best["repeat_of"]) and pd.isna(stable["repeat_of"])
+    assert len(neighbourhood_scores(trials, space)) == len(calls)
+
+
+def test_latin_hypercube_uses_every_slice_once():
+    from analysis.optimizer import latin_hypercube
+
+    params = (Param("a", "A", "int", 0, 90, 10), Param("b", "B", "float", 0.0, 0.9, 0.1),
+              Param("c", "C", "choice", choices=("x", "y")))
+    points = latin_hypercube(params, 10, seed=3)
+    assert sorted(point["a"] for point in points) == list(range(0, 100, 10))
+    assert len({round(point["b"], 1) for point in points}) == 10
+    assert sorted(point["c"] for point in points) == ["x"] * 5 + ["y"] * 5
+
+
+def test_search_starts_with_the_latin_hypercube_points():
+    from analysis.optimizer import latin_hypercube
+
+    space = SearchSpace((Param("a", "A", "int", 0, 90, 10),))
+    index = pd.bdate_range("2020-01-01", periods=300)
+    trials = run_search(lambda params: toy_backtest(index, 0.0003), space, index[0], index[199], n_trials=12,
+                        min_trades=1, n_startup_trials=10, seed=7)
+    assert list(trials["a"].iloc[:10]) == [point["a"] for point in latin_hypercube(space.params, 10, 7)]
+
+
+def test_weighted_objective_and_drawdown_limit():
+    from analysis.optimizer import objective_latex, objective_score
+
+    metrics = {"sharpe": 1.5, "cagr_pct": 12.0, "max_dd_pct": 20.0}
+    assert objective_score(metrics, {"sharpe": 2, "cagr_pct": 0.1, "max_dd_pct": 0.05}) == 3 + 1.2 - 1.0
+    assert objective_latex({"sharpe": 1, "max_dd_pct": 0.5}) == r"\text{score} = \text{Sharpe} - 0.5\times \text{max DD}\%"
+
+    index = pd.bdate_range("2020-01-01", periods=300)
+    falling = toy_backtest(index, -0.002)
+    trials = run_search(lambda params: falling, SEARCH_SPACES["breakout"], index[0], index[199], n_trials=3,
+                        min_trades=1, max_dd_limit=10)
+    assert trials["status"].eq("drawdown over 10%").all()
