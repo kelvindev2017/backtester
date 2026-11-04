@@ -851,6 +851,10 @@ def test_backtest_parameter_search(offline):
     assert list(tables[0][""]) == ["Most stable (plateau)", "Best single trial", "Your current settings", "Buy & hold"]
     trials = app.session_state["optimizer_result"]["trials"]
     assert len(trials) == 10
+    setup = next(frame.value for frame in app.dataframe if "Range tried" in frame.value.columns)
+    assert list(setup["Setting"]) == ["Breakout lookback (bars)", "Exit SMA (bars)"]
+    assert any("Phase" in frame.value.columns for frame in app.dataframe)
+    assert any("Distance" in frame.value.columns for frame in app.dataframe)
 
     app.button(key="optimizer_apply_stable_btn").click()
     open_tab(app, "Backtest")

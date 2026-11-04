@@ -32,9 +32,12 @@ from analysis.opening_bar import (
     summarize_opening_bar,
 )
 from analysis.optimizer import (
+    N_STARTUP_TRIALS,
     OBJECTIVES,
     PERIODS_PER_YEAR,
     SEARCH_SPACES,
+    nearest_trials,
+    param_importance,
     params_of,
     period_metrics,
     pick_settings,
@@ -4949,7 +4952,8 @@ def render_optimizer(price_df, s):
         st.session_state["optimizer_result"] = {
             "signature": signature, "trials": trials, "searched": searched, "current": current,
             "objective": OBJECTIVES[objective_label], "objective_label": objective_label, "tune_end": tune_end,
-            "periods": periods,
+            "periods": periods, "fixed": fixed, "tune_pct": tune_pct, "min_trades": min_trades,
+            "n_startup": N_STARTUP_TRIALS, "seed": 0,
         }
 
     result = st.session_state.get("optimizer_result")
@@ -5015,17 +5019,130 @@ def render_optimizer(price_df, s):
     # Best first and larger, so the star stays visible on top when both picks are the same trial.
     picks = [("Best single trial", best, "crimson", "diamond"), ("Most stable", stable, "gold", "star")]
     show_chart(optimizer_chart(trials, space, result["searched"], picks), width="stretch", key="optimizer_chart")
-    with st.expander("All trials"):
-        shown = trials.copy()
-        for column in ("return", "cagr", "max_dd"):
-            if column in shown:
-                shown[column] = shown[column] * 100
-        shown = shown.rename(columns={"trial": "Trial", "score": "Tuning score", "return": "Return %",
-                                      "cagr": "CAGR %", "max_dd": "Max DD %", "sharpe": "Sharpe",
-                                      "calmar": "Return / max DD", "trades": "Trades", "status": "Status"})
-        shown = shown.rename(columns={param.key: param.label for param in space.params})
-        st.dataframe(shown.sort_values("Tuning score", ascending=False), hide_index=True, width="stretch",
-                     key="optimizer_trials_table")
+    with st.expander("Advanced: how the search ran"):
+        render_optimizer_details(result, space, stable, best, tune_window, forward_window)
+
+
+def render_optimizer_details(result, space, stable, best, tune_window, forward_window):
+    """The search's setup, its progress trial by trial, which settings mattered, and why the stable pick won."""
+
+    trials, searched = result["trials"], result["searched"]
+    st.markdown("**Setup**")
+    setup_rows = []
+    for param in space.params:
+        if param.kind == "choice":
+            values = " / ".join(param.choices)
+        else:
+            values = f"{param.low:g} to {param.high:g}, step {param.step:g}"
+        setup_rows.append({"Setting": param.label, "Searched": "Yes" if param.key in searched else "No (held)",
+                           "Range tried": values if param.key in searched else "",
+                           "Held at": "" if param.key in searched else str(result["fixed"].get(param.key, ""))})
+    st.dataframe(pd.DataFrame(setup_rows), hide_index=True, width="stretch", key="optimizer_setup_table")
+    repeats = int(trials["repeat_of"].notna().sum()) if "repeat_of" in trials else 0
+    skipped = trials.loc[trials["status"].ne("ok"), "status"].value_counts()
+    skipped_text = ("; skipped: " + ", ".join(f"{count} {reason}" for reason, count in skipped.items())
+                    if not skipped.empty else "; none skipped")
+    st.caption(
+        f"{len(trials)} trials tried {len(trials) - repeats} distinct settings ({repeats} repeated an earlier trial; "
+        "TPE re-proposes settings it likes, and a repeat is not backtested again or counted twice when picking). "
+        f"Sampler: Optuna TPE, random seed {result['seed']}. Score: {result['objective_label']} over the tuning period "
+        f"({tune_window[0]:%Y-%m-%d} to {tune_window[1]:%Y-%m-%d}, {result['tune_pct']}% of the bars), costs "
+        f"included. Trials need at least {result['min_trades']} trades to count{skipped_text}. Forward period "
+        f"{forward_window[0]:%Y-%m-%d} to {forward_window[1]:%Y-%m-%d}, scored only after the search.")
+
+    st.markdown("**How the search moved, trial by trial**")
+    st.caption(
+        f"The first {result['n_startup']} trials pick values at random, to map the ground. After that TPE splits "
+        "the trials so far into the best ~10% and the rest, and picks the next values where the best trials are "
+        "common and the rest are rare. Dots bunching up near the top as the trials go on means it found an area "
+        "worth exploring. A best-so-far line that stops rising early means more trials would add little.")
+    show_chart(optimizer_history_chart(trials, result["n_startup"]), width="stretch", key="optimizer_history_chart")
+
+    importance = param_importance(trials, space, searched)
+    if importance:
+        st.markdown("**Which settings mattered**")
+        st.caption("Share of the score's variation explained by each setting (Optuna's PED-ANOVA importance, "
+                   "measured on the better trials). A setting near 0 barely changed the result; you could hold it "
+                   "fixed and search the others more closely.")
+        labels = {param.key: param.label for param in space.params}
+        ordered = sorted(importance.items(), key=lambda item: item[1])
+        fig = go.Figure(go.Bar(x=[value for _, value in ordered], y=[labels[key] for key, _ in ordered],
+                               orientation="h", marker_color="steelblue",
+                               hovertemplate="%{y}: %{x:.0%}<extra></extra>"))
+        fig.update_layout(height=80 + 45 * len(ordered) + (40 if MOBILE else 0),
+                          margin=dict(t=60 if MOBILE else 20, b=40, l=10, r=20),
+                          xaxis=dict(tickformat=".0%", title="Importance"))
+        show_chart(fig, width="stretch", key="optimizer_importance_chart")
+    elif len(searched) >= 2:
+        st.caption("Too few scored trials to say which settings mattered; run at least 10.")
+
+    st.markdown("**Why the most stable pick**")
+    neighbours = nearest_trials(trials, space, stable)
+    labels = {param.key: param.label for param in space.params}
+    # The pick itself first (distance 0), then its neighbours.
+    itself = stable.to_frame().T.assign(distance=0.0)
+    table = pd.concat([itself, neighbours])[["trial", *searched, "score", "distance"]]
+    table["trial"] = table["trial"].astype(int).astype(str)
+    table.iloc[0, 0] = f"{table.iloc[0, 0]} (pick)"
+    table = table.rename(
+        columns={"trial": "Trial", "score": "Tuning score", "distance": "Distance", **labels})
+    st.caption(
+        f"Trial {int(stable['trial'])} scored {stable['score']:.2f}. Its {len(neighbours)} nearest trials (distance "
+        "0 = the same values, 1 = one setting across its whole range) average with it to "
+        f"{stable['neighbourhood']:.2f}, the highest of any trial. The best single trial, {int(best['trial'])}, "
+        f"scored {best['score']:.2f} with a neighbourhood average of {best['neighbourhood']:.2f}.")
+    st.dataframe(table, hide_index=True, width="stretch", key="optimizer_neighbours_table",
+                 column_config={"Tuning score": st.column_config.NumberColumn(format="%.2f"),
+                                "Distance": st.column_config.NumberColumn(format="%.2f")})
+
+    st.markdown("**All trials**")
+    shown = trials.copy()
+    for column in ("return", "cagr", "max_dd"):
+        if column in shown:
+            shown[column] = shown[column] * 100
+    shown = shown.rename(columns={"trial": "Trial", "phase": "Phase", "score": "Tuning score",
+                                  "best_so_far": "Best so far", "return": "Return %", "cagr": "CAGR %",
+                                  "max_dd": "Max DD %", "sharpe": "Sharpe", "calmar": "Return / max DD",
+                                  "trades": "Trades", "status": "Status", "repeat_of": "Repeat of trial"})
+    shown = shown.rename(columns=labels)
+    two_decimals = ["Tuning score", "Best so far", "Return %", "CAGR %", "Max DD %", "Sharpe", "Return / max DD"]
+    st.dataframe(shown, hide_index=True, width="stretch", key="optimizer_trials_table", column_config={
+        **{column: st.column_config.NumberColumn(format="%.2f") for column in two_decimals},
+        "Repeat of trial": st.column_config.NumberColumn(format="%d")})
+
+
+def optimizer_history_chart(trials, n_startup):
+    """Tuning score of each trial in order, with the best score so far as a step line."""
+
+    scored = trials.loc[trials["status"].eq("ok")]
+    fig = go.Figure()
+    if n_startup:
+        fig.add_vrect(x0=0.5, x1=min(n_startup, len(trials)) + 0.5, fillcolor="lightgray", opacity=0.3,
+                      line_width=0, annotation_text="random start", annotation_position="top left")
+    repeat = scored["repeat_of"].notna() if "repeat_of" in scored else pd.Series(False, index=scored.index)
+    for phase, color in (("random start", "gray"), ("guided", "steelblue")):
+        points = scored.loc[scored["phase"].eq(phase) & ~repeat]
+        fig.add_trace(go.Scatter(x=points["trial"], y=points["score"], mode="markers", name=phase.capitalize(),
+                                 marker=dict(color=color, size=8),
+                                 hovertemplate="Trial %{x}<br>Tuning score %{y:.2f}<extra></extra>"))
+    repeats = scored.loc[repeat]
+    if not repeats.empty:
+        fig.add_trace(go.Scatter(x=repeats["trial"], y=repeats["score"], mode="markers", name="Repeat of an earlier trial",
+                                 marker=dict(color="white", size=8, line=dict(color="steelblue", width=1.5)),
+                                 customdata=repeats["repeat_of"],
+                                 hovertemplate="Trial %{x} repeats trial %{customdata}<br>Tuning score %{y:.2f}"
+                                 "<extra></extra>"))
+    best = trials[["trial", "best_so_far"]].dropna()
+    fig.add_trace(go.Scatter(x=best["trial"], y=best["best_so_far"], mode="lines", name="Best so far",
+                             line=dict(color="crimson", width=2, shape="hv"),
+                             hovertemplate="After trial %{x}: best %{y:.2f}<extra></extra>"))
+    # Phones: room above for the chart toolbar and below for the legend, which wraps to two lines.
+    # Phones: room above for the chart toolbar; show_chart puts the legend right under the axis there, so the
+    # axis gets no title (the hover box says "Trial").
+    fig.update_layout(height=430 if MOBILE else 360, margin=dict(t=60 if MOBILE else 30, b=50, l=50, r=20),
+                      hovermode="closest", xaxis=dict(title=None if MOBILE else "Trial"),
+                      yaxis=dict(title="Tuning score"), legend=dict(orientation="h", y=-0.25, x=0))
+    return fig
 
 
 def current_param_values(s, space):
