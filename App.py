@@ -5198,7 +5198,7 @@ def render_backtest(s):
         metric_col3.metric("Positive Active Bars", f"{positive_active_bars:.1f}%")
     st.info(rule_text)
     if setup != "opening_bar":
-        with st.expander("Find better settings (Bayesian optimization with a forward test)"):
+        with st.expander("Optimization"):
             render_optimizer(price_df, s)
 
     fig = make_subplots(
