@@ -836,3 +836,24 @@ def test_stock_fundamentals_without_earnings_dates(offline, monkeypatch):
     app = open_tab(start_app(), "Stock Fundamentals")
     assert any("No earnings release dates were available" in element.value for element in app.caption)
     assert any("Next earnings: no date published yet." in element.value for element in app.markdown)
+
+
+def test_backtest_parameter_search(offline):
+    app = open_tab(start_app(), "Backtest")
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
+    open_tab(app, "Backtest")
+    next(box for box in app.number_input if box.label == "Trials").set_value(10)
+    next(box for box in app.number_input if box.label == "Min trades in the tuning period").set_value(1)
+    app.button(key="optimizer_run_btn").click()
+    open_tab(app, "Backtest")
+    tables = [frame.value for frame in app.dataframe if "Forward score" in frame.value.columns]
+    assert tables, "no optimizer results table"
+    assert list(tables[0][""]) == ["Most stable (plateau)", "Best single trial", "Your current settings", "Buy & hold"]
+    trials = app.session_state["optimizer_result"]["trials"]
+    assert len(trials) == 10
+
+    app.button(key="optimizer_apply_stable_btn").click()
+    open_tab(app, "Backtest")
+    lookback = next(box for box in app.number_input if box.label == "Breakout lookback (bars)").value
+    stable = trials.loc[trials["status"].eq("ok")]
+    assert lookback in set(stable["breakout_lookback"])

@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 from datetime import date, timedelta
 import json
@@ -29,6 +30,16 @@ from analysis.opening_bar import (
     order_costs,
     run_opening_bar,
     summarize_opening_bar,
+)
+from analysis.optimizer import (
+    OBJECTIVES,
+    PERIODS_PER_YEAR,
+    SEARCH_SPACES,
+    params_of,
+    period_metrics,
+    pick_settings,
+    run_search,
+    split_date,
 )
 from analysis.chart_fit import fit_y_axes
 from analysis.economy import (
@@ -1923,16 +1934,19 @@ def run_position_engine(price_df, buy_condition, sell_condition, max_hold=0, sto
     entry_row = 0
     exit_row = -10**9
     closes = price_df["Close"].to_numpy(dtype=float)
+    # Plain arrays: the parameter search runs this many times, and .iloc per bar is slow.
+    buys = np.asarray(buy_condition, dtype=bool)
+    sells = np.asarray(sell_condition, dtype=bool)
 
     for row_number in range(len(price_df)):
         buy_signal = False
         sell_signal = False
-        if (not in_trade and bool(buy_condition.iloc[row_number])
+        if (not in_trade and buys[row_number]
                 and row_number - exit_row > cooldown):
             in_trade = True
             buy_signal = True
             entry_row = row_number
-        elif in_trade and (bool(sell_condition.iloc[row_number])
+        elif in_trade and (sells[row_number]
                            or (max_hold and row_number - entry_row >= max_hold)
                            or (stop_pct and closes[row_number] <= closes[entry_row] * (1 - stop_pct / 100))):
             in_trade = False
@@ -4769,6 +4783,269 @@ BACKTEST_CHART_HEIGHT = 2200
 BACKTEST_PANEL_GAP_PX = 120
 
 
+def rule_conditions(df, s):
+    """Buy and sell conditions of the Backtest's signal rule (any rule but the first-bar day trade)."""
+
+    if s.setup == "ma_rule":
+        _, _, buy_condition, sell_condition = ma_rule_conditions(df, s.ma_rule)
+        return buy_condition, sell_condition
+    signals = detect_signals(df, s.setup, s.breakout_lookback, float(s.volume_multiple),
+                             **s.signal_settings.detector_kwargs())
+    buy_condition = signals["Signal_Up"].fillna(False).astype(bool)
+    sell_column = "Exit_Long" if "Exit_Long" in signals else "Signal_Down"
+    return buy_condition, signals[sell_column].fillna(False).astype(bool)
+
+
+def run_rule_positions(df, buy_condition, sell_condition, s):
+    """The position engine with the rule's own time exit, stop and wait after a sell."""
+
+    macd_rule = s.setup == "macd_bollinger"
+    return run_position_engine(df, buy_condition, sell_condition,
+                               max_hold=s.max_hold_bars if s.setup == "reversal" else 0,
+                               stop_pct=s.macd_stop_pct if macd_rule else 0.0,
+                               cooldown=s.macd_cooldown if macd_rule else 0)
+
+
+def strategy_with_params(s, params):
+    """A copy of the strategy settings ``s`` with searched values (keyed by their Session State keys) in place."""
+
+    s = SimpleNamespace(**vars(s))
+    settings = {}
+    for key, value in params.items():
+        if key in ("fast_period", "slow_period", "fast_type", "slow_type"):
+            setattr(s, key, value)
+            s.ma_rule = {**s.ma_rule, key: value}
+            settings["ma_rule"] = s.ma_rule
+        elif key in ("breakout_lookback", "breakdown_lookback", "signal_day_breakout_lookback"):
+            s.breakout_lookback = int(value)
+            settings["breakout_lookback"] = int(value)
+        elif key == "breakout_exit_ma":
+            settings["exit_ma"] = int(value)
+        elif key == "signal_day_breakout_exit_pct":
+            settings["keep_fraction"] = 1 - value / 100
+        elif key == "reversal_max_hold":
+            s.max_hold_bars = int(value)
+        elif key == "macd_cooldown":
+            s.macd_cooldown = int(value)
+        else:
+            if key == "macd_stop_pct":
+                s.macd_stop_pct = float(value)
+            if key == "macd_ma":
+                s.macd_ma = int(value)
+            settings[key] = value
+    s.signal_settings = dataclasses.replace(s.signal_settings, **settings)
+    return s
+
+
+def rule_backtest(price_df, s, params=None):
+    """Equity (with costs) and buy markers of the signal rule over ``price_df``, optionally with searched values."""
+
+    if params:
+        s = strategy_with_params(s, params)
+    buy_condition, sell_condition = rule_conditions(price_df, s)
+    result = run_rule_positions(price_df, buy_condition, sell_condition, s)
+    result["Equity"], _, _ = equity_with_costs(result, s.account_size, s.commission_plan, s.slippage)
+    return result[["Close", "Equity", "Buy_Signal"]]
+
+
+def describe_params(params, space):
+    labels = {param.key: param.label for param in space.params}
+    return ", ".join(f"{labels.get(key, key)} {value:g}" if isinstance(value, (int, float)) else f"{labels.get(key, key)} {value}"
+                     for key, value in params.items())
+
+
+def apply_params(params):
+    """Button callback: put searched values into the rule's settings (and a slider's number box)."""
+
+    for key, value in params.items():
+        st.session_state[key] = value
+        if f"{key}_input" in st.session_state:
+            st.session_state[f"{key}_input"] = value
+
+
+def optimizer_chart(trials, space, searched, picks):
+    """Tuning score against each searched parameter: a broad band of high dots is a plateau, a lone dot a spike."""
+
+    params = [param for param in space.params if param.key in searched]
+    scored = trials.loc[trials["status"].eq("ok")]
+    columns = 1 if MOBILE or len(params) == 1 else 2
+    rows = -(-len(params) // columns)
+    fig = make_subplots(rows=rows, cols=columns, subplot_titles=[param.label for param in params],
+                        vertical_spacing=min(0.5 / max(rows, 1), 0.12), horizontal_spacing=0.08)
+    for number, param in enumerate(params):
+        row, col = number // columns + 1, number % columns + 1
+        fig.add_trace(go.Scatter(
+            x=scored[param.key], y=scored["score"], mode="markers", name="Trial", showlegend=number == 0,
+            marker=dict(color=scored["trial"], colorscale="Blues", cmin=0, cmax=max(scored["trial"].max(), 1),
+                        size=8, line=dict(color="gray", width=0.5)),
+            customdata=scored["trial"],
+            hovertemplate=f"{param.label}: %{{x}}<br>Tuning score: %{{y:.2f}}<br>Trial %{{customdata}}<extra></extra>",
+        ), row=row, col=col)
+        for label, pick, color, symbol in picks:
+            if pick is None:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[pick[param.key]], y=[pick["score"]], mode="markers", name=label, showlegend=number == 0,
+                marker=dict(color=color, size=19 if symbol == "diamond" else 14, symbol=symbol,
+                            line=dict(color="black", width=1)),
+                hovertemplate=f"{label}<br>{param.label}: %{{x}}<br>Tuning score: %{{y:.2f}}<extra></extra>",
+            ), row=row, col=col)
+        fig.update_yaxes(title_text="Tuning score" if col == 1 else None, row=row, col=col)
+    # On phones the chart toolbar sits over the top, so leave room above the first panel's title.
+    fig.update_layout(height=max(320, 260 * rows) + (40 if MOBILE else 0),
+                      margin=dict(t=80 if MOBILE else 40, b=60, l=50, r=20), hovermode="closest",
+                      legend=dict(orientation="h", y=-0.08 if rows > 1 else -0.2, x=0))
+    return fig
+
+
+def render_optimizer(price_df, s):
+    """Bayesian search for the rule's settings on the first part of the dates, forward-tested on the rest."""
+
+    space = SEARCH_SPACES.get(s.setup)
+    if space is None:
+        st.caption("The parameter search works on the daily signal rules, not the first-bar day trade.")
+        return
+    st.caption(
+        "Optuna's TPE sampler (a form of Bayesian optimization) tries settings, learns which areas score well and "
+        "tries more there. It sees only the **tuning period** (the first part of the date range). The **forward "
+        "period** after it is scored once, after the search, as a test of the settings it picked. Costs are included.")
+    labels = {param.label: param.key for param in space.params}
+    with st.form("optimizer_form"):
+        chosen = st.multiselect("Settings to search (the others stay as set)", list(labels), default=list(labels),
+                                key=f"optimizer_params_{s.setup}")
+        columns = st.columns(2)
+        objective_label = columns[0].selectbox("Score to maximise", list(OBJECTIVES), key="optimizer_objective",
+                                               help="Sharpe: return per unit of daily volatility. Return / max "
+                                               "drawdown: annual return divided by the worst fall from a peak.")
+        n_trials = int(columns[1].number_input("Trials", min_value=10, max_value=300, value=60, step=10,
+                                               key="optimizer_trials",
+                                               help="Each trial is one backtest. More trials search better but "
+                                               "also make a lucky result more likely."))
+        tune_pct = int(columns[0].number_input("Tuning period (% of the dates)", min_value=40, max_value=90, value=70,
+                                               step=5, key="optimizer_tune_pct"))
+        min_trades = int(columns[1].number_input("Min trades in the tuning period", min_value=1, max_value=100,
+                                                 value=5, step=1, key="optimizer_min_trades",
+                                                 help="Settings with fewer trades are skipped: a handful of trades "
+                                                 "says little."))
+        submitted = st.form_submit_button("Run search", type="primary", key="optimizer_run_btn")
+
+    searched = [labels[label] for label in chosen]
+    signature = json.dumps([s.ticker, s.timeframe, str(s.start_date), str(s.end_date), s.setup], default=str)
+    if submitted:
+        if not searched:
+            st.warning("Pick at least one setting to search.")
+            return
+        current = current_param_values(s, space)
+        fixed = {key: value for key, value in current.items() if key not in searched}
+        tune_end = split_date(price_df.index, tune_pct / 100)
+        periods = PERIODS_PER_YEAR.get(s.timeframe, 252)
+        progress = st.progress(0.0, text="Searching...")
+        trials = run_search(
+            lambda params: rule_backtest(price_df, s, params), space, price_df.index[0], tune_end,
+            objective=OBJECTIVES[objective_label], n_trials=n_trials, min_trades=min_trades, fixed=fixed,
+            periods_per_year=periods,
+            progress=lambda done, total: progress.progress(done / total, text=f"Trial {done} of {total}"))
+        progress.empty()
+        st.session_state["optimizer_result"] = {
+            "signature": signature, "trials": trials, "searched": searched, "current": current,
+            "objective": OBJECTIVES[objective_label], "objective_label": objective_label, "tune_end": tune_end,
+            "periods": periods,
+        }
+
+    result = st.session_state.get("optimizer_result")
+    if not result or result["signature"] != signature:
+        return
+    trials, objective, tune_end, periods = result["trials"], result["objective"], result["tune_end"], result["periods"]
+    forward = price_df.index[price_df.index > tune_end]
+    if forward.empty:
+        st.warning("The forward period is empty; use a longer date range or a smaller tuning share.")
+        return
+    tune_window = (price_df.index[0], tune_end)
+    forward_window = (forward[0], price_df.index[-1])
+    best, stable = pick_settings(trials, space)
+    scored = int(trials["status"].eq("ok").sum())
+    st.markdown(
+        f"**{len(trials)} trials, {scored} scored** on {result['objective_label']}. Tuning period "
+        f"{tune_window[0]:%Y-%m-%d} to {tune_window[1]:%Y-%m-%d}; forward period {forward_window[0]:%Y-%m-%d} to "
+        f"{forward_window[1]:%Y-%m-%d}.")
+    if stable is None:
+        st.warning("No trial had enough trades to score. Lower the minimum trades or widen the dates.")
+        return
+
+    buy_hold = price_df[["Close"]].copy()
+    buy_hold["Equity"] = buy_hold["Close"] / buy_hold["Close"].iloc[0]
+    buy_hold["Buy_Signal"] = False
+    candidates = [
+        ("Most stable (plateau)", params_of(stable, space)),
+        ("Best single trial", params_of(best, space)),
+        ("Your current settings", result["current"]),
+    ]
+    rows = []
+    for label, params in candidates:
+        backtest = rule_backtest(price_df, s, params)
+        rows.append((label, describe_params({key: params[key] for key in result["searched"]}, space), backtest))
+    rows.append(("Buy & hold", "", buy_hold))
+    table = []
+    for label, text, backtest in rows:
+        tune = period_metrics(backtest, *tune_window, periods)
+        ahead = period_metrics(backtest, *forward_window, periods)
+        # Tuning and forward side by side, so the drop from one to the other reads at a glance.
+        table.append({
+            "": label, "Tuning score": tune[objective], "Forward score": ahead[objective],
+            "Tuning return %": tune["return"] * 100, "Forward return %": ahead["return"] * 100,
+            "Tuning max DD %": tune["max_dd"] * 100, "Forward max DD %": ahead["max_dd"] * 100,
+            "Tuning trades": tune["trades"], "Forward trades": ahead["trades"], "Settings": text,
+        })
+    table = pd.DataFrame(table)
+    for column in ("Tuning trades", "Forward trades"):
+        table.loc[table[""].eq("Buy & hold"), column] = None
+    st.dataframe(table, hide_index=True, width="stretch", key="optimizer_results_table", column_config={
+        column: st.column_config.NumberColumn(format="%.2f") for column in table.columns
+        if column.endswith("score") or column.endswith("%")})
+    st.caption(
+        "**Most stable** is the trial whose own score and its 5 nearest neighbours' scores average highest: a "
+        "setting on a plateau, where nearby values also work. **Best single trial** is the top score, often a lucky "
+        "spike. Trust a setting only if its forward score holds up against your current settings and buy & hold. "
+        f"With {len(trials)} trials, the best tuning score is flattered by luck, so expect the forward score to be lower.")
+    buttons = st.columns(2)
+    buttons[0].button("Use the most stable settings", on_click=apply_params, args=(params_of(stable, space),),
+                      key="optimizer_apply_stable_btn")
+    buttons[1].button("Use the best single trial", on_click=apply_params, args=(params_of(best, space),),
+                      key="optimizer_apply_best_btn")
+    # Best first and larger, so the star stays visible on top when both picks are the same trial.
+    picks = [("Best single trial", best, "crimson", "diamond"), ("Most stable", stable, "gold", "star")]
+    show_chart(optimizer_chart(trials, space, result["searched"], picks), width="stretch", key="optimizer_chart")
+    with st.expander("All trials"):
+        shown = trials.copy()
+        for column in ("return", "cagr", "max_dd"):
+            if column in shown:
+                shown[column] = shown[column] * 100
+        shown = shown.rename(columns={"trial": "Trial", "score": "Tuning score", "return": "Return %",
+                                      "cagr": "CAGR %", "max_dd": "Max DD %", "sharpe": "Sharpe",
+                                      "calmar": "Return / max DD", "trades": "Trades", "status": "Status"})
+        shown = shown.rename(columns={param.key: param.label for param in space.params})
+        st.dataframe(shown.sort_values("Tuning score", ascending=False), hide_index=True, width="stretch",
+                     key="optimizer_trials_table")
+
+
+def current_param_values(s, space):
+    """The rule's present settings, keyed like the search space."""
+
+    settings = s.signal_settings
+    values = {
+        "fast_period": s.fast_period, "slow_period": s.slow_period, "fast_type": s.fast_type, "slow_type": s.slow_type,
+        "breakout_lookback": s.breakout_lookback, "breakdown_lookback": s.breakout_lookback,
+        "signal_day_breakout_lookback": s.breakout_lookback, "breakout_exit_ma": settings.exit_ma,
+        "signal_day_breakout_exit_pct": int(round((1 - settings.keep_fraction) * 100)),
+        "reversal_max_hold": s.max_hold_bars, "trend_mid": settings.trend_mid, "trend_slow": settings.trend_slow,
+        "pullback_ema": settings.pullback_ema, "swing_bars": settings.swing_bars,
+        "pullback_bars": settings.pullback_bars, "min_depth_atr": settings.min_depth_atr,
+        "macd_ma": s.macd_ma, "macd_widen_pct": settings.macd_widen_pct, "macd_widen_days": settings.macd_widen_days,
+        "macd_stop_pct": s.macd_stop_pct, "macd_cooldown": s.macd_cooldown,
+    }
+    return {param.key: values[param.key] for param in space.params}
+
+
 def render_backtest(s):
     """Moving-average / signal-rule backtest of the chosen ticker with EPS, fundamentals, P/E and benchmark panels."""
 
@@ -4832,6 +5109,8 @@ def render_backtest(s):
         if fundamentals_sec_error:
             st.caption(f"SEC fallback diagnostic: {fundamentals_sec_error}")
 
+    # The plain bars, before the chart's columns are added: the parameter search backtests on these.
+    price_df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
     df["Fast_MA"] = compute_ma(df["Close"], fast_type, fast_period)
     df["Slow_MA"] = compute_ma(df["Close"], slow_type, slow_period)
 
@@ -4872,18 +5151,13 @@ def render_backtest(s):
         trades, days = run_opening_bar({ticker: intraday_bars}, s.opening_bar)
         df, rule_text = opening_bar_equity(intraday_bars, trades, s.opening_bar, account_size), opening_bar_rule_text(s.opening_bar)
     elif setup == "ma_rule":
-        _, _, buy_condition, sell_condition = ma_rule_conditions(df, ma_rule)
+        buy_condition, sell_condition = rule_conditions(df, s)
         rule_text = (
             f"**BUY:** `{buy_left} {buy_operator} {buy_right}`\n\n"
             f"**SELL:** `{sell_left} {sell_operator} {sell_right}`"
         )
     else:
-        backtest_signals = detect_signals(
-            df, setup, breakout_lookback, float(volume_multiple), **signal_settings.detector_kwargs()
-        )
-        buy_condition = backtest_signals["Signal_Up"].fillna(False).astype(bool)
-        sell_column = "Exit_Long" if "Exit_Long" in backtest_signals else "Signal_Down"
-        sell_condition = backtest_signals[sell_column].fillna(False).astype(bool)
+        buy_condition, sell_condition = rule_conditions(df, s)
         rule_text = (
             f"**BUY / SELL:** {setup_label} signals on {timeframe.lower()} bars. The position is held until "
             "its exit (see the rule's settings). Stops and targets are not simulated here; the **Validate** tab replays the "
@@ -4897,10 +5171,7 @@ def render_backtest(s):
                 + f", then waits {s.macd_cooldown} day(s). Full position."
             )
     if setup != "opening_bar":
-        macd_rule = setup == "macd_bollinger"
-        df = run_position_engine(df, buy_condition, sell_condition, max_hold=s.max_hold_bars if setup == "reversal" else 0,
-                                 stop_pct=s.macd_stop_pct if macd_rule else 0.0,
-                                 cooldown=s.macd_cooldown if macd_rule else 0)
+        df = run_rule_positions(df, buy_condition, sell_condition, s)
 
         df["Returns"] = df["Close"].pct_change().fillna(0.0)
         df["Equity"], total_costs, orders = equity_with_costs(df, account_size, s.commission_plan, s.slippage)
@@ -4926,6 +5197,9 @@ def render_backtest(s):
     else:
         metric_col3.metric("Positive Active Bars", f"{positive_active_bars:.1f}%")
     st.info(rule_text)
+    if setup != "opening_bar":
+        with st.expander("Find better settings (Bayesian optimization with a forward test)"):
+            render_optimizer(price_df, s)
 
     fig = make_subplots(
         rows=7,
