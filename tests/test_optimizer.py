@@ -1,0 +1,89 @@
+import numpy as np
+import pandas as pd
+
+from analysis.optimizer import (
+    SEARCH_SPACES,
+    Param,
+    SearchSpace,
+    neighbourhood_scores,
+    params_of,
+    period_metrics,
+    pick_settings,
+    run_search,
+    split_date,
+)
+
+
+def toy_backtest(index, daily_return):
+    equity = 100 * np.cumprod(np.full(len(index), 1 + daily_return))
+    buys = np.zeros(len(index), dtype=bool)
+    buys[::20] = True
+    return pd.DataFrame({"Equity": equity, "Buy_Signal": buys}, index=index)
+
+
+def test_period_metrics_rebases_each_window():
+    index = pd.bdate_range("2020-01-01", periods=504)
+    backtest = toy_backtest(index, 0.001)
+    first = period_metrics(backtest, index[0], index[251])
+    second = period_metrics(backtest, index[252], index[-1])
+    assert abs(first["return"] - (1.001 ** 251 - 1)) < 1e-9
+    assert abs(second["return"] - (1.001 ** 251 - 1)) < 1e-9
+    assert first["max_dd"] == 0
+    assert first["trades"] == 13
+
+
+def test_split_date_keeps_a_forward_period():
+    index = pd.bdate_range("2020-01-01", periods=100)
+    assert split_date(index, 0.7) == index[69]
+    assert split_date(index, 1.0) == index[98]
+
+
+def test_search_finds_the_peak_and_respects_ordering():
+    space = SearchSpace((Param("a", "A", "int", 0, 50, 1), Param("b", "B", "int", 0, 50, 1)), less_than=(("a", "b"),))
+    index = pd.bdate_range("2020-01-01", periods=300)
+
+    def evaluate(params):
+        # Best near a = 20, b = 40; noise-free so the search should get close.
+        quality = -((params["a"] - 20) ** 2 + (params["b"] - 40) ** 2) / 1e6
+        return toy_backtest(index, 0.0005 + quality)
+
+    trials = run_search(evaluate, space, index[0], index[199], objective="cagr", n_trials=60, min_trades=1)
+    assert len(trials) == 60
+    ok = trials.loc[trials["status"].eq("ok")]
+    assert (ok["a"] < ok["b"]).all()
+    assert trials.loc[trials["status"].ne("ok"), "score"].isna().all()
+    best, stable = pick_settings(trials, space)
+    assert abs(best["a"] - 20) <= 8 and abs(best["b"] - 40) <= 8
+    assert stable["neighbourhood"] <= best["score"] + 1e-12
+
+
+def test_fixed_params_are_not_searched_and_min_trades_skips():
+    space = SEARCH_SPACES["breakout"]
+    index = pd.bdate_range("2020-01-01", periods=300)
+    seen = []
+
+    def evaluate(params):
+        seen.append(params)
+        backtest = toy_backtest(index, 0.0003)
+        if params["breakout_lookback"] > 50:
+            backtest["Buy_Signal"] = False
+        return backtest
+
+    trials = run_search(evaluate, space, index[0], index[199], n_trials=20, min_trades=2,
+                        fixed={"breakout_exit_ma": 200})
+    assert all(params["breakout_exit_ma"] == 200 for params in seen)
+    skipped = trials.loc[trials["breakout_lookback"] > 50]
+    assert skipped["status"].str.startswith("fewer than").all()
+
+
+def test_stable_pick_prefers_a_plateau_over_a_spike():
+    space = SearchSpace((Param("x", "X", "int", 0, 100, 1),))
+    # A broad area scoring 1.0, and a lone 1.4 with poor values either side of it.
+    xs = list(range(0, 21)) + [74, 77, 80, 83, 86]
+    scores = [1.0] * 21 + [0.1, 0.2, 1.4, 0.2, 0.1]
+    trials = pd.DataFrame({"trial": range(1, len(xs) + 1), "x": xs, "score": scores, "status": "ok"})
+    best, stable = pick_settings(trials, space)
+    assert best["x"] == 80
+    assert stable["x"] <= 20
+    assert len(neighbourhood_scores(trials, space)) == len(xs)
+    assert params_of(stable, space) == {"x": int(stable["x"])}
