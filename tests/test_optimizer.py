@@ -171,3 +171,25 @@ def test_weighted_objective_and_drawdown_limit():
     trials = run_search(lambda params: falling, SEARCH_SPACES["breakout"], index[0], index[199], n_trials=3,
                         min_trades=1, max_dd_limit=10)
     assert trials["status"].eq("drawdown over 10%").all()
+
+
+def test_shortest_pullback_window_runs():
+    from analysis.patterns import detect_signals
+    from tests.conftest import make_bars
+    df = make_bars(np.linspace(50, 100, 400))
+    out = detect_signals(df, "pullback", pullback_bars=2)
+    assert "Signal_Up" in out
+
+
+def test_search_survives_a_setting_that_errors():
+    space = SearchSpace((Param("x", "X", "int", 1, 10, 1),))
+    index = pd.bdate_range("2020-01-01", periods=300)
+
+    def evaluate(params):
+        if params["x"] == 3:
+            raise ValueError("edge")
+        return toy_backtest(index, 0.0001 * params["x"])
+
+    trials = run_search(evaluate, space, index[0], index[199], objective="cagr", n_trials=30, min_trades=1, seed=1)
+    assert trials.loc[trials["x"].eq(3), "score"].isna().all()
+    assert trials["score"].notna().any()

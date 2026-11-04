@@ -177,7 +177,9 @@ def detect_pullbacks(
     swing_low = low.shift(1).rolling(swing_bars, min_periods=swing_bars).min()
     pullback_low = low.rolling(pullback_bars, min_periods=pullback_bars).min()
     pullback_high = high.rolling(pullback_bars, min_periods=pullback_bars).max()
-    pullback_rvol = rvol.shift(1).rolling(pullback_bars - 1, min_periods=2).mean()
+    # A 2-bar pullback window leaves 1 bar before the trigger, so the volume average can't ask for 2.
+    rvol_window = max(pullback_bars - 1, 1)
+    pullback_rvol = rvol.shift(1).rolling(rvol_window, min_periods=min(2, rvol_window)).mean()
     mid_rising = mid_ma > mid_ma.shift(10)
     mid_falling = mid_ma < mid_ma.shift(10)
 

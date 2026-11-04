@@ -244,7 +244,13 @@ def run_search(evaluate, space, tune_start, tune_end, objective="sharpe", n_tria
         if broken:
             rows.append({**row, "score": np.nan, "status": "fast MA not below slow MA"})
             raise optuna.TrialPruned()
-        metrics = period_metrics(evaluate(params), tune_start, tune_end, periods_per_year)
+        try:
+            backtest = evaluate(params)
+        except Exception as error:
+            # One setting the rule can't run (an edge of its range) shouldn't end the whole search.
+            rows.append({**row, "score": np.nan, "status": f"error: {type(error).__name__}"})
+            raise optuna.TrialPruned()
+        metrics = period_metrics(backtest, tune_start, tune_end, periods_per_year)
         if metrics["trades"] < min_trades:
             rows.append({**row, **metrics, "score": np.nan, "status": f"fewer than {min_trades} trades"})
             raise optuna.TrialPruned()
