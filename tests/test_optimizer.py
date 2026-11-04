@@ -101,7 +101,7 @@ def test_trials_record_phase_best_so_far_and_importance():
 
     trials = run_search(evaluate, space, index[0], index[199], objective="cagr", n_trials=30, min_trades=1,
                         n_startup_trials=5)
-    assert list(trials["phase"].iloc[:6]) == ["random start"] * 5 + ["guided"]
+    assert list(trials["phase"].iloc[:6]) == ["Latin hypercube start"] * 5 + ["guided"]
     assert trials["best_so_far"].is_monotonic_increasing
     importance = param_importance(trials, space, ["a", "b"])
     assert set(importance) == {"a", "b"}
@@ -136,3 +136,38 @@ def test_repeated_settings_are_not_rerun_or_counted_twice():
     best, stable = pick_settings(trials, space)
     assert pd.isna(best["repeat_of"]) and pd.isna(stable["repeat_of"])
     assert len(neighbourhood_scores(trials, space)) == len(calls)
+
+
+def test_latin_hypercube_uses_every_slice_once():
+    from analysis.optimizer import latin_hypercube
+
+    params = (Param("a", "A", "int", 0, 90, 10), Param("b", "B", "float", 0.0, 0.9, 0.1),
+              Param("c", "C", "choice", choices=("x", "y")))
+    points = latin_hypercube(params, 10, seed=3)
+    assert sorted(point["a"] for point in points) == list(range(0, 100, 10))
+    assert len({round(point["b"], 1) for point in points}) == 10
+    assert sorted(point["c"] for point in points) == ["x"] * 5 + ["y"] * 5
+
+
+def test_search_starts_with_the_latin_hypercube_points():
+    from analysis.optimizer import latin_hypercube
+
+    space = SearchSpace((Param("a", "A", "int", 0, 90, 10),))
+    index = pd.bdate_range("2020-01-01", periods=300)
+    trials = run_search(lambda params: toy_backtest(index, 0.0003), space, index[0], index[199], n_trials=12,
+                        min_trades=1, n_startup_trials=10, seed=7)
+    assert list(trials["a"].iloc[:10]) == [point["a"] for point in latin_hypercube(space.params, 10, 7)]
+
+
+def test_weighted_objective_and_drawdown_limit():
+    from analysis.optimizer import objective_latex, objective_score
+
+    metrics = {"sharpe": 1.5, "cagr_pct": 12.0, "max_dd_pct": 20.0}
+    assert objective_score(metrics, {"sharpe": 2, "cagr_pct": 0.1, "max_dd_pct": 0.05}) == 3 + 1.2 - 1.0
+    assert objective_latex({"sharpe": 1, "max_dd_pct": 0.5}) == r"\text{score} = \text{Sharpe} - 0.5\times \text{max DD}\%"
+
+    index = pd.bdate_range("2020-01-01", periods=300)
+    falling = toy_backtest(index, -0.002)
+    trials = run_search(lambda params: falling, SEARCH_SPACES["breakout"], index[0], index[199], n_trials=3,
+                        min_trades=1, max_dd_limit=10)
+    assert trials["status"].eq("drawdown over 10%").all()
