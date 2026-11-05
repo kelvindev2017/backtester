@@ -193,3 +193,24 @@ def test_search_survives_a_setting_that_errors():
     trials = run_search(evaluate, space, index[0], index[199], objective="cagr", n_trials=30, min_trades=1, seed=1)
     assert trials.loc[trials["x"].eq(3), "score"].isna().all()
     assert trials["score"].notna().any()
+
+
+def test_search_on_several_stocks_scores_the_median():
+    from analysis.optimizer import combined_metrics
+    index = pd.bdate_range("2020-01-01", periods=300)
+    one = period_metrics(toy_backtest(index, 0.001), index[0], index[199])
+    metrics, score = combined_metrics([one], {"cagr": 1.0})
+    assert score == one["cagr"]
+    space = SearchSpace((Param("x", "X", "int", 1, 10, 1),))
+
+    def evaluate(params):
+        # Stock A likes high x, stock B low x, stock C is indifferent: the median favours neither extreme alone.
+        return [toy_backtest(index, 0.0001 * params["x"]), toy_backtest(index, 0.0001 * (11 - params["x"])),
+                toy_backtest(index, 0.0005)]
+
+    trials = run_search(evaluate, space, index[0], index[199], objective="cagr", n_trials=20, min_trades=1, seed=1)
+    ok = trials.loc[trials["status"].eq("ok")]
+    for _, row in ok.iterrows():
+        cagrs = sorted([(1 + 0.0001 * row["x"]) ** 252 - 1, (1 + 0.0001 * (11 - row["x"])) ** 252 - 1,
+                        1.0005 ** 252 - 1])
+        assert abs(row["score"] - cagrs[1]) < 1e-3

@@ -849,6 +849,7 @@ def test_backtest_parameter_search(offline):
     tables = [frame.value for frame in app.dataframe if "Forward score" in frame.value.columns]
     assert tables, "no optimizer results table"
     assert list(tables[0][""]) == ["Most stable (plateau)", "Best single trial", "Your current settings", "Buy & hold"]
+    assert list(tables[0].columns[:2]) == ["", "Total gain %"]
     trials = app.session_state["optimizer_result"]["trials"]
     assert len(trials) == 10
     setup = next(frame.value for frame in app.dataframe if "Range tried" in frame.value.columns)
@@ -897,11 +898,37 @@ def test_optimized_settings_tested_on_other_stocks(offline):
     app.button(key="robustness_run_btn").click()
     open_tab(app, "Validate")
     summary = next(frame.value for frame in app.dataframe if "Median forward score" in frame.value.columns)
+    assert list(summary.columns[:2]) == ["Settings", "Median total gain %"]
     assert list(summary["Settings"]) == ["Most stable (plateau)", "Best single trial", "Your current settings",
                                          "Buy & hold"]
     rows = app.session_state["robustness_result"]["rows"]
     assert set(rows["Stock"]) == {"AAPL", "MSFT", "NVDA"}
     assert not app.session_state["robustness_result"]["yearly"].empty
+
+
+def test_optimization_tunes_on_several_stocks(offline):
+    app = open_tab(start_app(), "Backtest")
+    next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
+    open_tab(app, "Backtest")
+    assert app.text_input(key="optimizer_tickers").value == "AAPL"
+    app.text_input(key="optimizer_tickers").input("AAPL, MSFT, NVDA")
+    open_tab(app, "Backtest")
+    next(box for box in app.number_input if box.label == "Trials").set_value(10)
+    next(box for box in app.number_input if box.label == "Min trades in the tuning period").set_value(1)
+    app.button(key="optimizer_run_btn").click()
+    open_tab(app, "Backtest")
+    result = app.session_state["optimizer_result"]
+    assert result["tickers"] == ["AAPL", "MSFT", "NVDA"]
+    table = next(frame.value for frame in app.dataframe if "Forward score" in frame.value.columns
+                 and "" in frame.value.columns and "Stock" not in frame.value.columns)
+    assert list(table.columns[:2]) == ["", "Total gain %"]
+    per_stock = next(frame.value for frame in app.dataframe if "Stock" in frame.value.columns
+                     and "Forward score" in frame.value.columns)
+    assert set(per_stock["Stock"]) == {"AAPL", "MSFT", "NVDA"}
+    assert any("3 stocks" in element.value for element in app.markdown)
+
+    open_tab(app, "Validate")
+    assert app.text_input(key="robustness_tickers").value == "AAPL, MSFT, NVDA"
 
 
 def test_validate_without_an_optimization_tests_current_settings(offline):

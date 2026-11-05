@@ -2540,14 +2540,14 @@ def format_stats_table(frame):
     return formatted
 
 
-def fill_similar_stocks(ticker):
-    """Button callback: the stock plus up to 9 S&P 500 stocks in its sub-industry."""
+def fill_similar_stocks(ticker, key="robustness_tickers", count=9):
+    """Button callback: the stock plus up to ``count`` S&P 500 stocks in its sub-industry, into the ``key`` box."""
 
-    peers = sp500_competitors(ticker, 9)
+    peers = sp500_competitors(ticker, count)
     if peers:
-        st.session_state["robustness_tickers"] = ", ".join([ticker] + peers)
+        st.session_state[key] = ", ".join([ticker] + peers)
     else:
-        st.session_state["robustness_peers_error"] = (
+        st.session_state[key.replace("_tickers", "_peers_error")] = (
             f"No S&P 500 sub-industry found for {ticker}; type the stocks to test instead.")
 
 
@@ -2591,7 +2591,7 @@ def render_robustness(s):
                     "its picks here. Until then this tests your current settings.")
             tuned_ticker, tune_end, weights, label = s.ticker, None, {"sharpe": 1.0}, "Sharpe ratio"
         else:
-            tuned_ticker = json.loads(result["signature"])[0]
+            tuned_ticker = ", ".join(result.get("tickers") or [json.loads(result["signature"])[0]])
             tune_end, weights, label = result["tune_end"], result["weights"], result["objective_label"]
         st.caption(
             f"Runs each set of settings with the Backtest's own engine and costs on every stock below, over the "
@@ -2605,9 +2605,9 @@ def render_robustness(s):
             st.session_state["robustness_tickers"] = tuned_ticker
         columns = st.columns([3, 1], vertical_alignment="bottom")
         tickers_text = columns[0].text_input("Stocks to test (comma-separated)", key="robustness_tickers")
-        columns[1].button("Fill with similar stocks", on_click=fill_similar_stocks, args=(tuned_ticker,),
+        columns[1].button("Fill with similar stocks", on_click=fill_similar_stocks, args=(tuned_ticker.split(", ")[0],),
                           key="robustness_fill_btn",
-                          help=f"{tuned_ticker} plus up to 9 S&P 500 stocks in its sub-industry, largest by trading.")
+                          help=f"{tuned_ticker.split(', ')[0]} plus up to 9 S&P 500 stocks in its sub-industry, largest by trading.")
         error = st.session_state.pop("robustness_peers_error", None)
         if error:
             st.warning(error)
@@ -2634,7 +2634,8 @@ def render_robustness(s):
                 buy_hold = prices[["Close"]].assign(Equity=prices["Close"] / prices["Close"].iloc[0], Buy_Signal=False)
                 runs = [(name, rule_backtest(prices, s, params)) for name, params in candidates] + [("Buy & hold", buy_hold)]
                 for name, backtest in runs:
-                    row = {"Stock": ticker, "Settings": name}
+                    row = {"Stock": ticker, "Settings": name,
+                           "Total gain %": period_metrics(backtest, prices.index[0], prices.index[-1], periods)["return"] * 100}
                     for window, (start, end) in windows.items():
                         metrics = period_metrics(backtest, start, end, periods)
                         row[f"{window} score"] = objective_score(metrics, weights) if metrics["trades"] or name == "Buy & hold" else np.nan
@@ -2661,14 +2662,17 @@ def render_robustness_results(stored, names):
         st.warning("No prices for: " + ", ".join(stored["failed"]))
     if rows.empty:
         return
+    if "Total gain %" not in rows:  # a result stored before total gain was added
+        rows = rows.assign(**{"Total gain %": np.nan})
     by_stock = rows.pivot(index="Stock", columns="Settings", values="Forward score")
     summary = []
     for name in names:
         group = rows.loc[rows["Settings"].eq(name)]
-        others = group.loc[group["Stock"].ne(stored["tuned_ticker"])]
+        others = group.loc[~group["Stock"].isin(stored["tuned_ticker"].split(", "))]
         forward = by_stock[name]
         summary.append({
             "Settings": name,
+            "Median total gain %": group["Total gain %"].median(),
             "Median tuning score": group["Tuning score"].median(),
             "Median forward score": group["Forward score"].median(),
             "Median forward score, other stocks": others["Forward score"].median(),
@@ -2679,9 +2683,10 @@ def render_robustness_results(stored, names):
             "Median forward max DD %": group["Forward max DD %"].median(),
         })
     bh = rows.loc[rows["Settings"].eq("Buy & hold")]
-    summary.append({"Settings": "Buy & hold", "Median tuning score": bh["Tuning score"].median(),
+    summary.append({"Settings": "Buy & hold", "Median total gain %": bh["Total gain %"].median(),
+                    "Median tuning score": bh["Tuning score"].median(),
                     "Median forward score": bh["Forward score"].median(),
-                    "Median forward score, other stocks": bh.loc[bh["Stock"].ne(stored["tuned_ticker"]), "Forward score"].median(),
+                    "Median forward score, other stocks": bh.loc[~bh["Stock"].isin(stored["tuned_ticker"].split(", ")), "Forward score"].median(),
                     "Median forward return %": bh["Forward return %"].median(),
                     "Median forward max DD %": bh["Forward max DD %"].median()})
     summary = pd.DataFrame(summary)
@@ -2692,7 +2697,7 @@ def render_robustness_results(stored, names):
         "Forward: beats current settings": st.column_config.NumberColumn(format="%.0f%% of stocks")})
     st.caption(
         "Scores are medians across the stocks (the middle stock, so one outlier can't carry it). \"Other stocks\" "
-        f"leaves out {stored['tuned_ticker']}, the stock the picks were tuned on. Settings that only work on the stock "
+        f"leaves out {stored['tuned_ticker']}, the stock(s) the picks were tuned on. Settings that only work on the stock "
         "they were tuned on, or only before the forward period, did not find a lasting edge.")
 
     if not yearly.empty:
@@ -5109,6 +5114,24 @@ def optimizer_chart(trials, space, searched, picks):
     return fig
 
 
+def optimizer_frames(price_df, s, tickers):
+    """Daily bars for each stock to tune on (the Backtest's own prices for its stock), and the stocks with none."""
+
+    frames, failed = {}, []
+    start_str = pd.Timestamp(s.start_date).strftime("%Y-%m-%d")
+    end_str = pd.Timestamp(s.end_date).strftime("%Y-%m-%d")
+    for ticker in tickers:
+        if ticker == s.ticker:
+            frames[ticker] = price_df
+            continue
+        prices = load_data(ticker, start_str, end_str, s.timeframe)
+        if prices.empty or len(prices) < 50:
+            failed.append(ticker)
+            continue
+        frames[ticker] = prices[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    return frames, failed
+
+
 def render_optimizer(price_df, s):
     """Bayesian search for the rule's settings on the first part of the dates, forward-tested on the rest."""
 
@@ -5121,6 +5144,25 @@ def render_optimizer(price_df, s):
         "tries more there. It sees only the **tuning period** (the first part of the date range). The **forward "
         "period** after it is scored once, after the search, as a test of the settings it picked. Costs are included.")
     labels = {param.label: param.key for param in space.params}
+    # Stocks to tune on: the Backtest stock by default (follows it until the user types other stocks).
+    previous = st.session_state.get("optimizer_tickers_for")
+    if previous != s.ticker:
+        if str(st.session_state.get("optimizer_tickers") or "").strip().upper() in ("", str(previous or "").upper()):
+            st.session_state["optimizer_tickers"] = s.ticker
+        st.session_state["optimizer_tickers_for"] = s.ticker
+    stock_columns = st.columns([3, 1], vertical_alignment="bottom")
+    tickers_text = stock_columns[0].text_input(
+        "Stocks to tune on (comma-separated)", key="optimizer_tickers",
+        help="One stock: settings tuned to that stock. Several: each setting is scored on every stock and the "
+        "median score counts, so the search looks for settings that work across them, not on one stock's history.")
+    stock_columns[1].button("Add similar stocks", on_click=fill_similar_stocks, args=(s.ticker, "optimizer_tickers", 5),
+                            key="optimizer_fill_btn",
+                            help=f"{s.ticker} plus up to 5 S&P 500 stocks in its sub-industry, largest by trading.")
+    error = st.session_state.pop("optimizer_peers_error", None)
+    if error:
+        st.warning(error)
+    tune_tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()))
+    tune_tickers = tune_tickers or [s.ticker]
     with st.form("optimizer_form"):
         chosen = st.multiselect("Settings to search (the others stay as set)", list(labels), default=list(labels),
                                 key=f"optimizer_params_{s.setup}")
@@ -5166,7 +5208,8 @@ def render_optimizer(price_df, s):
     st.latex(objective_latex(weights))
 
     searched = [labels[label] for label in chosen]
-    signature = json.dumps([s.ticker, s.timeframe, str(s.start_date), str(s.end_date), s.setup], default=str)
+    signature = json.dumps([s.ticker, s.timeframe, str(s.start_date), str(s.end_date), s.setup, tune_tickers],
+                           default=str)
     if submitted:
         if not searched:
             st.warning("Pick at least one setting to search.")
@@ -5175,9 +5218,16 @@ def render_optimizer(price_df, s):
         fixed = {key: value for key, value in current.items() if key not in searched}
         tune_end = split_date(price_df.index, tune_pct / 100)
         periods = PERIODS_PER_YEAR.get(s.timeframe, 252)
+        frames, failed = optimizer_frames(price_df, s, tune_tickers)
+        if failed:
+            st.warning("No prices for: " + ", ".join(failed) + ". Tuning on the others.")
+        if not frames:
+            st.warning("No prices for any of the stocks to tune on.")
+            return
         progress = st.progress(0.0, text="Searching...")
         trials = run_search(
-            lambda params: rule_backtest(price_df, s, params), space, price_df.index[0], tune_end,
+            lambda params: [rule_backtest(frame, s, params) for frame in frames.values()], space, price_df.index[0],
+            tune_end,
             objective=weights, n_trials=n_trials, min_trades=min_trades, fixed=fixed, periods_per_year=periods,
             start="lhs" if start_label == "Latin hypercube" else "random", max_dd_limit=max_dd_limit or None,
             progress=lambda done, total: progress.progress(done / total, text=f"Trial {done} of {total}"))
@@ -5187,6 +5237,7 @@ def render_optimizer(price_df, s):
             "weights": weights, "objective_label": objective_label, "tune_end": tune_end,
             "periods": periods, "fixed": fixed, "tune_pct": tune_pct, "min_trades": min_trades,
             "n_startup": N_STARTUP_TRIALS, "seed": 0, "start": start_label, "max_dd_limit": max_dd_limit,
+            "tickers": list(frames),
         }
 
     result = st.session_state.get("optimizer_result")
@@ -5209,33 +5260,42 @@ def render_optimizer(price_df, s):
         st.warning("No trial had enough trades to score. Lower the minimum trades or widen the dates.")
         return
 
-    buy_hold = price_df[["Close"]].copy()
-    buy_hold["Equity"] = buy_hold["Close"] / buy_hold["Close"].iloc[0]
-    buy_hold["Buy_Signal"] = False
+    tickers = result.get("tickers") or [s.ticker]
+    frames = optimizer_frames(price_df, s, tickers)[0] if len(tickers) > 1 else {s.ticker: price_df}
+    if len(frames) > 1:
+        st.markdown(f"Tuned on **{len(frames)} stocks** ({', '.join(frames)}): each score below is the median "
+                    "across them (the middle stock).")
     candidates = [
         ("Most stable (plateau)", params_of(stable, space)),
         ("Best single trial", params_of(best, space)),
         ("Your current settings", result["current"]),
     ]
-    rows = []
-    for label, params in candidates:
-        backtest = rule_backtest(price_df, s, params)
-        rows.append((label, describe_params({key: params[key] for key in result["searched"]}, space), backtest))
-    rows.append(("Buy & hold", "", buy_hold))
-    table = []
-    for label, text, backtest in rows:
-        tune = period_metrics(backtest, *tune_window, periods)
-        ahead = period_metrics(backtest, *forward_window, periods)
-        # Tuning and forward side by side, so the drop from one to the other reads at a glance.
-        table.append({
-            "": label, "Tuning score": objective_score(tune, weights), "Forward score": objective_score(ahead, weights),
-            "Tuning return %": tune["return"] * 100, "Forward return %": ahead["return"] * 100,
-            "Tuning max DD %": tune["max_dd"] * 100, "Forward max DD %": ahead["max_dd"] * 100,
-            "Tuning trades": tune["trades"], "Forward trades": ahead["trades"], "Settings": text,
-        })
-    table = pd.DataFrame(table)
+    runs = [(label, describe_params({key: params[key] for key in result["searched"]}, space), params)
+            for label, params in candidates] + [("Buy & hold", "", None)]
+    per_stock = []
+    for ticker, frame in frames.items():
+        for label, text, params in runs:
+            backtest = (rule_backtest(frame, s, params) if params is not None
+                        else frame[["Close"]].assign(Equity=frame["Close"] / frame["Close"].iloc[0], Buy_Signal=False))
+            tune = period_metrics(backtest, *tune_window, periods)
+            ahead = period_metrics(backtest, *forward_window, periods)
+            whole = period_metrics(backtest, tune_window[0], forward_window[1], periods)
+            # Total gain first (what the setting made over all the dates), then tuning and forward side by side, so
+            # the drop from one to the other reads at a glance.
+            per_stock.append({
+                "Stock": ticker, "": label, "Total gain %": whole["return"] * 100,
+                "Tuning score": objective_score(tune, weights), "Forward score": objective_score(ahead, weights),
+                "Tuning return %": tune["return"] * 100, "Forward return %": ahead["return"] * 100,
+                "Tuning max DD %": tune["max_dd"] * 100, "Forward max DD %": ahead["max_dd"] * 100,
+                "Tuning trades": tune["trades"], "Forward trades": ahead["trades"], "Settings": text,
+            })
+    per_stock = pd.DataFrame(per_stock)
     for column in ("Tuning trades", "Forward trades"):
-        table.loc[table[""].eq("Buy & hold"), column] = None
+        per_stock[column] = per_stock[column].astype(float)
+        per_stock.loc[per_stock[""].eq("Buy & hold"), column] = np.nan
+    numbers = [column for column in per_stock.columns if column not in ("Stock", "", "Settings")]
+    table = per_stock.groupby("", sort=False)[numbers].median().reset_index()
+    table["Settings"] = [text for _, text, _ in runs]
     st.dataframe(table, hide_index=True, width="stretch", key="optimizer_results_table", column_config={
         column: st.column_config.NumberColumn(format="%.2f") for column in table.columns
         if column.endswith("score") or column.endswith("%")})
@@ -5244,6 +5304,11 @@ def render_optimizer(price_df, s):
         "setting on a plateau, where nearby values also work. **Best single trial** is the top score, often a lucky "
         "spike. Trust a setting only if its forward score holds up against your current settings and buy & hold. "
         f"With {len(trials)} trials, the best tuning score is flattered by luck, so expect the forward score to be lower.")
+    if len(frames) > 1:
+        with st.expander("Every stock"):
+            st.dataframe(per_stock, hide_index=True, width="stretch", key="optimizer_per_stock_table", column_config={
+                column: st.column_config.NumberColumn(format="%.2f") for column in per_stock.columns
+                if column.endswith("score") or column.endswith("%")})
     buttons = st.columns(2)
     buttons[0].button("Use the most stable settings", on_click=apply_params, args=(params_of(stable, space),),
                       key="optimizer_apply_stable_btn")
