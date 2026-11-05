@@ -708,6 +708,66 @@ CHART_AXIS_HOVER_JS = """
 })();
 """
 
+# Tables (st.dataframe / st.data_editor) keep their column order. Streamlit's grid lets a user drag a column
+# header to another place and has no option to turn that off, so when a press that began on a header row ends
+# after moving (or the browser cancels it because the finger scrolled), the script swallows the release, hovers
+# the pointer back over the starting column so the move is onto itself, and releases it outside the grid.
+# A plain tap on a header (sorting), resizing a column at its edge and cell selection are untouched.
+TABLE_COLUMN_LOCK_JS = """
+(function () {
+  const HEADER_PX = 36;  // table header row height
+  let press = null;
+  let swallowClick = false;
+  function gridCanvas(target) {
+    const grid = target instanceof Element ? target.closest("[data-testid='stDataFrame']") : null;
+    return grid ? grid.querySelector("canvas") : null;
+  }
+  function fire(target, type, x, y) {
+    target.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, composed: true, pointerId: 1, pointerType: "mouse", isPrimary: true,
+      clientX: x, clientY: y, button: 0, buttons: type === "pointerup" ? 0 : 1,
+    }));
+  }
+  document.addEventListener("pointerdown", function (e) {
+    press = null;
+    const canvas = gridCanvas(e.target);
+    if (!canvas || e.button !== 0) return;
+    const box = canvas.getBoundingClientRect();
+    if (e.clientY - box.top > HEADER_PX) return;            // a cell, not the header
+    if (canvas.style.cursor === "col-resize") return;       // dragging a column edge resizes it
+    press = { canvas: canvas, x: e.clientX, y: e.clientY, moved: false };
+  }, true);
+  document.addEventListener("pointermove", function (e) {
+    if (press && e.isTrusted && Math.abs(e.clientX - press.x) + Math.abs(e.clientY - press.y) > 4) press.moved = true;
+  }, true);
+  function snapBack(p) {
+    fire(p.canvas, "pointermove", p.x, p.y);
+    // Release once the grid has re-rendered with the pointer back over the starting column.
+    setTimeout(function () { fire(p.canvas, "pointerup", -9999, -9999); }, 80);
+  }
+  document.addEventListener("pointerup", function (e) {
+    if (!press || !e.isTrusted) return;
+    const p = press;
+    press = null;
+    if (!p.moved) return;
+    e.stopPropagation();
+    swallowClick = true;
+    snapBack(p);
+  }, true);
+  // On a touch screen a swipe that starts on a header scrolls instead, and the browser cancels the press.
+  // The grid never hears it end and keeps the column "picked up": the next tap on another column would drop it there.
+  document.addEventListener("pointercancel", function (e) {
+    if (!press || !e.isTrusted) return;
+    const p = press;
+    press = null;
+    snapBack(p);
+  }, true);
+  document.addEventListener("click", function (e) {
+    if (swallowClick && e.isTrusted) { swallowClick = false; e.stopPropagation(); }
+  }, true);
+})();
+"""
+
 # Streamlit Community Cloud wraps the app in its own page, whose install
 # manifest and home-screen icon are Streamlit's. Both pages share an origin,
 # so point the wrapper's manifest and apple-touch-icon at our favicon.
@@ -759,7 +819,7 @@ components.html(
   app.head.appendChild(script);
 })();
 </script>
-""" % json.dumps(CHART_TOUCH_JS + CHART_AXIS_HOVER_JS + CHART_FIT_Y_JS),
+""" % json.dumps(CHART_TOUCH_JS + CHART_AXIS_HOVER_JS + CHART_FIT_Y_JS + TABLE_COLUMN_LOCK_JS),
     height=0,
 )
 
