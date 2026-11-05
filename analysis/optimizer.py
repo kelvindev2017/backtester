@@ -157,6 +157,24 @@ def period_metrics(backtest, start, end, periods_per_year=252):
             "trades": trades}
 
 
+def combined_metrics(per_stock, weights):
+    """One trial's metrics over several stocks: the median of each metric, and the median of the per-stock scores.
+
+    With one stock this is that stock's metrics and score, so tuning on one stock works as before. The median (the
+    middle stock) keeps one stock that the setting happens to suit from carrying the score.
+    """
+
+    if len(per_stock) == 1:
+        metrics = dict(per_stock[0])
+        return metrics, objective_score(metrics, weights)
+    frame = pd.DataFrame(per_stock)
+    metrics = {key: float(frame[key].median()) for key in frame.columns}
+    metrics["trades"] = int(round(frame["trades"].median()))
+    scores = pd.Series([objective_score(m, weights) for m in per_stock], dtype=float)
+    scores = scores[np.isfinite(scores)]
+    return metrics, float(scores.median()) if len(scores) else np.nan
+
+
 def split_date(index, tune_fraction):
     """The last date of the tuning period: ``tune_fraction`` of the bars from the start."""
 
@@ -203,6 +221,8 @@ def run_search(evaluate, space, tune_start, tune_end, objective="sharpe", n_tria
                start="lhs", max_dd_limit=None):
     """Search ``space`` with Optuna's TPE sampler, scoring each trial on the tuning period only.
 
+    ``evaluate(params)`` returns one backtest, or a list of them (one per stock) to tune on several stocks at once:
+    then each trial is scored on the median across the stocks (``combined_metrics``).
     ``objective`` is a term name ("sharpe") or a dict of term weights (see ``SCORE_TERMS``). ``fixed`` maps keys to
     values that are held, not searched. Trials that break an ordering rule (fast MA above the slow MA), trade fewer
     than ``min_trades`` times or fall further than ``max_dd_limit`` % from a peak are recorded without a score and
@@ -250,14 +270,15 @@ def run_search(evaluate, space, tune_start, tune_end, objective="sharpe", n_tria
             # One setting the rule can't run (an edge of its range) shouldn't end the whole search.
             rows.append({**row, "score": np.nan, "status": f"error: {type(error).__name__}"})
             raise optuna.TrialPruned()
-        metrics = period_metrics(backtest, tune_start, tune_end, periods_per_year)
+        backtests = backtest if isinstance(backtest, (list, tuple)) else [backtest]
+        metrics, score = combined_metrics(
+            [period_metrics(one, tune_start, tune_end, periods_per_year) for one in backtests], weights)
         if metrics["trades"] < min_trades:
             rows.append({**row, **metrics, "score": np.nan, "status": f"fewer than {min_trades} trades"})
             raise optuna.TrialPruned()
         if max_dd_limit and metrics["max_dd_pct"] > max_dd_limit:
             rows.append({**row, **metrics, "score": np.nan, "status": f"drawdown over {max_dd_limit:g}%"})
             raise optuna.TrialPruned()
-        score = objective_score(metrics, weights)
         if not np.isfinite(score):
             rows.append({**row, **metrics, "score": np.nan, "status": "no score"})
             raise optuna.TrialPruned()
