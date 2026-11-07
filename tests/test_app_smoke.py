@@ -105,8 +105,8 @@ def open_tab(app, label):
 
 def test_app_runs_both_tabs(offline):
     app = start_app()
-    assert [tab.label for tab in app.tabs] == ["Economic analysis", "Market Analysis", "Industry Analysis",
-                                               "News", "Stock Fundamentals", "Semicon Supply Chain", "Stock Screener", "Backtest",
+    assert [tab.label for tab in app.tabs] == ["News", "Stock Screener", "Economic analysis", "Market Analysis",
+                                               "Industry Analysis", "Stock Fundamentals", "Semicon Supply Chain", "Backtest",
                                                "Signal Analysis & Trade Plan", "Validate", "Trade Journal"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
@@ -120,7 +120,7 @@ def test_app_runs_both_tabs(offline):
     assert any("Trade plan" in element.value for element in app.subheader)
 
 
-def test_economic_analysis_tab_opens_first(offline, monkeypatch):
+def test_economic_analysis_tab(offline, monkeypatch):
     import analysis.economy
     fred = {
         "CPIAUCSL": pd.Series(np.linspace(250, 320, 120), index=pd.date_range("2016-01-01", periods=120, freq="MS")),
@@ -136,6 +136,9 @@ def test_economic_analysis_tab_opens_first(offline, monkeypatch):
     monkeypatch.setattr(analysis.economy, "fred_series", fake_fred)
     app = start_app()
     assert not app.exception, app.exception
+    # News opens first.
+    assert app.sidebar.header[0].value == "News"
+    app = open_tab(app, "Economic analysis")
     assert app.sidebar.header[0].value == "Economic analysis"
     assert [element.value for element in app.subheader] == ["Asset classes compared", "S&P 500 vs the US economy"]
     assert any("Correlation with Stock (S&P 500)" in str(frame.value.columns) for frame in app.dataframe)
