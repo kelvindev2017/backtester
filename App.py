@@ -201,11 +201,14 @@ from analysis.news import (
     NEWS_CSS,
     NEWS_PERIODS,
     SECTOR_LEADERS,
+    TONES as NEWS_TONES,
+    add_tone,
     collect_news,
     filter_news,
     group_news,
     story_card_html,
     time_ago,
+    with_semi_ai_sector,
 )
 from analysis.universe import (
     MARKETS as SCREENER_MARKETS,
@@ -4454,7 +4457,7 @@ def news_companies(universe, custom_text):
     for ticker in tickers:
         sectors.setdefault(ticker, "Other")
         industries.setdefault(ticker, sectors[ticker])
-    return tickers, sectors, industries, note
+    return tickers, with_semi_ai_sector(sectors, industries), industries, note
 
 
 def supply_chain_levels():
@@ -4474,21 +4477,35 @@ def refresh_news():
     load_news.clear()
 
 
-def render_news_group(group, stories, limit, expanded, now):
-    """One industry: a collapsible list of its stories, newest first."""
+def render_news_group(group, stories, limit, expanded, now, split_tone=False):
+    """One industry: a collapsible list of its stories, newest first (positive, then negative, then neutral when split)."""
 
     latest = stories["published"].max()
     label = f"{group} · {len(stories)} {'story' if len(stories) == 1 else 'stories'}"
+    tones = stories["tone"].value_counts()
+    label += f" · :green[▲{tones.get('Positive', 0)}] :red[▼{tones.get('Negative', 0)}]"
     if pd.notna(latest):
         label += f" · latest {time_ago(latest, now)}"
     with st.expander(label, expanded=expanded):
         counts = pd.Series([ticker for tickers in stories["tickers"] for ticker in tickers]).value_counts()
         if len(counts) > 1:
             st.caption("Most covered: " + ", ".join(f"{ticker} ({count})" for ticker, count in counts.head(6).items()))
-        cards = "".join(story_card_html(row, now) for _, row in stories.head(limit).iterrows())
+        if split_tone:
+            parts = []
+            for tone in NEWS_TONES:
+                part = stories[stories["tone"] == tone]
+                if part.empty:
+                    continue
+                parts.append(f"<div class='news-tone-head news-{tone.lower()}'>{tone} ({len(part)})</div>")
+                parts += [story_card_html(row, now) for _, row in part.head(limit).iterrows()]
+            cards = "".join(parts)
+            hidden = int((stories["tone"].value_counts() - limit).clip(lower=0).sum())
+        else:
+            cards = "".join(story_card_html(row, now) for _, row in stories.head(limit).iterrows())
+            hidden = max(0, len(stories) - limit)
         st.markdown(cards, unsafe_allow_html=True)
-        if len(stories) > limit:
-            st.caption(f"{len(stories) - limit} older stories not shown. Raise **Stories per industry** in the settings, "
+        if hidden:
+            st.caption(f"{hidden} older stories not shown. Raise **Stories per industry** in the settings, "
                        "or narrow the list with **Search**.")
 
 
@@ -4510,6 +4527,11 @@ def render_news():
                             help="Industry is the GICS sub-industry for S&P 500 members (Yahoo's industry otherwise).")
         period = st.select_slider("Published in the last", list(NEWS_PERIODS), value="3 days", key="news_period")
         search = st.text_input("Search", key="news_search", placeholder="e.g. earnings, tariff, NVDA")
+        tone_pick = st.radio("Tone", ["All"] + NEWS_TONES, horizontal=True, key="news_tone",
+                             help="Positive (green headline) or negative (red) from the words in the headline and "
+                                  "summary: a finance word list, so a story can be misjudged.")
+        split_tone = st.checkbox("Separate positive and negative", value=True, key="news_split_tone",
+                                 help="Within each group: positive stories first, then negative, then neutral.")
         include_market = st.checkbox("Add whole-market news", value=True, key="news_market",
                                      help="Stories Yahoo files under the S&P 500 and Nasdaq that are not about "
                                           "one of the companies above.")
@@ -4530,7 +4552,9 @@ def render_news():
     with st.spinner(f"Loading news for {len(fetch_list)} symbols..."):
         news = load_news(tuple(fetch_list))
     now = pd.Timestamp.now(tz="UTC")
-    shown = filter_news(news, days=NEWS_PERIODS[period], search=search, now=now)
+    shown = add_tone(filter_news(news, days=NEWS_PERIODS[period], search=search, now=now))
+    if tone_pick != "All":
+        shown = shown[shown["tone"] == tone_pick]
     grouped = group_news(shown, groups, market_symbols=NEWS_MARKET_SYMBOLS if include_market else [])
     if NEWS_MARKET_GROUP in grouped and not include_market:
         grouped.pop(NEWS_MARKET_GROUP)
@@ -4539,7 +4563,8 @@ def render_news():
     st.caption(
         f"Latest stories from Yahoo Finance for {len(tickers)} companies, filed under the {group_by.lower()} of each "
         f"company a story is about (a story about companies in two {plural} shows in both). "
-        f"{total} stories in the last {period}. Tap a headline to open it."
+        f"{total} stories in the last {period}. Green headlines read positive, red negative (from a finance word "
+        "list). Tap a headline to open it."
     )
     if news.empty:
         st.warning("Yahoo Finance returned no news. It may be rate-limiting; try **Refresh news** in a few minutes.")
@@ -4557,7 +4582,8 @@ def render_news():
                           help="Pick one to show only its news.")
     picked = None if picked == every else picked
     for position, group in enumerate([picked] if picked else names):
-        render_news_group(group, grouped[group], limit, expanded=bool(picked) or position < 2, now=now)
+        render_news_group(group, grouped[group], limit, expanded=bool(picked) or position < 2, now=now,
+                          split_tone=split_tone and tone_pick == "All")
 
 
 # ============================================================

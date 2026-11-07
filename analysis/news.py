@@ -12,9 +12,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
-# About six of the largest S&P 500 companies in each GICS sector (late 2026).
+SEMI_AI_SECTOR = "Semiconductors & AI"
+# Chip makers and chip equipment (GICS sub-industries, and Yahoo's industry names for non-S&P stocks) ...
+SEMI_INDUSTRIES = {"Semiconductors", "Semiconductor Materials & Equipment", "Semiconductor Equipment & Materials"}
+# ... plus companies whose business is mainly AI software or AI data center hardware.
+AI_COMPANIES = {"PLTR", "SMCI", "ARM", "CRWV", "VRT", "ANET", "ALAB", "CRDO", "AI", "SOUN", "NBIS"}
+
+# About six of the largest S&P 500 companies in each GICS sector (late 2026), with chips and AI as a sector of its own.
 SECTOR_LEADERS = {
-    "Information Technology": ["NVDA", "MSFT", "AAPL", "AVGO", "ORCL", "AMD"],
+    SEMI_AI_SECTOR: ["NVDA", "AVGO", "AMD", "TSM", "MU", "ASML", "ARM", "PLTR"],
+    "Information Technology": ["MSFT", "AAPL", "ORCL", "CRM", "CSCO", "IBM"],
     "Communication Services": ["GOOGL", "META", "NFLX", "TMUS", "DIS", "VZ"],
     "Consumer Discretionary": ["AMZN", "TSLA", "HD", "MCD", "BKNG", "NKE"],
     "Consumer Staples": ["WMT", "COST", "PG", "KO", "PEP", "PM"],
@@ -79,6 +86,71 @@ def parse_article(item, fetched_for):
         "id": str(story_id), "title": title.strip(), "summary": summary, "publisher": publisher, "url": url,
         "published": published, "mentions": [str(ticker).upper() for ticker in tickers], "fetched_for": [fetched_for],
     }
+
+
+def with_semi_ai_sector(sectors, industries):
+    """Sectors with chip makers, chip equipment and AI companies moved into ``SEMI_AI_SECTOR``."""
+
+    return {ticker: SEMI_AI_SECTOR if industries.get(ticker) in SEMI_INDUSTRIES or ticker in AI_COMPANIES else sector
+            for ticker, sector in sectors.items()}
+
+
+# Tone of a story from its words: a finance word list (in the spirit of Loughran-McDonald), not a language model.
+POSITIVE_WORDS = {
+    "beat", "beats", "tops", "topped", "exceeds", "exceeded", "surge", "surges", "surged", "soar", "soars", "soared",
+    "jump", "jumps", "jumped", "rally", "rallies", "rallied", "gain", "gains", "gained", "rise", "rises", "rose",
+    "climb", "climbs", "climbed", "rebound", "rebounds", "rebounded", "upgrade", "upgrades", "upgraded",
+    "outperform", "outperforms", "bullish", "record", "strong", "stronger", "strength", "boost", "boosts", "boosted",
+    "raises", "raised", "lifts", "lifted", "wins", "won", "win", "approval", "approved", "approves", "profit",
+    "profitable", "growth", "grows", "grew", "expands", "expansion", "breakthrough", "optimism", "optimistic",
+    "upbeat", "robust", "accelerates", "accelerating", "higher", "highs", "buyback", "dividend", "partnership",
+    "deal", "best", "surpass", "surpasses", "surpassed", "rising", "soaring", "jumping", "rallying", "gaining",
+    "climbing", "upgrading", "recovers", "recovery", "outpaces", "skyrockets", "rockets", "booming", "boom", "upside",
+}
+NEGATIVE_WORDS = {
+    "miss", "misses", "missed", "fall", "falls", "fell", "drop", "drops", "dropped", "plunge", "plunges", "plunged",
+    "tumble", "tumbles", "tumbled", "sink", "sinks", "sank", "slump", "slumps", "slumped", "slide", "slides", "slid",
+    "decline", "declines", "declined", "downgrade", "downgrades", "downgraded", "lawsuit", "sued", "sues", "probe",
+    "investigation", "recall", "recalls", "loss", "losses", "weak", "weaker", "weakness", "warns", "warning",
+    "layoffs", "layoff", "cuts", "bearish", "selloff", "sell-off", "crash", "crashes", "fear", "fears", "concern",
+    "concerns", "worries", "worry", "delay", "delays", "delayed", "halt", "halts", "fined", "fine", "ban", "bans",
+    "rout", "correction", "worst", "lower", "lowers", "lowered", "bankruptcy", "fraud", "crater", "craters",
+    "cratered", "crumble", "crumbles", "wipes", "wiped", "slashes", "slashed", "underperform", "disappoints",
+    "disappointing", "disappointed", "lags", "lagging", "struggles", "struggling", "risk", "risks", "pressure",
+    "headwinds", "downturn", "recession", "tariff", "tariffs", "sanctions", "shortfall", "collapse", "collapses",
+    "slowdown", "slows", "broken", "falling", "dropping", "plunging", "tumbling", "sinking", "sliding", "slumping",
+    "declining", "plummet", "plummets", "plummeted", "selloffs", "losing", "lost", "volatile", "turmoil",
+}
+NEGATIONS = {"not", "no", "never", "without", "isn't", "wasn't", "doesn't", "didn't", "won't", "fails", "failed"}
+TONES = ["Positive", "Negative", "Neutral"]
+
+
+def tone_score(title, summary=""):
+    """Positive minus negative words, the headline counted twice; a word right after "not", "no" ... counts reversed."""
+
+    score = 0
+    for text, weight in ((title, 2), (summary, 1)):
+        words = re.findall(r"[a-z][a-z'\-]*", str(text or "").lower())
+        for position, word in enumerate(words):
+            sign = 1 if word in POSITIVE_WORDS else -1 if word in NEGATIVE_WORDS else 0
+            if sign and position and words[position - 1] in NEGATIONS:
+                sign = -sign
+            score += weight * sign
+    return score
+
+
+def story_tone(title, summary=""):
+    score = tone_score(title, summary)
+    return "Positive" if score > 0 else "Negative" if score < 0 else "Neutral"
+
+
+def add_tone(frame):
+    """``frame`` with a ``tone`` column (Positive / Negative / Neutral)."""
+
+    frame = frame.copy()
+    frame["tone"] = [story_tone(title, summary) for title, summary in zip(frame["title"], frame["summary"])] \
+        if not frame.empty else pd.Series(dtype=str)
+    return frame
 
 
 def fetch_ticker_news(ticker, count=20):
@@ -220,9 +292,11 @@ def story_card_html(row, now=None, summary_chars=220):
     if len(summary) > summary_chars:
         summary = summary[:summary_chars].rsplit(" ", 1)[0] + "…"
     summary_html = f"<div class='news-summary'>{_text(summary)}</div>" if summary else ""
+    tone = str(row.get("tone") or "").lower()
+    tone_class = f" news-{tone}" if tone in ("positive", "negative") else ""
     return (
         "<div class='news-card'>"
-        f"<a class='news-title' href='{html.escape(str(row.get('url') or ''), quote=True)}' target='_blank' "
+        f"<a class='news-title{tone_class}' href='{html.escape(str(row.get('url') or ''), quote=True)}' target='_blank' "
         f"rel='noopener noreferrer'>{_text(row.get('title'))}</a>"
         f"<div class='news-meta'>{meta}{(' ' + chips) if chips else ''}</div>"
         f"{summary_html}</div>"
@@ -235,6 +309,11 @@ NEWS_CSS = """
 .news-card:last-child {border-bottom: none}
 .news-title {font-weight: 600; font-size: 1rem; line-height: 1.3; text-decoration: none; color: inherit}
 .news-title:hover {text-decoration: underline}
+.news-title.news-positive {color: #16a34a}
+.news-title.news-negative {color: #dc2626}
+.news-tone-head {font-size: 0.85rem; font-weight: 600; margin: 0.6rem 0 0.1rem}
+.news-tone-head.news-positive {color: #16a34a}
+.news-tone-head.news-negative {color: #dc2626}
 .news-meta {font-size: 0.8rem; opacity: 0.7; margin-top: 0.2rem; line-height: 1.6}
 .news-chip {display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 0 0.4rem; margin-right: 0.25rem;
             border-radius: 0.6rem; background: rgba(128,128,128,0.18)}
