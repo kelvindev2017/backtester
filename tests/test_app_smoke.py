@@ -956,7 +956,16 @@ def test_news_tab_groups_stories_by_industry(offline):
     assert "NVDA story 0" in rendered and "&#36;5" in rendered and "<b>" not in rendered
     labels = [expander.label for expander in app.expander if expander.label != "News"]
     # Offline the S&P 500 list is unavailable, so sector leaders fall back to their sector as industry.
+    # Chips and AI are a sector of their own: 8 leaders x 3 stories.
+    assert any(label.startswith("Semiconductors & AI · 24 stories") for label in labels)
     assert any(label.startswith("Information Technology · 18 stories") for label in labels)
+    # Each story's tone colours its headline; the fake stories say "costs", so they are neutral.
+    assert "news-tone-head news-neutral" in rendered
+
+    app.radio(key="news_tone").set_value("Positive")
+    open_tab(app, "News")
+    assert any("No stories match" in element.value for element in app.info)
+    app.radio(key="news_tone").set_value("All")
     assert any(label.startswith("Whole market") for label in labels)
 
     app.radio(key="news_group_by").set_value("Sector")

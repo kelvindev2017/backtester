@@ -2,6 +2,10 @@ import pandas as pd
 
 from analysis.news import (
     MARKET_GROUP,
+    SEMI_AI_SECTOR,
+    add_tone,
+    story_tone,
+    with_semi_ai_sector,
     collect_news,
     filter_news,
     group_news,
@@ -66,3 +70,25 @@ def test_card_and_time_ago():
     card = story_card_html({"title": "Costs $5 <now>", "url": "https://e.com/?a=1&b='2'", "publisher": "Wire",
                             "published": NOW - pd.Timedelta(hours=1), "summary": "x " * 200, "tickers": ["NVDA"]}, NOW)
     assert "&#36;5 &lt;now&gt;" in card and "&#x27;2&#x27;" in card and "NVDA" in card and "…" in card
+
+
+def test_story_tone():
+    assert story_tone("Nvidia beats estimates and raises guidance") == "Positive"
+    assert story_tone("Stocks crater as investors flee tech") == "Negative"
+    assert story_tone("Q3 2026 earnings call transcript") == "Neutral"
+    # A word after "not" counts the other way; the headline outweighs the summary.
+    assert story_tone("Shares did not fall") == "Positive"
+    assert story_tone("Shares jump", "Despite a loss") == "Positive"
+    frame = add_tone(pd.DataFrame({"title": ["Shares plunge"], "summary": [""]}))
+    assert list(frame["tone"]) == ["Negative"]
+    card = story_card_html({"title": "Up", "url": "u", "tone": "Positive"})
+    assert "news-title news-positive" in card
+
+
+def test_semis_and_ai_get_their_own_sector():
+    sectors = {"NVDA": "Information Technology", "AMAT": "Information Technology", "PLTR": "Information Technology",
+               "MSFT": "Information Technology", "JPM": "Financials"}
+    industries = {"NVDA": "Semiconductors", "AMAT": "Semiconductor Materials & Equipment", "MSFT": "Systems Software"}
+    moved = with_semi_ai_sector(sectors, industries)
+    assert [ticker for ticker, sector in moved.items() if sector == SEMI_AI_SECTOR] == ["NVDA", "AMAT", "PLTR"]
+    assert moved["MSFT"] == "Information Technology" and moved["JPM"] == "Financials"
