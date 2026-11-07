@@ -133,6 +133,7 @@ from analysis.screener import (
 )
 from analysis.scoring import COMPONENT_WEIGHTS
 from analysis.supply_chain import (
+    ALL_CHAINS as ALL_SUPPLY_CHAINS,
     CHAINS as SUPPLY_CHAINS,
     COMPANIES as SUPPLY_COMPANIES,
     LEVEL_SHORT_NAMES as SUPPLY_LEVEL_SHORT_NAMES,
@@ -193,6 +194,18 @@ from analysis.what_happened_next import (
     summary_table,
     today_text,
     walkthrough_figure,
+)
+from analysis.news import (
+    MARKET_GROUP as NEWS_MARKET_GROUP,
+    MARKET_SYMBOLS as NEWS_MARKET_SYMBOLS,
+    NEWS_CSS,
+    NEWS_PERIODS,
+    SECTOR_LEADERS,
+    collect_news,
+    filter_news,
+    group_news,
+    story_card_html,
+    time_ago,
 )
 from analysis.universe import (
     MARKETS as SCREENER_MARKETS,
@@ -3185,10 +3198,11 @@ SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
 FUNDAMENTALS_TAB = "Stock Fundamentals"
 ECONOMY_TAB = "Economic analysis"
 JOURNAL_TAB = "Trade Journal"
+NEWS_TAB = "News"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
-TAB_NAMES = [ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB, "Stock Screener", "Backtest",
-             "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
+TAB_NAMES = [NEWS_TAB, "Stock Screener", ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB,
+             "Backtest", "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
@@ -4383,6 +4397,167 @@ def render_supply_chain(index_prices):
     with st.expander("All companies", expanded=not focus):
         columns = ["Company", "Level", "Trend", "Close"] + SUPPLY_NODE_METRICS
         st.dataframe(table[columns].style.format(precision=2), width="stretch")
+
+
+# ============================================================
+# News: page
+# ============================================================
+
+NEWS_UNIVERSES = ["Sector leaders", "S&P 500", "Semicon supply chain", "My tickers"]
+NEWS_GROUPINGS = ["Sector", "Industry"]
+NEWS_LEVEL_GROUPING = "Supply chain level"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_news(tickers):
+    """Latest Yahoo stories for each ticker, merged into one table. Cached for 15 minutes."""
+
+    return collect_news(list(tickers))
+
+
+def news_companies(universe, custom_text):
+    """(tickers, Sector map, Industry map, note) for the companies whose news the tab reads."""
+
+    members, _ = load_universe_members("US", "S&P 500")
+    gics = members.drop_duplicates("Ticker").set_index("Ticker") if not members.empty else pd.DataFrame(columns=["Sector", "Industry"])
+    note = ""
+    if universe == "Sector leaders":
+        sectors = {ticker: sector for sector, tickers in SECTOR_LEADERS.items() for ticker in tickers}
+        tickers = list(sectors)
+    elif universe == "S&P 500":
+        tickers = list(gics.index)
+        sectors = {}
+        if not tickers:
+            note = "The S&P 500 member list could not be loaded, so the sector leaders are shown instead."
+            sectors = {ticker: sector for sector, tickers in SECTOR_LEADERS.items() for ticker in tickers}
+            tickers = list(sectors)
+    elif universe == "Semicon supply chain":
+        tickers, sectors = chain_tickers(ALL_SUPPLY_CHAINS), {}
+    else:
+        tickers, sectors = parse_ticker_list(custom_text), {}
+    industries = {ticker: gics.at[ticker, "Industry"] for ticker in tickers
+                  if ticker in gics.index and str(gics.at[ticker, "Industry"] or "") not in ("", "nan")}
+    for ticker in tickers:
+        if ticker not in sectors and ticker in gics.index and str(gics.at[ticker, "Sector"] or "") not in ("", "nan"):
+            sectors[ticker] = gics.at[ticker, "Sector"]
+    # Companies outside the S&P 500 (ADRs, smaller stocks): Yahoo's own sector and industry.
+    unknown = [ticker for ticker in tickers if ticker not in sectors or ticker not in industries]
+    if unknown and len(unknown) <= 150:
+        with st.spinner("Looking up sectors on Yahoo..."):
+            yahoo = load_fundamental_table(unknown)
+        for ticker in unknown:
+            if ticker in yahoo.index:
+                if ticker not in sectors and yahoo.at[ticker, "Yahoo sector"]:
+                    sectors[ticker] = yahoo.at[ticker, "Yahoo sector"]
+                if ticker not in industries and yahoo.at[ticker, "Yahoo industry"]:
+                    industries[ticker] = yahoo.at[ticker, "Yahoo industry"]
+    for ticker in tickers:
+        sectors.setdefault(ticker, "Other")
+        industries.setdefault(ticker, sectors[ticker])
+    return tickers, sectors, industries, note
+
+
+def supply_chain_levels():
+    """{ticker: supply chain level} over every end market."""
+
+    return {ticker: SUPPLY_LEVELS[index]
+            for index, level in enumerate(SUPPLY_CHAINS[ALL_SUPPLY_CHAINS]["levels"]) for ticker in level}
+
+
+def reset_news_grouping():
+    # A new list of companies starts on its own first grouping (supply chain level for the semicon chain).
+    st.session_state.pop("news_group_by", None)
+    st.session_state.pop("news_pick", None)
+
+
+def refresh_news():
+    load_news.clear()
+
+
+def render_news_group(group, stories, limit, expanded, now):
+    """One industry: a collapsible list of its stories, newest first."""
+
+    latest = stories["published"].max()
+    label = f"{group} · {len(stories)} {'story' if len(stories) == 1 else 'stories'}"
+    if pd.notna(latest):
+        label += f" · latest {time_ago(latest, now)}"
+    with st.expander(label, expanded=expanded):
+        counts = pd.Series([ticker for tickers in stories["tickers"] for ticker in tickers]).value_counts()
+        if len(counts) > 1:
+            st.caption("Most covered: " + ", ".join(f"{ticker} ({count})" for ticker, count in counts.head(6).items()))
+        cards = "".join(story_card_html(row, now) for _, row in stories.head(limit).iterrows())
+        st.markdown(cards, unsafe_allow_html=True)
+        if len(stories) > limit:
+            st.caption(f"{len(stories) - limit} older stories not shown. Raise **Stories per industry** in the settings, "
+                       "or narrow the list with **Search**.")
+
+
+def render_news():
+    """Latest stock news from Yahoo Finance, filed under the industry of each company it is about."""
+
+    with settings_panel("News"):
+        universe = st.selectbox("Companies", NEWS_UNIVERSES, key="news_universe", on_change=reset_news_grouping,
+                                help="Whose news to read. Sector leaders: about 6 of the largest S&P 500 companies "
+                                     "in each sector. S&P 500: every member (the first load takes about a minute).")
+        custom_text = ""
+        if universe == "My tickers":
+            custom_text = st.text_area("Tickers", value="NVDA, TSM, ASML, BESIY, AAPL, JPM, XOM", key="news_tickers",
+                                       help="Comma or space separated Yahoo symbols.")
+        groupings = ([NEWS_LEVEL_GROUPING] if universe == "Semicon supply chain" else []) + NEWS_GROUPINGS
+        if st.session_state.get("news_group_by") not in groupings:
+            st.session_state["news_group_by"] = groupings[0]
+        group_by = st.radio("Group by", groupings, horizontal=True, key="news_group_by",
+                            help="Industry is the GICS sub-industry for S&P 500 members (Yahoo's industry otherwise).")
+        period = st.select_slider("Published in the last", list(NEWS_PERIODS), value="3 days", key="news_period")
+        search = st.text_input("Search", key="news_search", placeholder="e.g. earnings, tariff, NVDA")
+        include_market = st.checkbox("Add whole-market news", value=True, key="news_market",
+                                     help="Stories Yahoo files under the S&P 500 and Nasdaq that are not about "
+                                          "one of the companies above.")
+        limit = st.select_slider("Stories per industry", [5, 10, 20, 50], value=10, key="news_limit")
+        st.button("Refresh news", key="news_refresh_btn", on_click=refresh_news,
+                  help="News is kept for 15 minutes; this fetches it again now.")
+
+    tickers, sectors, industries, note = news_companies(universe, custom_text)
+    if note:
+        st.warning(note)
+    if not tickers:
+        st.info("Enter at least one ticker in the settings.")
+        return
+    groups = {"Sector": sectors, "Industry": industries}.get(group_by)
+    if groups is None:
+        groups = supply_chain_levels()
+    fetch_list = tickers + (NEWS_MARKET_SYMBOLS if include_market else [])
+    with st.spinner(f"Loading news for {len(fetch_list)} symbols..."):
+        news = load_news(tuple(fetch_list))
+    now = pd.Timestamp.now(tz="UTC")
+    shown = filter_news(news, days=NEWS_PERIODS[period], search=search, now=now)
+    grouped = group_news(shown, groups, market_symbols=NEWS_MARKET_SYMBOLS if include_market else [])
+    if NEWS_MARKET_GROUP in grouped and not include_market:
+        grouped.pop(NEWS_MARKET_GROUP)
+    total = len({story_id for part in grouped.values() for story_id in part["id"]})
+    plural = {"Industry": "industries", "Sector": "sectors"}.get(group_by, "levels")
+    st.caption(
+        f"Latest stories from Yahoo Finance for {len(tickers)} companies, filed under the {group_by.lower()} of each "
+        f"company a story is about (a story about companies in two {plural} shows in both). "
+        f"{total} stories in the last {period}. Tap a headline to open it."
+    )
+    if news.empty:
+        st.warning("Yahoo Finance returned no news. It may be rate-limiting; try **Refresh news** in a few minutes.")
+        return
+    if not grouped:
+        st.info("No stories match. Widen **Published in the last** or clear **Search**.")
+        return
+    st.markdown(NEWS_CSS, unsafe_allow_html=True)
+    names = list(grouped)
+    every = f"All {plural}"
+    if st.session_state.get("news_pick") not in [every] + names:
+        st.session_state["news_pick"] = every
+    picked = st.selectbox("Show", [every] + names, key="news_pick",
+                          format_func=lambda name: name if name == every else f"{name} ({len(grouped[name])})",
+                          help="Pick one to show only its news.")
+    picked = None if picked == every else picked
+    for position, group in enumerate([picked] if picked else names):
+        render_news_group(group, grouped[group], limit, expanded=bool(picked) or position < 2, now=now)
 
 
 # ============================================================
@@ -6965,6 +7140,8 @@ if check_password():
                 render_market_analysis(main_index_prices)
             elif label == "Industry Analysis":
                 render_industry_analysis(main_index_prices)
+            elif label == NEWS_TAB:
+                render_news()
             elif label == FUNDAMENTALS_TAB:
                 render_stock_fundamentals()
             elif label == SUPPLY_CHAIN_TAB:

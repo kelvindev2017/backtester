@@ -58,6 +58,14 @@ class FakeTicker:
         self.revenue_estimate = pd.DataFrame({"avg": [12e9, 13e9]}, index=pd.Index(["0q", "+1q"], name="period"))
         self.earnings_estimate = pd.DataFrame({"avg": [2.1, 9.0], "growth": [0.2, 0.25]}, index=["0q", "+1y"])
 
+    def get_news(self, count=10, tab="news"):
+        now = pd.Timestamp.now(tz="UTC")
+        return [{"id": f"{self.symbol}-{n}", "content": {
+            "contentType": "STORY", "title": f"{self.symbol} story {n} costs $5", "summary": "A <b>short</b> summary.",
+            "pubDate": f"{now - pd.Timedelta(hours=5 * n + 1):%Y-%m-%dT%H:%M:%SZ}",
+            "provider": {"displayName": "Wire"}, "canonicalUrl": {"url": f"https://example.com/{self.symbol}/{n}"},
+            "finance": {"stockTickers": [{"symbol": self.symbol}]}}} for n in range(3)]
+
     def get_earnings_dates(self, limit=100):
         # Midnight dates: a time of day between 1 and 2 am lands in the ambiguous hour when DST ends on Nov 1.
         dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=28, freq="QS-FEB", tz="America/New_York")
@@ -97,8 +105,8 @@ def open_tab(app, label):
 
 def test_app_runs_both_tabs(offline):
     app = start_app()
-    assert [tab.label for tab in app.tabs] == ["Economic analysis", "Market Analysis", "Industry Analysis",
-                                               "Stock Fundamentals", "Semicon Supply Chain", "Stock Screener", "Backtest",
+    assert [tab.label for tab in app.tabs] == ["News", "Stock Screener", "Economic analysis", "Market Analysis",
+                                               "Industry Analysis", "Stock Fundamentals", "Semicon Supply Chain", "Backtest",
                                                "Signal Analysis & Trade Plan", "Validate", "Trade Journal"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
@@ -112,7 +120,7 @@ def test_app_runs_both_tabs(offline):
     assert any("Trade plan" in element.value for element in app.subheader)
 
 
-def test_economic_analysis_tab_opens_first(offline, monkeypatch):
+def test_economic_analysis_tab(offline, monkeypatch):
     import analysis.economy
     fred = {
         "CPIAUCSL": pd.Series(np.linspace(250, 320, 120), index=pd.date_range("2016-01-01", periods=120, freq="MS")),
@@ -128,6 +136,9 @@ def test_economic_analysis_tab_opens_first(offline, monkeypatch):
     monkeypatch.setattr(analysis.economy, "fred_series", fake_fred)
     app = start_app()
     assert not app.exception, app.exception
+    # News opens first.
+    assert app.sidebar.header[0].value == "News"
+    app = open_tab(app, "Economic analysis")
     assert app.sidebar.header[0].value == "Economic analysis"
     assert [element.value for element in app.subheader] == ["Asset classes compared", "S&P 500 vs the US economy"]
     assert any("Correlation with Stock (S&P 500)" in str(frame.value.columns) for frame in app.dataframe)
@@ -937,3 +948,25 @@ def test_validate_without_an_optimization_tests_current_settings(offline):
     open_tab(app, "Validate")
     summary = next(frame.value for frame in app.dataframe if "Median forward score" in frame.value.columns)
     assert list(summary["Settings"]) == ["Your current settings", "Buy & hold"]
+
+
+def test_news_tab_groups_stories_by_industry(offline):
+    app = open_tab(start_app(), "News")
+    rendered = " ".join(element.value for element in app.markdown)
+    assert "NVDA story 0" in rendered and "&#36;5" in rendered and "<b>" not in rendered
+    labels = [expander.label for expander in app.expander if expander.label != "News"]
+    # Offline the S&P 500 list is unavailable, so sector leaders fall back to their sector as industry.
+    assert any(label.startswith("Information Technology · 18 stories") for label in labels)
+    assert any(label.startswith("Whole market") for label in labels)
+
+    app.radio(key="news_group_by").set_value("Sector")
+    app.text_input(key="news_search").input("JPM")
+    open_tab(app, "News")
+    labels = [expander.label for expander in app.expander if expander.label != "News"]
+    assert labels and all(label.startswith("Financials") for label in labels)
+
+    app.selectbox(key="news_universe").select("Semicon supply chain")
+    app.text_input(key="news_search").input("")
+    open_tab(app, "News")
+    assert app.radio(key="news_group_by").value == "Supply chain level"
+    assert any(expander.label.startswith("Chips & components") for expander in app.expander)
