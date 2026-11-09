@@ -4188,7 +4188,7 @@ def render_earnings_signals(ticker, releases, valuation, forward_pe, start, log_
         forward_change=change_since_release(forward_pe, releases).loc[start:] if forward_pe is not None else None,
         log_price=log_price, height=600 if MOBILE else None), width="stretch")
     st.caption(
-        "Bold lines mark each earnings release, on the first session that could react (the next day for a release "
+        "Dashed lines mark each earnings release, on the first session that could react (the next day for a release "
         "after the close). Top: the daily close, with a dot at each release (green = EPS beat the analysts' average "
         "estimate, red = missed; a bigger dot is a bigger surprise). Bottom, daily: the last release's EPS surprise %, "
         "held until the next release, and how far the trailing and forward P/E have moved since the close just before "

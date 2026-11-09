@@ -777,7 +777,7 @@ RELEASE_LINE_COLOR = "rgba(40, 40, 40, 0.5)"
 
 def earnings_signal_figure(close, releases, surprise=None, pe_change=None, forward_change=None, log_price=False,
                            height=None):
-    """Daily close over daily earnings signals, with a bold line at every earnings release.
+    """Daily close over daily earnings signals, with a dashed line at every earnings release.
 
     Bottom panel, all daily: ``surprise`` (the latest release's EPS surprise %, held until the next release),
     ``pe_change`` and ``forward_change`` (trailing and forward P/E, % change since the latest release; see
@@ -823,13 +823,13 @@ def earnings_signal_figure(close, releases, surprise=None, pe_change=None, forwa
         fig.layout.annotations[1].text += f" (capped at ±{SIGNAL_AXIS_CAP})"
     fig.update_yaxes(ticksuffix="%", row=2, col=1)
 
-    # A bold line at every release, across both panels, on the first session that could react.
+    # A dashed line at every release, across both panels, on the first session that could react.
     for day in marked["Reaction day"] if not marked.empty else []:
         for row in (1, 2):
             subplot = fig.get_subplot(row, 1)
             fig.add_shape(type="line", x0=day, x1=day, y0=0, y1=1, xref=subplot.xaxis.plotly_name.replace("axis", ""),
                           yref=f"{subplot.yaxis.plotly_name.replace('axis', '')} domain", layer="below",
-                          line=dict(color=RELEASE_LINE_COLOR, width=2))
+                          line=dict(color=RELEASE_LINE_COLOR, width=1.5, dash="dash"))
     fig.update_xaxes(rangeslider_visible=False)
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60))
     legends_under_panels(fig, 2, height)

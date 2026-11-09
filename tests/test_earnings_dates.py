@@ -168,8 +168,8 @@ def test_valuation_changes_and_signal_chart():
     assert names[:2] == ["Close", "Release (green beat, red miss)"]
     assert "EPS surprise % (last release)" in names and "P/E % since release" in names
     assert "Forward P/E % since release" not in names
-    bold = [shape for shape in fig.layout.shapes if shape.line.width == 2]
-    assert len(bold) == 3 * 2  # three releases, two panels
+    dashed = [shape for shape in fig.layout.shapes if shape.line.dash == "dash"]
+    assert len(dashed) == 3 * 2  # three releases, two panels
 
 
 def test_two_releases_on_one_reaction_day():
