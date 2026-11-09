@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pandas as pd
 
 from analysis.news import (
@@ -92,3 +94,17 @@ def test_semis_and_ai_get_their_own_sector():
     moved = with_semi_ai_sector(sectors, industries)
     assert [ticker for ticker, sector in moved.items() if sector == SEMI_AI_SECTOR] == ["NVDA", "AMAT", "PLTR"]
     assert moved["MSFT"] == "Information Technology" and moved["JPM"] == "Financials"
+
+
+def test_tone_matches_hand_labels():
+    # 157 Yahoo stories from Nov 2026, labelled by hand. "tuning" stories were used to build the word list,
+    # "unseen" ones were labelled before any check. Coloured (green/red) labels should rarely be wrong.
+    labels = pd.read_csv(Path(__file__).parent / "data" / "news_tone_labels.csv").fillna("")
+    labels["got"] = [story_tone(title, summary) for title, summary in zip(labels["title"], labels["summary"])]
+    assert (labels["got"] == labels["tone"]).mean() >= 0.8
+    coloured = labels[labels["got"] != "Neutral"]
+    assert (coloured["got"] == coloured["tone"]).mean() >= 0.85
+    # Buying guides and "after the selloff" background no longer colour a story.
+    assert story_tone("5 Best Dow Stocks to Buy for 2027", "The Dow tumbled 3.4% and the S&P 500 fell 4.4%.") == "Neutral"
+    assert story_tone("Micron, AMD and Nvidia Lead AI Stocks Rebound After Historic Selloff") == "Positive"
+    assert story_tone("Intel, Arm, and Marvell Have Each Been Cut in Half Since June. Only 1 Is a Stock I'd Buy Now.") == "Negative"

@@ -96,47 +96,107 @@ def with_semi_ai_sector(sectors, industries):
 
 
 # Tone of a story from its words: a finance word list (in the spirit of Loughran-McDonald), not a language model.
+# Words that only hint at a direction ("best", "dividend", "deal", "higher") are left out, because they show up as
+# often in buying guides and mixed results as in good news.
 POSITIVE_WORDS = {
     "beat", "beats", "tops", "topped", "exceeds", "exceeded", "surge", "surges", "surged", "soar", "soars", "soared",
     "jump", "jumps", "jumped", "rally", "rallies", "rallied", "gain", "gains", "gained", "rise", "rises", "rose",
     "climb", "climbs", "climbed", "rebound", "rebounds", "rebounded", "upgrade", "upgrades", "upgraded",
-    "outperform", "outperforms", "bullish", "record", "strong", "stronger", "strength", "boost", "boosts", "boosted",
-    "raises", "raised", "lifts", "lifted", "wins", "won", "win", "approval", "approved", "approves", "profit",
-    "profitable", "growth", "grows", "grew", "expands", "expansion", "breakthrough", "optimism", "optimistic",
-    "upbeat", "robust", "accelerates", "accelerating", "higher", "highs", "buyback", "dividend", "partnership",
-    "deal", "best", "surpass", "surpasses", "surpassed", "rising", "soaring", "jumping", "rallying", "gaining",
-    "climbing", "upgrading", "recovers", "recovery", "outpaces", "skyrockets", "rockets", "booming", "boom", "upside",
+    "outperform", "outperforms", "outperformance", "bullish", "record", "strong", "stronger", "boost", "boosts",
+    "boosted", "boosting", "raises", "raised", "lifts", "lifted", "wins", "won", "approval", "approved", "approves",
+    "nod", "profitable", "grows", "grew", "expands", "expanding", "expansion", "breakthrough", "optimism",
+    "upbeat", "robust", "accelerates", "accelerating", "surpass", "surpasses", "surpassed", "soaring", "jumping",
+    "rallying", "skyrockets", "rockets", "booming", "invest", "invests", "partnerships", "secures", "riding",
+    "winners", "rebounds", "bounces", "lands",
 }
 NEGATIVE_WORDS = {
     "miss", "misses", "missed", "fall", "falls", "fell", "drop", "drops", "dropped", "plunge", "plunges", "plunged",
     "tumble", "tumbles", "tumbled", "sink", "sinks", "sank", "slump", "slumps", "slumped", "slide", "slides", "slid",
     "decline", "declines", "declined", "downgrade", "downgrades", "downgraded", "lawsuit", "sued", "sues", "probe",
-    "investigation", "recall", "recalls", "loss", "losses", "weak", "weaker", "weakness", "warns", "warning",
-    "layoffs", "layoff", "cuts", "bearish", "selloff", "sell-off", "crash", "crashes", "fear", "fears", "concern",
-    "concerns", "worries", "worry", "delay", "delays", "delayed", "halt", "halts", "fined", "fine", "ban", "bans",
-    "rout", "correction", "worst", "lower", "lowers", "lowered", "bankruptcy", "fraud", "crater", "craters",
-    "cratered", "crumble", "crumbles", "wipes", "wiped", "slashes", "slashed", "underperform", "disappoints",
-    "disappointing", "disappointed", "lags", "lagging", "struggles", "struggling", "risk", "risks", "pressure",
-    "headwinds", "downturn", "recession", "tariff", "tariffs", "sanctions", "shortfall", "collapse", "collapses",
-    "slowdown", "slows", "broken", "falling", "dropping", "plunging", "tumbling", "sinking", "sliding", "slumping",
-    "declining", "plummet", "plummets", "plummeted", "selloffs", "losing", "lost", "volatile", "turmoil",
+    "investigation", "recall", "recalls", "loss", "losses", "losing", "lost", "weak", "weaker", "weakness", "warns",
+    "layoffs", "layoff", "bearish", "selloff", "sell-off", "rout", "crater", "craters", "cratered", "crumble",
+    "crumbles", "wipes", "wiped", "slashes", "slashed", "underperforming", "disappoints", "disappointing", "lags",
+    "struggles", "struggling", "risks", "headwinds", "downturn", "shortfall", "collapse", "collapses", "slowdown",
+    "broken", "falling", "dropping", "plunging", "tumbling", "sinking", "sliding", "slumping", "declining", "plummet",
+    "plummets", "plummeted", "turmoil", "suffer", "suffers", "punished", "fleeing", "squeezing", "bankruptcy", "fraud",
+    "losers", "doubt", "doubts", "trouble", "alarm", "dips", "dipped",
 }
 NEGATIONS = {"not", "no", "never", "without", "isn't", "wasn't", "doesn't", "didn't", "won't", "fails", "failed"}
+# Phrases whose meaning is not in their single words.
+POSITIVE_PHRASES = ["price target raised", "raises price target", "raises guidance", "raises outlook", "all-time high",
+                    "record high", "buy rating", "beat estimates", "beats estimates", "top estimates", "tops estimates",
+                    "view up", "outlook up", "outlook raised", "best day", "back above", "net buyers",
+                    "(lead|leads|move|moves|trade|trades|close|closes|push|pushes) (\\w+ ){0,4}higher"]
+NEGATIVE_PHRASES = ["cut in half", "brick wall", "hit a wall", "price target cut", "cuts price target",
+                    "cuts guidance", "lowers guidance", "cuts outlook", "lowers outlook", "misses estimates",
+                    "sell rating", "lost trillions", "down \\d+%", "off \\d+%", "risks? rise", "worst day",
+                    "falls below", "back below", "net sellers", "could go down",
+                    "(lead|leads|move|moves|trade|trades|close|closes|drag|drags) (\\w+ ){0,4}lower"]
+# Words that look like tone words but are not, in these phrases.
+TONE_FREE_PHRASES = ["weight loss", "loss-making", "misses about", "stop loss", "stop-loss"]
+# Buying guides, comparisons and opinion pieces: about investing in a stock, not news about it.
+NOT_NEWS = re.compile(
+    r"^\s*(top )?\d+ |stocks? to |to buy|buy (now|today|hand)|better (dividend )?stock|"
+    r"\bvs\.? |\bversus\b|should you|what you need to know|here'?s (how|what|why)|is it (time|too late)|"
+    r"stock picks|passive income|strategy|could (cash|gain|go)|bargain|watch list|to watch|reports soon|"
+    r"in the cards|what to expect|misses about|i'?d buy|i'?m buying|i'?ll buy|i would buy|hold (it )?forever|"
+    r"^(do|does|are|is|will|can|could|should|would|has|have|what|why|how)\b.*\?\s*$",
+    re.IGNORECASE,
+)
 TONES = ["Positive", "Negative", "Neutral"]
 
 
-def tone_score(title, summary=""):
-    """Positive minus negative words, the headline counted twice; a word right after "not", "no" ... counts reversed."""
+def _side_counts(text):
+    """(positive, negative) word and phrase counts in ``text``; a word right after "not", "no" ... counts reversed."""
 
-    score = 0
-    for text, weight in ((title, 2), (summary, 1)):
-        words = re.findall(r"[a-z][a-z'\-]*", str(text or "").lower())
-        for position, word in enumerate(words):
-            sign = 1 if word in POSITIVE_WORDS else -1 if word in NEGATIVE_WORDS else 0
-            if sign and position and words[position - 1] in NEGATIONS:
-                sign = -sign
-            score += weight * sign
-    return score
+    text = str(text or "").lower()
+    for phrase in TONE_FREE_PHRASES:
+        text = text.replace(phrase, " ")
+    positive = negative = 0
+    # Count a phrase once, then blank it out so its words are not counted again.
+    for phrases, side in ((POSITIVE_PHRASES, 1), (NEGATIVE_PHRASES, -1)):
+        for phrase in phrases:
+            found = len(re.findall(phrase, text))
+            if found:
+                text = re.sub(phrase, " ", text)
+                positive += found * (side > 0)
+                negative += found * (side < 0)
+    words = re.findall(r"[a-z][a-z'\-]*", text)
+    for position, word in enumerate(words):
+        sign = 1 if word in POSITIVE_WORDS else -1 if word in NEGATIVE_WORDS else 0
+        if sign and position and words[position - 1] in NEGATIONS:
+            sign = -sign
+        positive += sign > 0
+        negative += sign < 0
+    return positive, negative
+
+
+def tone_score(title, summary=""):
+    """Positive minus negative, read from the headline.
+
+    The summary only decides when the headline has no tone words at all, and then only with a clear margin (2+),
+    because summaries often describe the market around a story rather than the story. A headline with words on
+    both sides ("earnings miss, revenue beats"), a buying guide or an opinion piece scores 0 (neutral).
+    """
+
+    title = str(title or "")
+    lowered = title.lower()
+    has_phrase = any(re.search(phrase, lowered) for phrase in POSITIVE_PHRASES + NEGATIVE_PHRASES)
+    # A buying guide is neutral unless its headline also reports a clear event ("cut in half", "down 20%").
+    if NOT_NEWS.search(title) and not has_phrase:
+        return 0
+    # "X rebounds after selloff": what happened before "after" / "following" / "despite" is only background.
+    lead = re.split(r"\b(?:after|following|despite)\b", title, maxsplit=1, flags=re.IGNORECASE)[0]
+    positive, negative = _side_counts(lead)
+    if not (positive or negative):
+        positive, negative = _side_counts(title)
+    if positive and negative:
+        return 0
+    if positive or negative:
+        return positive - negative
+    positive, negative = _side_counts(summary)
+    score = positive - negative
+    return score if abs(score) >= 2 and not (positive and negative and min(positive, negative) * 2 > max(positive, negative)) else 0
 
 
 def story_tone(title, summary=""):
