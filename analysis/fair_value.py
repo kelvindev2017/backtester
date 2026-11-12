@@ -64,6 +64,19 @@ CASH_FLOW_ROWS = {
 }
 COST_LINES = ["Cost of sales", "R&D", "SG&A"]
 
+# US over-the-counter ADRs whose home listing has fuller data in the company's own currency:
+# ADR -> (home listing, home shares per ADR).
+HOME_LISTINGS = {
+    "ASMVY": ("0522.HK", 3.0),
+    "BESIY": ("BESI.AS", 1.0),
+}
+
+
+def home_listing(ticker):
+    """(home listing, home shares per ADR) for an ADR in HOME_LISTINGS, else None."""
+
+    return HOME_LISTINGS.get((ticker or "").upper())
+
 
 def _finite(value):
     try:
@@ -215,13 +228,29 @@ def quality_flags(quality):
 
 
 def run_rate_eps(frame, column="Adjusted net income"):
-    """Four times the latest quarter's per-share profit (``column`` / diluted shares), or None."""
+    """Four times the latest quarter's per-share profit (``column`` / diluted shares), or None.
+
+    When the latest quarter has only its reported EPS (Yahoo's data for Hong Kong listings), that EPS is used.
+    """
 
     rows = frame[[column, "Shares"]].dropna()
     rows = rows.loc[rows["Shares"] > 0]
+    eps = frame["Diluted EPS"].dropna() if "Diluted EPS" in frame else pd.Series(dtype=float)
+    if not eps.empty and (rows.empty or eps.index[-1] > rows.index[-1]):
+        return _finite(eps.iloc[-1] * 4)
     if rows.empty:
         return None
     return _finite(rows[column].iloc[-1] / rows["Shares"].iloc[-1] * 4)
+
+
+def analyst_operating_margin(revenue_estimate, eps_estimate, shares, net_share_pct):
+    """Operating margin implied by analysts' next-year EPS and revenue: EPS x shares / revenue, grossed up
+    from net to operating profit with ``net_share_pct``. None when an input is missing."""
+
+    revenue_estimate, eps_estimate, shares = _finite(revenue_estimate), _finite(eps_estimate), _finite(shares)
+    if not revenue_estimate or eps_estimate is None or not shares or not net_share_pct:
+        return None
+    return eps_estimate * shares / revenue_estimate * 100 / (net_share_pct / 100)
 
 
 def run_rate_pe(price, eps):
@@ -233,7 +262,7 @@ def run_rate_pe(price, eps):
     return price / eps
 
 
-def default_scenarios(frame, analyst_growth=None):
+def default_scenarios(frame, analyst_growth=None, base_margin=None):
     """Bear / base / bull starting assumptions for next year from the reported periods.
 
     Base: analysts' next-year revenue growth when known (else half the latest year-on-year growth), at the
@@ -241,11 +270,16 @@ def default_scenarios(frame, analyst_growth=None):
     years. Bull: growth 1.7 times the base at three points more margin. "Multiple +/-" is each case's P/E
     against the acceptable multiple: 3 lower for the bear case and 5 higher for the bull case (14x / 17x / 22x
     in the worked example).
+
+    ``base_margin`` (analysts' implied margin, used when the reported figures are stale) replaces the latest
+    margin; the bear case is then 5 points lower.
     """
 
     margins = common_size(frame).get("Operating margin", pd.Series(dtype=float)).dropna()
     latest_margin = float(margins.iloc[-1]) if not margins.empty else 10.0
     low_margin = float(margins.iloc[-8:].min()) if not margins.empty else latest_margin - 5
+    if _finite(base_margin) is not None:
+        latest_margin, low_margin = float(base_margin), float(base_margin) - 5
     growth = _finite(analyst_growth)
     if growth is None:
         recent = yoy_growth(frame["Revenue"])

@@ -104,11 +104,13 @@ from analysis.fair_value import (
     SCENARIO_COLUMNS,
     SCENARIOS,
     acceptable_multiple,
+    analyst_operating_margin,
     common_size,
     default_risks,
     default_scenarios,
     earnings_quality,
     earnings_risks,
+    home_listing,
     market_check,
     multiple_deductions,
     net_from_operating,
@@ -4413,9 +4415,11 @@ def peer_row(peer):
         return row
     snapshot = load_fundamental_snapshot(peer)
     rate = exchange_rate(snapshot.get("financialCurrency"), snapshot.get("currency")) or 1.0
-    eps = run_rate_eps(frame) if periods == 4 else (
-        earnings_quality(frame, 1).get("Adjusted net income") or np.nan) / frame["Shares"].dropna().iloc[-1] \
-        if frame["Shares"].notna().any() else None
+    # Hong Kong listings have recent quarterly EPS but only yearly revenue: use the quarters for the run rate.
+    quarters = period_frame(statements.get("quarterly"), statements.get("quarterly_cash"))
+    eps = run_rate_eps(quarters) if not quarters.empty else None
+    if eps is None and periods == 1 and frame["Shares"].notna().any():
+        eps = (earnings_quality(frame, 1).get("Adjusted net income") or np.nan) / frame["Shares"].dropna().iloc[-1]
     pe = run_rate_pe(close.iloc[-1], eps * rate if eps else None)
     growth = yoy_growth(frame["Revenue"]) if periods == 4 else frame["Revenue"].dropna().pct_change() * 100
     shares = common_size(frame)
@@ -4425,6 +4429,16 @@ def peer_row(peer):
                 if "Gross margin" in shares and shares["Gross margin"].notna().any() else None,
                 "Quarter": frame.index[-1].strftime("%Y-%m-%d")})
     return row
+
+
+def analyst_estimate(estimates, period, column="avg"):
+    """One cell of Yahoo's analyst estimate table (rows 0q, +1q, 0y, +1y), or None."""
+
+    try:
+        value = float(estimates.at[period, column])
+    except Exception:
+        return None
+    return value if np.isfinite(value) else None
 
 
 def fair_value_store(name, ticker, default):
@@ -4477,8 +4491,15 @@ def render_fair_value():
     """Risk-adjusted earnings times an acceptable multiple, against today's price (analysis.fair_value)."""
 
     with settings_panel("Stock"):
-        ticker = st.text_input("Ticker", value="NVDA", key="fair_value_ticker",
-                               help="Any Yahoo symbol with financial statements, e.g. NVDA, TSM, ASMVY.").strip().upper()
+        entered = st.text_input("Ticker", value="NVDA", key="fair_value_ticker",
+                                help="Any Yahoo symbol with financial statements, e.g. NVDA, TSM, ASMVY, 0522.HK, "
+                                     "BESI.AS.").strip().upper()
+        home = home_listing(entered)
+        use_home = home is not None and st.checkbox(
+            f"Use the home listing {home[0]}" if home else "Use the home listing", value=True,
+            key=f"fair_value_home_{entered}",
+            help="The home exchange has fuller figures and shows them in the company's own currency.")
+        ticker = home[0] if use_home else entered
         peers_text = st.text_input("Peers (comma-separated)", value="", key=f"fair_value_peers_{ticker}",
                                    help="Companies that do similar work. Their average run-rate P/E is where the "
                                         "acceptable multiple starts.")
@@ -4507,18 +4528,25 @@ def render_fair_value():
         st.warning(f"Yahoo Finance has no revenue figures for {ticker}.")
         return
     name = snapshot.get("shortName")
-    st.subheader(f"{ticker} · {name}" if name else ticker)
+    st.subheader((f"{entered} → {ticker}" if use_home else ticker) + (f" · {name}" if name else ""))
+    revenue_estimates = load_revenue_estimates(ticker)
+    eps_estimates = load_earnings_estimates(ticker)
     age_days = (pd.Timestamp(date.today()) - frame.index[-1]).days
-    if age_days > 200:
+    stale = age_days > 200
+    current_year_revenue = analyst_estimate(revenue_estimates, "0y")
+    if stale:
         st.warning(
-            f"Yahoo's latest figures for {ticker} are for the {period_label} to {frame.index[-1]:%d %b %Y}, "
-            f"{age_days // 30} months old (common for companies that file outside the US). Type newer revenue, "
-            "shares and margins from the company's latest results into Earnings inputs and the scenarios below."
+            f"Yahoo's latest revenue figures for {ticker} are for the {period_label} to {frame.index[-1]:%d %b %Y}, "
+            f"{age_days // 30} months old (common for companies that file outside the US). "
+            + ("The starting revenue and base-case margin come from analysts' estimates instead. "
+               if current_year_revenue else "")
+            + "Type figures from the company's latest results into Earnings inputs and the scenarios to override."
         )
 
     price_currency = snapshot.get("currency") or ""
     statement_currency = snapshot.get("financialCurrency") or price_currency
-    foreign = (statement_currency != price_currency) or (len(ticker) == 5 and ticker.endswith(("Y", "F")))
+    foreign = (use_home or statement_currency != price_currency
+               or (len(entered) == 5 and entered.endswith(("Y", "F"))))
     quality = earnings_quality(frame, periods)
     annual = statements.get("annual")
     price = float(close.iloc[-1])
@@ -4535,12 +4563,14 @@ def render_fair_value():
                                 key=f"fair_value_ratio_{ticker}",
                                 help="Leave at 1 when the diluted shares under Earnings inputs are already counted "
                                      "in traded shares. Yahoo often does that for ADRs: for ASMVY it shows about "
-                                     "140M shares, which is 418M Hong Kong shares / 3. If you type the company's own "
-                                     "share count instead, set the ratio (3 for ASMVY).")
+                                     "140M shares, which is 418M Hong Kong shares / 3. Simpler: use the home "
+                                     "listing (0522.HK for ASMPT, BESI.AS for BESI), where it is always 1.")
     per_share = rate * ratio
 
     # ---- Peers and the starting multiple (computed first: the scenarios and values use it)
     peers = [p.strip().upper() for p in peers_text.replace(";", ",").split(",") if p.strip()]
+    if use_home:
+        peers = [home_listing(peer)[0] if home_listing(peer) else peer for peer in peers]
     peer_table = pd.DataFrame([peer_row(peer) for peer in peers]) if peers else pd.DataFrame()
     peer_pes = pd.to_numeric(peer_table.get("Run-rate P/E", pd.Series(dtype=float)), errors="coerce")
     peer_pes = peer_pes.loc[(peer_pes > 0) & (peer_pes < 200)]
@@ -4626,13 +4656,18 @@ def render_fair_value():
 
     # ---- 5. Scenarios
     st.markdown("#### 5. Scenarios and risk-adjusted earnings")
-    analyst_growth = None
-    try:
-        analyst_growth = float(load_revenue_estimates(ticker).at["+1y", "growth"]) * 100
-    except Exception:
-        analyst_growth = None
-    base_revenue_default = quality.get("Revenue") or float(revenue.iloc[-1])
-    shares_default = float(frame["Shares"].dropna().iloc[-1]) if frame["Shares"].notna().any() else 0.0
+    analyst_growth = analyst_estimate(revenue_estimates, "+1y", "growth")
+    analyst_growth = analyst_growth * 100 if analyst_growth is not None else None
+    use_estimates = stale and current_year_revenue is not None
+    if use_estimates:
+        trailing_label = "analysts' estimate for this fiscal year"
+    base_revenue_default = current_year_revenue if use_estimates else (quality.get("Revenue") or
+                                                                        float(revenue.iloc[-1]))
+    # The latest share count can be in quarters whose revenue Yahoo lacks (Hong Kong listings).
+    quarter_shares = period_frame(statements.get("quarterly"), statements.get("quarterly_cash")).get("Shares")
+    all_shares = pd.concat([frame["Shares"], quarter_shares]).dropna().sort_index() \
+        if quarter_shares is not None else frame["Shares"].dropna()
+    shares_default = float(all_shares.iloc[-1]) if not all_shares.empty else 0.0
     sbc_default = quality.get("Share-based pay") or 0.0
     with st.expander("Earnings inputs", expanded=False):
         base_revenue = st.number_input(
@@ -4647,13 +4682,21 @@ def render_fair_value():
         sbc = st.number_input(f"Share-based pay next year ({statement_currency}, millions)", min_value=0.0,
                               value=round(sbc_default / 1e6, 1), step=1.0, key=f"fair_value_sbc_{ticker}") * 1e6
     st.caption(
-        "Next 12 months from the latest results. Revenue = starting revenue x (1 + growth); operating profit = "
+        ("Next fiscal year, from analysts' revenue estimate for this one. " if use_estimates else
+         "Next 12 months from the latest results. ")
+        + "Revenue = starting revenue x (1 + growth); operating profit = "
         "revenue x margin; EPS after share-based pay deducts the pay before dividing by the shares. "
         "\"Multiple +/-\" is each case's P/E against the acceptable multiple."
         + (f" The base case starts from analysts' next-year revenue growth ({analyst_growth:+.1f}%)."
            if analyst_growth is not None else "")
     )
-    scenarios = fair_value_store("scenarios", ticker, lambda: default_scenarios(frame, analyst_growth))
+    base_margin = analyst_operating_margin(analyst_estimate(revenue_estimates, "+1y"),
+                                           analyst_estimate(eps_estimates, "+1y"), shares, net_share) \
+        if use_estimates else None
+    if base_margin is not None:
+        st.caption(f"Base-case operating margin {base_margin:.1f}%: analysts' next-year EPS x shares / their "
+                   f"revenue estimate, grossed up from net to operating profit at {net_share:.0f}%.")
+    scenarios = fair_value_store("scenarios", ticker, lambda: default_scenarios(frame, analyst_growth, base_margin))
     scenarios = fair_value_editor(
         "scenarios", ticker, scenarios, num_rows="fixed",
         column_config={
@@ -4686,7 +4729,8 @@ def render_fair_value():
         })
         st.caption("Run-rate P/E = price / (4 x the latest quarter's adjusted EPS), in the price's currency. "
                    "Fiscal quarters and adjusted figures differ between companies, so check the outliers.")
-    own_eps = run_rate_eps(frame) if periods == 4 else None
+    own_quarters = period_frame(statements.get("quarterly"), statements.get("quarterly_cash"))
+    own_eps = run_rate_eps(own_quarters) if not own_quarters.empty else None
     own_pe = run_rate_pe(price, own_eps * per_share if own_eps else None)
     start_default = round(peer_average, 1) if peer_average else FAIR_VALUE_DEFAULT_MULTIPLE
     start = st.number_input("Starting P/E", min_value=1.0, max_value=200.0, value=float(start_default), step=0.5,
@@ -4749,6 +4793,14 @@ def render_fair_value():
                         else None)
         low, high = values["Value per share"].min(), values["Value per share"].max()
         tiles[2].metric("Bear to bull", f"{low:,.0f} to {high:,.0f}" if pd.notna(low) and pd.notna(high) else "n/a")
+        if use_home:
+            adr_close = recent_close(entered, days=14)
+            adr_currency = load_fundamental_snapshot(entered).get("currency") or "USD"
+            to_adr = exchange_rate(price_currency, adr_currency)
+            if not adr_close.empty and to_adr and risk_adjusted["Value per share"] is not None:
+                st.caption(f"Per {entered} ADR ({home[1]:g} {ticker} share{'s' if home[1] != 1 else ''}): about "
+                           f"{money(risk_adjusted['Value per share'] * home[1] * to_adr, adr_currency)} against "
+                           f"{money(float(adr_close.iloc[-1]), adr_currency)} on {adr_close.index[-1]:%d %b}.")
         st.caption(
             f"Risk-adjusted EPS {money(risk_adjusted['EPS'], statement_currency)} (after share-based pay) x "
             f"{acceptable:.1f}x acceptable P/E. Statements to {period_end:%d %b %Y}, price {price_date:%d %b %Y}"

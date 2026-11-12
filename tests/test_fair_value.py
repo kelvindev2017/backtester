@@ -155,3 +155,23 @@ def test_foreign_filer_with_empty_quarters_keeps_reported_periods():
     frame = period_frame(income, cash)
     assert len(frame) == 3
     assert earnings_quality(frame)["Reported net income"] is None
+
+
+def test_adrs_use_their_home_listing_and_hong_kong_quarters_give_a_run_rate():
+    from analysis.fair_value import analyst_operating_margin, home_listing
+
+    assert home_listing("asmvy") == ("0522.HK", 3.0)
+    assert home_listing("BESIY") == ("BESI.AS", 1.0)
+    assert home_listing("NVDA") is None
+    # Yahoo's Hong Kong quarters carry EPS and shares but no revenue: the newest EPS sets the run rate.
+    income, cash = quarters(5)
+    income.loc["Total Revenue", income.columns[:3]] = np.nan
+    income.loc["Normalized Income", income.columns[:3]] = np.nan
+    income.loc["Diluted EPS", income.columns[0]] = 1.27
+    assert run_rate_eps(period_frame(income, cash)) == pytest.approx(5.08)
+    # Analysts' HK$6.06 EPS on 419M shares and HK$23.0B revenue is a 11% net margin, 20% operating at 55%.
+    margin = analyst_operating_margin(23.0e9, 6.06, 419e6, 55.0)
+    assert margin == pytest.approx(20.07, abs=0.01)
+    assert analyst_operating_margin(None, 6.06, 419e6, 55.0) is None
+    scenarios = default_scenarios(period_frame(*quarters()), analyst_growth=43.8, base_margin=margin)
+    assert scenarios["Operating margin %"].tolist() == [15.1, 20.1, 23.1]

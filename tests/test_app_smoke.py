@@ -460,6 +460,12 @@ def test_fair_value_tab(offline, monkeypatch):
     assert before != after
     assert any(element.value.startswith("Parked") for element in app.caption)
 
+    # An OTC ADR switches to its home listing, in the home currency, with the ADR value alongside.
+    next(box for box in app.text_input if box.key == "fair_value_ticker").input("ASMVY")
+    open_tab(app, "Fair Value")
+    assert app.subheader[0].value.startswith("ASMVY → 0522.HK")
+    assert any(box.key == "fair_value_home_ASMVY" and box.value for box in app.checkbox)
+
 
 def test_supply_chain_tab(offline, monkeypatch):
     monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
