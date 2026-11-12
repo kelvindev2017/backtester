@@ -106,7 +106,8 @@ def open_tab(app, label):
 def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["News", "Stock Screener", "Economic analysis", "Market Analysis",
-                                               "Industry Analysis", "Stock Fundamentals", "Semicon Supply Chain", "Backtest",
+                                               "Industry Analysis", "Stock Fundamentals", "Fair Value", "Semicon Supply Chain",
+                                               "Backtest",
                                                "Signal Analysis & Trade Plan", "Validate", "Trade Journal"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
@@ -409,6 +410,61 @@ class FakeTickerWithRevenue(FakeTicker):
         self.quarterly_income_stmt = pd.DataFrame(
             [np.linspace(8e9, 11e9, 8), np.linspace(2e9, 3e9, 8)], index=["Total Revenue", "Net Income"], columns=quarters
         )
+
+
+class FakeTickerWithStatements(FakeTicker):
+    def __init__(self, symbol):
+        super().__init__(symbol)
+        quarters = pd.date_range(end=pd.Timestamp.today(), periods=8, freq="QE")[::-1]
+        revenue = np.linspace(11e9, 8e9, 8)
+        self.quarterly_income_stmt = pd.DataFrame(
+            [revenue, revenue * 0.55, revenue * 0.45, revenue * 0.1, revenue * 0.12, revenue * 0.23, revenue * 0.23,
+             revenue * 0.04, revenue * 0.18, revenue * 0.19, [-1e8, 0, -2e8, 0, 0, 0, 0, 0], revenue * 0.18 / 1e9,
+             [1e9] * 8],
+            index=["Total Revenue", "Cost Of Revenue", "Gross Profit", "Research And Development",
+                   "Selling General And Administration", "Operating Income", "Pretax Income", "Tax Provision",
+                   "Net Income", "Normalized Income", "Total Unusual Items", "Diluted EPS", "Diluted Average Shares"],
+            columns=quarters)
+        self.quarterly_cashflow = pd.DataFrame([revenue * 0.01, revenue * 0.2],
+                                               index=["Stock Based Compensation", "Operating Cash Flow"],
+                                               columns=quarters)
+        self.revenue_estimate = pd.DataFrame({"avg": [12e9, 13e9, 45e9, 50e9], "growth": [0.1, 0.1, 0.15, 0.12]},
+                                             index=pd.Index(["0q", "+1q", "0y", "+1y"], name="period"))
+
+
+def test_fair_value_tab(offline, monkeypatch):
+    monkeypatch.setattr(yf, "Ticker", FakeTickerWithStatements)
+    app = open_tab(start_app(), "Fair Value")
+    assert app.sidebar.header[0].value == "Fair Value"
+    assert app.subheader[0].value == "NVDA"
+    headings = " ".join(element.value for element in app.markdown)
+    for section in ["1. Where the income comes from", "2. Costs and margins", "3. EBITDA and earnings quality",
+                    "4. Risk register", "5. Scenarios", "6. Acceptable multiple", "7. What the market prices in"]:
+        assert section in headings
+    assert "Risk-adjusted value" in [metric.label for metric in app.metric]
+    # Base case starts from analysts' +12% next-year revenue growth.
+    assert any("analysts' next-year revenue growth (+12.0%)" in element.value for element in app.caption)
+    assert any("recur" in element.value for element in app.markdown)
+
+    # Peers set the starting multiple.
+    next(box for box in app.text_input if box.key == "fair_value_peers_NVDA").input("AMD, AVGO")
+    open_tab(app, "Fair Value")
+    assert any("Peer average run-rate P/E" in element.value for element in app.caption)
+    assert any(list(frame.value.columns[:2]) == ["Peer", "Run-rate P/E"] for frame in app.dataframe)
+
+    # A higher materiality bar parks the medium risks, so the acceptable multiple goes up.
+    before = next(element.value for element in app.caption if "acceptable**" in element.value)
+    next(slider for slider in app.select_slider if slider.key == "fair_value_bar").set_value("High")
+    open_tab(app, "Fair Value")
+    after = next(element.value for element in app.caption if "acceptable**" in element.value)
+    assert before != after
+    assert any(element.value.startswith("Parked") for element in app.caption)
+
+    # An OTC ADR switches to its home listing, in the home currency, with the ADR value alongside.
+    next(box for box in app.text_input if box.key == "fair_value_ticker").input("ASMVY")
+    open_tab(app, "Fair Value")
+    assert app.subheader[0].value.startswith("ASMVY → 0522.HK")
+    assert any(box.key == "fair_value_home_ASMVY" and box.value for box in app.checkbox)
 
 
 def test_supply_chain_tab(offline, monkeypatch):

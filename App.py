@@ -97,6 +97,36 @@ from analysis.patterns import (
     rule_condition,
 )
 from analysis.risk import RiskSettings
+from analysis.fair_value import (
+    DESTINATIONS as RISK_DESTINATIONS,
+    IMPACTS as RISK_IMPACTS,
+    RISK_COLUMNS,
+    SCENARIO_COLUMNS,
+    SCENARIOS,
+    acceptable_multiple,
+    analyst_operating_margin,
+    common_size,
+    default_risks,
+    default_scenarios,
+    earnings_quality,
+    earnings_risks,
+    home_listing,
+    market_check,
+    multiple_deductions,
+    net_from_operating,
+    operating_leverage,
+    period_frame,
+    run_rate_eps,
+    run_rate_pe,
+    scenario_earnings,
+    sensitivity,
+    suggested_deductions,
+    triage,
+    valuation as fair_valuation,
+    weighted as weighted_scenarios,
+    yoy_growth,
+)
+from analysis.fair_value_chart import income_figure, margin_figure, value_figure
 from analysis.rule_diagrams import (
     breakout_figure,
     day_breakout_figure,
@@ -2121,6 +2151,7 @@ def fetch_fundamental_snapshot(symbol):
         "trailingPE", "forwardPE", "pegRatio", "trailingPegRatio", "earningsGrowth",
         "revenueGrowth", "profitMargins", "priceToBook", "debtToEquity", "sector", "industry", "shortName",
         "nextFiscalYearEnd", "earningsTimestamp", "earningsTimestampStart", "isEarningsDateEstimate",
+        "currency", "financialCurrency", "quoteType", "exchange",
     ]
     info = yf.Ticker(symbol).info or {}
     snapshot = {key: info.get(key) for key in keys if info.get(key) is not None}
@@ -3199,13 +3230,14 @@ def index_membership(market, tickers):
 
 SUPPLY_CHAIN_TAB = "Semicon Supply Chain"
 FUNDAMENTALS_TAB = "Stock Fundamentals"
+FAIR_VALUE_TAB = "Fair Value"
 ECONOMY_TAB = "Economic analysis"
 JOURNAL_TAB = "Trade Journal"
 NEWS_TAB = "News"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
-TAB_NAMES = [NEWS_TAB, "Stock Screener", ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB,
-             "Backtest", "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
+TAB_NAMES = [NEWS_TAB, "Stock Screener", ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB,
+             FAIR_VALUE_TAB, SUPPLY_CHAIN_TAB, "Backtest", "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
@@ -4304,6 +4336,478 @@ def render_stock_fundamentals():
     if render_fundamentals(ticker, years, log_price, link_dates) is False:
         return
     render_what_happened_next(ticker, years, frequency, look_ahead, lookback_years, band)
+
+
+FAIR_VALUE_DEFAULT_MULTIPLE = 20.0
+FAIR_VALUE_PRICE_DAYS = 400
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_statements(symbol):
+    """Yahoo's quarterly and annual income and cash-flow statements; raises when all are empty so a failure
+    is not cached."""
+
+    stock = yf.Ticker(symbol)
+    statements = {
+        "quarterly": first_available_statement(stock, ["quarterly_income_stmt", "quarterly_financials"]),
+        "quarterly_cash": first_available_statement(stock, ["quarterly_cashflow", "quarterly_cash_flow"]),
+        "annual": first_available_statement(stock, ["income_stmt", "financials"]),
+        "annual_cash": first_available_statement(stock, ["cashflow", "cash_flow"]),
+    }
+    if all(statement.empty for statement in statements.values()):
+        raise ValueError(f"Yahoo returned no financial statements for {symbol}")
+    return statements
+
+
+def load_statements(symbol):
+    try:
+        return fetch_statements(symbol)
+    except Exception:
+        return {}
+
+
+def recent_close(symbol, days=FAIR_VALUE_PRICE_DAYS):
+    """Daily closes for the last ``days`` days, or an empty Series."""
+
+    today = pd.Timestamp(date.today())
+    prices = load_data(symbol, (today - pd.Timedelta(days=days)).strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"),
+                       "Daily")
+    if prices is None or prices.empty or "Close" not in prices:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(prices["Close"], errors="coerce").dropna()
+
+
+def exchange_rate(source, target):
+    """Latest ``source``->``target`` rate from Yahoo (e.g. HKD->USD), 1.0 for the same currency, or None."""
+
+    if not source or not target:
+        return None
+    if source == target:
+        return 1.0
+    rates = recent_close(f"{source}{target}=X", days=14)
+    return float(rates.iloc[-1]) if not rates.empty else None
+
+
+def statement_basis(statements):
+    """The periods the tab works from: quarters when Yahoo has at least four with revenue, otherwise full
+    years (many foreign filers). Returns (frame, periods per trailing year, label)."""
+
+    quarters = period_frame(statements.get("quarterly"), statements.get("quarterly_cash"))
+    if not quarters.empty and quarters["Revenue"].notna().sum() >= 4:
+        return quarters, 4, "quarter"
+    years = period_frame(statements.get("annual"), statements.get("annual_cash"))
+    if not years.empty and years["Revenue"].notna().any():
+        return years, 1, "year"
+    return quarters, 4, "quarter"
+
+
+def peer_row(peer):
+    """One peer's run-rate P/E (price over four times its latest quarter's adjusted EPS, converted to the
+    price currency), latest revenue growth and gross margin."""
+
+    statements = load_statements(peer)
+    close = recent_close(peer, days=14)
+    row = {"Peer": peer, "Run-rate P/E": None, "Revenue YoY %": None, "Gross margin %": None, "Quarter": None}
+    if not statements or close.empty:
+        return row
+    frame, periods, _ = statement_basis(statements)
+    if frame.empty:
+        return row
+    snapshot = load_fundamental_snapshot(peer)
+    rate = exchange_rate(snapshot.get("financialCurrency"), snapshot.get("currency")) or 1.0
+    # Hong Kong listings have recent quarterly EPS but only yearly revenue: use the quarters for the run rate.
+    quarters = period_frame(statements.get("quarterly"), statements.get("quarterly_cash"))
+    eps = run_rate_eps(quarters) if not quarters.empty else None
+    if eps is None and periods == 1 and frame["Shares"].notna().any():
+        eps = (earnings_quality(frame, 1).get("Adjusted net income") or np.nan) / frame["Shares"].dropna().iloc[-1]
+    pe = run_rate_pe(close.iloc[-1], eps * rate if eps else None)
+    growth = yoy_growth(frame["Revenue"]) if periods == 4 else frame["Revenue"].dropna().pct_change() * 100
+    shares = common_size(frame)
+    row.update({"Run-rate P/E": pe,
+                "Revenue YoY %": float(growth.dropna().iloc[-1]) if not growth.dropna().empty else None,
+                "Gross margin %": float(shares["Gross margin"].dropna().iloc[-1])
+                if "Gross margin" in shares and shares["Gross margin"].notna().any() else None,
+                "Quarter": frame.index[-1].strftime("%Y-%m-%d")})
+    return row
+
+
+def analyst_estimate(estimates, period, column="avg"):
+    """One cell of Yahoo's analyst estimate table (rows 0q, +1q, 0y, +1y), or None."""
+
+    try:
+        value = float(estimates.at[period, column])
+    except Exception:
+        return None
+    return value if np.isfinite(value) else None
+
+
+def fair_value_store(name, ticker, default):
+    """A table the user edits for ``ticker`` (scenarios or risks), kept in Session State per ticker."""
+
+    store = st.session_state.setdefault(f"fair_value_{name}", {})
+    if ticker not in store:
+        store[ticker] = default() if callable(default) else default
+    return store[ticker]
+
+
+def save_fair_value_table(name, ticker, table):
+    st.session_state.setdefault(f"fair_value_{name}", {})[ticker] = table
+    versions = st.session_state.setdefault(f"fair_value_{name}_version", {})
+    # A new editor key each time, so the grid starts from the stored table rather than replaying old edits.
+    versions[ticker] = versions.get(ticker, 0) + 1
+
+
+def reset_fair_value_tables(ticker):
+    for name in ["scenarios", "risks"]:
+        st.session_state.setdefault(f"fair_value_{name}", {}).pop(ticker, None)
+        versions = st.session_state.setdefault(f"fair_value_{name}_version", {})
+        versions[ticker] = versions.get(ticker, 0) + 1
+
+
+def fair_value_editor(name, ticker, table, **kwargs):
+    """``st.data_editor`` over a stored table; an edit is stored and the tab reruns from it."""
+
+    version = st.session_state.get(f"fair_value_{name}_version", {}).get(ticker, 0)
+    edited = st.data_editor(table, key=f"fair_value_{name}_{ticker}_{version}_table", width="stretch", **kwargs)
+    if not edited.astype(str).equals(table.astype(str)):
+        save_fair_value_table(name, ticker, edited)
+        st.rerun()
+    return edited
+
+
+def money(value, currency="", digits=2):
+    if value is None or pd.isna(value):
+        return "n/a"
+    return f"{currency + ' ' if currency else ''}{value:,.{digits}f}"
+
+
+def millions(value, currency=""):
+    if value is None or pd.isna(value):
+        return "n/a"
+    return f"{currency + ' ' if currency else ''}{value / 1e6:,.0f}M"
+
+
+def render_fair_value():
+    """Risk-adjusted earnings times an acceptable multiple, against today's price (analysis.fair_value)."""
+
+    with settings_panel("Stock"):
+        entered = st.text_input("Ticker", value="NVDA", key="fair_value_ticker",
+                                help="Any Yahoo symbol with financial statements, e.g. NVDA, TSM, ASMVY, 0522.HK, "
+                                     "BESI.AS.").strip().upper()
+        home = home_listing(entered)
+        use_home = home is not None and st.checkbox(
+            f"Use the home listing {home[0]}" if home else "Use the home listing", value=True,
+            key=f"fair_value_home_{entered}",
+            help="The home exchange has fuller figures and shows them in the company's own currency.")
+        ticker = home[0] if use_home else entered
+        peers_text = st.text_input("Peers (comma-separated)", value="", key=f"fair_value_peers_{ticker}",
+                                   help="Companies that do similar work. Their average run-rate P/E is where the "
+                                        "acceptable multiple starts.")
+        bar = st.select_slider("Materiality bar", RISK_IMPACTS, value="Medium", key="fair_value_bar",
+                               help="Risks rated below the bar are parked: listed, but with no effect on the value.")
+    st.caption(
+        "What is the stock worth on risk-adjusted earnings and a multiple you would accept? Each section is one "
+        "step: the income and costs, how clean the profit is, the risks, three scenarios, the multiple, and "
+        "what today's price implies. This is analysis to test your own assumptions, not a buy or sell call."
+    )
+    if not ticker:
+        st.info("Enter a ticker in the settings.")
+        return
+    with st.spinner("Loading financial statements and prices..."):
+        statements = load_statements(ticker)
+        close = recent_close(ticker)
+        snapshot = load_fundamental_snapshot(ticker)
+    if close.empty:
+        st.warning(f"Yahoo Finance has no price history for {ticker}. Check the symbol.")
+        return
+    if not statements:
+        st.warning(f"Yahoo Finance has no financial statements for {ticker}.")
+        return
+    frame, periods, period_label = statement_basis(statements)
+    if frame.empty or frame["Revenue"].dropna().empty:
+        st.warning(f"Yahoo Finance has no revenue figures for {ticker}.")
+        return
+    name = snapshot.get("shortName")
+    st.subheader((f"{entered} → {ticker}" if use_home else ticker) + (f" · {name}" if name else ""))
+    revenue_estimates = load_revenue_estimates(ticker)
+    eps_estimates = load_earnings_estimates(ticker)
+    age_days = (pd.Timestamp(date.today()) - frame.index[-1]).days
+    stale = age_days > 200
+    current_year_revenue = analyst_estimate(revenue_estimates, "0y")
+    if stale:
+        st.warning(
+            f"Yahoo's latest revenue figures for {ticker} are for the {period_label} to {frame.index[-1]:%d %b %Y}, "
+            f"{age_days // 30} months old (common for companies that file outside the US). "
+            + ("The starting revenue and base-case margin come from analysts' estimates instead. "
+               if current_year_revenue else "")
+            + "Type figures from the company's latest results into Earnings inputs and the scenarios to override."
+        )
+
+    price_currency = snapshot.get("currency") or ""
+    statement_currency = snapshot.get("financialCurrency") or price_currency
+    foreign = (use_home or statement_currency != price_currency
+               or (len(entered) == 5 and entered.endswith(("Y", "F"))))
+    quality = earnings_quality(frame, periods)
+    annual = statements.get("annual")
+    price = float(close.iloc[-1])
+    price_date = close.index[-1]
+    period_end = frame.index[-1]
+
+    with settings_panel("Per-share basis", expanded=False):
+        default_rate = exchange_rate(statement_currency, price_currency) or 1.0
+        rate = st.number_input(f"Exchange rate, {statement_currency or 'statement'} to {price_currency or 'price'} "
+                               "currency", min_value=0.0, value=float(default_rate), step=0.01, format="%.4f",
+                               key=f"fair_value_rate_{ticker}",
+                               help="1 when the company reports in the currency its shares trade in.")
+        ratio = st.number_input("Company shares per traded share (ADR ratio)", min_value=0.0, value=1.0, step=1.0,
+                                key=f"fair_value_ratio_{ticker}",
+                                help="Leave at 1 when the diluted shares under Earnings inputs are already counted "
+                                     "in traded shares. Yahoo often does that for ADRs: for ASMVY it shows about "
+                                     "140M shares, which is 418M Hong Kong shares / 3. Simpler: use the home "
+                                     "listing (0522.HK for ASMPT, BESI.AS for BESI), where it is always 1.")
+    per_share = rate * ratio
+
+    # ---- Peers and the starting multiple (computed first: the scenarios and values use it)
+    peers = [p.strip().upper() for p in peers_text.replace(";", ",").split(",") if p.strip()]
+    if use_home:
+        peers = [home_listing(peer)[0] if home_listing(peer) else peer for peer in peers]
+    peer_table = pd.DataFrame([peer_row(peer) for peer in peers]) if peers else pd.DataFrame()
+    peer_pes = pd.to_numeric(peer_table.get("Run-rate P/E", pd.Series(dtype=float)), errors="coerce")
+    peer_pes = peer_pes.loc[(peer_pes > 0) & (peer_pes < 200)]
+    peer_average = float(peer_pes.mean()) if not peer_pes.empty else None
+
+    bottom_line = st.container()
+
+    # ---- 1. Income map
+    st.markdown("#### 1. Where the income comes from")
+    revenue = frame["Revenue"].dropna()
+    growth = yoy_growth(revenue) if periods == 4 else revenue.pct_change().dropna() * 100
+    leverage = operating_leverage(frame) if periods == 4 else None
+    st.caption(
+        f"Latest {period_label} to {period_end:%d %b %Y}: revenue {millions(revenue.iloc[-1], statement_currency)}"
+        + (f", {growth.iloc[-1]:+.1f}% on a year earlier" if not growth.empty else "")
+        + (f". Operating leverage {leverage:.1f}x: operating profit moved {leverage:.1f} times as much as revenue, "
+           "which cuts both ways." if leverage is not None else ".")
+        + " Segment, region and order (bookings) splits are in the company's results filings, not in Yahoo's data."
+    )
+    show_chart(income_figure(frame), width="stretch", key="fair_value_income_chart")
+
+    # ---- 2. Costs and margins
+    st.markdown("#### 2. Costs and margins")
+    shares_of_revenue = common_size(frame)
+    if not shares_of_revenue.empty:
+        show_chart(margin_figure(shares_of_revenue), width="stretch", key="fair_value_margin_chart")
+        recent = shares_of_revenue.tail(4).T
+        recent.columns = [f"{when:%b %Y}" for when in recent.columns]
+        st.dataframe(recent.map(lambda v: f"{v:.1f}%" if pd.notna(v) else ""), width="stretch")
+        st.caption("Each cost line as a share of revenue. Dotted lines are costs, solid lines are margins.")
+
+    # ---- 3. Earnings quality
+    st.markdown("#### 3. EBITDA and earnings quality")
+    trailing_label = "last 4 quarters" if periods == 4 else f"year to {period_end:%b %Y}"
+    quality_rows = [
+        ("Reported net income", quality.get("Reported net income")),
+        ("Adjusted net income (excludes one-offs)", quality.get("Adjusted net income")),
+        ("Share-based pay", quality.get("Share-based pay")),
+        ("Clean net income (adjusted less share-based pay)", quality.get("Clean net income")),
+        ("EBITDA", quality.get("EBITDA")),
+        ("Adjusted EBITDA", quality.get("Adjusted EBITDA")),
+        ("Operating cash flow", quality.get("Operating cash flow")),
+    ]
+    quality_table = pd.DataFrame(
+        {f"{trailing_label.capitalize()} ({statement_currency or 'reporting currency'})":
+         [millions(value) for _, value in quality_rows]},
+        index=[label for label, _ in quality_rows])
+    st.dataframe(quality_table, width="stretch")
+    tax = quality.get("Tax rate %")
+    st.caption((f"Tax took {tax:.0f}% of pre-tax profit. " if tax is not None else "")
+               + "Adjusted figures leave out share-based pay although it is a real cost, so the value below "
+                 "uses EPS after share-based pay.")
+    for flag in quality.get("Flags") or []:
+        st.markdown(f"- {flag}")
+
+    # ---- 4. Risk register
+    st.markdown("#### 4. Risk register")
+    st.caption(
+        "Each risk goes into the model once. Specific events go into the earnings of the bear or base case "
+        "(set them in the scenarios below); general uncertainty goes to the multiple as a P/E deduction. "
+        f"Risks rated below the materiality bar ({bar}) are parked with no price effect. Add rows for risks you "
+        "find in filings, calls and news."
+    )
+    suggestions = suggested_deductions(frame, quality, annual=annual, foreign_listing=foreign)
+    risks = fair_value_store("risks", ticker, lambda: default_risks(suggestions))
+    risks = fair_value_editor(
+        "risks", ticker, risks, hide_index=True, num_rows="dynamic",
+        column_config={
+            "Risk": st.column_config.TextColumn("Risk", width="medium"),
+            "Evidence": st.column_config.TextColumn("Evidence", width="large"),
+            "Goes to": st.column_config.SelectboxColumn("Goes to", options=RISK_DESTINATIONS, required=True,
+                                                        default="Multiple", width="small"),
+            "Impact": st.column_config.SelectboxColumn("Impact", options=RISK_IMPACTS, required=True,
+                                                       default="Medium", width="small"),
+            "P/E deduction": st.column_config.NumberColumn("P/E −", min_value=0.0, max_value=30.0, step=0.5,
+                                                           format="%.1f", default=0.0, width="small",
+                                                           help="P/E points taken off (rows that go to Multiple)"),
+        })
+    active, parked = triage(risks, bar)
+    deductions = multiple_deductions(active)
+    if not parked.empty:
+        st.caption("Parked (below the bar): " + "; ".join(parked["Risk"].astype(str)))
+
+    # ---- 5. Scenarios
+    st.markdown("#### 5. Scenarios and risk-adjusted earnings")
+    analyst_growth = analyst_estimate(revenue_estimates, "+1y", "growth")
+    analyst_growth = analyst_growth * 100 if analyst_growth is not None else None
+    use_estimates = stale and current_year_revenue is not None
+    if use_estimates:
+        trailing_label = "analysts' estimate for this fiscal year"
+    base_revenue_default = current_year_revenue if use_estimates else (quality.get("Revenue") or
+                                                                        float(revenue.iloc[-1]))
+    # The latest share count can be in quarters whose revenue Yahoo lacks (Hong Kong listings).
+    quarter_shares = period_frame(statements.get("quarterly"), statements.get("quarterly_cash")).get("Shares")
+    all_shares = pd.concat([frame["Shares"], quarter_shares]).dropna().sort_index() \
+        if quarter_shares is not None else frame["Shares"].dropna()
+    shares_default = float(all_shares.iloc[-1]) if not all_shares.empty else 0.0
+    sbc_default = quality.get("Share-based pay") or 0.0
+    with st.expander("Earnings inputs", expanded=False):
+        base_revenue = st.number_input(
+            f"Starting revenue, {trailing_label} ({statement_currency}, millions)", min_value=0.0,
+            value=round(base_revenue_default / 1e6, 1), step=10.0, key=f"fair_value_revenue_{ticker}") * 1e6
+        shares = st.number_input("Diluted shares (millions)", min_value=0.0, value=round(shares_default / 1e6, 2),
+                                 step=1.0, key=f"fair_value_shares_{ticker}") * 1e6
+        net_share = st.number_input("Net profit kept from operating profit %", min_value=0.0, max_value=150.0,
+                                    value=round(net_from_operating(quality), 1), step=1.0,
+                                    key=f"fair_value_net_share_{ticker}",
+                                    help="After interest, tax and minorities, from the last year's figures.")
+        sbc = st.number_input(f"Share-based pay next year ({statement_currency}, millions)", min_value=0.0,
+                              value=round(sbc_default / 1e6, 1), step=1.0, key=f"fair_value_sbc_{ticker}") * 1e6
+    st.caption(
+        ("Next fiscal year, from analysts' revenue estimate for this one. " if use_estimates else
+         "Next 12 months from the latest results. ")
+        + "Revenue = starting revenue x (1 + growth); operating profit = "
+        "revenue x margin; EPS after share-based pay deducts the pay before dividing by the shares. "
+        "\"Multiple +/-\" is each case's P/E against the acceptable multiple."
+        + (f" The base case starts from analysts' next-year revenue growth ({analyst_growth:+.1f}%)."
+           if analyst_growth is not None else "")
+    )
+    base_margin = analyst_operating_margin(analyst_estimate(revenue_estimates, "+1y"),
+                                           analyst_estimate(eps_estimates, "+1y"), shares, net_share) \
+        if use_estimates else None
+    if base_margin is not None:
+        st.caption(f"Base-case operating margin {base_margin:.1f}%: analysts' next-year EPS x shares / their "
+                   f"revenue estimate, grossed up from net to operating profit at {net_share:.0f}%.")
+    scenarios = fair_value_store("scenarios", ticker, lambda: default_scenarios(frame, analyst_growth, base_margin))
+    scenarios = fair_value_editor(
+        "scenarios", ticker, scenarios, num_rows="fixed",
+        column_config={
+            "Scenario": st.column_config.TextColumn("Case", disabled=True, width=50),
+            "Probability %": st.column_config.NumberColumn("Prob. %", min_value=0.0, max_value=100.0, step=5.0,
+                                                           format="%.0f", width=60),
+            "Revenue growth %": st.column_config.NumberColumn("Growth %", min_value=-90.0, max_value=500.0,
+                                                              step=1.0, format="%.1f", width=70),
+            "Operating margin %": st.column_config.NumberColumn("Op. margin %", min_value=-100.0, max_value=100.0,
+                                                                step=0.5, format="%.1f", width=80),
+            "Multiple +/-": st.column_config.NumberColumn("P/E +/-", min_value=-50.0, max_value=50.0, step=1.0,
+                                                          format="%+.0f", width=60),
+        })
+    probability_total = scenarios["Probability %"].fillna(0).sum()
+    if abs(probability_total - 100) > 0.5:
+        st.caption(f"Probabilities add up to {probability_total:.0f}%; they are scaled to 100%.")
+    earnings = scenario_earnings(scenarios[SCENARIO_COLUMNS], base_revenue, shares, net_share, sbc)
+    for case in ["Bear", "Base"]:
+        named = earnings_risks(active, case)
+        if named:
+            st.caption(f"In the {case.lower()} case: " + "; ".join(named))
+
+    # ---- 6. Multiple and value
+    st.markdown("#### 6. Acceptable multiple and value")
+    if not peer_table.empty:
+        st.dataframe(peer_table, hide_index=True, width="stretch", column_config={
+            "Run-rate P/E": st.column_config.NumberColumn(format="%.1fx"),
+            "Revenue YoY %": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Gross margin %": st.column_config.NumberColumn(format="%.1f%%"),
+        })
+        st.caption("Run-rate P/E = price / (4 x the latest quarter's adjusted EPS), in the price's currency. "
+                   "Fiscal quarters and adjusted figures differ between companies, so check the outliers.")
+    own_quarters = period_frame(statements.get("quarterly"), statements.get("quarterly_cash"))
+    own_eps = run_rate_eps(own_quarters) if not own_quarters.empty else None
+    own_pe = run_rate_pe(price, own_eps * per_share if own_eps else None)
+    start_default = round(peer_average, 1) if peer_average else FAIR_VALUE_DEFAULT_MULTIPLE
+    start = st.number_input("Starting P/E", min_value=1.0, max_value=200.0, value=float(start_default), step=0.5,
+                            key=f"fair_value_start_{ticker}_{'-'.join(peers)}",
+                            help="The peer average when peers are set; otherwise 20 as a placeholder.")
+    acceptable = acceptable_multiple(start, deductions)
+    st.caption(
+        (f"Peer average run-rate P/E {peer_average:.1f}x. " if peer_average else
+         "Add peers in the settings to start from their average P/E. ")
+        + (f"{ticker} today: {own_pe:.1f}x run-rate. " if own_pe else "")
+        + f"Starting P/E {start:.1f}x less {deductions:.1f} for risks routed to the multiple = "
+          f"**{acceptable:.1f}x acceptable**."
+    )
+    values, risk_adjusted = fair_valuation(earnings, acceptable, per_share=per_share)
+    value_table = values.rename(columns={"EPS after share-based pay": "EPS"})
+    value_table.loc["Risk-adjusted"] = [100.0, risk_adjusted["EPS"], acceptable, risk_adjusted["Value per share"]]
+    value_table["Adjusted EPS"] = list(earnings["Adjusted EPS"]) + [weighted_scenarios(earnings, "Adjusted EPS")]
+    value_table = value_table[["Probability %", "Adjusted EPS", "EPS", "Multiple", "Value per share"]]
+    st.dataframe(value_table, width="stretch", column_config={
+        "Probability %": st.column_config.NumberColumn("Prob.", format="%.0f%%"),
+        "Adjusted EPS": st.column_config.NumberColumn(f"Adj. EPS ({statement_currency})", format="%.2f"),
+        "EPS": st.column_config.NumberColumn(f"EPS after SBC ({statement_currency})", format="%.2f"),
+        "Multiple": st.column_config.NumberColumn("P/E", format="%.1fx"),
+        "Value per share": st.column_config.NumberColumn(f"Value ({price_currency})", format="%.2f"),
+    })
+    if per_share != 1:
+        st.caption(f"Values are per traded share in {price_currency}: EPS per company share x {ratio:g} shares x "
+                   f"{rate:.4f} exchange rate.")
+    show_chart(value_figure(close, values["Value per share"].to_dict(), risk_adjusted["Value per share"]),
+               width="stretch", key="fair_value_value_chart")
+
+    # ---- 7. Market check
+    st.markdown("#### 7. What the market prices in")
+    check = market_check(earnings, price, acceptable, per_share=per_share)
+    moves = sensitivity(earnings, acceptable, per_share=per_share)
+    implied_bear = check["Implied bear probability"]
+    lines = [
+        f"At {money(price, price_currency)}, an acceptable {acceptable:.1f}x implies next-year EPS of "
+        f"{money(check['Implied EPS'], price_currency)} per traded share"
+        + (f" ({money(check['Implied EPS'] / per_share, statement_currency)} per company share)."
+           if per_share != 1 and check["Implied EPS"] else "."),
+        f"On the risk-adjusted EPS the price is {check['Implied multiple']:.1f}x." if check["Implied multiple"]
+        else "The risk-adjusted EPS is a loss, so there is no implied multiple.",
+        (f"The price fits the scenarios if the bear case is about {implied_bear:.0%} likely "
+         f"(you set {scenarios.at['Bear', 'Probability %']:.0f}%)." if implied_bear is not None else
+         "No bear-case probability between 0% and 100% fits the price: it lies outside what the scenarios reach."),
+    ]
+    if moves["Per 1x P/E"] is not None:
+        lines.append(f"Each 1x of P/E moves the value by {money(moves['Per 1x P/E'], price_currency)}; each 10 "
+                     f"points of probability moved into the bear case takes off "
+                     f"{money(-moves['Per 10 points to bear'], price_currency)}.")
+    for line in lines:
+        st.markdown(f"- {line}")
+
+    with bottom_line:
+        tiles = st.columns(3)
+        tiles[0].metric(f"Price {price_date:%d %b}", money(price, price_currency))
+        tiles[1].metric("Risk-adjusted value", money(risk_adjusted["Value per share"], price_currency),
+                        delta=f"{check['Value vs price %']:+.0f}% vs price" if check["Value vs price %"] is not None
+                        else None)
+        low, high = values["Value per share"].min(), values["Value per share"].max()
+        tiles[2].metric("Bear to bull", f"{low:,.0f} to {high:,.0f}" if pd.notna(low) and pd.notna(high) else "n/a")
+        if use_home:
+            adr_close = recent_close(entered, days=14)
+            adr_currency = load_fundamental_snapshot(entered).get("currency") or "USD"
+            to_adr = exchange_rate(price_currency, adr_currency)
+            if not adr_close.empty and to_adr and risk_adjusted["Value per share"] is not None:
+                st.caption(f"Per {entered} ADR ({home[1]:g} {ticker} share{'s' if home[1] != 1 else ''}): about "
+                           f"{money(risk_adjusted['Value per share'] * home[1] * to_adr, adr_currency)} against "
+                           f"{money(float(adr_close.iloc[-1]), adr_currency)} on {adr_close.index[-1]:%d %b}.")
+        st.caption(
+            f"Risk-adjusted EPS {money(risk_adjusted['EPS'], statement_currency)} (after share-based pay) x "
+            f"{acceptable:.1f}x acceptable P/E. Statements to {period_end:%d %b %Y}, price {price_date:%d %b %Y}"
+            + (f", {statement_currency} to {price_currency} at {rate:.4f}" if rate != 1 else "") + "."
+        )
+        st.button("Reset scenarios and risks to the defaults", key=f"fair_value_reset_{ticker}_btn",
+                  on_click=reset_fair_value_tables, args=(ticker,))
 
 
 def quoted_next_earnings(symbol):
@@ -7170,6 +7674,8 @@ if check_password():
                 render_news()
             elif label == FUNDAMENTALS_TAB:
                 render_stock_fundamentals()
+            elif label == FAIR_VALUE_TAB:
+                render_fair_value()
             elif label == SUPPLY_CHAIN_TAB:
                 render_supply_chain(main_index_prices)
             elif label == JOURNAL_TAB:
