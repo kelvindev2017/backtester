@@ -3,12 +3,15 @@
 Each chain starts at the companies that sell to the end market (level 0) and
 goes back through the chips they buy, the fabs and packaging houses that make
 those chips, and the tools, software and materials the fabs need. Only
-US-listed companies are included (ADRs such as TSM, ASML and SONY count).
+US-listed companies are included (ADRs such as TSM, ASML and SONY count, and so do the
+OTC ADRs ASMVY and BESIY).
 
 Links are curated by hand from public reporting (annual-report customer
 disclosures, teardowns, supply agreements). They show the main relationships,
 not every one. An edge points from supplier to customer.
 """
+
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -61,6 +64,9 @@ COMPANIES = {
     "KLAC": ("KLA", "Inspection and process control equipment."),
     "TER": ("Teradyne", "Automated test equipment for processors and RF chips."),
     "ENTG": ("Entegris", "Specialty materials, filtration and wafer handling for fabs."),
+    "ASMVY": ("ASMPT (OTC ADR)", "Back-end equipment: thermocompression and hybrid bonders, die and wire bonders."),
+    "BESIY": ("BE Semiconductor (OTC ADR)", "Back-end equipment: hybrid bonders for 3D chip stacking and die attach."),
+    "KLIC": ("Kulicke & Soffa", "Back-end equipment: wire bonders and thermocompression bonders for advanced packaging."),
     "SNPS": ("Synopsys", "Chip design software (EDA) and design IP."),
     "CDNS": ("Cadence Design Systems", "Chip design software (EDA) and design IP."),
     "ARM": ("Arm Holdings", "CPU architecture and core designs licensed to chip designers."),
@@ -72,7 +78,7 @@ CHAINS = {
             ["AAPL", "GOOGL"],
             ["QCOM", "AVGO", "SWKS", "CRUS", "TXN", "SONY"],
             ["TSM", "MU", "GFS", "AMKR", "ASX"],
-            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "TER", "ENTG"],
+            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "TER", "ASMVY", "BESIY", "KLIC", "ENTG"],
         ],
         "edges": [
             ("QCOM", "AAPL", "Cellular modems (Apple is shifting to its own C1 modem)"),
@@ -110,6 +116,15 @@ CHAINS = {
             ("KLAC", "MU", "Inspection and process control"),
             ("TER", "TSM", "Test systems for mobile processors"),
             ("TER", "AMKR", "Test systems for packaged chips"),
+            ("ASMVY", "TSM", "Bonders for advanced packaging"),
+            ("ASMVY", "AMKR", "Die bonders, wire bonders and thermocompression bonders"),
+            ("ASMVY", "ASX", "Die bonders, wire bonders and thermocompression bonders"),
+            ("BESIY", "TSM", "Hybrid bonders for 3D chip stacking (SoIC)"),
+            ("BESIY", "AMKR", "Die attach equipment"),
+            ("BESIY", "ASX", "Die attach equipment"),
+            ("KLIC", "TSM", "Thermocompression bonders for advanced packaging"),
+            ("KLIC", "AMKR", "Wire bonders and advanced packaging bonders"),
+            ("KLIC", "ASX", "Wire bonders and advanced packaging bonders"),
             ("ENTG", "TSM", "Specialty materials and filtration"),
             ("ENTG", "MU", "Specialty materials and filtration"),
         ],
@@ -119,7 +134,7 @@ CHAINS = {
             ["MSFT", "AMZN", "GOOGL", "META", "ORCL", "DELL", "SMCI", "ANET"],
             ["NVDA", "AMD", "AVGO", "MRVL", "INTC", "ALAB", "CRDO"],
             ["TSM", "MU", "AMKR"],
-            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "ENTG"],
+            ["ARM", "SNPS", "CDNS", "ASML", "AMAT", "LRCX", "KLAC", "ASMVY", "BESIY", "KLIC", "ENTG"],
         ],
         "edges": [
             ("NVDA", "MSFT", "GPUs for Azure"),
@@ -168,6 +183,11 @@ CHAINS = {
             ("LRCX", "MU", "Etch and deposition for DRAM and HBM"),
             ("KLAC", "TSM", "Inspection and process control"),
             ("KLAC", "MU", "Inspection and process control"),
+            ("ASMVY", "TSM", "Thermocompression and hybrid bonders for advanced packaging"),
+            ("ASMVY", "AMKR", "Bonders for advanced packaging"),
+            ("BESIY", "TSM", "Hybrid bonders for 3D chip stacking (SoIC)"),
+            ("KLIC", "TSM", "Thermocompression bonders for advanced packaging"),
+            ("KLIC", "AMKR", "Advanced packaging bonders"),
             ("ENTG", "TSM", "Specialty materials and filtration"),
             ("ENTG", "MU", "Specialty materials and filtration"),
         ],
@@ -227,24 +247,142 @@ def _merge_chains(chains):
 
 CHAINS[ALL_CHAINS] = _merge_chains(CHAINS)
 
+# Default supplier groups, shown as labelled boxes inside each column in this order. End-market companies are not
+# grouped by default. The app lets the user regroup and rename; a grouping is a {ticker: group name} dict, and a
+# company with no group sits below the groups of its column.
+GROUPS = [
+    {},
+    {
+        "Processors & accelerators": ["QCOM", "NVDA", "AMD", "AVGO", "MRVL", "INTC", "MBLY"],
+        "Connectivity & RF": ["SWKS", "ALAB", "CRDO"],
+        "Analog, power & microcontrollers": ["CRUS", "TXN", "ADI", "NXPI", "STM", "ON"],
+        "Sensors": ["SONY"],
+    },
+    {
+        "Foundry": ["TSM", "GFS"],
+        "Memory": ["MU"],
+        "Packaging & test": ["AMKR", "ASX"],
+    },
+    {
+        "Design software & IP": ["ARM", "SNPS", "CDNS"],
+        "Equipment": ["ASML", "AMAT", "LRCX", "KLAC", "TER", "ASMVY", "BESIY", "KLIC"],
+        "Materials": ["ENTG"],
+    },
+]
+COMPANY_GROUPS = {ticker: group for level in GROUPS for group, tickers in level.items() for ticker in tickers}
+GROUP_GAP = 1.0  # empty rows between two groups in a column
+
 NODE_METRICS = ["Return 1m %", "Return 3m %", "Return 6m %", "Return YTD %", "Return 1y %", "% from 52w high"]
 
 
-def chain_tickers(chain):
-    """Every ticker in a chain, level by level."""
+def company_levels():
+    """{ticker: level} over every chain, end market (0) to tools (3)."""
 
-    return [ticker for level in CHAINS[chain]["levels"] for ticker in level]
+    return {t: index for chain in CHAINS.values() for index, level in enumerate(chain["levels"]) for t in level}
 
 
-def node_positions(chain):
-    """(x, y) per ticker: x is the level (0 = end market), y spreads each level evenly over [0, 1], top first."""
+@lru_cache(maxsize=1)
+def default_order():
+    """Every company in its default display order: level by level, by default group, then as the chains list it."""
+
+    order = []
+    for index in range(len(LEVELS)):
+        for members in GROUPS[index].values():
+            order += [t for t in members if t not in order]
+        for chain in CHAINS.values():
+            order += [t for t in chain["levels"][index] if t not in order]
+    return order
+
+
+def column_groups(chain, level, groups=None):
+    """[(group, tickers)] for one column of a chain, in display order; group is None for ungrouped companies.
+
+    Groups keep the order of their first company in the default order, so the defaults draw as listed in GROUPS
+    and a group the user creates appears where its first member used to be.
+    """
+
+    groups = COMPANY_GROUPS if groups is None else groups
+    tickers = CHAINS[chain]["levels"][level]
+    named, loose = {}, []
+    for ticker in sorted(tickers, key=default_order().index):
+        name = (groups.get(ticker) or "").strip()
+        if name:
+            named.setdefault(name, []).append(ticker)
+        else:
+            loose.append(ticker)
+    return list(named.items()) + ([(None, loose)] if loose else [])
+
+
+def chain_tickers(chain, groups=None):
+    """Every ticker in a chain, level by level, grouped as drawn."""
+
+    return [t for level in range(len(LEVELS)) for _, tickers in column_groups(chain, level, groups) for t in tickers]
+
+
+def column_rows(chain, level, groups=None):
+    """Rows a column takes: one per company plus the gaps between groups."""
+
+    column = column_groups(chain, level, groups)
+    return sum(len(tickers) for _, tickers in column) + GROUP_GAP * (len(column) - 1)
+
+
+def node_positions(chain, groups=None):
+    """(x, y) per ticker: x is the level (0 = end market), y spreads each column over [0, 1], top first,
+    with a gap between groups."""
 
     positions = {}
-    for x, level in enumerate(CHAINS[chain]["levels"]):
-        count = len(level)
-        for row, ticker in enumerate(level):
-            positions[ticker] = (x, 0.5 if count == 1 else 1 - row / (count - 1))
+    for x in range(len(LEVELS)):
+        rows = column_rows(chain, x, groups)
+        span = max(rows - 1, 1)
+        row = 0.0
+        for _, tickers in column_groups(chain, x, groups):
+            for ticker in tickers:
+                positions[ticker] = (x, 0.5 if rows == 1 else 1 - row / span)
+                row += 1
+            row += GROUP_GAP
     return positions
+
+
+def group_boxes(chain, groups=None):
+    """(level, group, members, top y, bottom y) for every named group, using the node positions."""
+
+    positions = node_positions(chain, groups)
+    return [(x, group, tickers, positions[tickers[0]][1], positions[tickers[-1]][1])
+            for x in range(len(LEVELS)) for group, tickers in column_groups(chain, x, groups) if group]
+
+
+def group_index(prices, tickers):
+    """Equal-weight index of a group's closes: each member rebased to 100 on the first day all of them trade,
+    then averaged. Returned as a price frame (Close = High = Low) so the usual snapshot and trend code applies."""
+
+    closes = pd.DataFrame({t: prices[t]["Close"] for t in tickers if t in prices and not prices[t].empty})
+    closes = closes.sort_index().ffill().dropna()
+    if closes.empty:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    level = (closes / closes.iloc[0] * 100).mean(axis=1)
+    return pd.DataFrame({"Open": level, "High": level, "Low": level, "Close": level, "Volume": 1.0})
+
+
+def group_table(chain, prices, groups=None):
+    """Snapshot of every named group's index in the chain: members, returns, distance from the high, trend."""
+
+    boxes = group_boxes(chain, groups)
+    names = [group for _, group, _, _, _ in boxes]
+    rows = {}
+    for x, group, tickers, _, _ in boxes:
+        index = group_index(prices, tickers)
+        row = stock_snapshot(index) if not index.empty else {}
+        row["Trend"] = index_trend(index) if row else "No data"
+        row["Level"] = LEVELS[x]
+        row["Group"] = group
+        row["Members"] = ", ".join(tickers)
+        # The same name in two layers is two groups; tell them apart by layer.
+        rows[group if names.count(group) == 1 else f"{group} ({LEVEL_SHORT_NAMES[x]})"] = row
+    table = pd.DataFrame.from_dict(rows, orient="index")
+    for column in ["Level", "Group", "Members", "Trend", "Close"] + NODE_METRICS:
+        if column not in table:
+            table[column] = np.nan
+    return table
 
 
 def neighbors(chain, ticker):
@@ -272,11 +410,12 @@ def linked_tickers(chain, ticker):
     return linked
 
 
-def node_table(chain, prices):
+def node_table(chain, prices, groups=None):
     """Price snapshot per company in the chain (one row per ticker, NaN where Yahoo returned nothing)."""
 
+    groups = COMPANY_GROUPS if groups is None else groups
     rows = {}
-    for ticker in chain_tickers(chain):
+    for ticker in chain_tickers(chain, groups):
         frame = prices.get(ticker)
         row = stock_snapshot(frame) if frame is not None and not frame.empty else {}
         row["Trend"] = index_trend(frame) if row else "No data"
@@ -287,6 +426,7 @@ def node_table(chain, prices):
             table[column] = np.nan
     names = {ticker: COMPANIES[ticker][0] for ticker in table.index}
     table.insert(0, "Company", pd.Series(names))
-    positions = node_positions(chain)
-    table.insert(1, "Level", [LEVELS[positions[ticker][0]] for ticker in table.index])
+    levels = company_levels()
+    table.insert(1, "Level", [LEVELS[levels[ticker]] for ticker in table.index])
+    table.insert(2, "Group", [(groups.get(ticker) or "").strip() for ticker in table.index])
     return table
