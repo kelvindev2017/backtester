@@ -997,7 +997,8 @@ def test_valuation_model_tab(offline, monkeypatch):
     # The block diagram, the open block's signals and the model price against the close.
     assert any("Quarterly rate" in spec and "Risk weighting" in spec and "Price per share" in spec for spec in charts)
     assert any("Output: Risk-adjusted EPS" in spec for spec in charts)
-    assert any("Model price" in spec and "Acceptable P/E" in spec for spec in charts)
+    # A "/" is escaped in the chart's JSON, so "Acceptable P/E" is matched up to the slash.
+    assert any("Model price" in spec and "Acceptable P" in spec and "Bear case" in spec for spec in charts)
     labels = [metric.label for metric in app.metric]
     assert labels[:4] == ["Model price per share", "Close", "Risk-adjusted EPS", "Acceptable P/E"]
     assert all(metric.value != "n/a" for metric in app.metric[:4])
