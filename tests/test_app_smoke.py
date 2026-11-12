@@ -106,7 +106,8 @@ def open_tab(app, label):
 def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["News", "Stock Screener", "Economic analysis", "Market Analysis",
-                                               "Industry Analysis", "Stock Fundamentals", "Semicon Supply Chain", "Backtest",
+                                               "Industry Analysis", "Stock Fundamentals", "Valuation Model",
+                                               "Semicon Supply Chain", "Backtest",
                                                "Signal Analysis & Trade Plan", "Validate", "Trade Journal"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
@@ -979,3 +980,62 @@ def test_news_tab_groups_stories_by_industry(offline):
     open_tab(app, "News")
     assert app.radio(key="news_group_by").value == "Supply chain level"
     assert any(expander.label.startswith("Chips & components") for expander in app.expander)
+
+
+def test_valuation_model_tab(offline, monkeypatch):
+    monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
+    app = open_tab(start_app(), "Valuation Model")
+    assert app.sidebar.header[0].value == "Valuation Model"
+    # The tab opens on the worked example: its preset fills the parameters, the peers and the register.
+    assert app.subheader[0].value == "ASMVY"
+    assert app.session_state["model_manual_eps"] == pytest.approx(1.64)
+    assert app.session_state["model_peers"] == "BESIY, KLIC, AMAT, COHU, CAMT"
+    assert len(app.session_state["model_register"]) == 10
+    rendered = " ".join(element.value for element in app.caption)
+    assert "a typed-in trailing EPS of 1.64" in rendered and "peer P/E from BESIY" in rendered
+    charts = [chart.proto.spec for chart in app.get("plotly_chart")]
+    # The block diagram, the open block's signals and the model price against the close.
+    assert any("Quarterly rate" in spec and "Risk weighting" in spec and "Price per share" in spec for spec in charts)
+    assert any("Output: Risk-adjusted EPS" in spec for spec in charts)
+    assert any("Model price" in spec and "Acceptable P/E" in spec for spec in charts)
+    labels = [metric.label for metric in app.metric]
+    assert labels[:4] == ["Model price per share", "Close", "Risk-adjusted EPS", "Acceptable P/E"]
+    assert all(metric.value != "n/a" for metric in app.metric[:4])
+    assert any(list(frame.value.columns) == ["Dial", "Block", "Now", "Needed", "Change", "Unit", "Read"]
+               and "Bear weight" in frame.value["Dial"].tolist() for frame in app.dataframe)
+    assert any("Goes to" in frame.value.columns and frame.value["In the model"].sum() == 3 for frame in app.dataframe)
+
+    # Opening another block shows its parameters and signals.
+    app.selectbox(key="model_block").select("scenario_engine")
+    open_tab(app, "Valuation Model")
+    assert any("Bear: growth points below base" in frame.value.get("Parameter", pd.Series(dtype=str)).tolist()
+               for frame in app.dataframe)
+    assert any("Output: Bear EPS" in chart.proto.spec for chart in app.get("plotly_chart"))
+
+    # A parameter changes the model price.
+    before = app.metric[0].value
+    app.number_input(key="model_weight_bear").set_value(60.0)
+    open_tab(app, "Valuation Model")
+    assert app.metric[0].value != before
+
+    # Another ticker starts from the defaults and runs on its reported quarters; the settings survive a tab switch.
+    app.text_input(key="model_ticker").input("nvda")
+    open_tab(app, "Valuation Model")
+    assert app.subheader[0].value == "NVDA"
+    assert app.session_state["model_manual_eps"] == 0 and app.session_state["model_weight_bear"] == 25
+    assert len(app.session_state["model_register"]) == 0
+    assert any("quarters of reported EPS" in element.value for element in app.caption)
+    assert app.metric[0].value != "n/a"
+    open_tab(app, "News")
+    open_tab(app, "Valuation Model")
+    assert app.subheader[0].value == "NVDA"
+
+    app.text_input(key="model_ticker").input("")
+    open_tab(app, "Valuation Model")
+    assert any("Enter a ticker" in element.value for element in app.info)
+
+    monkeypatch.setattr(yf, "download", lambda tickers, *args, **kwargs: (
+        pd.DataFrame() if tickers == "SKNX" else fake_download(tickers, *args, **kwargs)))
+    app.text_input(key="model_ticker").input("SKNX")
+    open_tab(app, "Valuation Model")
+    assert any("no price history for SKNX" in element.value for element in app.warning)
