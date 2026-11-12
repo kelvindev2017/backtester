@@ -984,6 +984,7 @@ def test_news_tab_groups_stories_by_industry(offline):
 
 def test_valuation_model_tab(offline, monkeypatch):
     monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
+    st.cache_data.clear()  # an earlier test cached NVDA without earnings dates
     app = open_tab(start_app(), "Valuation Model")
     assert app.sidebar.header[0].value == "Valuation Model"
     # The tab opens on the worked example: its preset fills the parameters, the peers and the register.
@@ -1025,7 +1026,8 @@ def test_valuation_model_tab(offline, monkeypatch):
     assert app.subheader[0].value == "NVDA"
     assert app.session_state["model_manual_eps"] == 0 and app.session_state["model_weight_bear"] == 25
     assert len(app.session_state["model_register"]) == 0
-    assert any("quarters of reported EPS" in element.value for element in app.caption)
+    assert any("28 quarters of reported EPS" in element.value and "8 quarters of revenue" in element.value
+               for element in app.caption)
     assert app.metric[0].value != "n/a"
     open_tab(app, "News")
     open_tab(app, "Valuation Model")
