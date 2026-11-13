@@ -131,6 +131,36 @@ to 12 months minus SPY's. A scatter shows every check, with those near today's P
 summarises them, counting how many checks do not overlap; and a walkthrough draws the close, trailing EPS, P/E window
 and look-ahead return behind any one dot. Code in `analysis/what_happened_next.py`.
 
+**Valuation Model** (any Yahoo ticker; opens on ASMVY): a block model of what a share is worth, drawn as a
+diagram. Results and prices go in, an estimated price per share comes out, and every block shows the value it
+produces. The model runs at two rates. On each earnings release: **income and cost map** (trailing revenue growth and
+net margin) -> **earnings quality** (reported EPS of the last four quarters less a haircut) -> **scenario engine**
+(next year's EPS in a bear, base and bull case) -> **risk weighting** (the weighted EPS). On each close: **multiple
+builder** (median P/E of the peers and of the stock's own past, plus or minus P/E points) -> **product** (EPS x
+acceptable P/E = price per share) -> **market check** (the gap to the close). Hold blocks keep the quarterly outputs
+until the next release.
+
+Inputs are signals (results, prices, the risk and product register); everything you choose is a parameter of the
+block that owns it, set in the settings: the EPS haircut, the growth and margin of each case, the scenario weights,
+the P/E look-back and peer share, the materiality bar. Tap a block (or pick it under the diagram) to see its
+parameters and each of its input and output signals over time, quarterly ones as steps and daily ones as lines.
+
+The **risk and product register** is an editable table. Each item enters once: an event inside the forecast year
+changes earnings by probability x EPS impact; a general risk, or anything beyond the horizon, changes the P/E by its
+points. The **item tracker** counts how often Yahoo's latest stories mention each item's keywords, flags modelled
+items no story mentions, and lists the stories no item explains, which can be parked as new items; the **triage
+gate** keeps an item out of the price until it is marked Modelled, sized and above the materiality bar. A change log
+records each edit with the model price before and after, and the register can be saved and loaded as CSV.
+
+**Market check: what the price implies** solves the model backwards: for every dial (bear weight, growth, margin,
+EPS haircut, acceptable P/E, each item's probability or P/E points, parked items included) the value that would make
+the model price equal the close with everything else unchanged, marked plausible, a stretch or impossible on its
+own. The history chart shows the model price and its bear-to-bull range against the close; each day uses only
+results released by then, while the parameters and register are today's. ASMVY loads a preset from a worked example
+(peers BESIY, KLIC, AMAT, COHU, CAMT; a typed-in EPS per ADR because Yahoo reports the company in Hong Kong dollars).
+An estimate from stated assumptions, not investment advice. Code in `analysis/valuation_model.py` and
+`analysis/model_diagram.py`.
+
 **Semicon Supply Chain** (US-listed companies only): a bottom-up graph of the semiconductor supply chain behind
 an end market: **Mobile devices**, **AI / data center**, **Automotive**, or **All end markets** merged into one graph
 (which shows where the chains meet, e.g. TSM and ASML). Columns run from the end market (and system makers such as

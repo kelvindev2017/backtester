@@ -195,6 +195,31 @@ from analysis.what_happened_next import (
     today_text,
     walkthrough_figure,
 )
+from analysis.valuation_model import (
+    BLOCKS as MODEL_BLOCKS,
+    PRESETS as MODEL_PRESETS,
+    REGISTER_DEFAULTS,
+    SCENARIOS as MODEL_SCENARIOS,
+    SIGNALS as MODEL_SIGNALS,
+    clean_register,
+    implied_dials,
+    latest_values,
+    model_params,
+    preset_params,
+    preset_register,
+    register_changes,
+    run_model,
+    sensitivities,
+    track_items,
+)
+from analysis.model_diagram import (
+    block_signals_figure,
+    items_table,
+    model_diagram,
+    model_price_figure,
+    parameter_table,
+    signal_text,
+)
 from analysis.news import (
     MARKET_GROUP as NEWS_MARKET_GROUP,
     MARKET_SYMBOLS as NEWS_MARKET_SYMBOLS,
@@ -3202,9 +3227,11 @@ FUNDAMENTALS_TAB = "Stock Fundamentals"
 ECONOMY_TAB = "Economic analysis"
 JOURNAL_TAB = "Trade Journal"
 NEWS_TAB = "News"
+MODEL_TAB = "Valuation Model"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
-TAB_NAMES = [NEWS_TAB, "Stock Screener", ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, SUPPLY_CHAIN_TAB,
+TAB_NAMES = [NEWS_TAB, "Stock Screener", ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, MODEL_TAB,
+             SUPPLY_CHAIN_TAB,
              "Backtest", "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
@@ -4304,6 +4331,445 @@ def render_stock_fundamentals():
     if render_fundamentals(ticker, years, log_price, link_dates) is False:
         return
     render_what_happened_next(ticker, years, frequency, look_ahead, lookback_years, band)
+
+
+# ============================================================
+# Valuation model: page
+# ============================================================
+
+MODEL_YEARS = [2, 3, 5, 8]
+MODEL_LOOKBACKS = [3, 5, 8, 10]
+MODEL_BLOCK_NOTES = {
+    "income_map": "Reads each quarter's revenue and net income on the day it was released and turns them into the "
+                  "trailing growth and net margin the scenarios start from.",
+    "earnings_quality": "Takes the reported EPS of the last four quarters and removes the share you consider not real "
+                        "earnings (share-based pay, one-offs that keep coming back).",
+    "item_tracker": "Holds the risk and product register and compares the latest stories with it: how often each "
+                    "item is mentioned, and which stories no item explains.",
+    "triage_gate": "Lets an item into the model only when you have marked it Modelled, it is sized, and its effect "
+                   "clears the materiality bar. Everything else stays parked, with no effect on the price.",
+    "item_router": "Sends each item to one place only: an event inside the forecast year changes earnings, a general "
+                   "risk or anything further out changes the P/E.",
+    "scenario_engine": "Builds next year's EPS in a bear, base and bull case: the clean EPS grows with revenue and is "
+                       "scaled by the change in net margin, then takes the expected hit or gain from the event items.",
+    "risk_weighting": "Multiplies each case by its weight and adds them up.",
+    "multiple_builder": "Starts from the median P/E of the peers and of the stock's own past, then adds the P/E "
+                        "points of the general items. Recomputed every day, because peer prices move every day.",
+    "product": "Risk-adjusted EPS, held since the last release, times the day's acceptable P/E.",
+    "market_check": "Compares the model price with the close, and works backwards from the close to the value each "
+                    "dial would need to explain the gap.",
+}
+
+
+def model_param_key(name):
+    return f"model_{name}"
+
+
+def apply_model_preset(ticker=None):
+    """Set every model parameter, the peers and the register to the ticker's preset, or to the defaults."""
+
+    ticker = (ticker if ticker is not None else st.session_state.get("model_ticker", "")).strip().upper()
+    for name, value in preset_params(ticker).items():
+        st.session_state[model_param_key(name)] = int(value) if name == "pe_lookback_years" else float(value)
+    st.session_state["model_peers"] = ", ".join(MODEL_PRESETS.get(ticker, {}).get("peers", []))
+    store_model_register(preset_register(ticker))
+    st.session_state["model_log"] = []
+    st.session_state["model_preset_for"] = ticker
+
+
+def model_ticker_changed():
+    apply_model_preset(st.session_state.get("model_ticker", ""))
+
+
+def model_register():
+    if "model_register" not in st.session_state:
+        st.session_state["model_register"] = preset_register(st.session_state.get("model_ticker", ""))
+        st.session_state["model_register_version"] = 0
+    return st.session_state["model_register"]
+
+
+def store_model_register(table):
+    st.session_state["model_register"] = clean_register(table)
+    # A new editor key each time, so the grid starts from the stored table rather than replaying old edits.
+    st.session_state["model_register_version"] = st.session_state.get("model_register_version", 0) + 1
+
+
+def model_graph_key():
+    return f"model_graph_{st.session_state.get('model_graph_round', 0)}_chart"
+
+
+def focus_model_block():
+    """A tap or click on a block of the diagram opens it in the inspector (see focus_from_graph)."""
+
+    event = st.session_state.get(model_graph_key())
+    st.session_state["model_graph_round"] = st.session_state.get("model_graph_round", 0) + 1
+    points = event.selection.points if event and event.selection else []
+    for point in points:
+        customdata = point.get("customdata")
+        if customdata and customdata[0] in MODEL_BLOCKS:
+            st.session_state["model_block"] = customdata[0]
+            return
+
+
+def model_settings():
+    """The model's parameters, one settings group per block that owns them. Returns (ticker, years, peers, params)."""
+
+    if "model_ticker" not in st.session_state:
+        st.session_state["model_ticker"] = "ASMVY"
+    if st.session_state.get("model_preset_for") is None:
+        apply_model_preset(st.session_state["model_ticker"])
+
+    def number(name, label, low, high, step, help=None):
+        return st.number_input(label, min_value=float(low), max_value=float(high), step=float(step),
+                               key=model_param_key(name), help=help)
+
+    params = {}
+    with settings_panel("Stock"):
+        ticker = st.text_input("Ticker", key="model_ticker", on_change=model_ticker_changed,
+                               help="Any Yahoo symbol. ASMVY loads the worked example; another ticker starts from "
+                                    "the default parameters and an empty register.").strip().upper()
+        years = st.select_slider("History (years)", MODEL_YEARS, value=3, key="model_years")
+        peers_text = st.text_input("Peers for the P/E anchor", key="model_peers",
+                                   help="Yahoo symbols separated by commas. Their median trailing P/E is one half of "
+                                        "the anchor; leave empty to use only the stock's own past P/E.")
+        st.button("Reset parameters and register", on_click=apply_model_preset, key="model_reset_btn",
+                  help="Back to the ticker's preset, or to the defaults when it has none.")
+    with settings_panel("Earnings quality", expanded=False):
+        params["eps_haircut_pct"] = number("eps_haircut_pct", "EPS haircut %", 0, 90, 1,
+                                           "Share of reported EPS that is not real earnings to you.")
+        params["manual_eps"] = number("manual_eps", "Typed-in trailing EPS (0 = reported)", 0, 1e6, 0.01,
+                                      "Per share, in the currency of the price. Use it when Yahoo has no reported EPS "
+                                      "or reports it in another currency; the model then holds it flat.")
+    with settings_panel("Scenario engine", expanded=False):
+        params["growth_follow"] = number("growth_follow", "Base growth as a share of trailing growth", 0, 2, 0.05)
+        params["growth_floor"] = number("growth_floor", "Base growth floor %", -90, 0, 1)
+        params["growth_cap"] = number("growth_cap", "Base growth cap %", 0, 300, 1)
+        params["bear_growth_gap"] = number("bear_growth_gap", "Bear: growth points below base", 0, 100, 1)
+        params["bull_growth_gap"] = number("bull_growth_gap", "Bull: growth points above base", 0, 100, 1)
+        params["bear_margin_pts"] = number("bear_margin_pts", "Bear: net margin change, points", -50, 50, 0.5)
+        params["base_margin_pts"] = number("base_margin_pts", "Base: net margin change, points", -50, 50, 0.5)
+        params["bull_margin_pts"] = number("bull_margin_pts", "Bull: net margin change, points", -50, 50, 0.5)
+        params["fallback_yoy"] = number("fallback_yoy", "Trailing growth % when there is no revenue history", -90, 300, 1)
+        params["fallback_margin"] = number("fallback_margin", "Net margin % when there is no net income", 0.5, 90, 0.5)
+    with settings_panel("Risk weighting", expanded=False):
+        for name in MODEL_SCENARIOS:
+            key = f"weight_{name.lower()}"
+            params[key] = number(key, f"{name} weight", 0, 100, 5)
+        st.caption("Weights are rescaled to add up to 100%.")
+    with settings_panel("Multiple builder", expanded=False):
+        params["pe_lookback_years"] = st.select_slider("Own P/E look-back (years)", MODEL_LOOKBACKS,
+                                                       key=model_param_key("pe_lookback_years"))
+        params["peer_weight"] = number("peer_weight", "Share of the anchor from peers", 0, 1, 0.05)
+        params["pe_floor"] = number("pe_floor", "P/E floor", 1, 100, 1)
+        params["pe_cap"] = number("pe_cap", "P/E cap", 1, 200, 1)
+    with settings_panel("Triage gate", expanded=False):
+        params["materiality_eps_pct"] = number("materiality_eps_pct", "Smallest expected EPS effect %", 0, 50, 0.5,
+                                               "Probability x impact of an event item must reach this to count.")
+        params["materiality_pe"] = number("materiality_pe", "Smallest P/E effect, points", 0, 20, 0.25)
+    peers = [symbol for symbol in dict.fromkeys(part.strip().upper() for part in peers_text.split(",")) if symbol and symbol != ticker]
+    return ticker, years, peers, model_params(params)
+
+
+def load_model_inputs(ticker, years, peers, lookback_years):
+    """Prices, results by release date and the peers' trailing P/E for the model, with a note on what was found."""
+
+    today = pd.Timestamp(date.today())
+    start = today - pd.DateOffset(years=years)
+    # Extra history so the trailing sums, the year-on-year growth and the P/E look-back exist on the first day shown.
+    load_start = (start - pd.DateOffset(years=lookback_years + 2)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+    prices = load_data(ticker, load_start, end, "Daily")
+    if prices.empty or "Close" not in prices:
+        return None
+    earnings = load_earnings_data(ticker, load_start, end)
+    fundamentals, _, source = load_quarterly_fundamentals(ticker, load_start, end)
+    released = fundamentals_by_release_date(fundamentals, earnings)
+    eps = earnings["Reported EPS"].dropna() if "Reported EPS" in earnings else pd.Series(dtype=float)
+    release_dates = pd.DatetimeIndex(released.index) if len(released) else pd.DatetimeIndex([])
+    eps_dates = pd.DatetimeIndex(eps.index) if len(eps) else pd.DatetimeIndex([])
+    quarters = pd.DataFrame(index=release_dates.union(eps_dates))
+    for column in ["Revenue", "Net_Income"]:
+        if column in released:
+            quarters[column] = released[column]
+    quarters["EPS"] = eps
+    peer_pe = {}
+    for peer in peers:
+        peer_prices = load_data(peer, load_start, end, "Daily")
+        if peer_prices.empty or "Close" not in peer_prices:
+            continue
+        ratio = build_valuation_data(peer_prices, load_earnings_data(peer, load_start, end))[0]["Trailing_PE"]
+        if ratio.notna().any():
+            peer_pe[peer] = ratio
+    found = dict(eps_quarters=int(eps.notna().sum()),
+                 revenue_quarters=int(quarters["Revenue"].notna().sum()) if "Revenue" in quarters else 0,
+                 source=source, peers_found=list(peer_pe), peers_missing=[peer for peer in peers if peer not in peer_pe])
+    return SimpleNamespace(close=prices["Close"], quarters=quarters, peer_pe=pd.DataFrame(peer_pe), start=start, found=found)
+
+
+def model_data_note(found, params):
+    eps = (f"a typed-in trailing EPS of {params['manual_eps']:g}, held flat" if params["manual_eps"] > 0
+           else f"{found['eps_quarters']} quarters of reported EPS")
+    revenue = (f"{found['revenue_quarters']} quarters of revenue ({found['source']})" if found["revenue_quarters"]
+               else f"no revenue history, so trailing growth is taken as {params['fallback_yoy']:g}% and the net margin "
+                    f"as {params['fallback_margin']:g}%")
+    peers = (f"peer P/E from {', '.join(found['peers_found'])}" if found["peers_found"] else "no peer P/E")
+    missing = f" (nothing for {', '.join(found['peers_missing'])})" if found["peers_missing"] else ""
+    return f"Inputs found: {eps}; {revenue}; {peers}{missing}."
+
+
+def render_model_inspector(result, block):
+    """One block opened up: what it does, the parameters it owns and its input and output signals over time."""
+
+    spec = MODEL_BLOCKS[block]
+    values = latest_values(result)
+    rate = "each earnings release" if spec["rate"] == "quarterly" else "each close"
+    st.markdown(f"**{spec['title']}** · runs {rate}")
+    st.caption(MODEL_BLOCK_NOTES[block])
+    table = parameter_table(result, block)
+    signals = pd.DataFrame(
+        [{"Signal": MODEL_SIGNALS[name][1], "Direction": direction, "Latest": signal_text(values, name),
+          "Updated": "quarterly" if MODEL_SIGNALS[name][0] == "quarterly" else "daily"}
+         for direction, names in [("In", spec["inputs"]), ("Out", spec["outputs"])] for name in names])
+    columns = st.columns(2)
+    with columns[0]:
+        st.markdown("Parameters")
+        if table.empty:
+            st.caption("This block has no parameters: it is logic only.")
+        else:
+            st.dataframe(table, hide_index=True, width="stretch",
+                         column_config={"Value": st.column_config.NumberColumn(format="%.2f")})
+    with columns[1]:
+        st.markdown("Signals, latest value")
+        if signals.empty:
+            st.caption("No signals.")
+        else:
+            st.dataframe(signals, hide_index=True, width="stretch")
+    fig = block_signals_figure(result, block, mobile=MOBILE)
+    if fig is not None:
+        show_chart(fig, width="stretch")
+        st.caption("Inputs in the upper panels, outputs in the lower ones. A stepped line is a quarterly signal, "
+                   "held between updates; a smooth line is recomputed every day.")
+    if block == "item_tracker":
+        st.caption("The register itself, the stories and the parked items are under 'Risk and product register' below.")
+
+
+def render_market_check(result):
+    """What the close implies for each dial, and how far one step of the main dials moves the model price."""
+
+    st.markdown("**Market check: what the price implies**")
+    dials = implied_dials(result)
+    if dials.empty:
+        st.caption("No model price yet, so there is nothing to compare with the close.")
+        return
+    values = latest_values(result)
+    above = values["model_price"] > values["close"]
+    st.caption(
+        f"The model price is {abs(values['residual_pct']):.0f}% {'above' if above else 'below'} the close. Each row "
+        "holds everything else as it is and finds the value of that one dial that would make the model price equal "
+        "the close. 'Plausible' means the needed value is inside the range such a dial normally takes; 'Cannot match "
+        "alone' means no value of it closes the gap. A parked item is tried too: a risk can only explain a model "
+        "price that is too high, a product one that is too low.")
+    st.dataframe(dials, hide_index=True, width="stretch", column_config={
+        column: st.column_config.NumberColumn(format="%.1f") for column in ["Now", "Needed", "Change"]})
+    steps = sensitivities(result)
+    if steps:
+        st.caption("One step of each main dial moves the model price by: "
+                   + "; ".join(f"{name} {value:+,.2f}" for name, value in steps.items() if np.isfinite(value))
+                   + ". Use the table to decide which assumption to look at again, not to fit the model to the "
+                     "price: a model tuned until the gap is zero can only ever say the stock is fairly priced.")
+
+
+def add_model_candidate(title, url):
+    table = model_register()
+    row = {**REGISTER_DEFAULTS, "Item": title[:80], "Source": url, "Since": f"{pd.Timestamp(date.today()):%Y-%m-%d}"}
+    store_model_register(pd.concat([table, pd.DataFrame([row])], ignore_index=True))
+    log_model_change([f"Parked from a story: {title[:80]}"], st.session_state.get("model_last_price"))
+
+
+def log_model_change(changes, price_before):
+    log = list(st.session_state.get("model_log", []))
+    when = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+    log += [{"When": when, "Change": change, "Model price before": price_before, "Model price after": None}
+            for change in changes]
+    st.session_state["model_log"] = log
+
+
+def load_model_register_upload(upload):
+    """Replace the register with an uploaded CSV (once per file)."""
+
+    if upload is None:
+        return
+    file_id = f"{upload.name}:{upload.size}"
+    if st.session_state.get("model_register_file") == file_id:
+        return
+    try:
+        loaded = clean_register(pd.read_csv(upload))
+    except Exception as error:
+        st.error(f"Could not read a register from {upload.name}: {error}")
+        return
+    st.session_state["model_register_file"] = file_id
+    log_model_change(register_changes(model_register(), loaded) or ["Register loaded from a file"],
+                     st.session_state.get("model_last_price"))
+    store_model_register(loaded)
+    st.rerun()
+
+
+def render_model_register(result, tracked, candidates, ticker):
+    """The register editor, the items after the gate and router, the stories no item explains and the change log."""
+
+    st.markdown("**Risk and product register**")
+    st.caption(
+        "One row per risk or product. An **Event** that is **In horizon** changes earnings by probability x EPS "
+        "impact; a **General** item, or anything **Beyond horizon**, changes the P/E by its points (times the "
+        "probability for an event). Risks subtract, products add; type the sizes as positive numbers. Only rows with "
+        "status **Modelled** that clear the materiality bar count; a **Parked** row is visible but has no effect. "
+        "**Since** (YYYY-MM-DD) is the day an item starts to apply in the history; empty means always. **Keywords** "
+        "are what the item tracker looks for in the stories.")
+    table = model_register()
+    edited = st.data_editor(
+        table, hide_index=True, width="stretch", num_rows="dynamic",
+        key=f"model_register_{st.session_state.get('model_register_version', 0)}_table",
+        column_config={
+            "Item": st.column_config.TextColumn("Item", width="large", required=True),
+            "Type": st.column_config.SelectboxColumn("Type", options=["Risk", "Product"], required=True),
+            "Kind": st.column_config.SelectboxColumn("Kind", options=["Event", "General"], required=True),
+            "Timing": st.column_config.SelectboxColumn("Timing", options=["In horizon", "Beyond horizon"], required=True),
+            "Probability %": st.column_config.NumberColumn("Probability %", min_value=0, max_value=100, format="%.0f"),
+            "EPS impact %": st.column_config.NumberColumn("EPS impact %", min_value=0, max_value=100, format="%.1f"),
+            "P/E points": st.column_config.NumberColumn("P/E points", min_value=0, max_value=50, format="%.1f"),
+            "Status": st.column_config.SelectboxColumn("Status", options=["Modelled", "Parked"], required=True),
+            "Since": st.column_config.TextColumn("Since"),
+            "Keywords": st.column_config.TextColumn("Keywords"),
+            "Source": st.column_config.TextColumn("Source"),
+        })
+    after = clean_register(edited)
+    if not after.astype(str).equals(table.astype(str)):
+        log_model_change(register_changes(table, after) or ["Register text edited"], st.session_state.get("model_last_price"))
+        store_model_register(after)
+        st.rerun()
+    columns = st.columns(2)
+    columns[0].download_button("Download register (CSV)", table.to_csv(index=False).encode("utf-8"),
+                               file_name=f"register_{ticker}.csv", mime="text/csv", key="model_register_download_btn")
+    with columns[1]:
+        load_model_register_upload(st.file_uploader("Load a register (CSV)", type="csv", key="model_register_upload"))
+
+    shown = items_table(result, tracked)
+    if not shown.empty:
+        st.markdown("After the triage gate and the item router")
+        st.dataframe(shown, hide_index=True, width="stretch")
+        stale = shown.loc[shown["Stale"] != "", "Item"].tolist() if "Stale" in shown else []
+        if stale:
+            st.caption("Not mentioned in the latest stories: " + "; ".join(stale) + ". Check whether these still "
+                       "apply before removing them: companies often stop talking about a risk before it has gone.")
+
+    st.markdown("Stories no item explains")
+    if candidates.empty:
+        st.caption("No story with a clear positive or negative tone is left unexplained by the register's keywords "
+                   "(or Yahoo returned no stories).")
+    else:
+        view = candidates.copy()
+        view["published"] = pd.to_datetime(view["published"]).dt.strftime("%d %b %H:%M")
+        st.dataframe(view[["published", "tone", "title", "publisher"]], hide_index=True, width="stretch")
+        st.caption("Possible new risks or products. The match is on keywords in Yahoo's latest headlines for the "
+                   "ticker, so it finds mentions, not meaning. Parking one adds a row to the register with no effect "
+                   "on the price until you size it and mark it Modelled.")
+        titles = list(candidates["title"])
+        if st.session_state.get("model_candidate") not in titles:
+            st.session_state["model_candidate"] = titles[0]
+        choice = st.selectbox("Park a story as an item", titles, key="model_candidate")
+        url = candidates.loc[candidates["title"] == choice, "url"].iloc[0] if choice else ""
+        st.button("Park it", on_click=add_model_candidate, args=(choice or "", url), key="model_candidate_btn",
+                  disabled=not choice)
+
+    log = pd.DataFrame(st.session_state.get("model_log", []))
+    with st.expander(f"Change log ({len(log)})"):
+        if log.empty:
+            st.caption("Changes to the register are listed here with the model price before and after.")
+        else:
+            st.dataframe(log.iloc[::-1], hide_index=True, width="stretch", column_config={
+                column: st.column_config.NumberColumn(format="%.2f")
+                for column in ["Model price before", "Model price after"]})
+
+
+def render_valuation_model():
+    """The block model of a share's fair price: diagram, signals between the blocks, parameters and market check."""
+
+    ticker, years, peers, params = model_settings()
+    st.caption(
+        "A block model of what a share is worth: results and prices go in, a price per share comes out. The upper "
+        "blocks run on each earnings release, the lower ones on each close. Tap a block to see its parameters and "
+        "the signals going in and out of it.")
+    if not ticker:
+        st.info("Enter a ticker in the settings.")
+        return
+    name = load_fundamental_snapshot(ticker).get("shortName")
+    st.subheader(f"{ticker} · {name}" if name else ticker)
+    preset = MODEL_PRESETS.get(ticker)
+    if preset:
+        st.caption(preset["note"])
+    with st.spinner("Loading results, prices and peers..."):
+        inputs = load_model_inputs(ticker, years, peers, params["pe_lookback_years"])
+    if inputs is None:
+        st.warning(f"Yahoo Finance has no price history for {ticker}. Check the symbol: it must be the ticker "
+                   "Yahoo uses, e.g. a US listing or an OTC ADR such as ASMVY.")
+        return
+    try:
+        news = add_tone(load_news((ticker,)))
+    except Exception:
+        news = None
+    tracked, candidates = track_items(model_register(), news)
+    # A story already parked as an item is no longer unexplained.
+    candidates = candidates[~candidates["title"].str[:80].isin(set(model_register()["Item"]))].reset_index(drop=True)
+    result = run_model(inputs.quarters, inputs.close, model_register(), params, inputs.peer_pe, start=inputs.start)
+    values = latest_values(result)
+    st.caption(model_data_note(inputs.found, params))
+
+    price = values.get("model_price", np.nan)
+    # The change log's "after" price is the first model price computed after the change.
+    log = st.session_state.get("model_log", [])
+    if log and np.isfinite(price):
+        for entry in log:
+            if entry["Model price after"] is None:
+                entry["Model price after"] = float(price)
+    st.session_state["model_last_price"] = float(price) if np.isfinite(price) else None
+    if not np.isfinite(price):
+        st.warning(
+            f"The model has no price for {ticker}: " + (
+                "there is no P/E anchor yet (add peers, or wait for more price history)."
+                if np.isfinite(values.get("held_eps", np.nan)) and values.get("held_eps", 0) > 0 else
+                "it needs four quarters of reported EPS, and Yahoo has fewer. Type a trailing EPS under Earnings "
+                "quality in the settings to run it."))
+    tiles = st.columns(4)
+    tiles[0].metric("Model price per share", f"{price:,.2f}" if np.isfinite(price) else "n/a",
+                    f"{values['residual_pct']:+.1f}% vs close" if np.isfinite(values.get("residual_pct", np.nan)) else None)
+    tiles[1].metric("Close", f"{values['close']:,.2f}" if np.isfinite(values.get("close", np.nan)) else "n/a")
+    tiles[2].metric("Risk-adjusted EPS", signal_text(values, "risk_adjusted_eps"))
+    tiles[3].metric("Acceptable P/E", signal_text(values, "acceptable_pe"))
+
+    blocks = list(MODEL_BLOCKS)
+    if st.session_state.get("model_block") not in blocks:
+        st.session_state["model_block"] = "risk_weighting"
+    block = st.session_state["model_block"]
+    show_chart(model_diagram(result, selected=block, mobile=MOBILE), width="stretch", key=model_graph_key(),
+               on_select=focus_model_block, selection_mode="points", config={"displayModeBar": False})
+    st.caption("Each block shows its latest output and each wire the value it carries. The dashed wire carries the "
+               "parked items to the market check without touching the price. Hover a block for its inputs, outputs "
+               "and parameters.")
+    st.selectbox("Open a block", blocks, key="model_block", format_func=lambda key: MODEL_BLOCKS[key]["title"])
+    render_model_inspector(result, block)
+
+    st.markdown(f"**{ticker} model price against the close, last {years} years**")
+    show_chart(model_price_figure(result, ticker, mobile=MOBILE), width="stretch")
+    st.caption(
+        "Every day uses only the results released by then, and the P/E anchor of a day ends the day before. The "
+        "parameters and the register are today's, applied to the whole history, so the past line shows what this "
+        "model would have said, not what you would have assumed at the time; an item with a Since date starts on "
+        "that date. The shaded band runs from the bear to the bull case at the same P/E. Dotted lines are the "
+        "updates of the quarterly part. The P/E anchors are trailing P/Es applied to next year's EPS, which favours "
+        "a growing company: size the P/E deductions with that in mind. An estimate from stated assumptions, not "
+        "investment advice.")
+    render_market_check(result)
+    render_model_register(result, tracked, candidates, ticker)
 
 
 def quoted_next_earnings(symbol):
@@ -7170,6 +7636,8 @@ if check_password():
                 render_news()
             elif label == FUNDAMENTALS_TAB:
                 render_stock_fundamentals()
+            elif label == MODEL_TAB:
+                render_valuation_model()
             elif label == SUPPLY_CHAIN_TAB:
                 render_supply_chain(main_index_prices)
             elif label == JOURNAL_TAB:
