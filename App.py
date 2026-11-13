@@ -235,6 +235,7 @@ from analysis.news import (
     time_ago,
     with_semi_ai_sector,
 )
+from analysis.peers import merge_peers, rank_by_size, target_weight
 from analysis.universe import (
     MARKETS as SCREENER_MARKETS,
     load_us_index_members,
@@ -3788,6 +3789,70 @@ def sp500_competitors(symbol, count):
     return sorted(dollar_volume, key=dollar_volume.get, reverse=True)[:count]
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _yahoo_industry_peers(symbol, count):
+    """Companies in the stock's Yahoo industry, closest in size first, and the industry's name."""
+
+    info = yf.Ticker(symbol).info or {}
+    industry = info.get("industryKey")
+    if not industry:
+        raise LookupError(symbol)  # raised, not returned, so a Yahoo hiccup is not cached
+    companies = yf.Industry(industry).top_companies
+    if companies is None or companies.empty or "market weight" not in companies:
+        raise LookupError(symbol)
+    weights = pd.Series(companies["market weight"].values,
+                        index=[normalize_ticker(ticker) for ticker in companies.index], dtype=float)
+    target = target_weight(weights, symbol)
+    if target is None and info.get("marketCap"):
+        # Scale the stock's market cap by the largest listed company's cap and weight (one more quote).
+        largest = weights.idxmax()
+        largest_cap = (yf.Ticker(largest).info or {}).get("marketCap")
+        target = target_weight(weights, symbol, info["marketCap"], (largest, largest_cap))
+    return rank_by_size(weights, target, count, exclude=[symbol]), info.get("industry") or industry
+
+
+def sp500_sub_industry(symbol):
+    """The stock's GICS sub-industry when it is an S&P 500 member, else ""."""
+
+    members, _ = load_universe_members("US", "S&P 500")
+    row = members[members["Ticker"].map(normalize_ticker) == symbol]
+    return str(row["Industry"].iloc[0]).strip() if not row.empty else ""
+
+
+def find_peers(symbol, count=5):
+    """Peers for the P/E anchor and where they came from (see analysis.peers): the S&P 500 sub-industry
+    first, topped up from the Yahoo industry by closeness in size. ([], "") when neither answers."""
+
+    symbol = normalize_ticker(symbol)
+    groups, sources = [], []
+    try:
+        sub_industry = sp500_sub_industry(symbol)
+        competitors = sp500_competitors(symbol, count) if sub_industry else []
+    except Exception:
+        sub_industry, competitors = "", []
+    if competitors:
+        groups.append(competitors)
+        sources.append(f"S&P 500 sub-industry \"{sub_industry}\", most traded first")
+    if len(merge_peers(groups, symbol, count)) < count:
+        try:
+            ranked, industry = _yahoo_industry_peers(symbol, count + len(competitors))
+        except Exception:
+            ranked, industry = [], ""
+        if ranked:
+            groups.append(ranked)
+            sources.append(f"Yahoo industry \"{industry}\", closest in size first")
+    return merge_peers(groups, symbol, count), "; ".join(sources)
+
+
+def fill_model_peers(ticker=None):
+    """Find the peers of the model's ticker and put them in the peers box (the user can still edit them)."""
+
+    ticker = (ticker if ticker is not None else st.session_state.get("model_ticker", "")).strip().upper()
+    peers, source = find_peers(ticker) if ticker else ([], "")
+    st.session_state["model_peers"] = ", ".join(peers)
+    st.session_state["model_peers_found"] = (st.session_state["model_peers"], source)
+
+
 def industry_leaders(symbol, count=3):
     """The leading companies for one line of the industry chart.
 
@@ -4371,7 +4436,13 @@ def apply_model_preset(ticker=None):
     ticker = (ticker if ticker is not None else st.session_state.get("model_ticker", "")).strip().upper()
     for name, value in preset_params(ticker).items():
         st.session_state[model_param_key(name)] = int(value) if name == "pe_lookback_years" else float(value)
-    st.session_state["model_peers"] = ", ".join(MODEL_PRESETS.get(ticker, {}).get("peers", []))
+    preset_peers = MODEL_PRESETS.get(ticker, {}).get("peers", [])
+    if preset_peers:
+        st.session_state["model_peers"] = ", ".join(preset_peers)
+        st.session_state["model_peers_found"] = (st.session_state["model_peers"], f"the {ticker} worked example")
+    else:
+        # No preset: find the peers automatically; the box stays editable.
+        fill_model_peers(ticker)
     store_model_register(preset_register(ticker))
     st.session_state["model_log"] = []
     st.session_state["model_preset_for"] = ticker
@@ -4431,7 +4502,18 @@ def model_settings():
         years = st.select_slider("History (years)", MODEL_YEARS, value=3, key="model_years")
         peers_text = st.text_input("Peers for the P/E anchor", key="model_peers",
                                    help="Yahoo symbols separated by commas. Their median trailing P/E is one half of "
-                                        "the anchor; leave empty to use only the stock's own past P/E.")
+                                        "the anchor; leave empty to use only the stock's own past P/E. Filled in "
+                                        "automatically for a new ticker; edit freely.")
+        found_text, found_source = st.session_state.get("model_peers_found", ("", ""))
+        if peers_text.strip() and peers_text == found_text and found_source:
+            st.caption(f"Found automatically from the {found_source}. Edit the list to change them.")
+        elif not peers_text.strip() and "model_peers_found" in st.session_state:
+            st.caption("No peers found automatically for this ticker; type some in.")
+        elif peers_text.strip():
+            st.caption("Edited by you. Find peers refills the list automatically.")
+        st.button("Find peers", on_click=fill_model_peers, key="model_find_peers_btn",
+                  help="Replace the list with peers found automatically: the S&P 500 sub-industry, then the "
+                       "Yahoo industry by closeness in size.")
         st.button("Reset parameters and register", on_click=apply_model_preset, key="model_reset_btn",
                   help="Back to the ticker's preset, or to the defaults when it has none.")
     with settings_panel("Earnings quality", expanded=False):

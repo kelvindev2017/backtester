@@ -1042,3 +1042,40 @@ def test_valuation_model_tab(offline, monkeypatch):
     app.text_input(key="model_ticker").input("SKNX")
     open_tab(app, "Valuation Model")
     assert any("no price history for SKNX" in element.value for element in app.warning)
+
+
+def test_valuation_model_finds_peers_automatically(offline, monkeypatch):
+    class Ticker(FakeTickerWithRevenue):
+        @property
+        def info(self):
+            caps = {"ASMVY": 5.4e9, "AMAT": 310e9}
+            return {**FakeTicker(self.symbol).info, "industryKey": "semiconductor-equipment-materials",
+                    "industry": "Semiconductor Equipment & Materials", "marketCap": caps.get(self.symbol, 1e9)}
+
+        @info.setter
+        def info(self, value):
+            pass
+
+    monkeypatch.setattr(yf, "Ticker", Ticker)
+    monkeypatch.setattr(yf, "Industry", lambda key: SimpleNamespace(top_companies=pd.DataFrame(
+        {"market weight": [0.31, 0.30, 0.21, 0.043, 0.024, 0.011]},
+        index=["AMAT", "LRCX", "KLAC", "TER", "ENTG", "NVMI"])), raising=False)
+    st.cache_data.clear()
+    app = open_tab(start_app(), "Valuation Model")
+    # The worked example keeps its own peers.
+    assert app.session_state["model_peers"] == "BESIY, KLIC, AMAT, COHU, CAMT"
+
+    # A ticker without a preset gets peers found automatically, closest in size first (not in the S&P 500 here).
+    app.text_input(key="model_ticker").input("ACMR")
+    open_tab(app, "Valuation Model")
+    assert app.session_state["model_peers"] == "NVMI, ENTG, TER, KLAC, LRCX"
+    assert any("Found automatically from the Yahoo industry" in element.value for element in app.caption)
+
+    # The list stays editable, and Find peers refills it.
+    app.text_input(key="model_peers").input("ENTG, ONTO")
+    open_tab(app, "Valuation Model")
+    assert app.session_state["model_peers"] == "ENTG, ONTO"
+    assert any("Edited by you" in element.value for element in app.caption)
+    app.button(key="model_find_peers_btn").click()
+    open_tab(app, "Valuation Model")
+    assert app.session_state["model_peers"] == "NVMI, ENTG, TER, KLAC, LRCX"
