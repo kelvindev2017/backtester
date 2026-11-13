@@ -1069,13 +1069,11 @@ def test_valuation_model_finds_peers_automatically(offline, monkeypatch):
     app.text_input(key="model_ticker").input("ACMR")
     open_tab(app, "Valuation Model")
     assert app.session_state["model_peers"] == "NVMI, ENTG, TER, KLAC, LRCX"
-    assert any("Found automatically from the Yahoo industry" in element.value for element in app.caption)
 
     # The list stays editable, and Find peers refills it.
     app.text_input(key="model_peers").input("ENTG, ONTO")
     open_tab(app, "Valuation Model")
     assert app.session_state["model_peers"] == "ENTG, ONTO"
-    assert any("Edited by you" in element.value for element in app.caption)
     app.button(key="model_find_peers_btn").click()
     open_tab(app, "Valuation Model")
     assert app.session_state["model_peers"] == "NVMI, ENTG, TER, KLAC, LRCX"

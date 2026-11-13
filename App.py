@@ -4504,18 +4504,15 @@ def model_settings():
                                    help="Yahoo symbols separated by commas. Their median trailing P/E is one half of "
                                         "the anchor; leave empty to use only the stock's own past P/E. Filled in "
                                         "automatically for a new ticker; edit freely.")
-        found_text, found_source = st.session_state.get("model_peers_found", ("", ""))
-        if peers_text.strip() and peers_text == found_text and found_source:
-            st.caption(f"Found automatically from the {found_source}. Edit the list to change them.")
-        elif not peers_text.strip() and "model_peers_found" in st.session_state:
-            st.caption("No peers found automatically for this ticker; type some in.")
-        elif peers_text.strip():
-            st.caption("Edited by you. Find peers refills the list automatically.")
-        st.button("Find peers", on_click=fill_model_peers, key="model_find_peers_btn",
-                  help="Replace the list with peers found automatically: the S&P 500 sub-industry, then the "
-                       "Yahoo industry by closeness in size.")
-        st.button("Reset parameters and register", on_click=apply_model_preset, key="model_reset_btn",
-                  help="Back to the ticker's preset, or to the defaults when it has none.")
+        # Both buttons on one row, on phones too.
+        st.html("<style>.st-key-model_peer_buttons [data-testid='stHorizontalBlock'] {flex-wrap: nowrap}"
+                ".st-key-model_peer_buttons [data-testid='stColumn'] {min-width: 0; width: auto; flex: 0 0 auto}</style>")
+        buttons = st.container(key="model_peer_buttons").columns(2)
+        buttons[0].button("Find peers", on_click=fill_model_peers, key="model_find_peers_btn",
+                          help="Replace the list with peers found automatically: the S&P 500 sub-industry, then "
+                               "the Yahoo industry by closeness in size.")
+        buttons[1].button("Reset parameters and register", on_click=apply_model_preset, key="model_reset_btn",
+                          help="Back to the ticker's preset, or to the defaults when it has none.")
     with settings_panel("Earnings quality", expanded=False):
         params["eps_haircut_pct"] = number("eps_haircut_pct", "EPS haircut %", 0, 90, 1,
                                            "Share of reported EPS that is not real earnings to you.")
