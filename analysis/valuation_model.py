@@ -31,6 +31,7 @@ DEFAULT_PARAMS = {
     # Earnings quality
     "eps_haircut_pct": 0.0,      # share of reported EPS removed (share-based pay, one-offs that keep coming back)
     "manual_eps": 0.0,           # trailing 12-month EPS per share typed in; 0 = use the reported quarters
+    "quality_pe_pts": 0.0,       # P/E points taken off the acceptable P/E for weak earnings quality
     # Scenario engine
     "growth_follow": 0.5,        # base growth = this share of the trailing revenue growth
     "growth_floor": -20.0,
@@ -76,11 +77,13 @@ SIGNALS = {
     "eps_bull": ("quarterly", "Bull EPS", "", "eps"),
     "risk_adjusted_eps": ("quarterly", "Risk-adjusted EPS", "", "eps"),
     "pe_adjust": ("quarterly", "P/E points from general items", "pts", "points"),
+    "quality_pe": ("quarterly", "P/E points from earnings quality", "pts", "points"),
     "items_modelled": ("quarterly", "Items in the model", "", "count"),
     "items_parked": ("quarterly", "Items parked", "", "count"),
     "close": ("daily", "Close", "", "price"),
     "held_eps": ("daily", "Risk-adjusted EPS (held)", "", "eps"),
     "held_pe_adjust": ("daily", "P/E points (held)", "pts", "points"),
+    "held_quality_pe": ("daily", "Earnings quality P/E points (held)", "pts", "points"),
     "own_anchor": ("daily", "Own median P/E", "x", "multiple"),
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
     "acceptable_pe": ("daily", "Acceptable P/E", "x", "multiple"),
@@ -98,8 +101,9 @@ BLOCKS = {
                 "fallback_margin": "Net margin % when there is no net income"}),
     "earnings_quality": dict(
         title="Earnings quality", rate="quarterly", role="Param: adjustment rules",
-        inputs=["eps"], outputs=["ttm_eps", "clean_eps"],
-        params={"eps_haircut_pct": "EPS haircut %", "manual_eps": "Typed-in trailing EPS (0 = reported)"}),
+        inputs=["eps"], outputs=["ttm_eps", "clean_eps", "quality_pe"],
+        params={"eps_haircut_pct": "EPS haircut %", "manual_eps": "Typed-in trailing EPS (0 = reported)",
+                "quality_pe_pts": "P/E deduction, points"}),
     "item_tracker": dict(
         title="Item tracker", rate="quarterly", role="Logic: detect and park",
         inputs=[], outputs=["items_modelled", "items_parked"], params={}),
@@ -124,7 +128,7 @@ BLOCKS = {
         params={"weight_bear": "Bear weight", "weight_base": "Base weight", "weight_bull": "Bull weight"}),
     "multiple_builder": dict(
         title="Multiple builder", rate="daily", role="Param: P/E deductions",
-        inputs=["own_anchor", "peer_anchor", "held_pe_adjust"], outputs=["acceptable_pe"],
+        inputs=["own_anchor", "peer_anchor", "held_pe_adjust", "held_quality_pe"], outputs=["acceptable_pe"],
         params={"pe_lookback_years": "Own P/E look-back, years", "peer_weight": "Share of the anchor from peers",
                 "pe_floor": "P/E floor", "pe_cap": "P/E cap"}),
     "product": dict(
@@ -310,7 +314,7 @@ def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0):
     base_growth = float(np.clip(params["growth_follow"] * yoy, params["growth_floor"], params["growth_cap"]))
     growth = {"Bear": base_growth - params["bear_growth_gap"], "Base": base_growth,
               "Bull": base_growth + params["bull_growth_gap"]}
-    point = {"clean_eps": clean, "event_effect": event_effect * 100}
+    point = {"clean_eps": clean, "event_effect": event_effect * 100, "quality_pe": -abs(float(params["quality_pe_pts"]))}
     for name in SCENARIOS:
         key = name.lower()
         margin_ratio = max(0.0, margin + params[f"{key}_margin_pts"]) / margin if margin > 0 else 1.0
@@ -401,10 +405,12 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     daily["close"] = close
     if quarterly.empty:
         daily["held_eps"], daily["held_pe_adjust"], held_ttm = np.nan, 0.0, pd.Series(np.nan, index=close.index)
+        daily["held_quality_pe"] = -abs(float(params["quality_pe_pts"]))
     else:
         # Hold blocks: each quarterly output keeps its last value until the next update.
         both = quarterly.reindex(quarterly.index.union(close.index)).ffill().reindex(close.index)
         daily["held_eps"], daily["held_pe_adjust"], held_ttm = both["risk_adjusted_eps"], both["pe_adjust"].fillna(0.0), both["ttm_eps"]
+        daily["held_quality_pe"] = both["quality_pe"].fillna(0.0)
 
     # Multiple builder. The own anchor is the median trailing P/E of the look-back, up to the day before, so the
     # day's own price does not set its own fair multiple.
@@ -430,7 +436,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     elif share <= 0:
         anchor = daily["own_anchor"].combine_first(daily["peer_anchor"])
     daily["anchor"] = anchor
-    daily["acceptable_pe"] = (anchor + daily["held_pe_adjust"]).clip(lower=params["pe_floor"], upper=params["pe_cap"])
+    daily["acceptable_pe"] = (anchor + daily["held_pe_adjust"] + daily["held_quality_pe"]).clip(lower=params["pe_floor"], upper=params["pe_cap"])
 
     # Product and market check.
     positive_eps = daily["held_eps"].where(daily["held_eps"] > 0)
@@ -474,7 +480,7 @@ def _point_price(state, params, routed):
         return np.nan
     if eps <= 0:
         return 0.0  # no earnings, no price: lets the solver see the sign change at the edge of a dial's range
-    return eps * float(np.clip(state["anchor"] + points, params["pe_floor"], params["pe_cap"]))
+    return eps * float(np.clip(state["anchor"] + points + point["quality_pe"], params["pe_floor"], params["pe_cap"]))
 
 
 def _solve(price_at, low, high, target, steps=60):
@@ -547,6 +553,7 @@ def implied_dials(result, on=None):
     add("EPS haircut", "Earnings quality", params["eps_haircut_pct"], 0, 90, (0, 30), "%",
         lambda haircut: _point_price(state, {**params, "eps_haircut_pct": haircut}, routed))
     events, points = item_effects(routed, on)
+    points -= abs(float(params["quality_pe_pts"]))
     add("Acceptable P/E", "Multiple builder", float(np.clip(anchor + points, params["pe_floor"], params["pe_cap"])),
         1, 100, (params["pe_floor"], params["pe_cap"]), "x",
         lambda multiple: _point_price(state, {**params, "pe_floor": multiple, "pe_cap": multiple}, routed))

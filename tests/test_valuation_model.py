@@ -241,3 +241,16 @@ def test_forward_basis_anchors_on_the_given_own_pe():
     last_t, last_f = trailing["daily"].iloc[-1], forward["daily"].iloc[-1]
     assert last_f["held_eps"] == pytest.approx(last_t["held_eps"])
     assert last_f["model_price"] == pytest.approx(last_t["model_price"] * 15 / 20)
+
+
+def test_earnings_quality_takes_points_off_the_acceptable_pe():
+    quarters = make_quarters()
+    close = make_close(quarters)
+    plain = run_model(quarters, close, None, model_params())
+    weak = run_model(quarters, close, None, model_params({"quality_pe_pts": 3.0}))
+    before, after = plain["daily"].iloc[-1], weak["daily"].iloc[-1]
+    assert after["held_quality_pe"] == pytest.approx(-3.0)
+    assert after["acceptable_pe"] == pytest.approx(before["acceptable_pe"] - 3.0)
+    assert after["model_price"] == pytest.approx(after["held_eps"] * after["acceptable_pe"])
+    dials = implied_dials(weak).set_index("Dial")
+    assert dials.at["Acceptable P/E", "Now"] == pytest.approx(after["acceptable_pe"])

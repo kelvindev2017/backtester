@@ -4527,6 +4527,7 @@ def model_settings():
         params["manual_eps"] = number("manual_eps", "Typed-in trailing EPS (0 = reported)", 0, 1e6, 0.01,
                                       "Per share, in the currency of the price. Use it when Yahoo has no reported EPS "
                                       "or reports it in another currency; the model then holds it flat.")
+        params["quality_pe_pts"] = number("quality_pe_pts", "P/E deduction, points", 0, 50, 0.5)
     with settings_panel("Scenario engine", expanded=False):
         params["growth_follow"] = number("growth_follow", "Base growth as a share of trailing growth", 0, 2, 0.05)
         params["growth_floor"] = number("growth_floor", "Base growth floor %", -90, 0, 1)
