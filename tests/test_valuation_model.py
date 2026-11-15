@@ -226,3 +226,18 @@ def test_register_is_cleaned_and_changes_are_listed():
         "Added: HBM delays", "Removed: Old item", "Export rules: Probability % 20 -> 35",
         "Export rules: Status Parked -> Modelled"]
     assert register_changes(before, before) == []
+
+
+def test_forward_basis_anchors_on_the_given_own_pe():
+    quarters = make_quarters()
+    close = make_close(quarters)
+    trailing = run_model(quarters, close, None, model_params({"peer_weight": 0.0}))
+    own_forward = pd.Series(15.0, index=close.index)
+    forward = run_model(quarters, close, None, model_params({"peer_weight": 0.0, "pe_basis": "Forward"}),
+                        own_pe=own_forward)
+    assert trailing["daily"]["own_anchor"].iloc[-1] == pytest.approx(20.0)
+    assert forward["daily"]["own_anchor"].iloc[-1] == pytest.approx(15.0)
+    # Same EPS, lower multiple: the price scales with the anchor.
+    last_t, last_f = trailing["daily"].iloc[-1], forward["daily"].iloc[-1]
+    assert last_f["held_eps"] == pytest.approx(last_t["held_eps"])
+    assert last_f["model_price"] == pytest.approx(last_t["model_price"] * 15 / 20)
