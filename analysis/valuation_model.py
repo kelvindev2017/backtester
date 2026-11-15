@@ -47,10 +47,11 @@ DEFAULT_PARAMS = {
     "weight_base": 50.0,
     "weight_bull": 25.0,
     # Multiple builder
+    "pe_basis": "Forward",       # Trailing: P/E on the last four quarters' EPS; Forward: on the next four quarters'
     "pe_lookback_years": 5,
     "peer_weight": 0.5,          # share of the P/E anchor taken from the peers' median; the rest is the own median
     "pe_floor": 5.0,
-    "pe_cap": 40.0,
+    "pe_cap": 100.0,
     # Triage gate
     "materiality_eps_pct": 1.0,  # smallest expected EPS effect (probability x impact) that enters the model
     "materiality_pe": 0.5,       # smallest P/E effect, in points, that enters the model
@@ -357,12 +358,14 @@ def quarterly_inputs(quarters):
     return frame
 
 
-def run_model(quarters, close, register=None, params=None, peer_pe=None, start=None):
+def run_model(quarters, close, register=None, params=None, peer_pe=None, start=None, own_pe=None):
     """Run the whole model over history.
 
     quarters: results by the date they became public (columns Revenue, Net_Income, EPS; any may be missing).
-    close: daily close of the share. register: the risk and product items. peer_pe: daily trailing P/E of each peer,
-    one column per peer. start: first day to report (earlier data still feeds the trailing sums and medians).
+    close: daily close of the share. register: the risk and product items. peer_pe: daily P/E of each peer, one
+    column per peer, on the basis the anchor uses. start: first day to report (earlier data still feeds the trailing
+    sums and medians). own_pe: the share's own daily P/E for its anchor; None uses the trailing P/E from ``quarters``
+    (pass a forward P/E here, with the peers' forward P/E, for a forward anchor).
 
     Returns a dict with ``quarterly`` (one row per update of the quarterly part), ``daily`` (one row per close),
     ``items`` (the register after the triage gate and router) and ``params``. Nothing on a date uses data from later.
@@ -405,7 +408,11 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
 
     # Multiple builder. The own anchor is the median trailing P/E of the look-back, up to the day before, so the
     # day's own price does not set its own fair multiple.
-    own_pe = (close / held_ttm.where(held_ttm > 0)).replace([np.inf, -np.inf], np.nan)
+    if own_pe is None:
+        own_pe = (close / held_ttm.where(held_ttm > 0)).replace([np.inf, -np.inf], np.nan)
+    else:
+        own_pe = pd.to_numeric(pd.Series(own_pe), errors="coerce")
+        own_pe = own_pe.where(own_pe > 0).reindex(own_pe.index.union(close.index)).ffill(limit=5).reindex(close.index)
     window = max(2, int(round(252 * float(params["pe_lookback_years"]))))
     daily["own_anchor"] = own_pe.shift(1).rolling(window, min_periods=min(window, 60)).median()
     if peer_pe is not None and not pd.DataFrame(peer_pe).empty:

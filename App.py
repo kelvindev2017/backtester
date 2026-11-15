@@ -4404,6 +4404,7 @@ def render_stock_fundamentals():
 
 MODEL_YEARS = [2, 3, 5, 8]
 MODEL_LOOKBACKS = [3, 5, 8, 10]
+MODEL_PE_BASES = ["Trailing", "Forward"]
 MODEL_BLOCK_NOTES = {
     "income_map": "Reads each quarter's revenue and net income on the day it was released and turns them into the "
                   "trailing growth and net margin the scenarios start from.",
@@ -4435,7 +4436,8 @@ def apply_model_preset(ticker=None):
 
     ticker = (ticker if ticker is not None else st.session_state.get("model_ticker", "")).strip().upper()
     for name, value in preset_params(ticker).items():
-        st.session_state[model_param_key(name)] = int(value) if name == "pe_lookback_years" else float(value)
+        st.session_state[model_param_key(name)] = (value if isinstance(value, str) else
+                                                   int(value) if name == "pe_lookback_years" else float(value))
     preset_peers = MODEL_PRESETS.get(ticker, {}).get("peers", [])
     if preset_peers:
         st.session_state["model_peers"] = ", ".join(preset_peers)
@@ -4507,7 +4509,7 @@ def model_settings():
             apply_model_preset(ticker)
         years = st.select_slider("History (years)", MODEL_YEARS, value=3, key="model_years")
         peers_text = st.text_input("Peers for the P/E anchor", key="model_peers",
-                                   help="Yahoo symbols separated by commas. Their median trailing P/E is one half of "
+                                   help="Yahoo symbols separated by commas. Their median P/E (trailing or forward) is one half of "
                                         "the anchor; leave empty to use only the stock's own past P/E. Filled in "
                                         "automatically for a new ticker; edit freely.")
         # Both buttons on one row, on phones too.
@@ -4542,6 +4544,11 @@ def model_settings():
             params[key] = number(key, f"{name} weight", 0, 100, 5)
         st.caption("Weights are rescaled to add up to 100%.")
     with settings_panel("Multiple builder", expanded=False):
+        params["pe_basis"] = st.radio(
+            "P/E basis", MODEL_PE_BASES, key=model_param_key("pe_basis"), horizontal=True,
+            help="Trailing: the anchor is the P/E on the last four quarters' EPS. Forward: the P/E on the next four "
+                 "quarters' EPS, the one most quotes use. The model's EPS is next year's, so Forward compares like "
+                 "with like; Trailing favours a fast grower.")
         params["pe_lookback_years"] = st.select_slider("Own P/E look-back (years)", MODEL_LOOKBACKS,
                                                        key=model_param_key("pe_lookback_years"))
         params["peer_weight"] = number("peer_weight", "Share of the anchor from peers", 0, 1, 0.05)
@@ -4555,8 +4562,22 @@ def model_settings():
     return ticker, years, peers, model_params(params)
 
 
-def load_model_inputs(ticker, years, peers, lookback_years):
-    """Prices, results by release date and the peers' trailing P/E for the model, with a note on what was found."""
+def daily_forward_pe(symbol, valuation, earnings):
+    """Close / next four quarters' EPS: EPS later reported for past quarters, analyst estimates for the rest."""
+
+    fiscal_year_end = load_fundamental_snapshot(symbol).get("nextFiscalYearEnd")
+    fiscal_year_end = pd.to_datetime(fiscal_year_end, unit="s") if fiscal_year_end else None
+    forward = forward_valuation(valuation, forward_eps(earnings, load_earnings_estimates(symbol),
+                                                       fiscal_year_end=fiscal_year_end))
+    return forward["Forward_PE"] if "Forward_PE" in forward else pd.Series(dtype=float)
+
+
+def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing"):
+    """Prices, results by release date and the share's and peers' P/E for the model, with a note on what was found.
+
+    With ``pe_basis`` Forward, ``own_pe`` and ``peer_pe`` are forward P/Es; with Trailing, ``own_pe`` is None (the
+    model works it out from the quarters) and ``peer_pe`` is trailing.
+    """
 
     today = pd.Timestamp(date.today())
     start = today - pd.DateOffset(years=years)
@@ -4577,18 +4598,24 @@ def load_model_inputs(ticker, years, peers, lookback_years):
         if column in released:
             quarters[column] = released[column]
     quarters["EPS"] = eps
+    forward = pe_basis == "Forward"
+    own_pe = daily_forward_pe(ticker, build_valuation_data(prices, earnings)[0], earnings) if forward else None
     peer_pe = {}
     for peer in peers:
         peer_prices = load_data(peer, load_start, end, "Daily")
         if peer_prices.empty or "Close" not in peer_prices:
             continue
-        ratio = build_valuation_data(peer_prices, load_earnings_data(peer, load_start, end))[0]["Trailing_PE"]
-        if ratio.notna().any():
+        peer_earnings = load_earnings_data(peer, load_start, end)
+        valuation = build_valuation_data(peer_prices, peer_earnings)[0]
+        ratio = daily_forward_pe(peer, valuation, peer_earnings) if forward else valuation["Trailing_PE"]
+        # A forward P/E without analyst estimates stops a year back: no use for today's anchor.
+        if ratio.tail(10).notna().any() if forward else ratio.notna().any():
             peer_pe[peer] = ratio
     found = dict(eps_quarters=int(eps.notna().sum()),
                  revenue_quarters=int(quarters["Revenue"].notna().sum()) if "Revenue" in quarters else 0,
                  source=source, peers_found=list(peer_pe), peers_missing=[peer for peer in peers if peer not in peer_pe])
-    return SimpleNamespace(close=prices["Close"], quarters=quarters, peer_pe=pd.DataFrame(peer_pe), start=start, found=found)
+    return SimpleNamespace(close=prices["Close"], quarters=quarters, peer_pe=pd.DataFrame(peer_pe), own_pe=own_pe,
+                           start=start, found=found)
 
 
 def model_data_note(found, params):
@@ -4597,7 +4624,8 @@ def model_data_note(found, params):
     revenue = (f"{found['revenue_quarters']} quarters of revenue ({found['source']})" if found["revenue_quarters"]
                else f"no revenue history, so trailing growth is taken as {params['fallback_yoy']:g}% and the net margin "
                     f"as {params['fallback_margin']:g}%")
-    peers = (f"peer P/E from {', '.join(found['peers_found'])}" if found["peers_found"] else "no peer P/E")
+    basis = params["pe_basis"].lower()
+    peers = (f"{basis} peer P/E from {', '.join(found['peers_found'])}" if found["peers_found"] else f"no {basis} peer P/E")
     missing = f" (nothing for {', '.join(found['peers_missing'])})" if found["peers_missing"] else ""
     return f"Inputs found: {eps}; {revenue}; {peers}{missing}."
 
@@ -4793,7 +4821,7 @@ def render_valuation_model():
     if preset:
         st.caption(preset["note"])
     with st.spinner("Loading results, prices and peers..."):
-        inputs = load_model_inputs(ticker, years, peers, params["pe_lookback_years"])
+        inputs = load_model_inputs(ticker, years, peers, params["pe_lookback_years"], params["pe_basis"])
     if inputs is None:
         st.warning(f"Yahoo Finance has no price history for {ticker}. Check the symbol: it must be the ticker "
                    "Yahoo uses, e.g. a US listing or an OTC ADR such as ASMVY.")
@@ -4805,7 +4833,8 @@ def render_valuation_model():
     tracked, candidates = track_items(model_register(), news)
     # A story already parked as an item is no longer unexplained.
     candidates = candidates[~candidates["title"].str[:80].isin(set(model_register()["Item"]))].reset_index(drop=True)
-    result = run_model(inputs.quarters, inputs.close, model_register(), params, inputs.peer_pe, start=inputs.start)
+    result = run_model(inputs.quarters, inputs.close, model_register(), params, inputs.peer_pe, start=inputs.start,
+                       own_pe=inputs.own_pe)
     values = latest_values(result)
     st.caption(model_data_note(inputs.found, params))
 
@@ -4850,9 +4879,15 @@ def render_valuation_model():
         "parameters and the register are today's, applied to the whole history, so the past line shows what this "
         "model would have said, not what you would have assumed at the time; an item with a Since date starts on "
         "that date. The shaded band runs from the bear to the bull case at the same P/E. Dotted lines are the "
-        "updates of the quarterly part. The P/E anchors are trailing P/Es applied to next year's EPS, which favours "
-        "a growing company: size the P/E deductions with that in mind. An estimate from stated assumptions, not "
-        "investment advice.")
+        "updates of the quarterly part. " + (
+            "The P/E anchors are forward P/Es (price / next four quarters' EPS), the same footing as the model's next-"
+            "year EPS. Past forward P/Es use the EPS later reported, which nobody knew on the day, and the latest "
+            "uses analyst estimates; a stock that beat its estimates a lot (or missed) gets a past anchor that is "
+            "lower (or higher) than the market's view at the time. "
+            if params["pe_basis"] == "Forward" else
+            "The P/E anchors are trailing P/Es applied to next year's EPS, which favours a growing company: size the "
+            "P/E deductions with that in mind, or switch the P/E basis to Forward under Multiple builder. ")
+        + "An estimate from stated assumptions, not investment advice.")
     render_market_check(result)
     render_model_register(result, tracked, candidates, ticker)
 
