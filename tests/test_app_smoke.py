@@ -989,7 +989,7 @@ def test_valuation_model_tab(offline, monkeypatch):
     assert app.sidebar.header[0].value == "Valuation Model"
     # The tab opens on the worked example: its preset fills the parameters, the peers and the register.
     assert app.subheader[0].value == "ASMVY"
-    assert app.session_state["model_manual_eps"] == pytest.approx(1.64)
+    assert app.session_state["model_ASMVY_manual_eps"] == pytest.approx(1.64)
     assert app.session_state["model_peers"] == "BESIY, KLIC, AMAT, COHU, CAMT"
     assert len(app.session_state["model_register"]) == 10
     rendered = " ".join(element.value for element in app.caption)
@@ -1016,7 +1016,7 @@ def test_valuation_model_tab(offline, monkeypatch):
 
     # A parameter changes the model price.
     before = app.metric[0].value
-    app.number_input(key="model_weight_bear").set_value(60.0)
+    app.number_input(key="model_ASMVY_weight_bear").set_value(60.0)
     open_tab(app, "Valuation Model")
     assert app.metric[0].value != before
 
@@ -1024,7 +1024,7 @@ def test_valuation_model_tab(offline, monkeypatch):
     app.text_input(key="model_ticker").input("nvda")
     open_tab(app, "Valuation Model")
     assert app.subheader[0].value == "NVDA"
-    assert app.session_state["model_manual_eps"] == 0 and app.session_state["model_weight_bear"] == 25
+    assert app.session_state["model_NVDA_manual_eps"] == 0 and app.session_state["model_NVDA_weight_bear"] == 25
     assert len(app.session_state["model_register"]) == 0
     assert any("28 quarters of reported EPS" in element.value and "8 quarters of revenue" in element.value
                for element in app.caption)
@@ -1084,12 +1084,12 @@ def test_new_model_ticker_resets_the_preset_even_when_another_tab_opens_first(of
     monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
     st.cache_data.clear()
     app = open_tab(start_app(), "Valuation Model")
-    assert app.session_state["model_manual_eps"] == pytest.approx(1.64)
+    assert app.session_state["model_ASMVY_manual_eps"] == pytest.approx(1.64)
     app.text_input(key="model_ticker").input("NVDA")
     open_tab(app, "News")
     open_tab(app, "Valuation Model")
     assert app.subheader[0].value == "NVDA"
-    assert app.session_state["model_manual_eps"] == 0
+    assert app.session_state["model_NVDA_manual_eps"] == 0
     assert not any("typed-in trailing EPS" in element.value for element in app.caption)
 
 
@@ -1099,13 +1099,13 @@ def test_valuation_model_switches_between_forward_and_trailing_pe(offline, monke
     app = open_tab(start_app(), "Valuation Model")
     app.text_input(key="model_ticker").input("NVDA")
     open_tab(app, "Valuation Model")
-    assert app.session_state["model_pe_basis"] == "Forward"
-    assert app.session_state["model_pe_cap"] == 100
+    assert app.session_state["model_NVDA_pe_basis"] == "Forward"
+    assert app.session_state["model_NVDA_pe_cap"] == 100
     assert any("forward P/Es" in element.value for element in app.caption)
-    app.radio(key="model_pe_basis").set_value("Trailing")
+    app.radio(key="model_NVDA_pe_basis").set_value("Trailing")
     open_tab(app, "Valuation Model")
     assert any("trailing P/Es applied" in element.value for element in app.caption)
     # A new ticker goes back to the default basis.
     app.text_input(key="model_ticker").input("AMD")
     open_tab(app, "Valuation Model")
-    assert app.session_state["model_pe_basis"] == "Forward"
+    assert app.session_state["model_AMD_pe_basis"] == "Forward"

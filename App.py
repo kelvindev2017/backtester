@@ -4427,8 +4427,11 @@ MODEL_BLOCK_NOTES = {
 }
 
 
-def model_param_key(name):
-    return f"model_{name}"
+def model_param_key(name, ticker=None):
+    """Each ticker has its own setting boxes, so a box can never show the value it had for another ticker."""
+
+    ticker = ticker if ticker is not None else st.session_state.get("model_preset_for") or ""
+    return f"model_{ticker}_{name}"
 
 
 def apply_model_preset(ticker=None):
@@ -4436,7 +4439,7 @@ def apply_model_preset(ticker=None):
 
     ticker = (ticker if ticker is not None else st.session_state.get("model_ticker", "")).strip().upper()
     for name, value in preset_params(ticker).items():
-        st.session_state[model_param_key(name)] = (value if isinstance(value, str) else
+        st.session_state[model_param_key(name, ticker)] = (value if isinstance(value, str) else
                                                    int(value) if name == "pe_lookback_years" else float(value))
     preset_peers = MODEL_PRESETS.get(ticker, {}).get("peers", [])
     if preset_peers:
