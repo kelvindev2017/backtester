@@ -179,13 +179,20 @@ def model_diagram(result, selected=None, on=None, mobile=False):
     _wire(fig, [edge("scenario_engine", "bottom"), edge("risk_weighting", "top")], "bear / base / bull EPS")
     _wire(fig, [edge("item_tracker", "bottom"), edge("triage_gate", "top")], f"{text('items_modelled')} + {text('items_parked')} items")
     _wire(fig, [edge("triage_gate", "bottom"), edge("item_router", "top")], f"{text('items_modelled')} modelled")
+    # Earnings quality's P/E deduction runs down the gap between the columns to the P/E hold.
+    gap_x = LEFT + HALF_WIDTH + 0.4
+    quality_y = POSITIONS["earnings_quality"][1] + 0.25
+    _wire(fig, [(LEFT + HALF_WIDTH, quality_y), (gap_x, quality_y), (gap_x, POSITIONS["hold_pe"][1]),
+                edge("hold_pe", "left")], f"P/E {text('quality_pe')}",
+          label_at=(gap_x, (POSITIONS["risk_weighting"][1] + POSITIONS["item_router"][1]) / 2 + 0.3))
     _wire(fig, [edge("item_router", "left"), edge("scenario_engine", "right")], f"EPS {text('event_effect')}",
-          label_at=(LEFT + HALF_WIDTH - 0.05, POSITIONS["item_router"][1] - 0.25))
+          label_at=(gap_x, POSITIONS["item_router"][1] - 0.65))
     _wire(fig, [edge("item_router", "bottom"), edge("hold_pe", "top")], f"P/E {text('pe_adjust')}")
     _wire(fig, [edge("risk_weighting", "bottom"), edge("hold_eps", "top")], f"EPS {text('risk_adjusted_eps')}")
     # Daily part.
     _wire(fig, [edge("hold_eps", "bottom"), edge("product", "top")], f"EPS {text('held_eps')}")
-    _wire(fig, [edge("hold_pe", "bottom"), edge("multiple_builder", "top")], f"P/E {text('held_pe_adjust')}")
+    _wire(fig, [edge("hold_pe", "bottom"), edge("multiple_builder", "top")],
+          f"P/E {text('held_pe_adjust')}<br>quality {text('held_quality_pe')}")
     _wire(fig, [edge("multiple_builder", "left"), edge("product", "right")], f"P/E {text('acceptable_pe')}",
           label_at=(LEFT + HALF_WIDTH - 0.05, POSITIONS["product"][1] - 0.25))
     _wire(fig, [edge("market_data", "top"), edge("multiple_builder", "bottom")], "peer P/E")
