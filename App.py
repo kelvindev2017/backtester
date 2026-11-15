@@ -4449,7 +4449,10 @@ def apply_model_preset(ticker=None):
 
 
 def model_ticker_changed():
-    apply_model_preset(st.session_state.get("model_ticker", ""))
+    # Only mark the preset as due: model_settings applies it before the parameter boxes are drawn. Applied here, it
+    # can be undone when the change lands on a run of another tab (ticker typed, then another tab tapped): the
+    # boxes are not drawn in that run, and their old values come back.
+    st.session_state["model_preset_for"] = None
 
 
 def model_register():
@@ -4499,6 +4502,9 @@ def model_settings():
         ticker = st.text_input("Ticker", key="model_ticker", on_change=model_ticker_changed,
                                help="Any Yahoo symbol. ASMVY loads the worked example; another ticker starts from "
                                     "the default parameters and an empty register.").strip().upper()
+        # A new ticker gets its preset (or the defaults) here, before the parameter boxes below are drawn.
+        if ticker != st.session_state.get("model_preset_for"):
+            apply_model_preset(ticker)
         years = st.select_slider("History (years)", MODEL_YEARS, value=3, key="model_years")
         peers_text = st.text_input("Peers for the P/E anchor", key="model_peers",
                                    help="Yahoo symbols separated by commas. Their median trailing P/E is one half of "

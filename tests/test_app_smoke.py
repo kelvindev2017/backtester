@@ -1077,3 +1077,17 @@ def test_valuation_model_finds_peers_automatically(offline, monkeypatch):
     app.button(key="model_find_peers_btn").click()
     open_tab(app, "Valuation Model")
     assert app.session_state["model_peers"] == "NVMI, ENTG, TER, KLAC, LRCX"
+
+
+def test_new_model_ticker_resets_the_preset_even_when_another_tab_opens_first(offline, monkeypatch):
+    # Typed into the ticker box, then another tab tapped before Enter: the change lands on that tab's run.
+    monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
+    st.cache_data.clear()
+    app = open_tab(start_app(), "Valuation Model")
+    assert app.session_state["model_manual_eps"] == pytest.approx(1.64)
+    app.text_input(key="model_ticker").input("NVDA")
+    open_tab(app, "News")
+    open_tab(app, "Valuation Model")
+    assert app.subheader[0].value == "NVDA"
+    assert app.session_state["model_manual_eps"] == 0
+    assert not any("typed-in trailing EPS" in element.value for element in app.caption)
