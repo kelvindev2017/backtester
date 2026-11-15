@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from analysis.valuation_chart import legends_under_panels
 from analysis.valuation_model import BLOCKS, MODELLED, SCENARIOS, SIGNALS, latest_values, scenario_weights
 
 BLOCK_FILL = "rgba(65, 105, 225, 0.12)"
@@ -289,7 +290,10 @@ def model_price_figure(result, ticker="", mobile=False):
     market pays for the risk-adjusted EPS against the acceptable P/E, and the gap between model and close."""
 
     daily, quarterly = result["daily"], result["quarterly"]
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.5, 0.25, 0.25],
+    # Room between the panels for each panel's own legend, right under it, and the next panel's title.
+    height = 900
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=(110 if mobile else 80) / height,
+                        row_heights=[0.5, 0.25, 0.25],
                         subplot_titles=[f"{ticker} model price per share and close".strip(),
                                         "P/E: what the market pays and what the model accepts",
                                         "Model price vs close, %"])
@@ -326,8 +330,8 @@ def model_price_figure(result, ticker="", mobile=False):
                           line=dict(color="rgba(120, 120, 120, 0.35)", width=1, dash="dot"))
     for annotation in fig.layout.annotations:
         annotation.update(font=dict(size=10 if mobile else 12), x=0, xanchor="left")
-    fig.update_layout(height=760 if mobile else 820, hovermode="x unified", margin=dict(l=10, r=10, t=40, b=10),
-                      legend=dict(orientation="h", yanchor="top", y=-0.05, xanchor="left", x=0))
+    fig.update_layout(height=height, hovermode="x unified", margin=dict(l=10, r=10, t=40, b=40))
+    legends_under_panels(fig, 3, height)
     return fig
 
 
