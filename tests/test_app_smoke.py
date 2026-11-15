@@ -1093,18 +1093,19 @@ def test_new_model_ticker_resets_the_preset_even_when_another_tab_opens_first(of
     assert not any("typed-in trailing EPS" in element.value for element in app.caption)
 
 
-def test_valuation_model_switches_to_a_forward_pe_anchor(offline, monkeypatch):
+def test_valuation_model_switches_between_forward_and_trailing_pe(offline, monkeypatch):
     monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
     st.cache_data.clear()
     app = open_tab(start_app(), "Valuation Model")
     app.text_input(key="model_ticker").input("NVDA")
     open_tab(app, "Valuation Model")
-    assert app.session_state["model_pe_basis"] == "Trailing"
-    app.radio(key="model_pe_basis").set_value("Forward")
-    open_tab(app, "Valuation Model")
-    assert not app.exception
+    assert app.session_state["model_pe_basis"] == "Forward"
+    assert app.session_state["model_pe_cap"] == 100
     assert any("forward P/Es" in element.value for element in app.caption)
+    app.radio(key="model_pe_basis").set_value("Trailing")
+    open_tab(app, "Valuation Model")
+    assert any("trailing P/Es applied" in element.value for element in app.caption)
     # A new ticker goes back to the default basis.
     app.text_input(key="model_ticker").input("AMD")
     open_tab(app, "Valuation Model")
-    assert app.session_state["model_pe_basis"] == "Trailing"
+    assert app.session_state["model_pe_basis"] == "Forward"

@@ -47,11 +47,11 @@ DEFAULT_PARAMS = {
     "weight_base": 50.0,
     "weight_bull": 25.0,
     # Multiple builder
-    "pe_basis": "Trailing",      # Trailing: P/E on the last four quarters' EPS; Forward: on the next four quarters'
+    "pe_basis": "Forward",       # Trailing: P/E on the last four quarters' EPS; Forward: on the next four quarters'
     "pe_lookback_years": 5,
     "peer_weight": 0.5,          # share of the P/E anchor taken from the peers' median; the rest is the own median
     "pe_floor": 5.0,
-    "pe_cap": 40.0,
+    "pe_cap": 100.0,
     # Triage gate
     "materiality_eps_pct": 1.0,  # smallest expected EPS effect (probability x impact) that enters the model
     "materiality_pe": 0.5,       # smallest P/E effect, in points, that enters the model

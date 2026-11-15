@@ -233,7 +233,7 @@ def test_forward_basis_anchors_on_the_given_own_pe():
     close = make_close(quarters)
     trailing = run_model(quarters, close, None, model_params({"peer_weight": 0.0}))
     own_forward = pd.Series(15.0, index=close.index)
-    forward = run_model(quarters, close, None, model_params({"peer_weight": 0.0, "pe_basis": "Forward"}),
+    forward = run_model(quarters, close, None, model_params({"peer_weight": 0.0}),
                         own_pe=own_forward)
     assert trailing["daily"]["own_anchor"].iloc[-1] == pytest.approx(20.0)
     assert forward["daily"]["own_anchor"].iloc[-1] == pytest.approx(15.0)
