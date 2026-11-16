@@ -1109,3 +1109,27 @@ def test_valuation_model_switches_between_forward_and_trailing_pe(offline, monke
     app.text_input(key="model_ticker").input("AMD")
     open_tab(app, "Valuation Model")
     assert app.session_state["model_AMD_pe_basis"] == "Forward"
+
+
+def test_model_haircut_starts_at_stock_pay_and_equations_show(offline, monkeypatch):
+    class Ticker(FakeTickerWithRevenue):
+        def __init__(self, symbol):
+            super().__init__(symbol)
+            quarters = self.quarterly_income_stmt.columns
+            # Net income of the last 4 quarters: 2.57e9 + ... ; stock pay 10% of each quarter's net income.
+            self.quarterly_cashflow = pd.DataFrame(
+                [self.quarterly_income_stmt.loc["Net Income"].to_numpy() * 0.1], index=["Stock Based Compensation"],
+                columns=quarters)
+
+    monkeypatch.setattr(yf, "Ticker", Ticker)
+    st.cache_data.clear()
+    app = open_tab(start_app(), "Valuation Model")
+    # The worked example keeps its own haircut.
+    assert app.session_state["model_ASMVY_eps_haircut_pct"] == pytest.approx(11.0)
+    app.text_input(key="model_ticker").input("NVDA")
+    open_tab(app, "Valuation Model")
+    assert app.session_state["model_NVDA_eps_haircut_pct"] == pytest.approx(10.0)
+    assert any("stock-based pay / net income" in element.value for element in app.caption)
+    formulas = [element.value for element in app.get("latex")]
+    assert any("EPS}_{\\text{clean}}" in formula for formula in formulas)
+    assert any("P/E}_{\\text{acc}}" in formula for formula in formulas)

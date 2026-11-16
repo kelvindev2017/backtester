@@ -254,3 +254,31 @@ def test_earnings_quality_takes_points_off_the_acceptable_pe():
     assert after["model_price"] == pytest.approx(after["held_eps"] * after["acceptable_pe"])
     dials = implied_dials(weak).set_index("Dial")
     assert dials.at["Acceptable P/E", "Now"] == pytest.approx(after["acceptable_pe"])
+
+
+def test_stock_pay_haircut_uses_the_last_quarters_of_both():
+    from analysis.model_equations import stock_pay_haircut
+    dates = pd.date_range("2025-03-31", periods=5, freq="QE")
+    pay = pd.Series([9.0, 1.0, 1.0, 1.0, 1.0], index=dates)
+    income = pd.Series([1.0, 10.0, 10.0, 10.0, 10.0], index=dates)
+    assert stock_pay_haircut(pay, income) == pytest.approx(10.0)
+    assert np.isnan(stock_pay_haircut(pay, -income))
+    assert np.isnan(stock_pay_haircut(pay.iloc[:2], income))
+    assert stock_pay_haircut(pay * 100, income) == 90
+
+
+def test_worked_equations_end_in_the_model_values():
+    from analysis.model_equations import EQUATIONS, worked_equations
+    quarters = make_quarters()
+    close = make_close(quarters)
+    peers = pd.DataFrame({"AAA": 24.0, "BBB": 16.0}, index=close.index)
+    result = run_model(quarters, close, None, model_params({"eps_haircut_pct": 5.0, "quality_pe_pts": 2.0}), peers)
+    values = latest_values(result)
+    for block in BLOCKS:
+        assert EQUATIONS[block]
+    assert f"& {values['risk_adjusted_eps']:,.2f} \\end{{aligned}}" in worked_equations(result, "risk_weighting")[0]
+    assert worked_equations(result, "product")[0].endswith(f"{values['model_price']:,.2f}")
+    assert f"& {values['acceptable_pe']:,.1f} \\end{{aligned}}" in worked_equations(result, "multiple_builder")[1]
+    for name in ["bear", "base", "bull"]:
+        line = [eq for eq in worked_equations(result, "scenario_engine") if rf"\text{{EPS}}_{{\text{{{name}}}}}" in eq][0]
+        assert f"& {values[f'eps_{name}']:,.2f} \\end{{aligned}}" in line
