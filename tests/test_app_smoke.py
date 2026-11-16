@@ -1133,3 +1133,17 @@ def test_model_haircut_starts_at_stock_pay_and_equations_show(offline, monkeypat
     formulas = [element.value for element in app.get("latex")]
     assert any("EPS}_{\\text{clean}}" in formula for formula in formulas)
     assert any("P/E}_{\\text{acc}}" in formula for formula in formulas)
+
+
+def test_model_weights_warn_when_not_100_and_block_shows_only_used_weights(offline, monkeypatch):
+    monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
+    st.cache_data.clear()
+    app = open_tab(start_app(), "Valuation Model")
+    assert not any("not 100%" in element.value for element in app.warning)
+    app.number_input(key="model_ASMVY_weight_bear").set_value(35.0)
+    app.selectbox(key="model_block").select("risk_weighting")
+    open_tab(app, "Valuation Model")
+    assert any("add up to 110%" in element.value and "bear 31.8%" in element.value for element in app.warning)
+    table = [frame.value for frame in app.dataframe if "Parameter" in frame.value.columns][0]
+    assert table["Parameter"].tolist() == ["Bear weight %", "Base weight %", "Bull weight %"]
+    assert table["Value"].tolist() == [31.8, 45.5, 22.7]

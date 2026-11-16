@@ -200,6 +200,7 @@ from analysis.valuation_model import (
     PRESETS as MODEL_PRESETS,
     REGISTER_DEFAULTS,
     SCENARIOS as MODEL_SCENARIOS,
+    scenario_weights as model_scenario_weights,
     SIGNALS as MODEL_SIGNALS,
     clean_register,
     implied_dials,
@@ -4593,7 +4594,11 @@ def model_settings():
         for name in MODEL_SCENARIOS:
             key = f"weight_{name.lower()}"
             params[key] = number(key, f"{name} weight", 0, 100, 5)
-        st.caption("Weights are rescaled to add up to 100%.")
+        total = sum(params[f"weight_{name.lower()}"] for name in MODEL_SCENARIOS)
+        if abs(total - 100) > 1e-9:
+            used = ", ".join(f"{name.lower()} {weight * 100:.1f}%" for name, weight in
+                             zip(MODEL_SCENARIOS, model_scenario_weights(params)))
+            st.warning(f"The weights add up to {total:g}%, not 100%. The model rescales them to {used}.")
     with settings_panel("Multiple builder", expanded=False):
         show_model_equations("multiple_builder")
         params["pe_basis"] = st.radio(

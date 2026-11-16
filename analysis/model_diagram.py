@@ -94,10 +94,12 @@ def parameter_table(result, block):
     """The parameters one block owns, with the values in use."""
 
     params = result["params"]
-    rows = [{"Parameter": label, "Value": params[key]} for key, label in BLOCKS[block]["params"].items()]
     if block == "risk_weighting":
-        rows += [{"Parameter": f"{name} weight, normalised %", "Value": round(float(weight) * 100, 1)}
-                 for name, weight in zip(SCENARIOS, scenario_weights(params))]
+        # Only the weights the formula uses: the typed ones rescaled to add up to 100%.
+        rows = [{"Parameter": f"{name} weight %", "Value": round(float(weight) * 100, 1)}
+                for name, weight in zip(SCENARIOS, scenario_weights(params))]
+    else:
+        rows = [{"Parameter": label, "Value": params[key]} for key, label in BLOCKS[block]["params"].items()]
     return pd.DataFrame(rows, columns=["Parameter", "Value"])
 
 
