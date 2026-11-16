@@ -38,7 +38,7 @@ def test_diagram_shows_every_block_with_its_value_and_both_rates(result):
     markers = fig.data[-1]
     assert [row[0] for row in markers.customdata] == list(BLOCKS)
     hover = markers.hovertext[list(BLOCKS).index("risk_weighting")]
-    assert "In: Bear EPS" in hover and "Out: Risk-adjusted EPS" in hover and "Param: Bear weight = 25" in hover
+    assert "In: Bear EPS" in hover and "Out: Risk-adjusted EPS" in hover and "Param: Bear weight % = 25" in hover
     # The chosen block has the heavy border; every block sits inside the drawing.
     assert sum(shape.line.width == 3 for shape in fig.layout.shapes) == 1
     assert all(0 < x < 10 and 0 < y < 14.4 for x, y in POSITIONS.values())
@@ -75,8 +75,8 @@ def test_price_chart_has_the_model_the_close_and_the_range(result):
 
 def test_parameter_and_item_tables(result):
     weights = parameter_table(result, "risk_weighting")
-    assert weights["Parameter"].tolist()[:3] == ["Bear weight", "Base weight", "Bull weight"]
-    assert weights["Value"].tolist()[3:] == [25.0, 50.0, 25.0]
+    assert weights["Parameter"].tolist() == ["Bear weight %", "Base weight %", "Bull weight %"]
+    assert weights["Value"].tolist() == [25.0, 50.0, 25.0]
     assert parameter_table(result, "product").empty
     table = items_table(result)
     assert table["Goes to"].tolist() == ["Multiple builder", "Scenario engine"]
