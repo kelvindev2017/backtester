@@ -212,6 +212,7 @@ from analysis.valuation_model import (
     sensitivities,
     track_items,
 )
+from analysis.model_equations import EQUATIONS as MODEL_EQUATIONS, SYMBOLS as MODEL_SYMBOLS, stock_pay_haircut, worked_equations
 from analysis.model_diagram import (
     block_signals_figure,
     items_table,
@@ -4409,7 +4410,9 @@ MODEL_BLOCK_NOTES = {
     "income_map": "Reads each quarter's revenue and net income on the day it was released and turns them into the "
                   "trailing growth and net margin the scenarios start from.",
     "earnings_quality": "Takes the reported EPS of the last four quarters and removes the share you consider not real "
-                        "earnings (share-based pay, one-offs that keep coming back).",
+                        "earnings. The haircut starts at the company's stock-based pay as a share of its net income "
+                        "(a cost most 'adjusted' EPS leaves out); add one-offs that keep coming back. It also sets a "
+                        "P/E deduction for weak earnings quality.",
     "item_tracker": "Holds the risk and product register and compares the latest stories with it: how often each "
                     "item is mentioned, and which stories no item explains.",
     "triage_gate": "Lets an item into the model only when you have marked it Modelled, it is sized, and its effect "
@@ -4420,11 +4423,32 @@ MODEL_BLOCK_NOTES = {
                        "scaled by the change in net margin, then takes the expected hit or gain from the event items.",
     "risk_weighting": "Multiplies each case by its weight and adds them up.",
     "multiple_builder": "Starts from the median P/E of the peers and of the stock's own past, then adds the P/E "
-                        "points of the general items. Recomputed every day, because peer prices move every day.",
+                        "points of the general items and takes off the earnings quality deduction. Recomputed every day, because peer prices move every day.",
     "product": "Risk-adjusted EPS, held since the last release, times the day's acceptable P/E.",
     "market_check": "Compares the model price with the close, and works backwards from the close to the value each "
                     "dial would need to explain the gap.",
 }
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_stock_pay_haircut(symbol):
+    """(stock-based pay as a % of net income, where it came from), or (NaN, reason) when Yahoo lacks either."""
+
+    try:
+        stock = yf.Ticker(symbol)
+        for income_names, cash_names, periods, label in [
+                (["quarterly_income_stmt", "quarterly_financials"], ["quarterly_cashflow", "quarterly_cash_flow"], 4,
+                 "last 4 quarters"),
+                (["income_stmt", "financials"], ["cashflow", "cash_flow"], 1, "last fiscal year")]:
+            income = extract_statement_row(first_available_statement(stock, income_names),
+                                           ["Net Income", "Net Income Common Stockholders"])
+            pay = extract_statement_row(first_available_statement(stock, cash_names), ["Stock Based Compensation"])
+            share = stock_pay_haircut(pay, income, periods)
+            if np.isfinite(share):
+                return share, f"stock-based pay / net income, {label} (Yahoo cash flow)"
+    except Exception:
+        pass
+    return np.nan, "Yahoo has no stock-based pay or no profit to compare it with"
 
 
 def model_param_key(name, ticker=None):
@@ -4438,7 +4462,15 @@ def apply_model_preset(ticker=None):
     """Set every model parameter, the peers and the register to the ticker's preset, or to the defaults."""
 
     ticker = (ticker if ticker is not None else st.session_state.get("model_ticker", "")).strip().upper()
-    for name, value in preset_params(ticker).items():
+    params = preset_params(ticker)
+    if "eps_haircut_pct" not in MODEL_PRESETS.get(ticker, {}).get("params", {}) and ticker:
+        share, source = load_stock_pay_haircut(ticker)
+        if np.isfinite(share):
+            params["eps_haircut_pct"] = round(share, 1)
+        st.session_state["model_haircut_source"] = (ticker, source)
+    else:
+        st.session_state["model_haircut_source"] = (ticker, f"the {ticker} worked example")
+    for name, value in params.items():
         st.session_state[model_param_key(name, ticker)] = (value if isinstance(value, str) else
                                                    int(value) if name == "pe_lookback_years" else float(value))
     preset_peers = MODEL_PRESETS.get(ticker, {}).get("peers", [])
@@ -4490,6 +4522,15 @@ def focus_model_block():
             return
 
 
+def show_model_equations(block):
+    """A block's equations and what its symbols stand for, at the top of its settings or in the inspector."""
+
+    for equation in MODEL_EQUATIONS.get(block, []):
+        st.latex(r"\small " + equation)
+    if block in MODEL_SYMBOLS:
+        st.caption(MODEL_SYMBOLS[block])
+
+
 def model_settings():
     """The model's parameters, one settings group per block that owns them. Returns (ticker, years, peers, params)."""
 
@@ -4525,13 +4566,18 @@ def model_settings():
         buttons[1].button("Reset parameters and register", on_click=apply_model_preset, key="model_reset_btn",
                           help="Back to the ticker's preset, or to the defaults when it has none.")
     with settings_panel("Earnings quality", expanded=False):
+        show_model_equations("earnings_quality")
         params["eps_haircut_pct"] = number("eps_haircut_pct", "EPS haircut %", 0, 90, 1,
                                            "Share of reported EPS that is not real earnings to you.")
+        haircut_for, haircut_source = st.session_state.get("model_haircut_source", (None, ""))
+        if haircut_for == ticker and haircut_source:
+            st.caption(f"Filled in from {haircut_source}; edit freely.")
         params["manual_eps"] = number("manual_eps", "Typed-in trailing EPS (0 = reported)", 0, 1e6, 0.01,
                                       "Per share, in the currency of the price. Use it when Yahoo has no reported EPS "
                                       "or reports it in another currency; the model then holds it flat.")
         params["quality_pe_pts"] = number("quality_pe_pts", "P/E deduction, points", 0, 50, 0.5)
     with settings_panel("Scenario engine", expanded=False):
+        show_model_equations("scenario_engine")
         params["growth_follow"] = number("growth_follow", "Base growth as a share of trailing growth", 0, 2, 0.05)
         params["growth_floor"] = number("growth_floor", "Base growth floor %", -90, 0, 1)
         params["growth_cap"] = number("growth_cap", "Base growth cap %", 0, 300, 1)
@@ -4543,11 +4589,13 @@ def model_settings():
         params["fallback_yoy"] = number("fallback_yoy", "Trailing growth % when there is no revenue history", -90, 300, 1)
         params["fallback_margin"] = number("fallback_margin", "Net margin % when there is no net income", 0.5, 90, 0.5)
     with settings_panel("Risk weighting", expanded=False):
+        show_model_equations("risk_weighting")
         for name in MODEL_SCENARIOS:
             key = f"weight_{name.lower()}"
             params[key] = number(key, f"{name} weight", 0, 100, 5)
         st.caption("Weights are rescaled to add up to 100%.")
     with settings_panel("Multiple builder", expanded=False):
+        show_model_equations("multiple_builder")
         params["pe_basis"] = st.radio(
             "P/E basis", MODEL_PE_BASES, key=model_param_key("pe_basis"), horizontal=True,
             help="Trailing: the anchor is the P/E on the last four quarters' EPS. Forward: the P/E on the next four "
@@ -4559,6 +4607,7 @@ def model_settings():
         params["pe_floor"] = number("pe_floor", "P/E floor", 1, 100, 1)
         params["pe_cap"] = number("pe_cap", "P/E cap", 1, 200, 1)
     with settings_panel("Triage gate", expanded=False):
+        show_model_equations("triage_gate")
         params["materiality_eps_pct"] = number("materiality_eps_pct", "Smallest expected EPS effect %", 0, 50, 0.5,
                                                "Probability x impact of an event item must reach this to count.")
         params["materiality_pe"] = number("materiality_pe", "Smallest P/E effect, points", 0, 20, 0.25)
@@ -4642,6 +4691,12 @@ def render_model_inspector(result, block):
     rate = "each earnings release" if spec["rate"] == "quarterly" else "each close"
     st.markdown(f"**{spec['title']}** · runs {rate}")
     st.caption(MODEL_BLOCK_NOTES[block])
+    show_model_equations(block)
+    worked = worked_equations(result, block)
+    if worked:
+        st.markdown("With the latest numbers:")
+        for equation in worked:
+            st.latex(r"\small " + equation)
     table = parameter_table(result, block)
     signals = pd.DataFrame(
         [{"Signal": MODEL_SIGNALS[name][1], "Direction": direction, "Latest": signal_text(values, name),
