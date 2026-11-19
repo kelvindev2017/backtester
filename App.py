@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -243,6 +244,23 @@ from analysis.universe import (
     normalize_symbol,
     normalize_ticker,
     parse_ticker_list,
+)
+from analysis.pretrade import (
+    FAIL as PRETRADE_FAIL,
+    day_pnl,
+    position_status,
+    price_levels,
+    run_checks as pretrade_checks,
+    size_trade,
+    verdict as pretrade_verdict,
+)
+from analysis.trade_store import (
+    CLOSED_FIELDS,
+    POSITION_FIELDS,
+    StoreConflict,
+    StoreError,
+    make_store,
+    normalize as normalize_trading_data,
 )
 from analysis.trade_journal import (
     BREAKDOWNS as JOURNAL_BREAKDOWNS,
@@ -3264,7 +3282,8 @@ NEWS_TAB = "News"
 MODEL_TAB = "Valuation Model"
 FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
-TAB_NAMES = [NEWS_TAB, "Stock Screener", ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, MODEL_TAB,
+PRETRADE_TAB = "Pre-trade Check"
+TAB_NAMES = [PRETRADE_TAB, NEWS_TAB, "Stock Screener", ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, MODEL_TAB,
              SUPPLY_CHAIN_TAB,
              "Backtest", "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
@@ -7856,6 +7875,344 @@ def render_trade_journal():
 
 
 # ============================================================
+# Pre-trade Check tab
+# ============================================================
+
+PRETRADE_ICONS = {"pass": "✅", "fail": "❌", "warn": "⚠️"}
+PRETRADE_SETTINGS = {"account": "pretrade_account", "slot_pct": "pretrade_slot_pct", "stop_pct": "pretrade_stop_pct",
+                     "max_positions": "pretrade_max_positions"}
+PRETRADE_SETUP_STEPS = """
+Do this once (about 5 minutes, works on a phone browser):
+
+1. **Make a private repository for the data.** On github.com tap **+ > New repository**. Name it
+   `backtester-data`, choose **Private**, tick **Add a README file**, and tap **Create repository**.
+2. **Make a token that can only touch that repository.** Go to **Settings > Developer settings > Personal access
+   tokens > Fine-grained tokens > Generate new token**. Name it `backtester`, pick the longest expiry, under
+   **Repository access** choose **Only select repositories > backtester-data**, and under **Permissions >
+   Repository permissions** set **Contents** to **Read and write**. Tap **Generate token** and copy it.
+3. **Give it to this app.** On share.streamlit.io open this app's **⋮ > Settings > Secrets**, add these lines
+   below what is already there, paste your token in, and tap **Save**:
+
+```toml
+[trade_store]
+github_token = "github_pat_paste_yours_here"
+repo = "YOUR_GITHUB_NAME/backtester-data"
+```
+
+The app restarts by itself. After that, every change here is saved as a commit to `trading.json` in that
+repository, so it survives restarts and shows the same data on your phone and computer.
+"""
+
+
+def pretrade_today():
+    """Today's date in New York, where the US market trades."""
+
+    return pd.Timestamp.now(tz="America/New_York").tz_localize(None).normalize()
+
+
+def trading_store():
+    try:
+        config = st.secrets.get("trade_store")
+        config = dict(config) if config else None
+    except Exception:
+        config = None
+    local_path = os.getenv("TRADE_STORE_PATH") or os.path.join(tempfile.gettempdir(), "backtester_trading.json")
+    return make_store(config, local_path)
+
+
+def trading_data(reload=False):
+    """The saved positions, closed trades and settings, read once per session (or again on ``reload``)."""
+
+    reload = reload or st.session_state.pop("trading_reload", False)
+    if reload or "trading_data" not in st.session_state:
+        store = trading_store()
+        try:
+            data, version = store.load()
+            st.session_state.pop("trading_error", None)
+        except StoreError as error:
+            data, version = normalize_trading_data({}), None
+            st.session_state["trading_error"] = str(error)
+            st.session_state["trading_load_failed"] = True
+        else:
+            st.session_state["trading_load_failed"] = False
+        st.session_state["trading_data"], st.session_state["trading_version"] = data, version
+        for name, key in PRETRADE_SETTINGS.items():
+            st.session_state[key] = type(normalize_trading_data({})["settings"][name])(data["settings"][name])
+    return st.session_state["trading_data"]
+
+
+def save_trading_data(data, notice="Saved."):
+    """Write the data to the store. Returns True when it was saved."""
+
+    if st.session_state.get("trading_load_failed"):
+        st.session_state["trading_error"] = ("The saved data could not be read, so nothing was saved (it would "
+                                             "overwrite it). Tap Reload saved data and try again.")
+        return False
+    store = trading_store()
+    try:
+        version = store.save(data, st.session_state.get("trading_version"))
+    except StoreError as error:
+        st.session_state["trading_error"] = str(error)
+        if isinstance(error, StoreConflict):
+            st.session_state["trading_conflict"] = True
+        return False
+    st.session_state["trading_data"], st.session_state["trading_version"] = data, version
+    st.session_state.pop("trading_error", None)
+    st.session_state["trading_notice"] = notice
+    return True
+
+
+def save_pretrade_settings():
+    data = json.loads(json.dumps(trading_data(), default=str))
+    data["settings"] = {name: st.session_state[key] for name, key in PRETRADE_SETTINGS.items()}
+    save_trading_data(data, "Settings saved.")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def pretrade_levels(symbol, day_str):
+    start = (pd.Timestamp(day_str) - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
+    return price_levels(load_data(journal_symbol(symbol), start, day_str, "Daily"))
+
+
+def rows_from_editor(frame, fields, date_fields):
+    """Rows of an edited table as plain dicts for the JSON file; rows without a symbol are dropped."""
+
+    rows = []
+    for record in frame.to_dict("records"):
+        symbol = str(record.get("Symbol") or "").strip().upper()
+        if not symbol or symbol == "NONE" or symbol == "NAN":
+            continue
+        row = {}
+        for field in fields:
+            value = record.get(field)
+            if field == "Symbol":
+                value = symbol
+            elif field in date_fields:
+                value = pd.Timestamp(value).strftime("%Y-%m-%d") if value is not None and not pd.isna(value) else None
+            elif field == "Note":
+                value = "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
+            else:
+                value = None if value is None or pd.isna(value) else float(value)
+            row[field] = value
+        rows.append(row)
+    return rows
+
+
+def editor_frame(rows, fields, date_fields):
+    frame = pd.DataFrame(rows, columns=fields)
+    for field in date_fields:
+        frame[field] = pd.to_datetime(frame[field], errors="coerce")
+    for field in fields:
+        if field not in date_fields and field not in ("Symbol", "Note"):
+            frame[field] = pd.to_numeric(frame[field], errors="coerce")
+    frame["Symbol"] = frame["Symbol"].astype("string")
+    frame["Note"] = frame["Note"].fillna("").astype("string")
+    return frame
+
+
+def render_pretrade_status(store, data):
+    if st.session_state.get("trading_error"):
+        st.error(st.session_state["trading_error"])
+    if st.session_state.pop("trading_notice", None):
+        st.toast("Saved to " + ("GitHub" if store.durable else "the app's disk"))
+    if store.durable:
+        st.caption(f"Your positions and trades are saved in {store.label}.")
+    else:
+        st.warning("Positions and trades are only kept until the app restarts. Connect a free GitHub store to keep "
+                   "them for good (steps below).")
+        with st.expander("Keep this data for good: one-time setup"):
+            st.markdown(PRETRADE_SETUP_STEPS)
+    if st.session_state.get("trading_conflict") or st.session_state.get("trading_load_failed"):
+        if st.button("Reload saved data", key="pretrade_reload_btn"):
+            st.session_state.pop("trading_conflict", None)
+            st.session_state["trading_reload"] = True
+            st.rerun()
+
+
+def render_pretrade_trade(data, today):
+    settings = data["settings"]
+    st.subheader("Check a trade")
+    symbol = st.text_input("Ticker", key="pretrade_symbol", placeholder="e.g. NVDA").strip().upper()
+    planned = st.number_input("Your buy price ($, 0 = latest price)", 0.0, 1_000_000.0, 0.0, 0.01,
+                              key="pretrade_entry_price", format="%.2f")
+    if not symbol:
+        st.info("Type a ticker to check it against your rules before you place the order in IBKR.")
+        return
+    with st.spinner(f"Loading {symbol}..."):
+        levels = pretrade_levels(symbol, f"{today:%Y-%m-%d}")
+    price = planned or (levels["price"] if levels else 0.0)
+    checks = pretrade_checks(symbol, levels, data["closed"], today, entry_price=planned or None,
+                             open_positions=len(data["positions"]), max_positions=int(settings["max_positions"]))
+    outcome = pretrade_verdict(checks)
+    if outcome == "go":
+        st.success(f"**{symbol}: all rules pass.**")
+    elif outcome == "caution":
+        st.warning(f"**{symbol}: allowed, with a condition** (see the warning below).")
+    else:
+        failed = sum(check.status == PRETRADE_FAIL for check in checks)
+        st.error(f"**{symbol}: don't buy.** {failed} rule{'s' if failed != 1 else ''} failed.")
+    for check in checks:
+        st.markdown(f"{PRETRADE_ICONS[check.status]} **{check.name}**: {check.detail}")
+    if levels is not None:
+        st.caption(f"Prices from Yahoo, last bar {levels['date']:%d %b %Y} (during the session it is today's bar, "
+                   "about 15 minutes behind).")
+
+    sizing = size_trade(float(settings["account"]), float(settings["slot_pct"]), float(settings["stop_pct"]), price)
+    st.markdown(f"**Order size** for a {settings['slot_pct']:g}% slot of ${float(settings['account']):,.0f} at "
+                f"${price:,.2f}:")
+    tiles = st.columns(2 if MOBILE else 4)
+    tiles[0].metric("Shares", f"{sizing['shares']:,}")
+    tiles[1 % len(tiles)].metric("Position", f"${sizing['value']:,.0f}")
+    tiles[2 % len(tiles)].metric(f"Stop ({settings['stop_pct']:g}% below)", f"${sizing['stop']:,.2f}")
+    tiles[3 % len(tiles)].metric("Lost if stopped", f"${sizing['risk']:,.0f}")
+
+    with st.expander("Bought it? Save it as an open position"):
+        shares = st.number_input("Shares bought", 0.0, 10_000_000.0, float(sizing["shares"]), 1.0,
+                                 key=f"pretrade_buy_shares_{symbol}_draft")
+        fill = st.number_input("Fill price ($)", 0.0, 1_000_000.0, float(round(price, 2)), 0.01,
+                               key=f"pretrade_buy_price_{symbol}_draft", format="%.2f")
+        stop = st.number_input("Stop ($)", 0.0, 1_000_000.0, float(round(fill * (1 - settings["stop_pct"] / 100), 2)),
+                               0.01, key=f"pretrade_buy_stop_{symbol}_draft", format="%.2f")
+        if st.button("Save position", key="pretrade_buy_btn", disabled=shares <= 0 or fill <= 0):
+            new = json.loads(json.dumps(data, default=str))
+            new["positions"].append({"Symbol": symbol, "Shares": shares, "Entry price": fill,
+                                     "Entry date": f"{today:%Y-%m-%d}", "Stop": stop or None, "Note": ""})
+            if save_trading_data(new, f"{symbol} saved."):
+                st.rerun()
+
+
+def render_pretrade_positions(data, today):
+    positions = data["positions"]
+    st.subheader(f"Open positions ({len(positions)})")
+    if positions:
+        rows = [position_status(position, pretrade_levels(str(position.get("Symbol") or "").upper(),
+                                                          f"{today:%Y-%m-%d}"))
+                for position in positions]
+        live = pd.DataFrame(rows)
+        value = sum((row["Price"] or row["Entry price"]) * row["Shares"] for row in rows)
+        unrealised = sum(row["P&L"] or 0 for row in rows)
+        tiles = st.columns(3)
+        tiles[0].metric("Open value", f"${value:,.0f}")
+        tiles[1].metric("Open P&L", f"${unrealised:+,.0f}")
+        tiles[2].metric("Closed today", f"${day_pnl(data['closed'], today):+,.0f}")
+        selling = live[live["Action"].str.startswith("Sell")]
+        for _, row in selling.iterrows():
+            st.error(f"**{row['Symbol']}**: {row['Action']}")
+        st.dataframe(live.style.format({"Shares": "{:,.0f}", "Entry price": "${:,.2f}", "Stop": "${:,.2f}",
+                                        "Price": "${:,.2f}", "P&L": "${:+,.0f}", "P&L %": "{:+.1f}%",
+                                        "Exit average": "${:,.2f}"}, na_rep="-"),
+                     hide_index=True, width="stretch")
+        st.caption("Sell when the price is at the stop, or below its 20-day average (the breakout rule's exit).")
+
+        labels = [f"{n + 1}. {p.get('Symbol')} {float(p.get('Shares') or 0):,.0f} @ ${float(p.get('Entry price') or 0):,.2f}"
+                  for n, p in enumerate(positions)]
+        with st.expander("Sold one? Close it"):
+            choice = st.selectbox("Position", range(len(labels)), format_func=lambda n: labels[n],
+                                  key="pretrade_close_pick_draft")
+            position = positions[choice]
+            latest = rows[choice]["Price"] or float(position.get("Entry price") or 0)
+            held = float(position.get("Shares") or 0)
+            sold = st.number_input("Shares sold", 0.0, held, held, 1.0, key=f"pretrade_close_shares_{choice}_draft")
+            exit_price = st.number_input("Sale price ($)", 0.0, 1_000_000.0, float(round(latest, 2)), 0.01,
+                                         key=f"pretrade_close_price_{choice}_draft", format="%.2f")
+            exit_day = st.date_input("Sale date", value=today.date(), key=f"pretrade_close_date_{choice}_draft")
+            if st.button("Close position", key="pretrade_close_btn", disabled=sold <= 0 or exit_price <= 0):
+                new = json.loads(json.dumps(data, default=str))
+                entry = float(position.get("Entry price") or 0)
+                new["closed"].append({"Symbol": position.get("Symbol"), "Shares": sold, "Entry price": entry,
+                                      "Entry date": position.get("Entry date"), "Exit price": exit_price,
+                                      "Exit date": f"{exit_day:%Y-%m-%d}", "P&L": round(sold * (exit_price - entry), 2),
+                                      "Note": position.get("Note") or ""})
+                if sold >= held:
+                    new["positions"].pop(choice)
+                else:
+                    new["positions"][choice]["Shares"] = held - sold
+                if save_trading_data(new, f"{position.get('Symbol')} closed."):
+                    st.rerun()
+    else:
+        st.caption("No open positions saved. Save one after a check, or type them into the table below.")
+
+    with st.expander("Edit open positions"):
+        edited = st.data_editor(
+            editor_frame(positions, POSITION_FIELDS, ["Entry date"]), num_rows="dynamic", hide_index=True,
+            width="stretch", key="pretrade_positions_table",
+            column_config={"Entry date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                           "Entry price": st.column_config.NumberColumn(format="$%.2f"),
+                           "Stop": st.column_config.NumberColumn(format="$%.2f")})
+        if st.button("Save open positions", key="pretrade_positions_save_btn"):
+            new = json.loads(json.dumps(data, default=str))
+            new["positions"] = rows_from_editor(edited, POSITION_FIELDS, ["Entry date"])
+            if save_trading_data(new, "Positions saved."):
+                st.rerun()
+
+
+def render_pretrade_closed(data, today):
+    closed = data["closed"]
+    st.subheader(f"Closed trades ({len(closed)})")
+    st.caption("The checks use these: a stock you lost on today, and whether today is a losing day. Add a trade you "
+               "closed in IBKR here (P&L is worked out from the prices when both are filled in).")
+    with st.expander("Edit closed trades", expanded=not MOBILE and len(closed) <= 10):
+        ordered = sorted(closed, key=lambda row: str(row.get("Exit date") or ""), reverse=True)
+        edited = st.data_editor(
+            editor_frame(ordered, CLOSED_FIELDS, ["Entry date", "Exit date"]), num_rows="dynamic", hide_index=True,
+            width="stretch", key="pretrade_closed_table",
+            column_config={"Entry date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                           "Exit date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                           "Entry price": st.column_config.NumberColumn(format="$%.2f"),
+                           "Exit price": st.column_config.NumberColumn(format="$%.2f"),
+                           "P&L": st.column_config.NumberColumn(format="$%.2f")})
+        if st.button("Save closed trades", key="pretrade_closed_save_btn"):
+            rows = rows_from_editor(edited, CLOSED_FIELDS, ["Entry date", "Exit date"])
+            for row in rows:
+                if row["Shares"] and row["Entry price"] and row["Exit price"]:
+                    row["P&L"] = round(row["Shares"] * (row["Exit price"] - row["Entry price"]), 2)
+                if not row["Exit date"]:
+                    row["Exit date"] = f"{today:%Y-%m-%d}"
+            new = json.loads(json.dumps(data, default=str))
+            new["closed"] = rows
+            if save_trading_data(new, "Closed trades saved."):
+                st.rerun()
+
+
+def render_pretrade_check():
+    """Pre-trade Check tab: check one stock against the trading rules, size it, and keep the positions saved."""
+
+    store = trading_store()
+    data = trading_data()
+    with settings_panel("Account and sizing"):
+        st.number_input("Account size ($)", 1_000.0, 100_000_000.0, step=1_000.0, key="pretrade_account",
+                        on_change=save_pretrade_settings)
+        st.number_input("Slot per trade (% of account)", 0.5, 100.0, step=0.5, key="pretrade_slot_pct",
+                        on_change=save_pretrade_settings)
+        st.number_input("Stop (% below the buy)", 0.5, 50.0, step=0.5, key="pretrade_stop_pct",
+                        on_change=save_pretrade_settings)
+        st.number_input("Most positions at once", 1, 100, step=1, key="pretrade_max_positions",
+                        on_change=save_pretrade_settings)
+        st.caption("Saved with your positions.")
+    with settings_panel("Backup", expanded=False):
+        st.download_button("Download a backup (JSON)", json.dumps(data, indent=1, default=str).encode("utf-8"),
+                           file_name=f"trading_{pd.Timestamp(date.today()):%Y%m%d}.json", mime="application/json")
+        upload = st.file_uploader("Restore a backup", type=["json"], key="pretrade_restore_upload")
+        if upload is not None and st.button("Replace the saved data with this file", key="pretrade_restore_btn"):
+            try:
+                restored = normalize_trading_data(json.loads(upload.getvalue().decode("utf-8")))
+            except ValueError:
+                st.error("That file is not a backup from this tab.")
+            else:
+                if save_trading_data(restored, "Backup restored."):
+                    st.session_state["trading_reload"] = True
+                    st.rerun()
+
+    st.caption("Check a stock against your rules before you place the order in the IBKR app, get the share count and "
+               "stop, and keep your open positions and closed trades saved.")
+    render_pretrade_status(store, data)
+    today = pretrade_today()
+    render_pretrade_trade(data, today)
+    render_pretrade_positions(data, today)
+    render_pretrade_closed(data, today)
+
+
+# ============================================================
 # Main application
 # ============================================================
 
@@ -7880,7 +8237,9 @@ if check_password():
         with tab:
             if not tab_is_open(tab, label):
                 continue
-            if label == ECONOMY_TAB:
+            if label == PRETRADE_TAB:
+                render_pretrade_check()
+            elif label == ECONOMY_TAB:
                 render_economic_analysis()
             elif label == "Stock Screener":
                 render_stock_screener()

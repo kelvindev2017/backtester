@@ -105,7 +105,7 @@ def open_tab(app, label):
 
 def test_app_runs_both_tabs(offline):
     app = start_app()
-    assert [tab.label for tab in app.tabs] == ["News", "Stock Screener", "Economic analysis", "Market Analysis",
+    assert [tab.label for tab in app.tabs] == ["Pre-trade Check", "News", "Stock Screener", "Economic analysis", "Market Analysis",
                                                "Industry Analysis", "Stock Fundamentals", "Valuation Model",
                                                "Semicon Supply Chain", "Backtest",
                                                "Signal Analysis & Trade Plan", "Validate", "Trade Journal"]
@@ -137,8 +137,8 @@ def test_economic_analysis_tab(offline, monkeypatch):
     monkeypatch.setattr(analysis.economy, "fred_series", fake_fred)
     app = start_app()
     assert not app.exception, app.exception
-    # News opens first.
-    assert app.sidebar.header[0].value == "News"
+    # The Pre-trade Check opens first.
+    assert app.sidebar.header[0].value == "Pre-trade Check"
     app = open_tab(app, "Economic analysis")
     assert app.sidebar.header[0].value == "Economic analysis"
     assert [element.value for element in app.subheader] == ["Asset classes compared", "S&P 500 vs the US economy"]
