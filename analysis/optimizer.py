@@ -63,6 +63,8 @@ SEARCH_SPACES = {
     "day_breakout": SearchSpace((
         Param("signal_day_breakout_lookback", "Prior N-day high", "int", 2, 60, 1),
         Param("signal_day_breakout_exit_pct", "Exit below high (% of range)", "int", 10, 90, 5),
+        Param("day_breakout_stop_pct", "Stop % below entry", "float", 0.0, 15.0, 0.5),
+        Param("day_breakout_breakeven_pct", "Stop to entry once up %", "float", 0.0, 10.0, 0.5),
     )),
     "macd_bollinger": SearchSpace((
         Param("macd_ma", "MA and Bollinger period", "int", 5, 60, 1),
