@@ -648,3 +648,25 @@ def test_position_engine_breakeven_stop():
     assert not run_position_engine(df, buy, sell, stop_pct=3.0)["Sell_Signal"].any()
     # A 2% stop sells at the close of 98.
     assert list(run_position_engine(df, buy, sell, stop_pct=2.0)["Sell_Signal"]).index(True) == 6
+
+
+def test_position_engine_intraday_stop_fills_at_stop_or_gap_open():
+    from App import equity_with_costs, run_position_engine
+
+    df = pd.DataFrame({"Open": [100, 100, 99, 95], "High": [100, 101, 99.5, 96],
+                       "Low": [99, 98.5, 96.5, 94], "Close": [100, 100, 98, 95]},
+                      index=pd.date_range("2026-01-01", periods=4, freq="D"))
+    buy = pd.Series([True, False, False, False], index=df.index)
+    sell = pd.Series(False, index=df.index)
+    # The low of 96.5 on bar 2 reaches the 97 stop: sold at 97 that day, not at the 98 close.
+    result = run_position_engine(df, buy, sell, stop_pct=3.0, intraday_stop=True)
+    assert list(result["Sell_Signal"]).index(True) == 2
+    assert result["Exit_Price"].iloc[2] == pytest.approx(97.0)
+    equity, _, _ = equity_with_costs(result, 10_000, commission_plan="none", slippage=0.0)
+    assert equity.iloc[-1] == pytest.approx(9_700.0, abs=1.0)
+    # Close-based, the 98 close is above the stop; the 95 close on bar 3 sells.
+    assert list(run_position_engine(df, buy, sell, stop_pct=3.0)["Sell_Signal"]).index(True) == 3
+    # A gap below the stop fills at the open.
+    gap = df.assign(Open=[100, 100, 96.8, 95])
+    result = run_position_engine(gap, buy, sell, stop_pct=3.0, intraday_stop=True)
+    assert result["Exit_Price"].iloc[2] == pytest.approx(96.8)
