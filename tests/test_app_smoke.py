@@ -107,7 +107,7 @@ def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["News", "Stock Screener", "Economic analysis", "Market Analysis",
                                                "Industry Analysis", "Stock Fundamentals", "Valuation Model",
-                                               "Semicon Supply Chain", "Backtest",
+                                               "Semicon Supply Chain", "Backtest", "Portfolio",
                                                "Signal Analysis & Trade Plan", "Validate", "Trade Journal"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
@@ -1133,3 +1133,19 @@ def test_model_haircut_starts_at_stock_pay_and_equations_show(offline, monkeypat
     formulas = [element.value for element in app.get("latex")]
     assert any("EPS}_{\\text{clean}}" in formula for formula in formulas)
     assert any("P/E}_{\\text{acc}}" in formula for formula in formulas)
+
+
+def test_portfolio_tab(offline):
+    app = open_tab(start_app(), "Portfolio")
+    next(box for box in app.text_input if box.key == "portfolio_stocks").input("AAA, BBB, CCC")
+    open_tab(app, "Portfolio")
+    labels = [metric.label for metric in app.metric]
+    assert "Worst drop" in labels and "Yearly return (CAGR)" in labels
+    assert any("first trading day of each year" in element.value for element in app.info)
+    next(box for box in app.selectbox if box.key == "portfolio_rebalance").select(
+        "When a holding drifts more than a band from its target")
+    open_tab(app, "Portfolio")
+    assert any(box.key == "portfolio_band" for box in app.number_input)
+    next(box for box in app.text_input if box.key == "portfolio_holdings").input("QQQ:80")
+    open_tab(app, "Portfolio")
+    assert any("add up to" in element.value for element in app.error)
