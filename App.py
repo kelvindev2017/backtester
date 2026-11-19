@@ -236,6 +236,7 @@ from analysis.news import (
     time_ago,
     with_semi_ai_sector,
 )
+from analysis import portfolio as pf
 from analysis.peers import merge_peers, rank_by_size, target_weight
 from analysis.universe import (
     MARKETS as SCREENER_MARKETS,
@@ -3266,7 +3267,7 @@ FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
 TAB_NAMES = [NEWS_TAB, "Stock Screener", ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, MODEL_TAB,
              SUPPLY_CHAIN_TAB,
-             "Backtest", "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
+             "Backtest", "Portfolio", "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
@@ -7309,6 +7310,211 @@ def render_opening_bar_details(trades, days, settings):
 
 
 # ============================================================
+# Portfolio: held assets plus breakout trades spread over many stocks, rebalanced
+# ============================================================
+
+PORTFOLIO_TAB = "Portfolio"
+PORTFOLIO_DEFAULT_STOCKS = "MU, TSM, ASML, QCOM, GOOG, INTC, AAPL, NVDA, TER, IONQ, NOK, SMCI, LUNR, TSLA, AMD, AVAV, IBM"
+
+
+def parse_holdings(text):
+    """'QQQ:30, GLD:10' -> {'QQQ': 0.30, 'GLD': 0.10}. Raises ValueError on a malformed entry."""
+
+    holdings = {}
+    for part in [p.strip() for p in text.split(",") if p.strip()]:
+        symbol, _, share = part.partition(":")
+        symbol = normalize_symbol(symbol.strip())
+        if not symbol or not share.strip():
+            raise ValueError(f"'{part}' needs the form SYMBOL:percent, for example QQQ:30")
+        holdings[symbol] = holdings.get(symbol, 0.0) + float(share) / 100
+    return holdings
+
+
+def portfolio_rebalance_text(rule, band_pct):
+    if rule == "yearly":
+        when = "On the first trading day of each year"
+    elif rule == "quarterly":
+        when = "On the first trading day of each quarter"
+    elif rule == "monthly":
+        when = "On the first trading day of each month"
+    elif rule == "band":
+        when = (f"Whenever the held assets, the breakout part or cash has drifted more than {band_pct:g} percentage "
+                "points from its target (checked every day)")
+    else:
+        return "Never rebalanced: every part grows or shrinks with its own returns."
+    return (f"{when}, every holding goes back to its target share of the total: sell what has grown above its target "
+            "and buy what has fallen below it. Each stock's breakout slot is reset to the same size; a slot that is in "
+            "a trade keeps the trade and is topped up or trimmed.")
+
+
+def render_portfolio():
+    """Backtest of a mix of held assets and breakout trades over many stocks, with a rebalancing rule."""
+
+    with settings_panel("Portfolio"):
+        stocks_text = st.text_input("Breakout stocks (one slot each)", value=PORTFOLIO_DEFAULT_STOCKS,
+                                    key="portfolio_stocks")
+        holdings_text = st.text_input("Held assets (SYMBOL:% of the account)", value="QQQ:30, GLD:10",
+                                      key="portfolio_holdings")
+        breakout_pct = float(st.number_input("Breakout trades (% of the account)", min_value=0.0, max_value=100.0,
+                                             value=60.0, step=5.0, key="portfolio_breakout_pct"))
+        date_range = st.date_input("Date Range", value=(date(2018, 1, 1), date.today()), max_value=date.today(),
+                                   format="YYYY-MM-DD", key="portfolio_dates")
+    with settings_panel("Breakout rule"):
+        columns = st.columns(2)
+        lookback = int(columns[0].number_input("Buy above the prior N-day high", min_value=2, max_value=250, value=20,
+                                               step=1, key="portfolio_lookback"))
+        trend_sma = int(columns[1].number_input("Only when above this SMA (days, 0 = off)", min_value=0,
+                                                max_value=400, value=50, step=5, key="portfolio_trend_sma"))
+        exit_sma = int(columns[0].number_input("Sell on a close below this SMA (days)", min_value=2, max_value=400,
+                                               value=20, step=1, key="portfolio_exit_sma"))
+        stop_pct = float(columns[1].number_input("Stop % below the entry (0 = off)", min_value=0.0, max_value=50.0,
+                                                 value=5.0, step=0.5, key="portfolio_stop_pct"))
+        cost_pct = float(st.number_input("Cost per buy or sell (% of the amount)", min_value=0.0, max_value=2.0,
+                                         value=0.05, step=0.01, key="portfolio_cost_pct",
+                                         help="Broker fee and slippage together. 0.05% is about $5 on a $10,000 order."))
+    with settings_panel("Rebalancing"):
+        rule_label = st.selectbox("Rebalance", list(pf.REBALANCE_RULES), index=0, key="portfolio_rebalance")
+        rule = pf.REBALANCE_RULES[rule_label]
+        band_pct = 5.0
+        if rule == "band":
+            band_pct = float(st.number_input("Band (percentage points)", min_value=1.0, max_value=50.0, value=5.0,
+                                             step=1.0, key="portfolio_band"))
+
+    try:
+        holdings = parse_holdings(holdings_text)
+    except ValueError as error:
+        st.error(str(error))
+        return
+    stocks = list(dict.fromkeys(normalize_symbol(s.strip()) for s in stocks_text.split(",") if s.strip()))
+    breakout_weight = breakout_pct / 100
+    cash_weight = 1 - sum(holdings.values()) - breakout_weight
+    if cash_weight < -1e-9:
+        st.error(f"The held assets and the breakout part add up to {100 - cash_weight * 100:.0f}% of the account; "
+                 "bring them to 100% or less (the rest is cash).")
+        return
+    if not isinstance(date_range, (tuple, list)) or len(date_range) != 2:
+        st.info("Please select both a start date and an end date.")
+        return
+    start_date, end_date = date_range
+    rule_settings = pf.BreakoutRule(lookback, trend_sma, exit_sma, stop_pct, cost_pct)
+    warmup = (pd.Timestamp(start_date) - pd.Timedelta(days=int(max(lookback, trend_sma, exit_sma) * 1.6) + 30))
+
+    def daily(symbol):
+        return load_data(symbol, warmup.strftime("%Y-%m-%d"), str(end_date), "Daily")
+
+    missing = []
+    with st.spinner(f"Loading {len(stocks) + len(holdings) + 2} price histories..."):
+        slot_returns, all_trades = {}, []
+        for symbol in stocks:
+            frame = daily(symbol)
+            if frame.empty:
+                missing.append(symbol)
+                continue
+            returns, trades = pf.breakout_slot_returns(frame, rule_settings)
+            slot_returns[symbol] = returns
+            if not trades.empty:
+                all_trades.append(trades.assign(Ticker=symbol))
+        core = {}
+        for symbol in holdings:
+            frame = daily(symbol)
+            if frame.empty:
+                missing.append(symbol)
+                continue
+            core[symbol] = frame["Close"].pct_change()
+        benchmarks = {symbol: daily(symbol)["Close"] for symbol in ("QQQ", "SPY")}
+    if missing:
+        st.warning(f"No price data for {', '.join(missing)}; left out.")
+    if not slot_returns and not core:
+        st.error("No price data for any holding.")
+        return
+
+    slots = pd.DataFrame(slot_returns)
+    core_frame = pd.DataFrame(core) if core else pd.DataFrame(index=slots.index)
+    weights = {symbol: holdings[symbol] for symbol in core}
+    result = pf.run_portfolio(core_frame, weights, slots, breakout_weight if slot_returns else 0.0,
+                              rebalance=rule, band_pct=band_pct, start=start_date, rebalance_cost_pct=cost_pct)
+    equity = result.equity * 100_000
+    stats = pf.summarize(equity)
+    trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    if not trades.empty:
+        trades = trades[trades["Entry date"] >= pd.Timestamp(start_date)]
+
+    mix = ", ".join([f"{symbol} {share * 100:g}%" for symbol, share in weights.items()]
+                    + [f"breakout trades {breakout_pct:g}% over {len(slot_returns)} stocks "
+                       f"({breakout_pct / max(len(slot_returns), 1):.1f}% each)"]
+                    + ([f"cash {cash_weight * 100:.0f}%"] if cash_weight > 1e-9 else []))
+    st.subheader("Portfolio backtest")
+    st.caption(f"{mix}. Starting at $100,000 on {equity.index[0]:%Y-%m-%d}.")
+    columns = st.columns(3)
+    columns[0].metric("Yearly return (CAGR)", f"{stats['CAGR %']:.1f}%", f"{stats['Total return %']:.0f}% total",
+                      delta_color="off")
+    columns[1].metric("Worst drop", f"{stats['Worst drop %']:.1f}%")
+    columns[2].metric("Sharpe", f"{stats['Sharpe']:.2f}")
+
+    rows = {"This portfolio": stats}
+    for symbol, closes in benchmarks.items():
+        closes = closes.loc[closes.index >= equity.index[0]]
+        if len(closes) > 1:
+            rows[f"{symbol} buy & hold"] = pf.summarize(closes / closes.iloc[0])
+    comparison = pd.DataFrame(rows).T
+    st.dataframe(comparison.style.format({"CAGR %": "{:.1f}", "Worst drop %": "{:.1f}", "Sharpe": "{:.2f}",
+                                          "Total return %": "{:.0f}"}), width="stretch")
+
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.5, 0.25, 0.25],
+                        subplot_titles=("Equity ($, log scale)", "Drop from the peak (%)", "Share of the account (%)"))
+    fig.add_trace(go.Scatter(x=equity.index, y=equity, name="Portfolio", line=dict(color="#2a7de1", width=2)),
+                  row=1, col=1)
+    for symbol, closes in benchmarks.items():
+        closes = closes.loc[closes.index >= equity.index[0]]
+        if len(closes) > 1:
+            fig.add_trace(go.Scatter(x=closes.index, y=closes / closes.iloc[0] * 100_000, name=f"{symbol} buy & hold",
+                                     line=dict(width=1)), row=1, col=1)
+    drawdown = (equity / equity.cummax() - 1) * 100
+    fig.add_trace(go.Scatter(x=drawdown.index, y=drawdown, name="Drop from peak", fill="tozeroy",
+                             line=dict(color="#d64545", width=1)), row=2, col=1)
+    for name in result.weights.columns:
+        fig.add_trace(go.Scatter(x=result.weights.index, y=result.weights[name] * 100, name=f"{name} share",
+                                 stackgroup="weights", line=dict(width=0.5)), row=3, col=1)
+    fig.update_yaxes(type="log", row=1, col=1)
+    fig.update_layout(height=900, hovermode="x unified", legend=dict(orientation="h", y=-0.08),
+                      margin=dict(l=10, r=10, t=40, b=10))
+    show_chart(fig, width="stretch")
+
+    st.markdown("**Rebalancing rule**")
+    st.info(portfolio_rebalance_text(rule, band_pct)
+            + f" Rebalanced {len(result.rebalance_dates)} times; each rebalance pays {cost_pct:g}% of the amount moved.")
+
+    yearly = pf.yearly_returns(equity).rename("Portfolio %").to_frame()
+    for symbol, closes in benchmarks.items():
+        closes = closes.loc[closes.index >= equity.index[0]]
+        if len(closes) > 1:
+            yearly[f"{symbol} %"] = pf.yearly_returns(closes)
+    st.markdown("**Return by year**")
+    st.dataframe(yearly.style.format("{:.1f}"), width="stretch")
+
+    if not trades.empty:
+        wins = (trades["Return %"] > 0).mean() * 100
+        st.markdown("**Breakout trades**")
+        st.caption(
+            f"{len(trades)} trades, {wins:.0f}% winners, average {trades['Return %'].mean():+.2f}% per trade, "
+            f"held {trades['Days held'].mean():.1f} days on average. On an average day "
+            f"{result.slot_exposure.mean() * 100:.0f}% of the slots were in a trade; the rest of the breakout part "
+            "waited in cash."
+        )
+        by_stock = trades.groupby("Ticker")["Return %"].agg(Trades="size", Average="mean",
+                                                            Winners=lambda s: (s > 0).mean() * 100)
+        st.dataframe(by_stock.sort_values("Average", ascending=False).style.format(
+            {"Average": "{:+.2f}%", "Winners": "{:.0f}%"}), width="stretch")
+    st.caption(
+        "Daily bars. A breakout slot buys when the price trades above the prior N-day high while the prior close is "
+        "above the trend SMA (at that high, or at the open on a gap), sells on a close below the exit SMA or during "
+        "the day at the stop (at the open on a gap below it), and holds cash otherwise. Each slot is a fixed share of "
+        "the account between rebalances. Dividends are left out; the stock list is chosen today, so stocks that did "
+        "well are over-represented."
+    )
+
+
+# ============================================================
 # Trade Journal: import IBKR trades, see where the P&L comes from, replay them with other rules
 # ============================================================
 
@@ -7898,6 +8104,8 @@ if check_password():
                 render_supply_chain(main_index_prices)
             elif label == JOURNAL_TAB:
                 render_trade_journal()
+            elif label == PORTFOLIO_TAB:
+                render_portfolio()
             else:
                 strategy = strategy_settings(label)
                 if strategy is None:
