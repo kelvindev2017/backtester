@@ -70,3 +70,10 @@ def intraday_breakout():
     volumes[6:10] = 3.0e6
     session = make_session("2024-03-06", closes, volumes)
     return pd.concat([prior_1, prior_2, session])
+
+
+@pytest.fixture(autouse=True)
+def private_trade_store(tmp_path, monkeypatch):
+    """Each test saves positions and trades to its own file, never to a shared one."""
+
+    monkeypatch.setenv("TRADE_STORE_PATH", str(tmp_path / "trading.json"))
