@@ -2033,12 +2033,14 @@ def equity_with_costs(df, account_size, commission_plan="tiered", slippage=0.01)
     return pd.Series(values, index=df.index), total_costs, orders
 
 
-def run_position_engine(price_df, buy_condition, sell_condition, max_hold=0, stop_pct=0.0, cooldown=0):
+def run_position_engine(price_df, buy_condition, sell_condition, max_hold=0, stop_pct=0.0, cooldown=0,
+                        breakeven_pct=0.0):
     """Generate long-only positions and entry/exit markers.
 
     ``max_hold`` (bars, 0 = no limit) also sells a position that has been held that long. ``stop_pct`` (0 = off)
-    sells at the first close at least that % below the entry close. ``cooldown`` bars must pass after a sell
-    before the next buy.
+    sells at the first close at least that % below the entry close. ``breakeven_pct`` (0 = off): once a bar after
+    the entry trades that % above the entry close (its high), the stop moves up to the entry, so from the next bar
+    the first close at or below the entry sells. ``cooldown`` bars must pass after a sell before the next buy.
     """
 
     positions, buy_markers, sell_markers = [], [], []
@@ -2047,8 +2049,10 @@ def run_position_engine(price_df, buy_condition, sell_condition, max_hold=0, sto
     exit_row = -10**9
     closes = price_df["Close"].to_numpy(dtype=float)
     # Plain arrays: the parameter search runs this many times, and .iloc per bar is slow.
+    highs = price_df["High"].to_numpy(dtype=float) if "High" in price_df else closes
     buys = np.asarray(buy_condition, dtype=bool)
     sells = np.asarray(sell_condition, dtype=bool)
+    at_breakeven = False
 
     for row_number in range(len(price_df)):
         buy_signal = False
@@ -2058,12 +2062,16 @@ def run_position_engine(price_df, buy_condition, sell_condition, max_hold=0, sto
             in_trade = True
             buy_signal = True
             entry_row = row_number
+            at_breakeven = False
         elif in_trade and (sells[row_number]
                            or (max_hold and row_number - entry_row >= max_hold)
-                           or (stop_pct and closes[row_number] <= closes[entry_row] * (1 - stop_pct / 100))):
+                           or (stop_pct and closes[row_number] <= closes[entry_row] * (1 - stop_pct / 100))
+                           or (at_breakeven and closes[row_number] <= closes[entry_row])):
             in_trade = False
             sell_signal = True
             exit_row = row_number
+        elif in_trade and breakeven_pct and highs[row_number] >= closes[entry_row] * (1 + breakeven_pct / 100):
+            at_breakeven = True
 
         positions.append(1 if in_trade else 0)
         buy_markers.append(buy_signal)
@@ -5654,6 +5662,7 @@ def strategy_settings(tab="Backtest"):
     keep_fraction = 2 / 3
     exit_ma, max_hold_bars = 200, 0
     macd_ma, macd_stop_pct, macd_exit_on_ma_down, macd_cooldown = 20, 3.0, False, 1
+    day_stop_pct, day_breakeven_pct = 3.0, 2.0
     macd_widen_days, macd_widen_pct, macd_bb_std = 5, 10.0, 2.0
     opening_bar = None
 
@@ -5701,10 +5710,23 @@ def strategy_settings(tab="Backtest"):
             breakout_lookback = int(st.number_input("Breakout above the prior N-day high", min_value=1, max_value=250,
                                                     value=10, step=1, key="signal_day_breakout_lookback"))
             keep_fraction = exit_pct_slider("signal_day_breakout_exit_pct")
+            stop_columns = st.columns(2)
+            day_stop_pct = float(stop_columns[0].number_input(
+                "Stop: sell when the close is this % below the entry (0 = off)", min_value=0.0, max_value=30.0,
+                value=3.0, step=0.5, key="day_breakout_stop_pct"))
+            day_breakeven_pct = float(stop_columns[1].number_input(
+                "Move the stop to the entry once the price is this % above it (0 = off)", min_value=0.0,
+                max_value=30.0, value=2.0, step=0.5, key="day_breakout_breakeven_pct",
+                help="Once a day's high after the entry reaches this % above the entry, the first close at or "
+                "below the entry sells, so a winner is not allowed to turn into a loss."))
             st.caption(
                 f"Buy: price trades above the prior {breakout_lookback}-day high (buy-stop at that level) and closes "
                 f"within {(1 - keep_fraction) * 100:.0f}% of the day's range from its high. Sell / exit: the first close "
-                "further below the high than that. Long only. The Day Breakout Rule tab runs it on many tickers with fixed $ size."
+                "further below the high than that"
+                + (f", or a close {day_stop_pct:g}% below the entry" if day_stop_pct else "")
+                + (f", or, once the price has been {day_breakeven_pct:g}% above the entry, a close back at the entry"
+                   if day_breakeven_pct else "")
+                + ". Long only."
             )
         elif setup == "macd_bollinger":
             macd_ma = int(st.number_input("Moving average and Bollinger period (days)", min_value=5, max_value=100,
@@ -5893,6 +5915,7 @@ def strategy_settings(tab="Backtest"):
         volume_multiple=volume_multiple, ma_rule=ma_rule, signal_settings=signal_settings, risk_settings=risk_settings,
         max_hold_bars=max_hold_bars, opening_bar=opening_bar, macd_ma=macd_ma, macd_stop_pct=macd_stop_pct,
         macd_cooldown=macd_cooldown, macd_bb_std=macd_bb_std, commission_plan=commission_plan, slippage=slippage,
+        day_stop_pct=day_stop_pct, day_breakeven_pct=day_breakeven_pct,
     )
 
 
@@ -5922,10 +5945,13 @@ def run_rule_positions(df, buy_condition, sell_condition, s):
     """The position engine with the rule's own time exit, stop and wait after a sell."""
 
     macd_rule = s.setup == "macd_bollinger"
+    day_rule = s.setup == "day_breakout"
+    stop_pct = s.macd_stop_pct if macd_rule else getattr(s, "day_stop_pct", 0.0) if day_rule else 0.0
     return run_position_engine(df, buy_condition, sell_condition,
                                max_hold=s.max_hold_bars if s.setup == "reversal" else 0,
-                               stop_pct=s.macd_stop_pct if macd_rule else 0.0,
-                               cooldown=s.macd_cooldown if macd_rule else 0)
+                               stop_pct=stop_pct,
+                               cooldown=s.macd_cooldown if macd_rule else 0,
+                               breakeven_pct=getattr(s, "day_breakeven_pct", 0.0) if day_rule else 0.0)
 
 
 def strategy_with_params(s, params):
@@ -5949,6 +5975,8 @@ def strategy_with_params(s, params):
             s.max_hold_bars = int(value)
         elif key == "macd_cooldown":
             s.macd_cooldown = int(value)
+        elif key in ("day_breakout_stop_pct", "day_breakout_breakeven_pct"):
+            setattr(s, "day_stop_pct" if key == "day_breakout_stop_pct" else "day_breakeven_pct", float(value))
         else:
             if key == "macd_stop_pct":
                 s.macd_stop_pct = float(value)
@@ -6466,6 +6494,8 @@ def current_param_values(s, space):
         "pullback_bars": settings.pullback_bars, "min_depth_atr": settings.min_depth_atr,
         "macd_ma": s.macd_ma, "macd_widen_pct": settings.macd_widen_pct, "macd_widen_days": settings.macd_widen_days,
         "macd_stop_pct": s.macd_stop_pct, "macd_cooldown": s.macd_cooldown,
+        "day_breakout_stop_pct": getattr(s, "day_stop_pct", 0.0),
+        "day_breakout_breakeven_pct": getattr(s, "day_breakeven_pct", 0.0),
     }
     return {param.key: values[param.key] for param in space.params}
 
@@ -6593,6 +6623,15 @@ def render_backtest(s):
                 f"Sells on the first close below the SMA {s.macd_ma}"
                 + (f" or a close {s.macd_stop_pct:g}% below the entry" if s.macd_stop_pct else "")
                 + f", then waits {s.macd_cooldown} day(s). Full position."
+            )
+        elif setup == "day_breakout":
+            rule_text = (
+                f"**BUY / SELL:** {setup_label} on {timeframe.lower()} bars, buying and selling at the close. "
+                f"Sells on the first close outside the top {(1 - s.signal_settings.keep_fraction) * 100:.0f}% of the day's range"
+                + (f", a close {s.day_stop_pct:g}% below the entry" if s.day_stop_pct else "")
+                + (f", or a close back at the entry once the price has been {s.day_breakeven_pct:g}% above it"
+                   if s.day_breakeven_pct else "")
+                + ". Full position."
             )
     if setup != "opening_bar":
         df = run_rule_positions(df, buy_condition, sell_condition, s)

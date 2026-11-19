@@ -630,3 +630,21 @@ def test_macd_bollinger_band_width_setting():
     assert three["BB_Width"].iloc[-1] == pytest.approx(two["BB_Width"].iloc[-1] * 1.5)
     # The widening test is relative, so the buys do not depend on the band width.
     assert (two["Signal_Up"] == three["Signal_Up"]).all()
+
+
+def test_position_engine_breakeven_stop():
+    from App import run_position_engine
+
+    close = [100, 101, 102, 101, 100, 99, 98]
+    high = [100, 101, 103, 102, 101, 100, 99]
+    df = pd.DataFrame({"Close": close, "High": high},
+                      index=pd.date_range("2026-01-01", periods=len(close), freq="D"))
+    buy = pd.Series([True] + [False] * 6, index=df.index)
+    sell = pd.Series(False, index=df.index)
+    # Up 3% on bar 2 arms the stop at the entry; the close of 100 on bar 4 sells.
+    result = run_position_engine(df, buy, sell, breakeven_pct=2.0)
+    assert list(result["Sell_Signal"]).index(True) == 4
+    # Without it, and with a 3% stop, the close of 97 or below never prints, so the trade stays open.
+    assert not run_position_engine(df, buy, sell, stop_pct=3.0)["Sell_Signal"].any()
+    # A 2% stop sells at the close of 98.
+    assert list(run_position_engine(df, buy, sell, stop_pct=2.0)["Sell_Signal"]).index(True) == 6
