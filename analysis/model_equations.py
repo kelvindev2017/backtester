@@ -20,7 +20,7 @@ EQUATIONS = {
     ],
     "earnings_quality": [
         r"\text{EPS}_{\text{clean}} = \text{EPS}_{\text{last 4q}} \times \left(1 - \frac{h}{100}\right)",
-        r"h_{\text{default}} = \frac{\text{Stock-based pay}_{\text{last 4q}}}{\text{Net income}_{\text{last 4q}}} \times 100",
+        r"h_{\text{default}} = \frac{\text{SBC}_{\text{last 4q}}}{\text{Net income}_{\text{last 4q}} + \text{SBC}_{\text{last 4q}}} \times 100",
     ],
     "item_tracker": [r"\text{Items} = \text{modelled} + \text{parked}"],
     "triage_gate": [
@@ -59,7 +59,7 @@ EQUATIONS = {
 # What each symbol stands for, shown under the equations.
 SYMBOLS = {
     "income_map": "g: revenue growth %, m: net margin %.",
-    "earnings_quality": "h: EPS haircut %. The P/E deduction d_q goes to the Multiple builder.",
+    "earnings_quality": "h: EPS haircut %, SBC: stock-based pay (adjusted EPS leaves it out, so h_default takes it back). The P/E deduction d_q goes to the Multiple builder.",
     "triage_gate": "p: probability, impact: EPS impact %, points: P/E points.",
     "item_router": "e: expected EPS change % from event items, a: P/E points from general items (+ product, - risk).",
     "scenario_engine": "s: base growth as a share of trailing growth, g: revenue growth %, c: bear, base or bull, "
@@ -78,10 +78,15 @@ SYMBOLS = {
 
 
 def stock_pay_haircut(stock_pay, net_income, periods=4):
-    """Stock-based pay of the last ``periods`` reports as a % of net income over the same reports.
+    """Stock-based pay of the last ``periods`` reports as a % of net income plus that pay, over the same reports.
 
-    Both are series by period end. NaN when either is missing or net income is not positive (no profit to compare
-    with); capped at 90, the haircut box's limit.
+    The haircut is applied to reported EPS, which for most companies is the adjusted figure that leaves stock-based
+    pay out: adjusted earnings are about GAAP net income + stock-based pay, so the share of them that is stock pay is
+    pay / (net income + pay), and removing it lands near GAAP earnings. (Pay / net income alone would take off too
+    much: for a company whose stock pay is as large as its GAAP profit it would remove all of the adjusted EPS.)
+
+    Both are series by period end. NaN when either is missing or the sum is not positive; capped at 90, the haircut
+    box's limit.
     """
 
     pay = pd.to_numeric(pd.Series(stock_pay, dtype=float), errors="coerce").dropna().sort_index()
@@ -90,10 +95,11 @@ def stock_pay_haircut(stock_pay, net_income, periods=4):
     if len(shared) < periods:
         return np.nan
     shared = shared.sort_values()[-periods:]
-    total_income = income.loc[shared].sum()
-    if not np.isfinite(total_income) or total_income <= 0:
+    total_pay = abs(pay.loc[shared].sum())
+    adjusted = income.loc[shared].sum() + total_pay
+    if not np.isfinite(adjusted) or adjusted <= 0:
         return np.nan
-    return float(np.clip(abs(pay.loc[shared].sum()) / total_income * 100, 0, 90))
+    return float(np.clip(total_pay / adjusted * 100, 0, 90))
 
 
 def _n(value, digits=2):

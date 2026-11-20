@@ -4447,8 +4447,9 @@ MODEL_BLOCK_NOTES = {
     "income_map": "Reads each quarter's revenue and net income on the day it was released and turns them into the "
                   "trailing growth and net margin the scenarios start from.",
     "earnings_quality": "Takes the reported EPS of the last four quarters and removes the share you consider not real "
-                        "earnings. The haircut starts at the company's stock-based pay as a share of its net income "
-                        "(a cost most 'adjusted' EPS leaves out); add one-offs that keep coming back. It also sets a "
+                        "earnings. The haircut starts at the company's stock-based pay as a share of its net income plus that pay "
+                        "(a cost most 'adjusted' EPS leaves out, so the clean EPS lands near GAAP EPS); add one-offs "
+                        "that keep coming back. It also sets a "
                         "P/E deduction for weak earnings quality.",
     "item_tracker": "Holds the risk and product register and compares the latest stories with it: how often each "
                     "item is mentioned, and which stories no item explains.",
@@ -4477,7 +4478,7 @@ MODEL_BLOCK_NOTES = {
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_stock_pay_haircut(symbol):
-    """(stock-based pay as a % of net income, where it came from), or (NaN, reason) when Yahoo lacks either."""
+    """(stock-based pay as a % of net income plus that pay, where it came from), or (NaN, reason) when Yahoo lacks either."""
 
     try:
         stock = yf.Ticker(symbol)
@@ -4490,10 +4491,10 @@ def load_stock_pay_haircut(symbol):
             pay = extract_statement_row(first_available_statement(stock, cash_names), ["Stock Based Compensation"])
             share = stock_pay_haircut(pay, income, periods)
             if np.isfinite(share):
-                return share, f"stock-based pay / net income, {label} (Yahoo cash flow)"
+                return share, f"stock-based pay / (net income + stock-based pay), {label} (Yahoo cash flow)"
     except Exception:
         pass
-    return np.nan, "Yahoo has no stock-based pay or no profit to compare it with"
+    return np.nan, "Yahoo has no stock-based pay or no earnings to compare it with"
 
 
 def model_param_key(name, ticker=None):

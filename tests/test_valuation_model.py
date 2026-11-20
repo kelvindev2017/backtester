@@ -261,10 +261,13 @@ def test_stock_pay_haircut_uses_the_last_quarters_of_both():
     dates = pd.date_range("2025-03-31", periods=5, freq="QE")
     pay = pd.Series([9.0, 1.0, 1.0, 1.0, 1.0], index=dates)
     income = pd.Series([1.0, 10.0, 10.0, 10.0, 10.0], index=dates)
-    assert stock_pay_haircut(pay, income) == pytest.approx(10.0)
+    # Last four quarters: pay 4, net income 40, so 4 / (40 + 4) of adjusted earnings.
+    assert stock_pay_haircut(pay, income) == pytest.approx(4 / 44 * 100)
     assert np.isnan(stock_pay_haircut(pay, -income))
     assert np.isnan(stock_pay_haircut(pay.iloc[:2], income))
     assert stock_pay_haircut(pay * 100, income) == 90
+    # Stock pay as large as GAAP profit (Tesla, Q3 2026) takes off half of adjusted EPS, not all of it.
+    assert stock_pay_haircut(pay.iloc[1:], income.iloc[1:] / 10) == pytest.approx(50.0)
 
 
 def test_worked_equations_end_in_the_model_values():
