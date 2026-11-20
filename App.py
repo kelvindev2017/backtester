@@ -161,6 +161,7 @@ from analysis.signal_groups import (
 )
 from analysis.valuation_chart import (
     DOWN_COLOR,
+    no_hindsight_forward_pe,
     UP_COLOR,
     VALUATION_HISTORY_YEARS,
     add_volume_overlay,
@@ -4837,13 +4838,15 @@ def model_settings():
 
 
 def daily_forward_pe(symbol, valuation, earnings):
-    """Close / next four quarters' EPS: EPS later reported for past quarters, analyst estimates for the rest."""
+    """Forward P/E with no hindsight: close / analyst estimates where Yahoo has them, and before that close / the
+    trailing EPS grown by half its past year's growth (not the EPS reported later, which the market did not know)."""
 
     fiscal_year_end = load_fundamental_snapshot(symbol).get("nextFiscalYearEnd")
     fiscal_year_end = pd.to_datetime(fiscal_year_end, unit="s") if fiscal_year_end else None
     forward = forward_valuation(valuation, forward_eps(earnings, load_earnings_estimates(symbol),
                                                        fiscal_year_end=fiscal_year_end))
-    return forward["Forward_PE"] if "Forward_PE" in forward else pd.Series(dtype=float)
+    reported = earnings["Reported EPS"].dropna() if earnings is not None and "Reported EPS" in earnings else pd.Series(dtype=float)
+    return no_hindsight_forward_pe(valuation, forward, reported.index.max() if len(reported) else None)
 
 
 def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing"):
