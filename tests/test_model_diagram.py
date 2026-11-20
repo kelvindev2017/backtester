@@ -20,7 +20,7 @@ def result():
         ["Cyclicality", "Risk", "General", "Beyond horizon", None, None, 2, "Modelled", "", ""],
         ["Export rules", "Risk", "Event", "In horizon", 20, 60, None, "Parked", "", ""],
     ])
-    return run_model(quarters, close, items, model_params({"peer_weight": 1.0}), peers)
+    return run_model(quarters, close, items, model_params({"peer_weight": 1.0, "anchor_source": "Peers"}), peers)
 
 
 def texts(fig):

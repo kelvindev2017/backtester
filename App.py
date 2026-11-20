@@ -1147,6 +1147,8 @@ def load_yahoo_quarterly_fundamentals(symbol):
                 "Net Income Including Noncontrolling Interests",
             ],
         )
+        gross_profit = extract_statement_row(income_statement, ["Gross Profit"])
+        cost_of_revenue = extract_statement_row(income_statement, ["Cost Of Revenue", "Reconciled Cost Of Revenue"])
         capex = extract_statement_row(
             cash_flow_statement,
             [
@@ -1169,6 +1171,8 @@ def load_yahoo_quarterly_fundamentals(symbol):
         result["Total_Expense"] = total_expense.reindex(all_dates)
         result["CapEx"] = capex.reindex(all_dates)
         result["Net_Income"] = net_income.reindex(all_dates)
+        result["Gross_Profit"] = gross_profit.reindex(all_dates).combine_first(
+            revenue.reindex(all_dates) - cost_of_revenue.reindex(all_dates))
 
         # If Yahoo omits total expenses, derive it as revenue minus operating income.
         derived_total_expense = revenue.reindex(all_dates) - operating_income.reindex(all_dates)
@@ -1603,6 +1607,9 @@ def load_sec_quarterly_fundamentals(symbol):
             company_facts,
             ["NetIncomeLoss", "ProfitLoss"],
         )
+        gross_profit = extract_sec_fiscal_quarters(company_facts, ["GrossProfit"])
+        cost_of_revenue = extract_sec_fiscal_quarters(
+            company_facts, ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"])
 
         all_dates = revenue.index.union(operating_expense.index)
         all_dates = all_dates.union(total_expense.index).union(capex.index)
@@ -1617,6 +1624,8 @@ def load_sec_quarterly_fundamentals(symbol):
         result["Total_Expense"] = total_expense.reindex(all_dates)
         result["CapEx"] = capex.reindex(all_dates)
         result["Net_Income"] = net_income.reindex(all_dates)
+        result["Gross_Profit"] = gross_profit.reindex(all_dates).combine_first(
+            revenue.reindex(all_dates) - cost_of_revenue.reindex(all_dates))
 
         derived_total_expense = (
             revenue.reindex(all_dates) - operating_income.reindex(all_dates)
@@ -1636,7 +1645,7 @@ def load_quarterly_fundamentals(
     symbol,
     start_date_str,
     end_date_str,
-    cache_version="2026-10-12-v6",
+    cache_version="2026-11-20-v7",
 ):
     """Combine long SEC history with recent Yahoo Finance statements."""
 
@@ -4473,8 +4482,10 @@ MODEL_BLOCK_NOTES = {
                   "funds rate); on the last day, your forward rate if you set one. It sends the Multiple builder "
                   "how far the yield is from the years the own P/E median covers, and how far your forward rate "
                   "moves it from today's.",
-    "multiple_builder": "Starts from the median P/E of the peers and of the stock's own past, each moved by the "
-                        "Rate model's yield change (a higher yield lifts the earnings yield 1/P/E point for point), "
+    "multiple_builder": "Starts from an outside view of the P/E (by default the P/E the company's own revenue "
+                        "growth and gross margin justify: growth that fades to the terminal rate over more years the "
+                        "higher the gross margin, discounted at the yield plus a risk premium; or the peers' median) "
+                        "and the stock's own past median, each moved by the Rate model's yield change (a higher yield lifts the earnings yield 1/P/E point for point), "
                         "then adds the P/E points of the general items and takes off the earnings quality "
                         "deduction. Recomputed every day, because peer prices move every day.",
     "product": "Risk-adjusted EPS, held since the last release, times the day's acceptable P/E.",
@@ -4516,7 +4527,7 @@ def model_box_value(name, value):
 
     if isinstance(value, (str, bool)):
         return value
-    return int(value) if name in ("pe_lookback_years", "yield_years") else float(value)
+    return int(value) if name in ("pe_lookback_years", "yield_years", "growth_history_years") else float(value)
 
 
 def fill_missing_model_boxes(ticker):
@@ -4829,7 +4840,28 @@ def model_settings():
                  "with like; Trailing favours a fast grower.")
         params["pe_lookback_years"] = st.select_slider("Own P/E look-back (years)", MODEL_LOOKBACKS,
                                                        key=model_param_key("pe_lookback_years"))
-        params["peer_weight"] = number("peer_weight", "Share of the anchor from peers", 0, 1, 0.05)
+        params["anchor_source"] = st.radio(
+            "Outside view of the P/E", ["Fundamentals", "Peers"], key=model_param_key("anchor_source"), horizontal=True,
+            help="Fundamentals: the P/E the company's own revenue growth and gross margin justify at the day's "
+                 "yield. Peers: the median P/E of the peers in the Stock settings.")
+        params["peer_weight"] = number("peer_weight", "Share of the anchor from the outside view", 0, 1, 0.05,
+                                       "The rest comes from the stock's own P/E history.")
+        if params["anchor_source"] == "Fundamentals":
+            params["growth_history_years"] = st.select_slider("Growth history (years)", [1, 2, 3, 5],
+                                                              key=model_param_key("growth_history_years"))
+            params["fund_growth_floor"] = number("fund_growth_floor", "Growth floor %", -50, 0, 1)
+            params["fund_growth_cap"] = number("fund_growth_cap", "Growth cap %", 0, 200, 5)
+            params["equity_premium"] = number("equity_premium", "Equity risk premium %", 0, 15, 0.25,
+                                              "Required return = the Rate model's N-year yield + this.")
+            params["base_yield"] = number("base_yield", "Yield without rate data %", 0, 15, 0.25)
+            params["terminal_growth"] = number("terminal_growth", "Growth after the growth years %", 0, 6, 0.25)
+            params["growth_years_min"] = number("growth_years_min", "Growth years at a low gross margin", 1, 30, 1)
+            params["growth_years_max"] = number("growth_years_max", "Growth years at a high gross margin", 1, 30, 1)
+            params["gm_low"] = number("gm_low", "Low gross margin %", 0, 100, 5)
+            params["gm_high"] = number("gm_high", "High gross margin %", 0, 100, 5)
+            st.caption("The higher the gross margin, the longer the growth is assumed to last (pricing power). "
+                       "Examples at a 4.3% yield: 8% growth, 18% gross margin ≈ 18x; 30% growth, 60% margin ≈ 44x; "
+                       "50% growth, 75% margin ≈ 85x.")
         params["pe_floor"] = number("pe_floor", "P/E floor", 1, 100, 1)
         params["pe_cap"] = number("pe_cap", "P/E cap", 1, 200, 1)
         st.caption("Forward P/E history (Forward basis): before the latest report, the forward EPS is the trailing "
@@ -4895,7 +4927,7 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing",
     release_dates = pd.DatetimeIndex(released.index) if len(released) else pd.DatetimeIndex([])
     eps_dates = pd.DatetimeIndex(eps.index) if len(eps) else pd.DatetimeIndex([])
     quarters = pd.DataFrame(index=release_dates.union(eps_dates))
-    for column in ["Revenue", "Net_Income"]:
+    for column in ["Revenue", "Net_Income", "Gross_Profit"]:
         if column in released:
             quarters[column] = released[column]
     quarters["EPS"] = eps
@@ -4928,8 +4960,11 @@ def model_data_note(found, params):
                else f"no revenue history, so trailing growth is taken as {params['fallback_yoy']:g}% and the net margin "
                     f"as {params['fallback_margin']:g}%")
     basis = params["pe_basis"].lower()
-    peers = (f"{basis} peer P/E from {', '.join(found['peers_found'])}" if found["peers_found"] else f"no {basis} peer P/E")
-    missing = f" (nothing for {', '.join(found['peers_missing'])})" if found["peers_missing"] else ""
+    if params.get("anchor_source") == "Fundamentals":
+        peers, missing = "the outside P/E from the company's growth and gross margin (no peers)", ""
+    else:
+        peers = (f"{basis} peer P/E from {', '.join(found['peers_found'])}" if found["peers_found"] else f"no {basis} peer P/E")
+        missing = f" (nothing for {', '.join(found['peers_missing'])})" if found["peers_missing"] else ""
     note = f"Inputs found: {eps}; {revenue}; {peers}{missing}."
     analysts, rule = found.get("growth_check", (np.nan, np.nan))
     if np.isfinite(analysts) and np.isfinite(rule):
@@ -5211,7 +5246,8 @@ def render_valuation_model():
     if preset:
         st.caption(preset["note"])
     with st.spinner("Loading results, prices and peers..."):
-        inputs = load_model_inputs(ticker, years, peers, params["pe_lookback_years"], params["pe_basis"],
+        inputs = load_model_inputs(ticker, years, peers if params["anchor_source"] == "Peers" else [],
+                                   params["pe_lookback_years"], params["pe_basis"],
                                    (params["history_growth_follow"], params["history_growth_floor"],
                                     params["history_growth_cap"], params["history_recovery"]))
     if inputs is None:

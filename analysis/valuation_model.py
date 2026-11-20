@@ -55,7 +55,18 @@ DEFAULT_PARAMS = {
     # Multiple builder
     "pe_basis": "Forward",       # Trailing: P/E on the last four quarters' EPS; Forward: on the next four quarters'
     "pe_lookback_years": 5,
-    "peer_weight": 0.5,          # share of the P/E anchor taken from the peers' median; the rest is the own median
+    "peer_weight": 1.0,          # share of the P/E anchor from the outside view (fundamentals or peers); rest: own median
+    "anchor_source": "Fundamentals",  # the outside view: Fundamentals (growth, gross margin, yield) or Peers' median P/E
+    "growth_history_years": 3,   # fundamental P/E: revenue growth = the yearly growth (CAGR) over this many years
+    "fund_growth_cap": 50.0,     # ... kept within this cap
+    "fund_growth_floor": -10.0,  # ... and floor, in %
+    "equity_premium": 4.5,       # ... required return = N-year yield + this, in %
+    "base_yield": 4.0,           # ... the yield used when no rates are loaded, in %
+    "terminal_growth": 3.0,      # ... growth after the growth years, in %
+    "growth_years_min": 3.0,     # ... years the growth lasts (fading to terminal) at a gross margin of gm_low or less
+    "growth_years_max": 10.0,    # ... and at gm_high or more: a high gross margin is a moat, so growth lasts longer
+    "gm_low": 20.0,
+    "gm_high": 60.0,
     "history_growth_follow": 0.5,  # Forward basis, before the latest report: expected EPS growth = this x past year's
     "history_growth_floor": -20.0,  # ... kept within this floor
     "history_growth_cap": 100.0,    # ... and this cap (%), so a fast grower is not cut to an ordinary one
@@ -89,6 +100,8 @@ SIGNALS = {
     "ttm_revenue": ("quarterly", "Revenue, last 4 quarters", "", "amount"),
     "revenue_yoy": ("quarterly", "Revenue growth, year on year", "%", "percent"),
     "net_margin": ("quarterly", "Net margin, last 4 quarters", "%", "share"),
+    "gross_margin": ("quarterly", "Gross margin, last 4 quarters", "%", "share"),
+    "revenue_cagr": ("quarterly", "Revenue growth a year over the growth history", "%", "percent"),
     "ttm_eps": ("quarterly", "Reported EPS, last 4 quarters", "", "eps"),
     "clean_eps": ("quarterly", "Clean base EPS", "", "eps"),
     "growth_bear": ("quarterly", "Bear growth", "%", "percent"),
@@ -119,6 +132,11 @@ SIGNALS = {
     "held_quality_pe": ("daily", "Earnings quality P/E points (held)", "pts", "points"),
     "own_anchor": ("daily", "Own median P/E", "x", "multiple"),
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
+    "held_cagr": ("daily", "Revenue growth a year over the growth history (held)", "%", "percent"),
+    "held_gross_margin": ("daily", "Gross margin, last 4 quarters (held)", "%", "share"),
+    "growth_years": ("daily", "Years the growth lasts (from gross margin)", "", "count"),
+    "fundamental_pe": ("daily", "Fundamental P/E (growth, gross margin, yield)", "x", "multiple"),
+    "outside_anchor": ("daily", "Outside view P/E (fundamental or peers)", "x", "multiple"),
     "rate_anchor": ("daily", "P/E anchor after the rate model", "x", "multiple"),
     "peers_used": ("daily", "Peers in the median (P/E up to the cap)", "", "count"),
     "acceptable_pe": ("daily", "Acceptable P/E", "x", "multiple"),
@@ -138,7 +156,8 @@ SIGNALS = {
 BLOCKS = {
     "income_map": dict(
         title="Income and cost map", rate="quarterly", role="Logic: parsing only",
-        inputs=["revenue", "net_income"], outputs=["ttm_revenue", "revenue_yoy", "net_margin"],
+        inputs=["revenue", "net_income"], outputs=["ttm_revenue", "revenue_yoy", "net_margin", "gross_margin",
+                                                     "revenue_cagr"],
         params={"fallback_yoy": "Growth % when there is no revenue history",
                 "fallback_margin": "Net margin % when there is no net income"}),
     "earnings_quality": dict(
@@ -181,9 +200,20 @@ BLOCKS = {
                 "term_premium": "Term premium %", "rate_pass_through": "Share of a yield change passed to the P/E"}),
     "multiple_builder": dict(
         title="Multiple builder", rate="daily", role="Param: P/E deductions",
-        inputs=["own_anchor", "peer_anchor", "peers_used", "yield_gap", "forward_gap", "held_pe_adjust", "held_quality_pe"],
-        outputs=["now_pe", "rate_anchor", "acceptable_pe"],
-        params={"pe_lookback_years": "Own P/E look-back, years", "peer_weight": "Share of the anchor from peers",
+        inputs=["own_anchor", "held_cagr", "held_gross_margin", "now_yield", "peer_anchor", "peers_used", "yield_gap",
+                "forward_gap", "held_pe_adjust", "held_quality_pe"],
+        outputs=["growth_years", "fundamental_pe", "outside_anchor", "now_pe", "rate_anchor", "acceptable_pe"],
+        params={"pe_lookback_years": "Own P/E look-back, years",
+                "peer_weight": "Share of the anchor from the outside view (rest: own P/E history)",
+                "anchor_source": "Outside view: Fundamentals or Peers",
+                "growth_history_years": "Fundamental P/E: growth history, years",
+                "fund_growth_cap": "Fundamental P/E: growth cap %", "fund_growth_floor": "Fundamental P/E: growth floor %",
+                "equity_premium": "Fundamental P/E: equity risk premium %",
+                "base_yield": "Fundamental P/E: yield without rate data %",
+                "terminal_growth": "Fundamental P/E: growth after the growth years %",
+                "growth_years_min": "Fundamental P/E: growth years at a low gross margin",
+                "growth_years_max": "Fundamental P/E: growth years at a high gross margin",
+                "gm_low": "Fundamental P/E: low gross margin %", "gm_high": "Fundamental P/E: high gross margin %",
                 "pe_floor": "P/E floor", "pe_cap": "P/E cap",
                 "history_growth_follow": "Forward P/E history: share of past EPS growth expected",
                 "history_growth_floor": "Forward P/E history: expected growth floor %",
@@ -447,7 +477,7 @@ def _trailing(series, periods=4):
     return series.rolling(periods, min_periods=periods).sum()
 
 
-def quarterly_inputs(quarters):
+def quarterly_inputs(quarters, growth_years=3):
     """Income and cost map: trailing revenue, its growth and the net margin at each release date.
 
     ``quarters`` is indexed by the date each quarter became public, with any of the columns Revenue, Net_Income and
@@ -457,7 +487,8 @@ def quarterly_inputs(quarters):
 
     frame = pd.DataFrame(index=pd.DatetimeIndex(quarters.index).sort_values().unique()) if quarters is not None else pd.DataFrame()
     if quarters is None or quarters.empty:
-        return pd.DataFrame(columns=["revenue", "net_income", "eps", "ttm_revenue", "revenue_yoy", "net_margin", "ttm_eps"])
+        return pd.DataFrame(columns=["revenue", "net_income", "eps", "ttm_revenue", "revenue_yoy", "net_margin", "ttm_eps",
+                                     "gross_margin", "revenue_cagr"])
     quarters = quarters.sort_index()
     quarters = quarters.loc[~quarters.index.duplicated(keep="last")]
 
@@ -470,9 +501,18 @@ def quarterly_inputs(quarters):
     quarter_yoy = (revenue / revenue.shift(4).where(revenue.shift(4) > 0) - 1) * 100
     yoy = yoy.combine_first(quarter_yoy)
     margin = (ttm_income.reindex(ttm_revenue.index) / ttm_revenue.where(ttm_revenue > 0)) * 100
+    ttm_gross = _trailing(column("Gross_Profit"))
+    gross_margin = (ttm_gross.reindex(ttm_revenue.index) / ttm_revenue.where(ttm_revenue > 0)) * 100
+    # Yearly growth over the growth history; fewer years when the history is shorter (at least one).
+    cagr = pd.Series(np.nan, index=ttm_revenue.index, dtype=float)
+    for years in range(max(1, int(growth_years)), 0, -1):
+        earlier = ttm_revenue.shift(4 * years)
+        ratio = ttm_revenue / earlier.where(earlier > 0)
+        cagr = cagr.combine_first((ratio.where(ratio > 0) ** (1 / years) - 1) * 100)
     frame["revenue"], frame["net_income"], frame["eps"] = revenue, net_income, eps
     for name, series in [("ttm_revenue", ttm_revenue), ("revenue_yoy", yoy), ("net_margin", margin),
-                         ("ttm_eps", _trailing(eps))]:
+                         ("ttm_eps", _trailing(eps)), ("gross_margin", gross_margin.dropna()),
+                         ("revenue_cagr", cagr.dropna())]:
         # A quarter known for one measure but not another keeps the last value of the other.
         frame[name] = series.reindex(frame.index.union(series.index)).ffill().reindex(frame.index)
     return frame
@@ -521,6 +561,59 @@ def rate_adjusted_pe(pe, yield_change, pass_through=1.0):
     return 1 / earnings_yield if earnings_yield > 0 else np.inf
 
 
+def growth_years(gross_margin, params):
+    """Years the growth lasts before it has faded to the terminal growth: more with a higher gross margin."""
+
+    params = model_params(params)
+    if gross_margin is None or not np.isfinite(gross_margin):
+        return float(params["growth_years_min"])
+    span = max(1e-9, params["gm_high"] - params["gm_low"])
+    share = float(np.clip((gross_margin - params["gm_low"]) / span, 0, 1))
+    return params["growth_years_min"] + (params["growth_years_max"] - params["growth_years_min"]) * share
+
+
+def fundamental_pe(growth, gross_margin, yield_pct, params):
+    """The forward P/E the company's own growth and gross margin justify at a given yield.
+
+    Next year's earnings are 1. They grow at ``growth`` % (the company's revenue growth a year over its growth
+    history, within a floor and cap), fading in a straight line to the terminal growth over the growth years, which
+    the gross margin sets (a high gross margin is pricing power, so growth lasts longer). After that they grow at the
+    terminal rate for ever. The P/E is the value of that stream discounted at the N-year yield plus the equity risk
+    premium (at least 1 point above the terminal growth). NaN without a growth rate.
+    """
+
+    params = model_params(params)
+    if growth is None or not np.isfinite(growth):
+        return np.nan
+    g = float(np.clip(growth, params["fund_growth_floor"], params["fund_growth_cap"])) / 100
+    terminal = params["terminal_growth"] / 100
+    yield_pct = yield_pct if yield_pct is not None and np.isfinite(yield_pct) else params["base_yield"]
+    k = max(yield_pct / 100 + params["equity_premium"] / 100, terminal + 0.01)
+    years = max(1, int(round(growth_years(gross_margin, params))))
+    earnings, value = 1.0, 0.0
+    for t in range(1, years + 1):
+        value += earnings / (1 + k) ** t
+        rate = g + (terminal - g) * t / years
+        earnings *= 1 + rate
+    value += earnings / (k - terminal) / (1 + k) ** years
+    return float(value)
+
+
+def _fundamental_series(growth, years, yields, params):
+    """``fundamental_pe`` day by day (computed once per distinct growth, growth years and yield)."""
+
+    params = model_params(params)
+    out, cache = [], {}
+    for g, n, y in zip(growth, years, yields):
+        key = (round(g, 4) if np.isfinite(g) else None, round(n, 4), round(y, 4) if np.isfinite(y) else None)
+        if key not in cache:
+            margin = params["gm_low"] + (params["gm_high"] - params["gm_low"]) * (
+                (n - params["growth_years_min"]) / max(1e-9, params["growth_years_max"] - params["growth_years_min"]))
+            cache[key] = fundamental_pe(g, margin, y, params)
+        out.append(cache[key])
+    return pd.Series(out, index=growth.index, dtype=float)
+
+
 def blend_anchor(own, peer, share):
     """The P/E anchor: ``share`` of the peers' P/E and the rest of the own one; either alone when the other is missing."""
 
@@ -556,7 +649,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     close = pd.to_numeric(close, errors="coerce").dropna().sort_index()
     close = close.loc[~close.index.duplicated(keep="last")]
     routed = route_items(register, params)
-    inputs = quarterly_inputs(quarters)
+    inputs = quarterly_inputs(quarters, params["growth_history_years"])
 
     # The quarterly part also runs on the day an item starts to apply, with the last results held.
     item_dates = _since_dates(routed[routed["Gate"] == MODELLED]).dropna()
@@ -587,12 +680,15 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         daily["held_eps"], daily["held_pe_adjust"], held_ttm = np.nan, 0.0, pd.Series(np.nan, index=close.index)
         daily["held_quality_pe"] = -abs(float(params["quality_pe_pts"]))
         daily["held_clean_eps"] = np.nan
+        daily["held_cagr"], daily["held_gross_margin"] = np.nan, np.nan
     else:
         # Hold blocks: each quarterly output keeps its last value until the next update.
         both = quarterly.reindex(quarterly.index.union(close.index)).ffill().reindex(close.index)
         daily["held_eps"], daily["held_pe_adjust"], held_ttm = both["risk_adjusted_eps"], both["pe_adjust"].fillna(0.0), both["ttm_eps"]
         daily["held_quality_pe"] = both["quality_pe"].fillna(0.0)
         daily["held_clean_eps"] = both["clean_eps"]
+        daily["held_cagr"] = both["revenue_cagr"] if "revenue_cagr" in both else np.nan
+        daily["held_gross_margin"] = both["gross_margin"] if "gross_margin" in both else np.nan
 
     # Multiple builder. The own anchor is the median trailing P/E of the look-back, up to the day before, so the
     # day's own price does not set its own fair multiple.
@@ -642,16 +738,31 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         market = market.loc[~market.index.duplicated(keep="last")]
         daily["market_yield"] = market.reindex(market.index.union(close.index)).ffill(limit=10).reindex(close.index)
     passed = float(params["rate_pass_through"])
+    # The outside view: the P/E the company's growth and gross margin justify at the day's yield, or the peers'.
+    daily["growth_years"] = [growth_years(margin, params) if np.isfinite(margin)
+                             else (params["growth_years_min"] + params["growth_years_max"]) / 2
+                             for margin in daily["held_gross_margin"].astype(float)]
+    growth = daily["held_cagr"].astype(float).fillna(float(params["fallback_yoy"]) if quarterly.empty or
+                                                     daily["held_cagr"].isna().all() else np.nan)
+    now_yield = daily["now_yield"].astype(float)
+    daily["fundamental_pe"] = _fundamental_series(growth, daily["growth_years"], now_yield, params)
+    fundamentals = params["anchor_source"] == "Fundamentals"
+    if fundamentals:
+        outside_now = daily["fundamental_pe"]
+        outside_rate = _fundamental_series(growth, daily["growth_years"], daily["model_yield"].astype(float), params)
+    else:
+        outside_now = daily["peer_anchor"]
+        outside_rate = rate_adjusted_pe(daily["peer_anchor"], daily["forward_gap"], passed)
+    daily["outside_anchor"] = outside_now
     own_rate = rate_adjusted_pe(daily["own_anchor"], daily["yield_gap"], passed)
-    peer_rate = rate_adjusted_pe(daily["peer_anchor"], daily["forward_gap"], passed)
-    daily["anchor"] = blend_anchor(daily["own_anchor"], daily["peer_anchor"], params["peer_weight"])
-    daily["rate_anchor"] = blend_anchor(own_rate, peer_rate, params["peer_weight"])
+    daily["anchor"] = blend_anchor(daily["own_anchor"], outside_now, params["peer_weight"])
+    daily["rate_anchor"] = blend_anchor(own_rate, outside_rate, params["peer_weight"])
     anchor = daily["rate_anchor"]
     daily["acceptable_pe"] = (anchor + daily["held_pe_adjust"] + daily["held_quality_pe"]).clip(lower=params["pe_floor"], upper=params["pe_cap"])
     # "Now": the same chain with no forward assumption, i.e. today's policy rate, no register items and the clean
     # trailing EPS with no growth or margin change. Next to the model price it shows what the forward inputs add.
     own_now = rate_adjusted_pe(daily["own_anchor"], daily["yield_gap"] - daily["forward_gap"], passed)
-    daily["now_anchor"] = blend_anchor(own_now, daily["peer_anchor"], params["peer_weight"])
+    daily["now_anchor"] = blend_anchor(own_now, outside_now, params["peer_weight"])
     daily["now_pe"] = (daily["now_anchor"] + daily["held_quality_pe"]).clip(lower=params["pe_floor"], upper=params["pe_cap"])
 
     # Product and market check.
@@ -710,7 +821,9 @@ def _day_state(result, values, on):
     anchor = day["rate_anchor"] if "rate_anchor" in day else day["anchor"]
     return {"on": on, "ttm_eps": values.get("ttm_eps", np.nan), "revenue_yoy": values.get("revenue_yoy", np.nan),
             "net_margin": values.get("net_margin", np.nan), "anchor": anchor,
-            "own_anchor": day.get("own_anchor", np.nan), "peer_anchor": day.get("peer_anchor", np.nan),
+            "own_anchor": day.get("own_anchor", np.nan),
+            "peer_anchor": day.get("outside_anchor", day.get("peer_anchor", np.nan)),
+            "held_cagr": day.get("held_cagr", np.nan), "growth_years": day.get("growth_years", np.nan),
             "policy_rate": day.get("policy_rate", np.nan), "yield_ref": day.get("yield_ref", np.nan),
             "forward": _is_forward(result, on)}
 
@@ -739,7 +852,11 @@ def anchor_at_rate(state, params, rate):
     own_gap = expected - state["yield_ref"] if np.isfinite(state["yield_ref"]) else 0.0
     passed = params["rate_pass_through"]
     own = rate_adjusted_pe(state["own_anchor"], own_gap, passed)
-    peer = rate_adjusted_pe(state["peer_anchor"], expected - actual, passed)
+    if params["anchor_source"] == "Fundamentals" and np.isfinite(state.get("growth_years", np.nan)):
+        growth = state["held_cagr"] if np.isfinite(state.get("held_cagr", np.nan)) else params["fallback_yoy"]
+        peer = _fundamental_series(pd.Series([growth]), [state["growth_years"]], [expected], params).iloc[0]
+    else:
+        peer = rate_adjusted_pe(state["peer_anchor"], expected - actual, passed)
     return blend_anchor(own, peer, params["peer_weight"])
 
 

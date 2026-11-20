@@ -89,7 +89,9 @@ def block_summary(block, values):
         "item_router": lambda: f"EPS {signal_text(values, 'event_effect')} · P/E {signal_text(values, 'pe_adjust')}",
         "scenario_engine": lambda: " / ".join(signal_text(values, f"eps_{name.lower()}") for name in SCENARIOS),
         "risk_weighting": lambda: f"EPS {signal_text(values, 'risk_adjusted_eps')}",
-        "multiple_builder": lambda: f"P/E {signal_text(values, 'acceptable_pe')}",
+        "multiple_builder": lambda: (f"Fund. {signal_text(values, 'fundamental_pe')} → P/E {signal_text(values, 'acceptable_pe')}"
+                                     if np.isfinite(values.get("fundamental_pe", np.nan))
+                                     else f"P/E {signal_text(values, 'acceptable_pe')}"),
         "product": lambda: f"{signal_text(values, 'held_eps')} x {signal_text(values, 'acceptable_pe')}",
         "market_check": lambda: f"Model vs close {signal_text(values, 'residual_pct')}",
         "price": lambda: signal_text(values, "model_price"),
@@ -236,16 +238,19 @@ def model_diagram(result, selected=None, on=None, mobile=False):
           f"P/E {text('held_pe_adjust')}<br>quality {text('held_quality_pe')}")
     _wire(fig, [edge("multiple_builder", "left"), edge("product", "right")], f"P/E {text('acceptable_pe')}",
           label_at=(LEFT + HALF_WIDTH - 0.05, POSITIONS["product"][1] - 0.25))
-    # The peers' P/E runs up the right-hand side, past the rate model, into the multiple builder.
-    peer_x = RIGHT + HALF_WIDTH + 0.3
+    peers_used = result["params"].get("anchor_source") == "Peers"
     market_y, builder_y = POSITIONS["market_data"][1], POSITIONS["multiple_builder"][1]
-    _wire(fig, [(RIGHT + HALF_WIDTH, market_y - 0.2), (peer_x, market_y - 0.2), (peer_x, builder_y + 0.25),
-                (RIGHT + HALF_WIDTH, builder_y + 0.25)])
-    fig.add_annotation(x=peer_x - 0.14, y=POSITIONS["rate_model"][1], text="peer P/E", showarrow=False,
-                       textangle=-90, font=dict(size=small))
+    if peers_used:
+        # The peers' P/E runs up the right-hand side, past the rate model, into the multiple builder.
+        peer_x = RIGHT + HALF_WIDTH + 0.3
+        _wire(fig, [(RIGHT + HALF_WIDTH, market_y - 0.2), (peer_x, market_y - 0.2), (peer_x, builder_y + 0.25),
+                    (RIGHT + HALF_WIDTH, builder_y + 0.25)])
+        fig.add_annotation(x=peer_x - 0.14, y=POSITIONS["rate_model"][1], text="peer P/E", showarrow=False,
+                           textangle=-90, font=dict(size=small))
     _wire(fig, [edge("market_data", "top"), edge("rate_model", "bottom")], f"rate {text('policy_rate')}<br>N-year yield")
     _wire(fig, [edge("rate_model", "top"), edge("multiple_builder", "bottom")],
-          f"Δy own {text('yield_gap')}<br>peers {text('forward_gap')}")
+          f"Δy own {text('yield_gap')}<br>{'peers' if peers_used else 'yield'} "
+          f"{text('forward_gap') if peers_used else text('model_yield')}")
     _wire(fig, [edge("market_data", "bottom"), edge("market_check", "top")], f"close {text('close')}")
     _wire(fig, [edge("product", "bottom"), edge("price", "top")], f"price {text('model_price')}")
     # The model price branches to the market check.

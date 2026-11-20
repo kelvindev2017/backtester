@@ -9,6 +9,17 @@ from analysis.valuation_model import (
 )
 
 
+@pytest.fixture(autouse=True)
+def peer_anchor_defaults(monkeypatch):
+    """Most tests here were written for the peer-median anchor (half peers, half own): keep that as their default.
+    Tests of the fundamental P/E set ``anchor_source`` themselves."""
+
+    import analysis.valuation_model as model
+    monkeypatch.setitem(model.DEFAULT_PARAMS, "anchor_source", "Peers")
+    monkeypatch.setitem(model.DEFAULT_PARAMS, "peer_weight", 0.5)
+
+
+
 def make_quarters(count=14, growth=0.20, margin=0.20, shares=100.0, end="2026-10-28"):
     """Quarterly results by release date: revenue up ``growth`` a year, a steady net margin."""
 
@@ -484,3 +495,50 @@ def test_a_peer_p_e_above_the_cap_sits_out_the_median():
     assert table.loc["Revenue growth %", "Current"] == 40.0 and table.loc["Net margin %", "Current"] == 9.8
     assert (table["Current from"] == "fallback").all()
     assert (case_table(result)["Current from"] == "reported").all()
+
+
+def test_fundamental_pe_from_growth_and_gross_margin():
+    from analysis.valuation_model import fundamental_pe, growth_years, quarterly_inputs
+    params = model_params({"anchor_source": "Fundamentals"})
+    # A higher gross margin lets growth last longer: 3 years at 20% or less, 10 at 60% or more.
+    assert growth_years(10, params) == 3 and growth_years(60, params) == 10 and growth_years(40, params) == 6.5
+    # No growth, then 3% for ever, at 4% + 4.5%: close to 1 / (8.5% - 3%) = 18x.
+    flat = fundamental_pe(0, 18, 4.0, params)
+    assert 15 < flat < 19
+    # Faster growth and a higher gross margin are worth more; a higher yield is worth less.
+    assert fundamental_pe(30, 60, 4.0, params) > fundamental_pe(30, 18, 4.0, params) > fundamental_pe(8, 18, 4.0, params)
+    assert fundamental_pe(30, 60, 6.0, params) < fundamental_pe(30, 60, 4.0, params)
+    # Growth is capped: 300% counts as 50%.
+    assert fundamental_pe(300, 75, 4.0, params) == fundamental_pe(50, 75, 4.0, params)
+    assert np.isnan(fundamental_pe(np.nan, 50, 4.0, params))
+    # The income map gives the growth a year over the history and the gross margin.
+    quarters = make_quarters().assign(Gross_Profit=lambda frame: frame["Revenue"] * 0.45)
+    inputs = quarterly_inputs(quarters, 3)
+    assert inputs["gross_margin"].dropna().iloc[-1] == pytest.approx(45.0)
+    ttm = inputs["ttm_revenue"].dropna()
+    # 14 quarters give 11 trailing sums: not enough for 3 years back, so the growth a year is over 2 years.
+    assert len(ttm) < 13
+    assert inputs["revenue_cagr"].iloc[-1] == pytest.approx(((ttm.iloc[-1] / ttm.iloc[-9]) ** (1 / 2) - 1) * 100)
+
+
+def test_the_fundamental_anchor_replaces_the_peers_and_follows_the_rate():
+    quarters = make_quarters().assign(Gross_Profit=lambda frame: frame["Revenue"] * 0.45)
+    close = make_close(quarters)
+    peers = pd.DataFrame({"AAA": 6.0}, index=close.index)
+    rates = pd.Series(4.0, index=close.index)
+    base = {"anchor_source": "Fundamentals", "peer_weight": 1.0}
+    result = run_model(quarters, close, None, model_params(base), peers, policy_rate=rates)
+    values = latest_values(result)
+    # The peers are not used: the outside view is the fundamental P/E, worked out at the day's yield.
+    from analysis.valuation_model import fundamental_pe
+    expected = fundamental_pe(values["held_cagr"], values["held_gross_margin"], values["now_yield"], model_params(base))
+    assert values["fundamental_pe"] == pytest.approx(expected) and values["outside_anchor"] == pytest.approx(expected)
+    assert values["rate_anchor"] == pytest.approx(expected)
+    # A forward rate lifts the yield and lowers the fundamental P/E; 'now' stays at today's rate.
+    hiked = latest_values(run_model(quarters, close, None, model_params({**base, "use_forward_rate": True,
+                                                                         "forward_rate": 6.0}), peers, policy_rate=rates))
+    assert hiked["rate_anchor"] < values["rate_anchor"] and hiked["now_anchor"] == pytest.approx(values["now_anchor"])
+    # The rate dial and the rate cases redo the fundamental P/E at each rate.
+    from analysis.valuation_model import default_rate_cases, rate_cases
+    table, _ = rate_cases(result, default_rate_cases(4.0))
+    assert table["P/E anchor"].iloc[0] == pytest.approx(values["rate_anchor"]) and table["P/E anchor"].is_monotonic_decreasing
