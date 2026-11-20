@@ -145,7 +145,11 @@ quarterly outputs until the next release. **Rate cases** price the stock under a
 +0.50 by default) and weigh them by your probabilities into an expected model price.
 
 The assumptions about the future sit together under **Forward assumptions** at the top of the settings: the
-forward policy rate, the growth and margin cases, and the register items' status and sizes. Beside each block they
+forward policy rate; a growth and margin table (Current = latest reported, Forward = your base case or the auto rule,
+then the bull and bear adjustments in points; your Forward values apply from the latest release, earlier quarters
+keep the auto rule); and an item table (Current % = the market-implied probability that alone makes the model price
+equal the close, Forward %, bull and bear adjustments, sizes). An event item's EPS effect is worked out in each case
+at that case's probability; its P/E effect is weighted over the cases. Beside each block they
 change, the diagram shows **now** (today's data: today's rate, no items, the clean trailing EPS with no growth or
 margin change) and **fwd** (with the assumptions), down to the price; a **Now vs forward** table under the headline
 numbers sums it up, and the price chart adds the "now" price as a dotted line.

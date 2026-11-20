@@ -381,7 +381,8 @@ def test_now_is_the_chain_without_forward_assumptions():
     from analysis.valuation_model import FORWARD_PARAMS, now_and_forward
     flat = {"growth_follow": 0.0, "bear_growth_gap": 0.0, "bull_growth_gap": 0.0, "bear_margin_pts": 0.0,
             "base_margin_pts": 0.0, "bull_margin_pts": 0.0}
-    assert set(flat) <= set(FORWARD_PARAMS) and "forward_rate" in FORWARD_PARAMS
+    assert {"bear_growth_gap", "bull_growth_gap", "bear_margin_pts", "bull_margin_pts", "forward_rate", "forward_growth",
+            "forward_margin"} <= set(FORWARD_PARAMS)
     # With no growth, margin change, items or forward rate, now and forward are the same price.
     values = latest_values(rate_run(4.0, **flat))
     assert values["now_price"] == pytest.approx(values["model_price"])
@@ -402,3 +403,67 @@ def test_now_is_the_chain_without_forward_assumptions():
     close = make_close(quarters)
     with_items = latest_values(run_model(quarters, close, items, model_params(flat), pd.DataFrame({"AAA": 20.0}, index=close.index)))
     assert with_items["now_pe"] - with_items["acceptable_pe"] == pytest.approx(3.0)
+
+
+def test_forward_growth_and_margin_apply_to_the_latest_quarter_only():
+    from analysis.valuation_model import case_table, case_table_changes
+    auto = rate_run(4.0)
+    mine = rate_run(4.0, forward_growth=30.0, forward_margin=25.0, bull_growth_gap=10.0, bear_growth_gap=15.0,
+                    bull_margin_pts=1.0, bear_margin_pts=-2.0)
+    last = mine["quarterly"].iloc[-1]
+    assert last["growth_base"] == 30.0 and last["growth_bull"] == 40.0 and last["growth_bear"] == 15.0
+    assert last["margin_base"] == 25.0
+    clean, margin = last["clean_eps"], last["net_margin"]
+    assert last["eps_bear"] == pytest.approx(clean * 1.15 * 23.0 / margin)
+    assert last["eps_bull"] == pytest.approx(clean * 1.40 * 26.0 / margin)
+    # Earlier quarters keep the auto rule (the history stays a backtest).
+    earlier = mine["quarterly"].iloc[:-1]
+    assert (earlier["growth_base"] == auto["quarterly"]["growth_base"].iloc[:-1]).all()
+    # The table: current, forward (auto or yours), bull and bear adjustments (bear growth gap shown negative).
+    drawn = case_table(mine).set_index("Metric")
+    assert drawn.loc["Revenue growth %", "Forward"] == 30.0 and drawn.loc["Revenue growth %", "Bear adj"] == -15.0
+    assert drawn.loc["Net margin %", "Forward from"] == "you"
+    auto_table = case_table(auto)
+    assert (auto_table["Forward from"] == "auto rule").all()
+    assert auto_table.set_index("Metric").loc["Revenue growth %", "Forward"] == pytest.approx(
+        auto["quarterly"]["growth_base"].iloc[-1])
+    # Editing only an adjustment keeps forward on auto; a new forward becomes yours; a cleared one goes back to auto.
+    edited = auto_table.copy()
+    edited.loc[0, "Bear adj"] = -20.0
+    assert case_table_changes(auto_table, edited, auto["params"]) == {"bear_growth_gap": 20.0}
+    edited.loc[0, "Forward"] = 60.0
+    assert case_table_changes(auto_table, edited, auto["params"])["forward_growth"] == 60.0
+    cleared = case_table(mine)
+    cleared.loc[1, "Forward"] = np.nan
+    assert np.isnan(case_table_changes(case_table(mine), cleared, mine["params"])["forward_margin"])
+
+
+def test_item_probability_moves_with_the_case_and_the_market_implies_one():
+    from analysis.valuation_model import market_implied_probabilities
+    quarters = make_quarters()
+    close = make_close(quarters)
+    peers = pd.DataFrame({"AAA": 20.0}, index=close.index)
+    flat = model_params({"bear_growth_gap": 0.0, "bull_growth_gap": 0.0, "bear_margin_pts": 0.0, "bull_margin_pts": 0.0})
+    items = register([["Export rules", "Risk", "Event", "In horizon", 40, 20, None, "Modelled", "", ""]])
+    items["Bull prob adj"], items["Bear prob adj"] = -20.0, 30.0
+    result = run_model(quarters, close, items, flat, peers)
+    last = result["quarterly"].iloc[-1]
+    # Bear: 70% x 20% = -14% of EPS, base 40% -> -8%, bull 20% -> -4%.
+    assert last["event_bear"] == pytest.approx(-14.0) and last["event_base"] == pytest.approx(-8.0)
+    assert last["event_bull"] == pytest.approx(-4.0)
+    weights = scenario_weights(flat)
+    assert last["event_effect"] == pytest.approx(weights @ np.array([-14.0, -8.0, -4.0]))
+    # The market-implied probability prices the model at the close.
+    implied = market_implied_probabilities(result)
+    values = latest_values(result)
+    assert np.isfinite(implied.iloc[0])
+    # A risk: a model below the close needs a lower probability, above it a higher one.
+    assert (implied.iloc[0] < 40) == (values["model_price"] < values["close"])
+    if True:
+        trial = items.copy()
+        trial["Probability %"] = implied.iloc[0]
+        again = latest_values(run_model(quarters, close, trial, flat, peers))
+        assert again["model_price"] == pytest.approx(values["close"], rel=1e-3)
+    # A general item has no probability to imply.
+    general = register([["Cycle", "Risk", "General", "In horizon", None, None, 2, "Modelled", "", ""]])
+    assert market_implied_probabilities(run_model(quarters, close, general, flat, peers)).isna().all()

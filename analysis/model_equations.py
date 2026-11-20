@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.valuation_model import (
-    SCENARIOS, item_effects, latest_values, rate_adjusted_pe, rate_weight, scenario_weights,
+    SCENARIOS, case_effects, latest_values, rate_adjusted_pe, rate_weight, scenario_weights,
 )
 
 # Each string is one display line, kept short enough for a phone; aligned blocks break longer ones.
@@ -31,11 +31,11 @@ EQUATIONS = {
         r"e = \sum \pm\, p \times \text{impact} \qquad a = \sum \pm\, \text{points}",
     ],
     "scenario_engine": [
-        r"g_{\text{base}} = \min\!\big(\text{cap},\ \max(\text{floor},\ s \times g)\big)",
-        r"g_{\text{bear}} = g_{\text{base}} - \text{gap}_{\text{bear}}",
-        r"g_{\text{bull}} = g_{\text{base}} + \text{gap}_{\text{bull}}",
+        r"g_{\text{base}} = g_{\text{fwd}} \ \text{(yours) or } \min\!\big(\text{cap},\ \max(\text{floor},\ s \times g)\big)",
+        r"m_{\text{base}} = m_{\text{fwd}} \ \text{(yours) or } m + \Delta m_{\text{base}}",
+        r"g_c = g_{\text{base}} + \text{adj}_c \qquad m_c = m_{\text{base}} + \Delta m_c",
         r"\begin{aligned} \text{EPS}_{c} = {} & \text{EPS}_{\text{clean}} \times \left(1 + \frac{g_c}{100}\right) \\ "
-        r"& \times \frac{m + \Delta m_c}{m} \times \left(1 + \frac{e}{100}\right) \end{aligned}",
+        r"& \times \frac{m_c}{m} \times \left(1 + \frac{e_c}{100}\right) \end{aligned}",
     ],
     "risk_weighting": [
         r"\begin{aligned} \text{EPS}_{\text{risk}} = {} & w_{\text{bear}} \times \text{EPS}_{\text{bear}} \\ "
@@ -61,9 +61,12 @@ SYMBOLS = {
     "income_map": "g: revenue growth %, m: net margin %.",
     "earnings_quality": "h: EPS haircut %, SBC: stock-based pay (adjusted EPS leaves it out, so h_default takes it back). The P/E deduction d_q goes to the Multiple builder.",
     "triage_gate": "p: probability, impact: EPS impact %, points: P/E points.",
-    "item_router": "e: expected EPS change % from event items, a: P/E points from general items (+ product, - risk).",
-    "scenario_engine": "s: base growth as a share of trailing growth, g: revenue growth %, c: bear, base or bull, "
-                       "Δm_c: that case's net margin change in points, m: net margin %, e: event items' EPS change %.",
+    "item_router": "e: expected EPS change % from event items (per case: the forward probability plus the item's bull "
+                   "or bear adjustment; shown weighted), a: P/E points (+ product, - risk), weighted over the cases.",
+    "scenario_engine": "g, m: current (trailing) revenue growth and net margin %, g_fwd, m_fwd: your forward values "
+                       "(latest quarter only; blank = the auto rule with s: share of trailing growth), c: bear, base or "
+                       "bull, adj_c and Δm_c: the case's growth and margin adjustment in points (0 for base), e_c: event "
+                       "items' EPS change % at that case's probability.",
     "risk_weighting": "w: scenario weights, rescaled to add up to 1.",
     "rate_model": "r_f: policy rate used (your forward rate on the last day, the actual rate before), r_n: neutral "
                   "rate, h: half-life of a rate's gap to neutral in years, N: yield maturity in years, w_N: share of "
@@ -125,23 +128,32 @@ def worked_equations(result, block, on=None):
         return [rf"\text{{EPS}}_{{\text{{clean}}}} = {_n(get('ttm_eps'))} \times \left(1 - \frac{{{_n(params['eps_haircut_pct'], 1)}}}{{100}}\right)"
                 rf" = {_n(get('clean_eps'))}", rf"d_q = {_n(params['quality_pe_pts'], 1)} \text{{ P/E points}}"]
     if block == "scenario_engine":
-        base = float(np.clip(params["growth_follow"] * used_growth, params["growth_floor"], params["growth_cap"]))
-        lines = [rf"\begin{{aligned}} g_{{\text{{base}}}} = {{}} & \min\!\big({_n(params['growth_cap'], 0)},\ \max({_n(params['growth_floor'], 0)},\ "
-                 rf"{_n(params['growth_follow'])} \times {_n(used_growth, 1)})\big) \\ = {{}} & {_n(base, 1)}\% \end{{aligned}}"]
+        base, base_margin = get("growth_base"), get("margin_base")
+        forward = result.get("forward_from") is None or (on is None or pd.Timestamp(on) >= result["forward_from"])
+        if forward and np.isfinite(params.get("forward_growth", np.nan)):
+            lines = [rf"g_{{\text{{base}}}} = {_n(base, 1)}\% \ \text{{(yours)}}"]
+        else:
+            lines = [rf"\begin{{aligned}} g_{{\text{{base}}}} = {{}} & \min\!\big({_n(params['growth_cap'], 0)},\ \max({_n(params['growth_floor'], 0)},\ "
+                     rf"{_n(params['growth_follow'])} \times {_n(used_growth, 1)})\big) \\ = {{}} & {_n(base, 1)}\% \end{{aligned}}"]
+        source = r"\ \text{(yours)}" if forward and np.isfinite(params.get("forward_margin", np.nan)) else (
+            rf" = {_n(used_margin, 1)} + {_n(params['base_margin_pts'], 1)}")
+        lines.append(rf"m_{{\text{{base}}}}{source} = {_n(base_margin, 1)}\%")
         for name in SCENARIOS:
             key = name.lower()
-            points = params[f"{key}_margin_pts"]
+            case_margin = base_margin + (params[f"{key}_margin_pts"] if key != "base" else 0.0)
+            case_event = get(f"event_{key}")
+            case_event = case_event if np.isfinite(case_event) else 0.0
             lines.append(
                 rf"\begin{{aligned}} \text{{EPS}}_{{\text{{{key}}}}} = {{}} & {_n(get('clean_eps'))} \times {_n(1 + get(f'growth_{key}') / 100, 3)} \\ "
-                rf"& \times \frac{{{_n(used_margin, 1)} {'+' if points >= 0 else '-'} {_n(abs(points), 1)}}}{{{_n(used_margin, 1)}}} "
-                rf"\times {_n(1 + events / 100, 3)} \\ = {{}} & {_n(get(f'eps_{key}'))} \end{{aligned}}")
+                rf"& \times \frac{{{_n(case_margin, 1)}}}{{{_n(used_margin, 1)}}} "
+                rf"\times {_n(1 + case_event / 100, 3)} \\ = {{}} & {_n(get(f'eps_{key}'))} \end{{aligned}}")
         return lines
     if block == "risk_weighting":
         weights = scenario_weights(params)
         terms = r" \\ & + ".join(rf"{_n(weight, 2)} \times {_n(get(f'eps_{name.lower()}'))}" for weight, name in zip(weights, SCENARIOS))
         return [rf"\begin{{aligned}} \text{{EPS}}_{{\text{{risk}}}} = {{}} & {terms} \\ = {{}} & {_n(get('risk_adjusted_eps'))} \end{{aligned}}"]
     if block in ("item_router", "triage_gate", "item_tracker"):
-        _, points = item_effects(result["items"], result["daily"].index[-1] if on is None else on)
+        _, points = case_effects(result["items"], result["daily"].index[-1] if on is None else on, params)
         return [rf"e = {_n(events, 1)}\% \qquad a = {_n(points, 1)} \text{{ pts}}",
                 rf"\text{{{int(get('items_modelled') or 0)} modelled, {int(get('items_parked') or 0)} parked}}"]
     if block == "multiple_builder":
