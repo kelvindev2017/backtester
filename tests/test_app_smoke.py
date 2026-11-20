@@ -1128,8 +1128,9 @@ def test_model_haircut_starts_at_stock_pay_and_equations_show(offline, monkeypat
     assert app.session_state["model_ASMVY_eps_haircut_pct"] == pytest.approx(11.0)
     app.text_input(key="model_ticker").input("NVDA")
     open_tab(app, "Valuation Model")
-    assert app.session_state["model_NVDA_eps_haircut_pct"] == pytest.approx(10.0)
-    assert any("stock-based pay / net income" in element.value for element in app.caption)
+    # Stock pay is 10% of net income, so 0.1 / 1.1 = 9.1% of adjusted earnings (net income + stock pay).
+    assert app.session_state["model_NVDA_eps_haircut_pct"] == pytest.approx(9.1)
+    assert any("stock-based pay / (net income + stock-based pay)" in element.value for element in app.caption)
     formulas = [element.value for element in app.get("latex")]
     assert any("EPS}_{\\text{clean}}" in formula for formula in formulas)
     assert any("P/E}_{\\text{acc}}" in formula for formula in formulas)
