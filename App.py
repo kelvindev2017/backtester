@@ -4660,6 +4660,9 @@ def render_case_table(result):
                                                           "the auto rule (Scenario engine settings)."),
             "Bull adj": st.column_config.NumberColumn("Bull adj", format="%+.1f", help="Points added to Forward."),
             "Bear adj": st.column_config.NumberColumn("Bear adj", format="%+.1f", help="Points added to Forward."),
+            "Current from": st.column_config.TextColumn("Current from", disabled=True,
+                                                        help="'fallback': no reported value, so the Scenario engine's "
+                                                             "fallback is used (e.g. ADR financials in another currency)."),
             "Forward from": st.column_config.TextColumn("Forward from", disabled=True),
         })
     updates = case_table_changes(drawn, edited, result["params"])
@@ -4838,6 +4841,10 @@ def model_settings():
         params["history_growth_cap"] = number("history_growth_cap", "Expected growth cap %", 0, 1000, 10,
                                               "High enough for a fast grower: with 40% a share whose EPS doubled "
                                               "would be valued as if growth stopped at 40%.")
+        params["history_recovery"] = number("history_recovery", "Share of a slump expected back", 0, 1, 0.05,
+                                            "When trailing EPS is below its 3-year average, this share of the gap is "
+                                            "expected back (if that beats the growth rule), as the market does for a "
+                                            "cyclical in a downturn. 0 switches it off.")
     with settings_panel("Triage gate", expanded=False):
         show_model_equations("triage_gate")
         params["materiality_eps_pct"] = number("materiality_eps_pct", "Smallest expected EPS effect %", 0, 50, 0.5,
@@ -4847,7 +4854,7 @@ def model_settings():
     return ticker, years, peers, model_params(params)
 
 
-def daily_forward_pe(symbol, valuation, earnings, rule=(0.5, -20.0, 100.0)):
+def daily_forward_pe(symbol, valuation, earnings, rule=(0.5, -20.0, 100.0, 0.5)):
     """(forward P/E with no hindsight, (analysts' expected EPS growth %, the rule's) on the latest report).
 
     Close / analyst estimates from the latest report on; before it, close / the trailing EPS grown by ``rule``
@@ -4860,12 +4867,13 @@ def daily_forward_pe(symbol, valuation, earnings, rule=(0.5, -20.0, 100.0)):
                                                        fiscal_year_end=fiscal_year_end))
     reported = earnings["Reported EPS"].dropna() if earnings is not None and "Reported EPS" in earnings else pd.Series(dtype=float)
     last_report = reported.index.max() if len(reported) else None
-    follow, floor, cap = rule
-    pe = no_hindsight_forward_pe(valuation, forward, last_report, follow=follow, floor=floor, cap=cap)
-    return pe, expected_growth_check(valuation, forward, last_report, follow=follow, floor=floor, cap=cap)
+    follow, floor, cap, recovery = rule
+    pe = no_hindsight_forward_pe(valuation, forward, last_report, follow=follow, floor=floor, cap=cap, recovery=recovery)
+    return pe, expected_growth_check(valuation, forward, last_report, follow=follow, floor=floor, cap=cap,
+                                     recovery=recovery)
 
 
-def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing", history_rule=(0.5, -20.0, 100.0)):
+def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing", history_rule=(0.5, -20.0, 100.0, 0.5)):
     """Prices, results by release date and the share's and peers' P/E for the model, with a note on what was found.
 
     With ``pe_basis`` Forward, ``own_pe`` and ``peer_pe`` are forward P/Es; with Trailing, ``own_pe`` is None (the
@@ -4930,6 +4938,24 @@ def model_data_note(found, params):
     return note
 
 
+def render_peer_pe(result):
+    """Each peer's P/E against the anchor, so an odd anchor can be traced to the peer behind it."""
+
+    peers = result.get("peer_pe")
+    if peers is None or peers.empty or not len(peers.columns):
+        return
+    cap = result["params"]["pe_cap"]
+    st.markdown("Peers' P/E")
+    chart = peers.clip(upper=cap * 1.2).copy()
+    chart["Median used (anchor)"] = result["daily"]["peer_anchor"]
+    st.line_chart(chart, height=260)
+    latest = peers.iloc[-1]
+    st.caption(f"Each peer's P/E as the model sees it (shown up to {cap * 1.2:g}). A P/E above the cap "
+               f"({cap:g}) rests on earnings near zero and sits out the median that day, like a loss. Today: "
+               + ", ".join(f"{name} {value:.1f}x" if np.isfinite(value) else f"{name} n/a" for name, value in latest.items())
+               + ".")
+
+
 def render_model_inspector(result, block):
     """One block opened up: what it does, the parameters it owns and its input and output signals over time."""
 
@@ -4968,6 +4994,8 @@ def render_model_inspector(result, block):
         show_chart(fig, width="stretch")
         st.caption("Inputs in the upper panels, outputs in the lower ones. A stepped line is a quarterly signal, "
                    "held between updates; a smooth line is recomputed every day.")
+    if block == "multiple_builder":
+        render_peer_pe(result)
     if block == "item_tracker":
         st.caption("The register itself, the stories and the parked items are under 'Risk and product register' below.")
 
@@ -5185,7 +5213,7 @@ def render_valuation_model():
     with st.spinner("Loading results, prices and peers..."):
         inputs = load_model_inputs(ticker, years, peers, params["pe_lookback_years"], params["pe_basis"],
                                    (params["history_growth_follow"], params["history_growth_floor"],
-                                    params["history_growth_cap"]))
+                                    params["history_growth_cap"], params["history_recovery"]))
     if inputs is None:
         st.warning(f"Yahoo Finance has no price history for {ticker}. Check the symbol: it must be the ticker "
                    "Yahoo uses, e.g. a US listing or an OTC ADR such as ASMVY.")

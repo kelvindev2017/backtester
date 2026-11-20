@@ -232,17 +232,42 @@ def forward_eps(earnings, estimates=None, quarter_days=91, fiscal_year_end=None)
     return frame
 
 
-def no_hindsight_forward_pe(valuation, forward, last_report=None, follow=0.5, floor=-20.0, cap=100.0, year_days=365):
+def expected_forward_eps(ttm, follow=0.5, floor=-20.0, cap=100.0, recovery=0.5, year_days=365, normal_years=3):
+    """The next four quarters' EPS as it could be expected on each day, from the trailing EPS known then.
+
+    Two views, and the higher one counts: the trend (trailing EPS grown by ``follow`` x its growth over the past
+    year, kept within ``floor`` and ``cap`` %) and the recovery (when the trailing EPS is below its average of the
+    last ``normal_years`` years, ``recovery`` of the gap closes). The recovery view is how a cyclical is valued in a
+    slump: nobody prices a semiconductor maker on trough earnings at 100x, they expect earnings to come back.
+    """
+
+    ttm = pd.to_numeric(ttm, errors="coerce")
+    days = ttm.index
+    known = ttm.dropna()
+    year_ago = pd.Series(np.nan, index=days, dtype=float)
+    normal = pd.Series(np.nan, index=days, dtype=float)
+    if len(known):
+        lookup = known.reindex(known.index.union(days - pd.Timedelta(days=year_days))).ffill()
+        year_ago = pd.Series(lookup.reindex(days - pd.Timedelta(days=year_days)).to_numpy(), index=days)
+        normal = known.rolling(f"{int(normal_years * 365)}D", min_periods=60).mean()
+        normal = normal.reindex(days.union(normal.index)).ffill().reindex(days)
+    growth = ((ttm / year_ago.where(year_ago > 0) - 1) * 100).where(ttm > 0)
+    trend = ttm * (1 + (follow * growth).clip(lower=floor, upper=cap).fillna(0.0) / 100)
+    if recovery <= 0:
+        return trend.where(ttm.notna())
+    back = (ttm + recovery * (normal - ttm)).where(normal.notna() & (normal > ttm))
+    return pd.concat([trend, back], axis=1).max(axis=1, skipna=True).where(ttm.notna())
+
+
+def no_hindsight_forward_pe(valuation, forward, last_report=None, follow=0.5, floor=-20.0, cap=100.0, recovery=0.5,
+                            year_days=365):
     """Daily forward P/E with no hindsight: what could have been known on each day.
 
     :func:`forward_eps` fills past quarters with the EPS reported later, so a past forward P/E knows the coming
     boom or bust (low before a boom, high before a slump) and swings far more than the market's own forward P/E
-    did. Here, days that rest on any later-reported quarter use an expected forward EPS instead: the trailing EPS
-    grown by ``follow`` x its growth over the past year, kept within ``floor`` and ``cap`` % (the cap is high so a
-    fast grower is not cut to an ordinary one; the floor assumes a slump does not keep going at full speed). Only
-    days from
-    ``last_report`` (the latest announcement), when all four quarters ahead are analyst estimates, keep the
-    estimate-based forward P/E; without ``last_report``, days flagged ``Estimated`` (any estimate) keep it.
+    did. Here, days before ``last_report`` (the latest announcement) use :func:`expected_forward_eps` instead. From
+    ``last_report`` on, when all four quarters ahead are analyst estimates, the estimate-based forward P/E is kept;
+    without ``last_report``, days flagged ``Estimated`` (any estimate) keep it.
 
     ``valuation`` holds ``Close`` and ``TTM_Reported_EPS`` by day; ``forward`` is :func:`forward_valuation`'s frame.
     NaN where the expected EPS is not positive.
@@ -250,17 +275,9 @@ def no_hindsight_forward_pe(valuation, forward, last_report=None, follow=0.5, fl
 
     if valuation is None or valuation.empty or not {"Close", "TTM_Reported_EPS"}.issubset(valuation.columns):
         return pd.Series(dtype=float)
-    ttm = pd.to_numeric(valuation["TTM_Reported_EPS"], errors="coerce")
-    days = ttm.index
-    shifted = ttm.dropna()
-    year_ago = pd.Series(np.nan, index=days, dtype=float)
-    if len(shifted):
-        lookup = shifted.reindex(shifted.index.union(days - pd.Timedelta(days=year_days))).ffill()
-        year_ago = pd.Series(lookup.reindex(days - pd.Timedelta(days=year_days)).to_numpy(), index=days)
-    growth = ((ttm / year_ago.where(year_ago > 0) - 1) * 100).where(ttm > 0)
-    expected_growth = (follow * growth).clip(lower=floor, upper=cap).fillna(0.0)
-    expected_eps = ttm * (1 + expected_growth / 100)
-    proxy = (valuation["Close"] / expected_eps.where(expected_eps > 0)).replace([np.inf, -np.inf], np.nan)
+    days = valuation.index
+    expected = expected_forward_eps(valuation["TTM_Reported_EPS"], follow, floor, cap, recovery, year_days)
+    proxy = (valuation["Close"] / expected.where(expected > 0)).replace([np.inf, -np.inf], np.nan)
     if forward is None or forward.empty or "Forward_PE" not in forward:
         return proxy
     if last_report is not None:
@@ -270,27 +287,28 @@ def no_hindsight_forward_pe(valuation, forward, last_report=None, follow=0.5, fl
     return forward["Forward_PE"].reindex(days).where(estimated, proxy)
 
 
-def expected_growth_check(valuation, forward, last_report, follow=0.5, floor=-20.0, cap=100.0, year_days=365):
+def expected_growth_check(valuation, forward, last_report, follow=0.5, floor=-20.0, cap=100.0, recovery=0.5,
+                          year_days=365):
     """(analysts' expected EPS growth %, the history rule's growth %) on the latest report day, to tune the rule.
 
-    Analysts': the estimate-based forward EPS over the trailing EPS. The rule's: ``follow`` x the trailing EPS growth
-    over the past year, within ``floor`` and ``cap``. NaN where it cannot be worked out.
+    Analysts': the estimate-based forward EPS over the trailing EPS. The rule's: :func:`expected_forward_eps` over
+    the trailing EPS. NaN where it cannot be worked out.
     """
 
     if valuation is None or valuation.empty or forward is None or forward.empty or last_report is None:
         return np.nan, np.nan
-    ttm = pd.to_numeric(valuation["TTM_Reported_EPS"], errors="coerce").dropna()
-    on = ttm.index[ttm.index >= pd.Timestamp(last_report)]
+    ttm = pd.to_numeric(valuation["TTM_Reported_EPS"], errors="coerce")
+    on = ttm.dropna().index[ttm.dropna().index >= pd.Timestamp(last_report)]
     if not len(on):
         return np.nan, np.nan
     day = on[0]
     now = ttm[day]
-    before = ttm.loc[:day - pd.Timedelta(days=year_days)]
+    if not now > 0:
+        return np.nan, np.nan
     forward_eps_now = pd.to_numeric(forward["Forward_EPS"], errors="coerce").get(day, np.nan)
-    analysts = (forward_eps_now / now - 1) * 100 if now > 0 and np.isfinite(forward_eps_now) else np.nan
-    rule = np.nan
-    if now > 0 and len(before) and before.iloc[-1] > 0:
-        rule = float(np.clip(follow * (now / before.iloc[-1] - 1) * 100, floor, cap))
+    analysts = (forward_eps_now / now - 1) * 100 if np.isfinite(forward_eps_now) else np.nan
+    expected = expected_forward_eps(ttm, follow, floor, cap, recovery, year_days).get(day, np.nan)
+    rule = (expected / now - 1) * 100 if np.isfinite(expected) else np.nan
     return analysts, rule
 
 

@@ -361,8 +361,13 @@ def test_past_forward_pe_uses_no_later_reported_eps():
     assert pe[pd.Timestamp("2023-09-01")] == pytest.approx(60 / 3.75)
     # Early 2022: no year-back EPS, so no growth is assumed: 60 / 2.0 = 30x.
     assert pe[pd.Timestamp("2022-03-01")] == pytest.approx(30.0)
-    # After the slump: -66.7% on a year back, half of it capped at the -20% floor -> 60 / 0.8 = 75x.
-    assert pe[pd.Timestamp("2024-09-02")] == pytest.approx(75.0)
+    # After the slump: the trend alone (-66.7% on a year back, half of it floored at -20%) would give 60 / 0.8 =
+    # 75x; the recovery view expects half of the gap to the 3-year average EPS back, which is higher, so it counts.
+    slump = pd.Timestamp("2024-09-02")
+    normal = ttm.rolling("1095D", min_periods=60).mean()[slump]
+    assert 1.0 < normal < 3.0
+    assert pe[slump] == pytest.approx(60 / (1.0 + 0.5 * (normal - 1.0)))
+    assert no_hindsight_forward_pe(valuation, forward, last_report, recovery=0.0)[slump] == pytest.approx(75.0)
     # From the latest report on, all four quarters ahead are analyst estimates: those are kept.
     assert (pe[days >= last_report] == 45.0).all()
     # A loss has no P/E.
@@ -382,3 +387,15 @@ def test_fast_growers_keep_their_growth_and_the_rule_is_checked_against_analysts
     analysts, rule = expected_growth_check(valuation, forward, pd.Timestamp("2024-11-01"))
     assert analysts == pytest.approx(50.0) and rule == pytest.approx(100.0)
     assert np.isnan(expected_growth_check(valuation, forward, None)[0])
+
+
+def test_a_trough_near_zero_earnings_does_not_make_a_p_e_of_100():
+    days = pd.bdate_range("2021-01-04", "2025-06-30")
+    # A cyclical: EPS 4.0 for years, then trough earnings of 0.2 from 2024 on.
+    ttm = pd.Series(np.where(days < "2024-01-01", 4.0, 0.2), index=days)
+    valuation = pd.DataFrame({"Close": 80.0, "TTM_Reported_EPS": ttm}, index=days)
+    day = pd.Timestamp("2024-11-01")
+    trough = no_hindsight_forward_pe(valuation, None)[day]
+    # Trough EPS alone: 80 / (0.2 x 0.8) = 500x. With half the gap to the ~3-year average back it is ~40x.
+    assert no_hindsight_forward_pe(valuation, None, recovery=0.0)[day] == pytest.approx(500.0)
+    assert 25 < trough < 60

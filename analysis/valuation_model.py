@@ -59,6 +59,7 @@ DEFAULT_PARAMS = {
     "history_growth_follow": 0.5,  # Forward basis, before the latest report: expected EPS growth = this x past year's
     "history_growth_floor": -20.0,  # ... kept within this floor
     "history_growth_cap": 100.0,    # ... and this cap (%), so a fast grower is not cut to an ordinary one
+    "history_recovery": 0.5,        # ... or, below its 3-year average EPS, this share of the gap back (the higher)
     "pe_floor": 5.0,
     "pe_cap": 100.0,
     # Triage gate
@@ -119,6 +120,7 @@ SIGNALS = {
     "own_anchor": ("daily", "Own median P/E", "x", "multiple"),
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
     "rate_anchor": ("daily", "P/E anchor after the rate model", "x", "multiple"),
+    "peers_used": ("daily", "Peers in the median (P/E up to the cap)", "", "count"),
     "acceptable_pe": ("daily", "Acceptable P/E", "x", "multiple"),
     "margin_base": ("quarterly", "Base (forward) net margin", "%", "share"),
     "held_clean_eps": ("daily", "Clean trailing EPS (held)", "", "eps"),
@@ -179,13 +181,14 @@ BLOCKS = {
                 "term_premium": "Term premium %", "rate_pass_through": "Share of a yield change passed to the P/E"}),
     "multiple_builder": dict(
         title="Multiple builder", rate="daily", role="Param: P/E deductions",
-        inputs=["own_anchor", "peer_anchor", "yield_gap", "forward_gap", "held_pe_adjust", "held_quality_pe"],
+        inputs=["own_anchor", "peer_anchor", "peers_used", "yield_gap", "forward_gap", "held_pe_adjust", "held_quality_pe"],
         outputs=["now_pe", "rate_anchor", "acceptable_pe"],
         params={"pe_lookback_years": "Own P/E look-back, years", "peer_weight": "Share of the anchor from peers",
                 "pe_floor": "P/E floor", "pe_cap": "P/E cap",
                 "history_growth_follow": "Forward P/E history: share of past EPS growth expected",
                 "history_growth_floor": "Forward P/E history: expected growth floor %",
-                "history_growth_cap": "Forward P/E history: expected growth cap %"}),
+                "history_growth_cap": "Forward P/E history: expected growth cap %",
+                "history_recovery": "Forward P/E history: share of a slump expected back"}),
     "product": dict(
         title="Product", rate="daily", role="EPS x acceptable P/E",
         inputs=["held_clean_eps", "held_eps", "now_pe", "acceptable_pe"], outputs=["now_price", "model_price"], params={}),
@@ -603,9 +606,15 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     if peer_pe is not None and not pd.DataFrame(peer_pe).empty:
         peers = pd.DataFrame(peer_pe).apply(pd.to_numeric, errors="coerce")
         peers = peers.where(peers > 0).reindex(peers.index.union(close.index)).ffill(limit=5).reindex(close.index)
-        daily["peer_anchor"] = peers.median(axis=1, skipna=True)
+        # A P/E above the cap rests on earnings near zero and says nothing about a fair multiple: like a loss, it
+        # sits out that day's median.
+        usable = peers.where(peers <= float(params["pe_cap"]))
+        daily["peer_anchor"] = usable.median(axis=1, skipna=True)
+        daily["peers_used"] = usable.notna().sum(axis=1).astype(float)
     else:
+        peers = pd.DataFrame(index=close.index)
         daily["peer_anchor"] = np.nan
+        daily["peers_used"] = 0.0
 
     # Rate model. The own anchor is a median over years of past rates, so it moves with the yield against the median
     # yield of those years; the peers' P/E is today's and already prices today's rate, so it moves only with the
@@ -657,7 +666,8 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         # Keep the update in force on the first day shown.
         before = quarterly.loc[:pd.Timestamp(start)]
         quarterly = quarterly.loc[before.index[-1]:] if len(before) else quarterly
-    return {"quarterly": quarterly, "daily": daily, "items": routed, "params": params, "forward_from": last_release}
+    return {"quarterly": quarterly, "daily": daily, "items": routed, "params": params, "forward_from": last_release,
+            "peer_pe": peers.reindex(daily.index)}
 
 
 def latest_values(result, on=None):
@@ -901,13 +911,14 @@ def market_implied_probabilities(result, on=None):
 
 CASE_ROWS = {"Revenue growth %": ("revenue_yoy", "growth_base", "forward_growth", "bull_growth_gap", "bear_growth_gap"),
              "Net margin %": ("net_margin", "margin_base", "forward_margin", "bull_margin_pts", "bear_margin_pts")}
-CASE_COLUMNS = ["Metric", "Current", "Forward", "Bull adj", "Bear adj", "Forward from"]
+CASE_COLUMNS = ["Metric", "Current", "Forward", "Bull adj", "Bear adj", "Current from", "Forward from"]
 
 
 def case_table(result, params=None):
     """Growth and margin now and forward, with the bull and bear adjustments, as the Forward table shows them.
 
-    Current: the latest reported trailing value. Forward: yours if set, else the auto rule. Bull and bear adjustments
+    Current: the latest reported trailing value, or the fallback the model uses without one. Forward: yours if set,
+    else the auto rule. Bull and bear adjustments
     are points added to the forward value (the bear growth gap shows as a negative number).
     """
 
@@ -915,13 +926,17 @@ def case_table(result, params=None):
     values = latest_values(result)
     yoy, growth, margin, base_margin = base_growth_and_margin(values.get("revenue_yoy", np.nan),
                                                               values.get("net_margin", np.nan), params, forward=True)
-    current = {"Revenue growth %": values.get("revenue_yoy", np.nan), "Net margin %": values.get("net_margin", np.nan)}
+    reported = {"Revenue growth %": values.get("revenue_yoy", np.nan), "Net margin %": values.get("net_margin", np.nan)}
+    # Without a reported value the model runs on the fallback (Scenario engine settings): show that, and say so.
+    current = {"Revenue growth %": yoy, "Net margin %": margin}
     forward = {"Revenue growth %": growth, "Net margin %": base_margin}
     rows = []
     for metric, (_, _, key, bull, bear) in CASE_ROWS.items():
         bear_value = -abs(params[bear]) if key == "forward_growth" else params[bear]
         rows.append({"Metric": metric, "Current": current[metric], "Forward": forward[metric],
                      "Bull adj": params[bull], "Bear adj": bear_value,
+                     "Current from": "reported" if np.isfinite(reported[metric]) and (
+                         metric == "Revenue growth %" or reported[metric] > 0) else "fallback",
                      "Forward from": "you" if np.isfinite(params.get(key, np.nan)) else "auto rule"})
     return pd.DataFrame(rows, columns=CASE_COLUMNS)
 
