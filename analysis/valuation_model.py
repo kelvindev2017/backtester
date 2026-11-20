@@ -56,6 +56,9 @@ DEFAULT_PARAMS = {
     "pe_basis": "Forward",       # Trailing: P/E on the last four quarters' EPS; Forward: on the next four quarters'
     "pe_lookback_years": 5,
     "peer_weight": 0.5,          # share of the P/E anchor taken from the peers' median; the rest is the own median
+    "history_growth_follow": 0.5,  # Forward basis, before the latest report: expected EPS growth = this x past year's
+    "history_growth_floor": -20.0,  # ... kept within this floor
+    "history_growth_cap": 100.0,    # ... and this cap (%), so a fast grower is not cut to an ordinary one
     "pe_floor": 5.0,
     "pe_cap": 100.0,
     # Triage gate
@@ -179,7 +182,10 @@ BLOCKS = {
         inputs=["own_anchor", "peer_anchor", "yield_gap", "forward_gap", "held_pe_adjust", "held_quality_pe"],
         outputs=["now_pe", "rate_anchor", "acceptable_pe"],
         params={"pe_lookback_years": "Own P/E look-back, years", "peer_weight": "Share of the anchor from peers",
-                "pe_floor": "P/E floor", "pe_cap": "P/E cap"}),
+                "pe_floor": "P/E floor", "pe_cap": "P/E cap",
+                "history_growth_follow": "Forward P/E history: share of past EPS growth expected",
+                "history_growth_floor": "Forward P/E history: expected growth floor %",
+                "history_growth_cap": "Forward P/E history: expected growth cap %"}),
     "product": dict(
         title="Product", rate="daily", role="EPS x acceptable P/E",
         inputs=["held_clean_eps", "held_eps", "now_pe", "acceptable_pe"], outputs=["now_price", "model_price"], params={}),

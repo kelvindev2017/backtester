@@ -161,6 +161,8 @@ from analysis.signal_groups import (
 )
 from analysis.valuation_chart import (
     DOWN_COLOR,
+    expected_growth_check,
+    no_hindsight_forward_pe,
     UP_COLOR,
     VALUATION_HISTORY_YEARS,
     add_volume_overlay,
@@ -4827,6 +4829,15 @@ def model_settings():
         params["peer_weight"] = number("peer_weight", "Share of the anchor from peers", 0, 1, 0.05)
         params["pe_floor"] = number("pe_floor", "P/E floor", 1, 100, 1)
         params["pe_cap"] = number("pe_cap", "P/E cap", 1, 200, 1)
+        st.caption("Forward P/E history (Forward basis): before the latest report, the forward EPS is the trailing "
+                   "EPS grown by a share of its past year's growth, within a floor and cap, so the past P/E does not "
+                   "know the EPS reported later. The data note under the title compares the rule with today's "
+                   "analyst estimates.")
+        params["history_growth_follow"] = number("history_growth_follow", "Share of past EPS growth expected", 0, 2, 0.05)
+        params["history_growth_floor"] = number("history_growth_floor", "Expected growth floor %", -90, 0, 5)
+        params["history_growth_cap"] = number("history_growth_cap", "Expected growth cap %", 0, 1000, 10,
+                                              "High enough for a fast grower: with 40% a share whose EPS doubled "
+                                              "would be valued as if growth stopped at 40%.")
     with settings_panel("Triage gate", expanded=False):
         show_model_equations("triage_gate")
         params["materiality_eps_pct"] = number("materiality_eps_pct", "Smallest expected EPS effect %", 0, 50, 0.5,
@@ -4836,17 +4847,25 @@ def model_settings():
     return ticker, years, peers, model_params(params)
 
 
-def daily_forward_pe(symbol, valuation, earnings):
-    """Close / next four quarters' EPS: EPS later reported for past quarters, analyst estimates for the rest."""
+def daily_forward_pe(symbol, valuation, earnings, rule=(0.5, -20.0, 100.0)):
+    """(forward P/E with no hindsight, (analysts' expected EPS growth %, the rule's) on the latest report).
+
+    Close / analyst estimates from the latest report on; before it, close / the trailing EPS grown by ``rule``
+    (share of the past year's EPS growth, floor %, cap %), not the EPS reported later, which the market did not know.
+    """
 
     fiscal_year_end = load_fundamental_snapshot(symbol).get("nextFiscalYearEnd")
     fiscal_year_end = pd.to_datetime(fiscal_year_end, unit="s") if fiscal_year_end else None
     forward = forward_valuation(valuation, forward_eps(earnings, load_earnings_estimates(symbol),
                                                        fiscal_year_end=fiscal_year_end))
-    return forward["Forward_PE"] if "Forward_PE" in forward else pd.Series(dtype=float)
+    reported = earnings["Reported EPS"].dropna() if earnings is not None and "Reported EPS" in earnings else pd.Series(dtype=float)
+    last_report = reported.index.max() if len(reported) else None
+    follow, floor, cap = rule
+    pe = no_hindsight_forward_pe(valuation, forward, last_report, follow=follow, floor=floor, cap=cap)
+    return pe, expected_growth_check(valuation, forward, last_report, follow=follow, floor=floor, cap=cap)
 
 
-def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing"):
+def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing", history_rule=(0.5, -20.0, 100.0)):
     """Prices, results by release date and the share's and peers' P/E for the model, with a note on what was found.
 
     With ``pe_basis`` Forward, ``own_pe`` and ``peer_pe`` are forward P/Es; with Trailing, ``own_pe`` is None (the
@@ -4873,7 +4892,8 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing")
             quarters[column] = released[column]
     quarters["EPS"] = eps
     forward = pe_basis == "Forward"
-    own_pe = daily_forward_pe(ticker, build_valuation_data(prices, earnings)[0], earnings) if forward else None
+    own_pe, growth_check = (daily_forward_pe(ticker, build_valuation_data(prices, earnings)[0], earnings, history_rule)
+                            if forward else (None, (np.nan, np.nan)))
     peer_pe = {}
     for peer in peers:
         peer_prices = load_data(peer, load_start, end, "Daily")
@@ -4881,13 +4901,14 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing")
             continue
         peer_earnings = load_earnings_data(peer, load_start, end)
         valuation = build_valuation_data(peer_prices, peer_earnings)[0]
-        ratio = daily_forward_pe(peer, valuation, peer_earnings) if forward else valuation["Trailing_PE"]
+        ratio = daily_forward_pe(peer, valuation, peer_earnings, history_rule)[0] if forward else valuation["Trailing_PE"]
         # A forward P/E without analyst estimates stops a year back: no use for today's anchor.
         if ratio.tail(10).notna().any() if forward else ratio.notna().any():
             peer_pe[peer] = ratio
     found = dict(eps_quarters=int(eps.notna().sum()),
                  revenue_quarters=int(quarters["Revenue"].notna().sum()) if "Revenue" in quarters else 0,
-                 source=source, peers_found=list(peer_pe), peers_missing=[peer for peer in peers if peer not in peer_pe])
+                 source=source, peers_found=list(peer_pe), peers_missing=[peer for peer in peers if peer not in peer_pe],
+                 growth_check=growth_check)
     return SimpleNamespace(close=prices["Close"], quarters=quarters, peer_pe=pd.DataFrame(peer_pe), own_pe=own_pe,
                            start=start, found=found)
 
@@ -4901,7 +4922,12 @@ def model_data_note(found, params):
     basis = params["pe_basis"].lower()
     peers = (f"{basis} peer P/E from {', '.join(found['peers_found'])}" if found["peers_found"] else f"no {basis} peer P/E")
     missing = f" (nothing for {', '.join(found['peers_missing'])})" if found["peers_missing"] else ""
-    return f"Inputs found: {eps}; {revenue}; {peers}{missing}."
+    note = f"Inputs found: {eps}; {revenue}; {peers}{missing}."
+    analysts, rule = found.get("growth_check", (np.nan, np.nan))
+    if np.isfinite(analysts) and np.isfinite(rule):
+        note += (f" At the latest report analysts expect EPS growth of {analysts:+.0f}% over the next four quarters; "
+                 f"the forward P/E history rule gives {rule:+.0f}%.")
+    return note
 
 
 def render_model_inspector(result, block):
@@ -5157,7 +5183,9 @@ def render_valuation_model():
     if preset:
         st.caption(preset["note"])
     with st.spinner("Loading results, prices and peers..."):
-        inputs = load_model_inputs(ticker, years, peers, params["pe_lookback_years"], params["pe_basis"])
+        inputs = load_model_inputs(ticker, years, peers, params["pe_lookback_years"], params["pe_basis"],
+                                   (params["history_growth_follow"], params["history_growth_floor"],
+                                    params["history_growth_cap"]))
     if inputs is None:
         st.warning(f"Yahoo Finance has no price history for {ticker}. Check the symbol: it must be the ticker "
                    "Yahoo uses, e.g. a US listing or an OTC ADR such as ASMVY.")

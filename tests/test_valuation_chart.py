@@ -12,6 +12,8 @@ from analysis.valuation_chart import (
     later_quarter_estimates,
     forward_eps,
     forward_valuation,
+    no_hindsight_forward_pe,
+    expected_growth_check,
     quarterly_eps,
     break_long_gaps,
     gap_spans,
@@ -343,3 +345,40 @@ def test_later_quarters_follow_where_the_fiscal_year_ends():
     assert fiscal_quarters_reported(nvda, 9.31, 2.47, 2.75) == 2
     q2, q3 = later_quarter_estimates(2.47, 2.75, 9.31, 15.91, nvda)
     assert 2.75 < q2 < q3 and q2 + q3 < 15.91 / 2
+
+
+def test_past_forward_pe_uses_no_later_reported_eps():
+    days = pd.bdate_range("2022-01-03", "2024-12-31")
+    # Trailing EPS 2.0 for 2022, 3.0 from 2023 (+50% on a year back), then a slump to 1.0 reported in 2024.
+    ttm = pd.Series(np.where(days < "2023-01-01", 2.0, np.where(days < "2024-06-01", 3.0, 1.0)), index=days)
+    valuation = pd.DataFrame({"Close": 60.0, "TTM_Reported_EPS": ttm}, index=days)
+    # Hindsight forward P/E knows the slump: 60 / 1.0 = 60x through 2023.
+    forward = pd.DataFrame({"Forward_PE": 60.0, "Estimated": False}, index=days)
+    last_report = pd.Timestamp("2024-11-01")
+    forward.loc[days >= last_report, "Forward_PE"] = 45.0
+    pe = no_hindsight_forward_pe(valuation, forward, last_report)
+    # Mid 2023: trailing 3.0 grew 50% on a year back, so expected EPS = 3.0 x (1 + 0.5 x 50%) = 3.75 -> 16x.
+    assert pe[pd.Timestamp("2023-09-01")] == pytest.approx(60 / 3.75)
+    # Early 2022: no year-back EPS, so no growth is assumed: 60 / 2.0 = 30x.
+    assert pe[pd.Timestamp("2022-03-01")] == pytest.approx(30.0)
+    # After the slump: -66.7% on a year back, half of it capped at the -20% floor -> 60 / 0.8 = 75x.
+    assert pe[pd.Timestamp("2024-09-02")] == pytest.approx(75.0)
+    # From the latest report on, all four quarters ahead are analyst estimates: those are kept.
+    assert (pe[days >= last_report] == 45.0).all()
+    # A loss has no P/E.
+    loss = valuation.assign(TTM_Reported_EPS=-1.0)
+    assert no_hindsight_forward_pe(loss, None).isna().all()
+
+
+def test_fast_growers_keep_their_growth_and_the_rule_is_checked_against_analysts():
+    days = pd.bdate_range("2023-01-02", "2024-12-31")
+    # EPS tripled on a year back (+200%): half is +100%, which the default cap keeps; a 40% cap would not.
+    ttm = pd.Series(np.where(days < "2024-01-01", 1.0, 3.0), index=days)
+    valuation = pd.DataFrame({"Close": 120.0, "TTM_Reported_EPS": ttm}, index=days)
+    day = pd.Timestamp("2024-06-03")
+    assert no_hindsight_forward_pe(valuation, None)[day] == pytest.approx(120 / 6.0)
+    assert no_hindsight_forward_pe(valuation, None, cap=40.0)[day] == pytest.approx(120 / 4.2)
+    forward = pd.DataFrame({"Forward_EPS": 4.5, "Forward_PE": 120 / 4.5, "Estimated": True}, index=days)
+    analysts, rule = expected_growth_check(valuation, forward, pd.Timestamp("2024-11-01"))
+    assert analysts == pytest.approx(50.0) and rule == pytest.approx(100.0)
+    assert np.isnan(expected_growth_check(valuation, forward, None)[0])
