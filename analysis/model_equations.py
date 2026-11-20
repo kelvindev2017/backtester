@@ -184,11 +184,12 @@ def worked_equations(result, block, on=None):
                 rf"& \text{{kept in }} {_n(params['pe_floor'], 0)} \text{{ to }} {_n(params['pe_cap'], 0)} \\ = {{}} & {_n(get('acceptable_pe'), 1)} \end{{aligned}}"]
         if fundamentals and np.isfinite(get("fundamental_pe")):
             margin = get("held_gross_margin")
-            lines.insert(0, rf"n = {_n(get('growth_years'), 1)} \text{{ years}} \quad (GM = "
-                            rf"{_n(margin, 1) if np.isfinite(margin) else r'\text{n/a}'}\%), \qquad g = "
-                            rf"{_n(get('held_cagr'), 1) if np.isfinite(get('held_cagr')) else _n(params['fallback_yoy'], 1)}\%")
-            lines.insert(1, rf"\text{{P/E}}_{{\text{{fund}}}} = {_n(get('fundamental_pe'), 1)} \quad (r = "
-                            rf"{_n((get('now_yield') if np.isfinite(get('now_yield')) else params['base_yield']) + params['equity_premium'], 2)}\%)")
+            margin_text = _n(margin, 1) + r"\%" if np.isfinite(margin) else r"\text{n/a}"
+            growth = get("held_cagr") if np.isfinite(get("held_cagr")) else params["fallback_yoy"]
+            required = (get("now_yield") if np.isfinite(get("now_yield")) else params["base_yield"]) + params["equity_premium"]
+            years_text, pe_text = _n(get("growth_years"), 1), _n(get("fundamental_pe"), 1)
+            lines.insert(0, rf"n = {years_text} \text{{ years}} \quad (GM = {margin_text}), \qquad g = {_n(growth, 1)}\%")
+            lines.insert(1, rf"\text{{P/E}}_{{\text{{fund}}}} = {pe_text} \quad (r = {_n(required, 2)}\%)")
         pairs = [("own", raw_own, get("yield_gap"))] + ([] if fundamentals else [("peers", raw_peer, get("forward_gap"))])
         for label, raw, gap in pairs:
             if np.isfinite(raw) and np.isfinite(get("policy_rate")):
