@@ -5145,7 +5145,7 @@ def render_model_check(result, inputs):
         if np.isfinite(after) and np.isfinite(now) and result["params"]["anchor_source"] == "Fundamentals":
             st.caption(f"With them the fundamental P/E goes from {now:.1f}x to {after:.1f}x (before register items, "
                        "quality and premium).")
-        if st.button("Apply the suggestions", key="model_apply_suggestions",
+        if st.button("Apply the suggestions", key="model_apply_suggestions_btn",
                      help="Fills them in under Forward assumptions, where you can still change each one."):
             for row in proposed.to_dict("records"):
                 st.session_state[model_param_key(row["Parameter"])] = float(row["Suggested"])
