@@ -1010,7 +1010,8 @@ def test_valuation_model_tab(offline, monkeypatch):
     # Opening another block shows its parameters and signals.
     app.selectbox(key="model_block").select("scenario_engine")
     open_tab(app, "Valuation Model")
-    assert any("Bear: growth points below base" in frame.value.get("Parameter", pd.Series(dtype=str)).tolist()
+    # Forward parameters keep their block and are marked as set under Forward assumptions.
+    assert any("Bear: growth points below base (forward)" in frame.value.get("Parameter", pd.Series(dtype=str)).tolist()
                for frame in app.dataframe)
     assert any("Output: Bear EPS" in chart.proto.spec for chart in app.get("plotly_chart"))
 

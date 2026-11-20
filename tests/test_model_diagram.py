@@ -68,7 +68,8 @@ def test_block_charts_split_inputs_and_outputs(result):
 def test_price_chart_has_the_model_the_close_and_the_range(result):
     fig = model_price_figure(result, "TEST")
     names = [trace.name for trace in fig.data]
-    assert names[:4] == ["Bull case", "Bear case", "Model price", "Close"] and "Acceptable P/E" in names
+    assert names[:5] == ["Bull case", "Bear case", "Model price", "Model price now (no forward assumptions)", "Close"]
+    assert "Acceptable P/E" in names
     model = next(trace for trace in fig.data if trace.name == "Model price")
     assert np.nanmax(np.asarray(model.y, dtype=float)) == pytest.approx(result["daily"]["model_price"].max())
 
