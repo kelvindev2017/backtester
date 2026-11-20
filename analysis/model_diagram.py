@@ -413,6 +413,32 @@ def model_price_figure(result, ticker="", mobile=False):
     return fig
 
 
+def price_and_fundamentals_figure(result, ticker="", mobile=False):
+    """Close and model price on the left axis; the revenue growth (a year, over the growth history) and the gross
+    margin, both as held from the latest release, on the right one."""
+
+    daily = result["daily"]
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    for name, label, style in [("close", "Close", dict(width=1.6, color="dimgray")),
+                               ("model_price", "Model price", dict(width=2, color="royalblue"))]:
+        if name in daily:
+            fig.add_trace(go.Scatter(x=daily.index, y=daily[name], name=label, mode="lines", line=style,
+                                     hovertemplate=f"{label}: %{{y:,.2f}}<extra></extra>"), secondary_y=False)
+    for name, label, color in [("held_cagr", "Revenue growth a year (history)", "seagreen"),
+                               ("held_gross_margin", "Gross margin", "darkorange")]:
+        if name in daily and daily[name].notna().any():
+            fig.add_trace(go.Scatter(x=daily.index, y=daily[name], name=label, mode="lines", line_shape="hv",
+                                     line=dict(width=1.4, color=color, dash="dash"),
+                                     hovertemplate=f"{label}: %{{y:.1f}}%<extra></extra>"), secondary_y=True)
+    fig.update_yaxes(title_text="Price", secondary_y=False)
+    fig.update_yaxes(title_text="%", secondary_y=True, showgrid=False, zeroline=True, zerolinecolor="lightgray")
+    fig.update_layout(height=380 if mobile else 420, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10),
+                      title=dict(text=f"{ticker} price against growth and gross margin".strip(),
+                                 font=dict(size=10 if mobile else 12), x=0, xanchor="left"),
+                      legend=dict(orientation="h", yanchor="top", y=-0.12, x=0, xanchor="left"))
+    return fig
+
+
 def items_table(result, tracked=None):
     """The register after the gate and router, for display: where each item goes and what it does."""
 

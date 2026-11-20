@@ -1180,6 +1180,7 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     assert any(expander.label == "Forward assumptions" for expander in app.expander)
     headings = [element.value for element in app.markdown]
     assert "**Growth and margin** · Scenario engine" in headings
+    assert "**ASMVY price against growth and gross margin**" in headings
     assert "**Risk and product items** · Triage gate, Item router" in headings
     steps = next(frame.value for frame in app.dataframe if list(frame.value.columns) == ["Step", "Now", "Forward", "Change"])
     steps = steps.set_index("Step")

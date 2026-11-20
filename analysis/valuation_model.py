@@ -58,13 +58,13 @@ DEFAULT_PARAMS = {
     "peer_weight": 1.0,          # share of the P/E anchor from the outside view (fundamentals or peers); rest: own median
     "anchor_source": "Fundamentals",  # the outside view: Fundamentals (growth, gross margin, yield) or Peers' median P/E
     "growth_history_years": 3,   # fundamental P/E: revenue growth = the yearly growth (CAGR) over this many years
-    "fund_growth_cap": 50.0,     # ... kept within this cap
-    "fund_growth_floor": -10.0,  # ... and floor, in %
+    "fund_growth_cap": 300.0,    # ... kept within this cap (high: some companies grow over 100% a year)
+    "fund_growth_floor": -50.0,  # ... and floor, in %
     "equity_premium": 4.5,       # ... required return = N-year yield + this, in %
     "base_yield": 4.0,           # ... the yield used when no rates are loaded, in %
     "terminal_growth": 3.0,      # ... growth after the growth years, in %
-    "growth_years_min": 3.0,     # ... years the growth lasts (fading to terminal) at a gross margin of gm_low or less
-    "growth_years_max": 10.0,    # ... and at gm_high or more: a high gross margin is a moat, so growth lasts longer
+    "growth_half_life_min": 0.5,  # ... years for half of the extra growth to fade, at a gross margin of gm_low or less
+    "growth_half_life_max": 2.0,  # ... and at gm_high or more: a high gross margin is a moat, so growth lasts longer
     "gm_low": 20.0,
     "gm_high": 60.0,
     "history_growth_follow": 0.5,  # Forward basis, before the latest report: expected EPS growth = this x past year's
@@ -134,7 +134,7 @@ SIGNALS = {
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
     "held_cagr": ("daily", "Revenue growth a year over the growth history (held)", "%", "percent"),
     "held_gross_margin": ("daily", "Gross margin, last 4 quarters (held)", "%", "share"),
-    "growth_years": ("daily", "Years the growth lasts (from gross margin)", "", "count"),
+    "growth_half_life": ("daily", "Half-life of the extra growth, years (from gross margin)", "", "count"),
     "fundamental_pe": ("daily", "Fundamental P/E (growth, gross margin, yield)", "x", "multiple"),
     "outside_anchor": ("daily", "Outside view P/E (fundamental or peers)", "x", "multiple"),
     "rate_anchor": ("daily", "P/E anchor after the rate model", "x", "multiple"),
@@ -202,7 +202,7 @@ BLOCKS = {
         title="Multiple builder", rate="daily", role="Param: P/E deductions",
         inputs=["own_anchor", "held_cagr", "held_gross_margin", "now_yield", "peer_anchor", "peers_used", "yield_gap",
                 "forward_gap", "held_pe_adjust", "held_quality_pe"],
-        outputs=["growth_years", "fundamental_pe", "outside_anchor", "now_pe", "rate_anchor", "acceptable_pe"],
+        outputs=["growth_half_life", "fundamental_pe", "outside_anchor", "now_pe", "rate_anchor", "acceptable_pe"],
         params={"pe_lookback_years": "Own P/E look-back, years",
                 "peer_weight": "Share of the anchor from the outside view (rest: own P/E history)",
                 "anchor_source": "Outside view: Fundamentals or Peers",
@@ -211,8 +211,8 @@ BLOCKS = {
                 "equity_premium": "Fundamental P/E: equity risk premium %",
                 "base_yield": "Fundamental P/E: yield without rate data %",
                 "terminal_growth": "Fundamental P/E: growth after the growth years %",
-                "growth_years_min": "Fundamental P/E: growth years at a low gross margin",
-                "growth_years_max": "Fundamental P/E: growth years at a high gross margin",
+                "growth_half_life_min": "Fundamental P/E: growth half-life at a low gross margin, years",
+                "growth_half_life_max": "Fundamental P/E: growth half-life at a high gross margin, years",
                 "gm_low": "Fundamental P/E: low gross margin %", "gm_high": "Fundamental P/E: high gross margin %",
                 "pe_floor": "P/E floor", "pe_cap": "P/E cap",
                 "history_growth_follow": "Forward P/E history: share of past EPS growth expected",
@@ -561,25 +561,28 @@ def rate_adjusted_pe(pe, yield_change, pass_through=1.0):
     return 1 / earnings_yield if earnings_yield > 0 else np.inf
 
 
-def growth_years(gross_margin, params):
-    """Years the growth lasts before it has faded to the terminal growth: more with a higher gross margin."""
+def growth_half_life(gross_margin, params):
+    """Years for half of the growth above the terminal rate to fade: longer with a higher gross margin."""
 
     params = model_params(params)
+    low, high = params["growth_half_life_min"], params["growth_half_life_max"]
     if gross_margin is None or not np.isfinite(gross_margin):
-        return float(params["growth_years_min"])
+        return (low + high) / 2
     span = max(1e-9, params["gm_high"] - params["gm_low"])
     share = float(np.clip((gross_margin - params["gm_low"]) / span, 0, 1))
-    return params["growth_years_min"] + (params["growth_years_max"] - params["growth_years_min"]) * share
+    return low + (high - low) * share
 
 
-def fundamental_pe(growth, gross_margin, yield_pct, params):
+def fundamental_pe(growth, gross_margin, yield_pct, params, horizon=40):
     """The forward P/E the company's own growth and gross margin justify at a given yield.
 
     Next year's earnings are 1. They grow at ``growth`` % (the company's revenue growth a year over its growth
-    history, within a floor and cap), fading in a straight line to the terminal growth over the growth years, which
-    the gross margin sets (a high gross margin is pricing power, so growth lasts longer). After that they grow at the
-    terminal rate for ever. The P/E is the value of that stream discounted at the N-year yield plus the equity risk
-    premium (at least 1 point above the terminal growth). NaN without a growth rate.
+    history, within a floor and cap) and the growth above the terminal rate fades away, halving every half-life
+    years; the gross margin sets the half-life (a high gross margin is pricing power, so growth lasts longer). The
+    fade is in log terms, so 100% or 300% growth is handled: the P/E rises with it without exploding (at a 60% gross
+    margin and a 4.3% yield: 30% -> ~28x, 100% -> ~71x, 300% -> ~340x). The P/E is the value of that stream
+    discounted at the N-year yield plus the equity risk premium (at least 1 point above the terminal growth), with the
+    terminal growth for ever after ``horizon`` years. NaN without a growth rate.
     """
 
     params = model_params(params)
@@ -589,26 +592,27 @@ def fundamental_pe(growth, gross_margin, yield_pct, params):
     terminal = params["terminal_growth"] / 100
     yield_pct = yield_pct if yield_pct is not None and np.isfinite(yield_pct) else params["base_yield"]
     k = max(yield_pct / 100 + params["equity_premium"] / 100, terminal + 0.01)
-    years = max(1, int(round(growth_years(gross_margin, params))))
+    half_life = max(1e-6, growth_half_life(gross_margin, params))
+    start, end = np.log1p(g), np.log1p(terminal)
     earnings, value = 1.0, 0.0
-    for t in range(1, years + 1):
+    for t in range(1, horizon + 1):
         value += earnings / (1 + k) ** t
-        rate = g + (terminal - g) * t / years
-        earnings *= 1 + rate
-    value += earnings / (k - terminal) / (1 + k) ** years
+        earnings *= np.exp(end + (start - end) * 0.5 ** (t / half_life))
+    value += earnings / (k - terminal) / (1 + k) ** horizon
     return float(value)
 
 
-def _fundamental_series(growth, years, yields, params):
-    """``fundamental_pe`` day by day (computed once per distinct growth, growth years and yield)."""
+def _fundamental_series(growth, half_lives, yields, params):
+    """``fundamental_pe`` day by day (computed once per distinct growth, half-life and yield)."""
 
     params = model_params(params)
+    low, high = params["growth_half_life_min"], params["growth_half_life_max"]
     out, cache = [], {}
-    for g, n, y in zip(growth, years, yields):
-        key = (round(g, 4) if np.isfinite(g) else None, round(n, 4), round(y, 4) if np.isfinite(y) else None)
+    for g, h, y in zip(growth, half_lives, yields):
+        key = (round(g, 4) if np.isfinite(g) else None, round(h, 4), round(y, 4) if np.isfinite(y) else None)
         if key not in cache:
-            margin = params["gm_low"] + (params["gm_high"] - params["gm_low"]) * (
-                (n - params["growth_years_min"]) / max(1e-9, params["growth_years_max"] - params["growth_years_min"]))
+            # The gross margin that gives this half-life (the half-life is what the P/E needs).
+            margin = params["gm_low"] + (params["gm_high"] - params["gm_low"]) * ((h - low) / max(1e-9, high - low))
             cache[key] = fundamental_pe(g, margin, y, params)
         out.append(cache[key])
     return pd.Series(out, index=growth.index, dtype=float)
@@ -739,17 +743,15 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         daily["market_yield"] = market.reindex(market.index.union(close.index)).ffill(limit=10).reindex(close.index)
     passed = float(params["rate_pass_through"])
     # The outside view: the P/E the company's growth and gross margin justify at the day's yield, or the peers'.
-    daily["growth_years"] = [growth_years(margin, params) if np.isfinite(margin)
-                             else (params["growth_years_min"] + params["growth_years_max"]) / 2
-                             for margin in daily["held_gross_margin"].astype(float)]
+    daily["growth_half_life"] = [growth_half_life(margin, params) for margin in daily["held_gross_margin"].astype(float)]
     growth = daily["held_cagr"].astype(float).fillna(float(params["fallback_yoy"]) if quarterly.empty or
                                                      daily["held_cagr"].isna().all() else np.nan)
     now_yield = daily["now_yield"].astype(float)
-    daily["fundamental_pe"] = _fundamental_series(growth, daily["growth_years"], now_yield, params)
+    daily["fundamental_pe"] = _fundamental_series(growth, daily["growth_half_life"], now_yield, params)
     fundamentals = params["anchor_source"] == "Fundamentals"
     if fundamentals:
         outside_now = daily["fundamental_pe"]
-        outside_rate = _fundamental_series(growth, daily["growth_years"], daily["model_yield"].astype(float), params)
+        outside_rate = _fundamental_series(growth, daily["growth_half_life"], daily["model_yield"].astype(float), params)
     else:
         outside_now = daily["peer_anchor"]
         outside_rate = rate_adjusted_pe(daily["peer_anchor"], daily["forward_gap"], passed)
@@ -823,7 +825,7 @@ def _day_state(result, values, on):
             "net_margin": values.get("net_margin", np.nan), "anchor": anchor,
             "own_anchor": day.get("own_anchor", np.nan),
             "peer_anchor": day.get("outside_anchor", day.get("peer_anchor", np.nan)),
-            "held_cagr": day.get("held_cagr", np.nan), "growth_years": day.get("growth_years", np.nan),
+            "held_cagr": day.get("held_cagr", np.nan), "growth_half_life": day.get("growth_half_life", np.nan),
             "policy_rate": day.get("policy_rate", np.nan), "yield_ref": day.get("yield_ref", np.nan),
             "forward": _is_forward(result, on)}
 
@@ -852,9 +854,9 @@ def anchor_at_rate(state, params, rate):
     own_gap = expected - state["yield_ref"] if np.isfinite(state["yield_ref"]) else 0.0
     passed = params["rate_pass_through"]
     own = rate_adjusted_pe(state["own_anchor"], own_gap, passed)
-    if params["anchor_source"] == "Fundamentals" and np.isfinite(state.get("growth_years", np.nan)):
+    if params["anchor_source"] == "Fundamentals" and np.isfinite(state.get("growth_half_life", np.nan)):
         growth = state["held_cagr"] if np.isfinite(state.get("held_cagr", np.nan)) else params["fallback_yoy"]
-        peer = _fundamental_series(pd.Series([growth]), [state["growth_years"]], [expected], params).iloc[0]
+        peer = _fundamental_series(pd.Series([growth]), [state["growth_half_life"]], [expected], params).iloc[0]
     else:
         peer = rate_adjusted_pe(state["peer_anchor"], expected - actual, passed)
     return blend_anchor(own, peer, params["peer_weight"])

@@ -230,6 +230,7 @@ from analysis.model_diagram import (
     items_table,
     model_diagram,
     model_price_figure,
+    price_and_fundamentals_figure,
     parameter_table,
     signal_text,
 )
@@ -4849,19 +4850,25 @@ def model_settings():
         if params["anchor_source"] == "Fundamentals":
             params["growth_history_years"] = st.select_slider("Growth history (years)", [1, 2, 3, 5],
                                                               key=model_param_key("growth_history_years"))
-            params["fund_growth_floor"] = number("fund_growth_floor", "Growth floor %", -50, 0, 1)
-            params["fund_growth_cap"] = number("fund_growth_cap", "Growth cap %", 0, 200, 5)
+            params["fund_growth_floor"] = number("fund_growth_floor", "Growth floor %", -90, 0, 5)
+            params["fund_growth_cap"] = number("fund_growth_cap", "Growth cap %", 0, 1000, 25,
+                                               "High on purpose: some companies grow over 100% a year. The fade "
+                                               "below keeps the P/E sensible for any growth.")
             params["equity_premium"] = number("equity_premium", "Equity risk premium %", 0, 15, 0.25,
                                               "Required return = the Rate model's N-year yield + this.")
             params["base_yield"] = number("base_yield", "Yield without rate data %", 0, 15, 0.25)
             params["terminal_growth"] = number("terminal_growth", "Growth after the growth years %", 0, 6, 0.25)
-            params["growth_years_min"] = number("growth_years_min", "Growth years at a low gross margin", 1, 30, 1)
-            params["growth_years_max"] = number("growth_years_max", "Growth years at a high gross margin", 1, 30, 1)
+            params["growth_half_life_min"] = number("growth_half_life_min", "Growth half-life at a low gross margin, years",
+                                                    0.25, 10, 0.25)
+            params["growth_half_life_max"] = number("growth_half_life_max", "Growth half-life at a high gross margin, years",
+                                                    0.25, 10, 0.25, "Years for half of the growth above the terminal "
+                                                    "rate to fade. Longer: the growth lasts and is worth more.")
             params["gm_low"] = number("gm_low", "Low gross margin %", 0, 100, 5)
             params["gm_high"] = number("gm_high", "High gross margin %", 0, 100, 5)
-            st.caption("The higher the gross margin, the longer the growth is assumed to last (pricing power). "
-                       "Examples at a 4.3% yield: 8% growth, 18% gross margin ≈ 18x; 30% growth, 60% margin ≈ 44x; "
-                       "50% growth, 75% margin ≈ 85x.")
+            st.caption("The growth above the terminal rate fades, halving every half-life; the higher the gross "
+                       "margin, the longer the half-life (pricing power). Examples at a 4.3% yield and a 60%+ gross "
+                       "margin: 8% growth ≈ 19x, 30% ≈ 28x, 100% ≈ 71x, 200% ≈ 177x, 300% ≈ 340x; at an 18% gross "
+                       "margin 100% growth ≈ 21x.")
         params["pe_floor"] = number("pe_floor", "P/E floor", 1, 100, 1)
         params["pe_cap"] = number("pe_cap", "P/E cap", 1, 200, 1)
         st.caption("Forward P/E history (Forward basis): before the latest report, the forward EPS is the trailing "
@@ -5312,13 +5319,17 @@ def render_valuation_model():
         "that date. The shaded band runs from the bear to the bull case at the same P/E. Dotted lines are the "
         "updates of the quarterly part. " + (
             "The P/E anchors are forward P/Es (price / next four quarters' EPS), the same footing as the model's next-"
-            "year EPS. Past forward P/Es use the EPS later reported, which nobody knew on the day, and the latest "
-            "uses analyst estimates; a stock that beat its estimates a lot (or missed) gets a past anchor that is "
-            "lower (or higher) than the market's view at the time. "
+            "year EPS. Past forward P/Es use only what was known on the day (trailing EPS grown by the history "
+            "rule), the latest uses analyst estimates. "
             if params["pe_basis"] == "Forward" else
             "The P/E anchors are trailing P/Es applied to next year's EPS, which favours a growing company: size the "
             "P/E deductions with that in mind, or switch the P/E basis to Forward under Multiple builder. ")
         + "An estimate from stated assumptions, not investment advice.")
+    st.markdown(f"**{ticker} price against growth and gross margin**")
+    show_chart(price_and_fundamentals_figure(result, ticker, mobile=MOBILE), width="stretch")
+    st.caption("Close and model price on the left axis; on the right, the revenue growth a year over the growth "
+               "history and the gross margin that feed the fundamental P/E, each held from the release it came from. "
+               "Without revenue or gross profit (e.g. an ADR reporting in another currency) those lines are missing.")
     render_market_check(result)
     render_rate_cases(result)
     render_model_register(result, tracked, candidates, ticker)

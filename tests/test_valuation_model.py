@@ -498,18 +498,21 @@ def test_a_peer_p_e_above_the_cap_sits_out_the_median():
 
 
 def test_fundamental_pe_from_growth_and_gross_margin():
-    from analysis.valuation_model import fundamental_pe, growth_years, quarterly_inputs
+    from analysis.valuation_model import fundamental_pe, growth_half_life, quarterly_inputs
     params = model_params({"anchor_source": "Fundamentals"})
-    # A higher gross margin lets growth last longer: 3 years at 20% or less, 10 at 60% or more.
-    assert growth_years(10, params) == 3 and growth_years(60, params) == 10 and growth_years(40, params) == 6.5
+    # A higher gross margin lets growth last longer: a half-life of 0.5 years at 20% or less, 2 at 60% or more.
+    assert growth_half_life(10, params) == 0.5 and growth_half_life(60, params) == 2.0
+    assert growth_half_life(40, params) == 1.25 and growth_half_life(np.nan, params) == 1.25
     # No growth, then 3% for ever, at 4% + 4.5%: close to 1 / (8.5% - 3%) = 18x.
     flat = fundamental_pe(0, 18, 4.0, params)
     assert 15 < flat < 19
     # Faster growth and a higher gross margin are worth more; a higher yield is worth less.
     assert fundamental_pe(30, 60, 4.0, params) > fundamental_pe(30, 18, 4.0, params) > fundamental_pe(8, 18, 4.0, params)
     assert fundamental_pe(30, 60, 6.0, params) < fundamental_pe(30, 60, 4.0, params)
-    # Growth is capped: 300% counts as 50%.
-    assert fundamental_pe(300, 75, 4.0, params) == fundamental_pe(50, 75, 4.0, params)
+    # Growth over 100% counts, and the P/E keeps rising with it without exploding.
+    steps = [fundamental_pe(g, 75, 4.3, params) for g in (50, 100, 200, 300)]
+    assert steps == sorted(steps) and 60 < steps[1] < 80 and steps[-1] < 400
+    assert fundamental_pe(1000, 75, 4.3, params) == fundamental_pe(300, 75, 4.3, params)
     assert np.isnan(fundamental_pe(np.nan, 50, 4.0, params))
     # The income map gives the growth a year over the history and the gross margin.
     quarters = make_quarters().assign(Gross_Profit=lambda frame: frame["Revenue"] * 0.45)
