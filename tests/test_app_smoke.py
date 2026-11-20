@@ -1011,7 +1011,7 @@ def test_valuation_model_tab(offline, monkeypatch):
     app.selectbox(key="model_block").select("scenario_engine")
     open_tab(app, "Valuation Model")
     # Forward parameters keep their block and are marked as set under Forward assumptions.
-    assert any("Bear: growth points below base (forward)" in frame.value.get("Parameter", pd.Series(dtype=str)).tolist()
+    assert any("Bear: growth points below forward (forward)" in frame.value.get("Parameter", pd.Series(dtype=str)).tolist()
                for frame in app.dataframe)
     assert any("Output: Bear EPS" in chart.proto.spec for chart in app.get("plotly_chart"))
 
@@ -1170,6 +1170,9 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     assert app.metric[0].value != before
     # The forward assumptions sit together; the Now vs forward table shows what they do.
     assert any(expander.label == "Forward assumptions" for expander in app.expander)
+    headings = [element.value for element in app.markdown]
+    assert "**Growth and margin** · Scenario engine" in headings
+    assert "**Risk and product items** · Triage gate, Item router" in headings
     steps = next(frame.value for frame in app.dataframe if list(frame.value.columns) == ["Step", "Now", "Forward", "Change"])
     steps = steps.set_index("Step")
     assert steps.loc["Policy rate %", "Now"] == pytest.approx(4.0) and steps.loc["Policy rate %", "Forward"] == pytest.approx(5.0)

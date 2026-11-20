@@ -199,14 +199,18 @@ from analysis.valuation_model import (
     BLOCKS as MODEL_BLOCKS,
     PRESETS as MODEL_PRESETS,
     RATE_CASE_COLUMNS,
+    DEFAULT_PARAMS as MODEL_DEFAULTS,
     REGISTER_DEFAULTS,
     SCENARIOS as MODEL_SCENARIOS,
     SIGNALS as MODEL_SIGNALS,
     YIELD_MATURITIES,
+    case_table,
+    case_table_changes,
     clean_register,
     default_rate_cases,
     has_rates,
     implied_dials,
+    market_implied_probabilities,
     now_and_forward,
     latest_values,
     model_params,
@@ -4615,39 +4619,103 @@ def show_model_equations(block):
         st.caption(MODEL_SYMBOLS[block])
 
 
-FORWARD_ITEM_COLUMNS = ["Item", "Status", "Probability %", "EPS impact %", "P/E points"]
+FORWARD_TABLES_BOX = None  # set by model_settings: where the Forward tables go once the model has run
+CASE_TABLE_PARAMS = ["forward_growth", "forward_margin", "bull_growth_gap", "bear_growth_gap", "bull_margin_pts",
+                     "bear_margin_pts"]
+FORWARD_ITEM_COLUMNS = ["Item", "Status", "Current %", "Forward %", "Bull adj", "Bear adj", "EPS impact %", "P/E points"]
 
 
-def forward_items_editor():
-    """The register's sizes and status, editable next to the other forward assumptions.
+def forward_version():
+    return st.session_state.get("model_forward_version", 0)
 
-    Same table as the full register below the chart (which also adds, removes and describes items): an edit here is
-    written back to it row by row.
-    """
 
+def bump_forward_version():
+    # A new editor key each time, so a grid starts from the stored values rather than replaying old edits.
+    st.session_state["model_forward_version"] = forward_version() + 1
+
+
+def render_forward_tables(result):
+    """The growth and margin table and the item table in the Forward assumptions section."""
+
+    if FORWARD_TABLES_BOX is None:
+        return
+    with FORWARD_TABLES_BOX:
+        render_case_table(result)
+        render_forward_items(result)
+
+
+def render_case_table(result):
+    st.markdown("**Growth and margin** · Scenario engine")
+    drawn = case_table(result)
+    edited = st.data_editor(
+        drawn, hide_index=True, width="stretch", num_rows="fixed", key=f"model_case_{forward_version()}_table",
+        column_config={
+            "Metric": st.column_config.TextColumn("Metric", disabled=True),
+            "Current": st.column_config.NumberColumn("Current", disabled=True, format="%.1f",
+                                                     help="Latest reported, last 4 quarters."),
+            "Forward": st.column_config.NumberColumn("Forward", format="%.1f",
+                                                     help="Your base case for the next year. Clear it to go back to "
+                                                          "the auto rule (Scenario engine settings)."),
+            "Bull adj": st.column_config.NumberColumn("Bull adj", format="%+.1f", help="Points added to Forward."),
+            "Bear adj": st.column_config.NumberColumn("Bear adj", format="%+.1f", help="Points added to Forward."),
+            "Forward from": st.column_config.TextColumn("Forward from", disabled=True),
+        })
+    updates = case_table_changes(drawn, edited, result["params"])
+    if updates:
+        for name, value in updates.items():
+            st.session_state[model_param_key(name)] = float(value)
+        log_model_change([f"{name}: {value:g}" for name, value in updates.items()], st.session_state.get("model_last_price"))
+        bump_forward_version()
+        st.rerun()
+    st.caption("Each case grows the clean EPS by its growth and scales it by its margin over the current one. Your "
+               "Forward values apply from the latest release; earlier quarters use the auto rule.")
+
+
+def render_forward_items(result):
+    st.markdown("**Risk and product items** · Triage gate, Item router")
     table = model_register()
     if table.empty:
         st.caption("No items yet: add risks and products in the register under the chart.")
         return
+    implied = market_implied_probabilities(result)
+    drawn = pd.DataFrame({
+        "Item": table["Item"], "Status": table["Status"], "Current %": implied.reindex(table.index).to_numpy(),
+        "Forward %": table["Probability %"], "Bull adj": table["Bull prob adj"], "Bear adj": table["Bear prob adj"],
+        "EPS impact %": table["EPS impact %"], "P/E points": table["P/E points"]})
     edited = st.data_editor(
-        table[FORWARD_ITEM_COLUMNS], hide_index=True, width="stretch", num_rows="fixed",
-        key=f"model_forward_items_{st.session_state.get('model_register_version', 0)}_table",
+        drawn, hide_index=True, width="stretch", num_rows="fixed",
+        key=f"model_forward_items_{st.session_state.get('model_register_version', 0)}_{forward_version()}_table",
         column_config={
             "Item": st.column_config.TextColumn("Item", disabled=True),
             "Status": st.column_config.SelectboxColumn("Status", options=["Modelled", "Parked"], required=True),
-            "Probability %": st.column_config.NumberColumn("Prob. %", min_value=0, max_value=100, format="%.0f"),
+            "Current %": st.column_config.NumberColumn(
+                "Current %", disabled=True, format="%.0f",
+                help="Market-implied: the probability that on its own makes the model price equal today's close "
+                     "(today's P/E), everything else as set. Blank: no probability does it alone, or the item has "
+                     "no probability (a general item)."),
+            "Forward %": st.column_config.NumberColumn("Forward %", min_value=0, max_value=100, format="%.0f",
+                                                       help="Your probability for the next year (the base case)."),
+            "Bull adj": st.column_config.NumberColumn("Bull adj", min_value=-100, max_value=100, format="%+.0f",
+                                                      help="Points added to Forward % in the bull case."),
+            "Bear adj": st.column_config.NumberColumn("Bear adj", min_value=-100, max_value=100, format="%+.0f",
+                                                      help="Points added to Forward % in the bear case."),
             "EPS impact %": st.column_config.NumberColumn("EPS %", min_value=0, max_value=100, format="%.1f"),
             "P/E points": st.column_config.NumberColumn("P/E pts", min_value=0, max_value=50, format="%.1f"),
         })
+    edited = pd.DataFrame(edited)
     after = table.copy()
-    for column in FORWARD_ITEM_COLUMNS[1:]:
-        after[column] = pd.DataFrame(edited)[column].to_numpy()
+    after["Status"] = edited["Status"].to_numpy()
+    after["Probability %"] = edited["Forward %"].to_numpy()
+    after["Bull prob adj"], after["Bear prob adj"] = edited["Bull adj"].to_numpy(), edited["Bear adj"].to_numpy()
+    after["EPS impact %"], after["P/E points"] = edited["EPS impact %"].to_numpy(), edited["P/E points"].to_numpy()
     after = clean_register(after)
     if not after.astype(str).equals(table.astype(str)):
         log_model_change(register_changes(table, after) or ["Register edited"], st.session_state.get("model_last_price"))
         store_model_register(after)
         st.rerun()
-    st.caption("Add, remove or describe items in the register under the chart.")
+    st.caption("An event item's EPS effect is worked out in each case at its own probability (Forward plus the "
+               "adjustment); its P/E effect is weighted over the cases. Add, remove or describe items in the register "
+               "under the chart.")
 
 
 def model_settings():
@@ -4696,17 +4764,11 @@ def model_settings():
                  "the rate below instead, e.g. the rate you expect after the next Fed meeting.")
         params["forward_rate"] = number("forward_rate", "Forward policy rate %", -1, 20, 0.25,
                                         "The policy rate you expect. Filled in with today's rate when you tick the box.")
-        st.markdown("**Growth and margin cases** · Scenario engine")
-        params["growth_follow"] = number("growth_follow", "Base growth as a share of trailing growth", 0, 2, 0.05)
-        params["growth_floor"] = number("growth_floor", "Base growth floor %", -90, 0, 1)
-        params["growth_cap"] = number("growth_cap", "Base growth cap %", 0, 300, 1)
-        params["bear_growth_gap"] = number("bear_growth_gap", "Bear: growth points below base", 0, 100, 1)
-        params["bull_growth_gap"] = number("bull_growth_gap", "Bull: growth points above base", 0, 100, 1)
-        params["bear_margin_pts"] = number("bear_margin_pts", "Bear: net margin change, points", -50, 50, 0.5)
-        params["base_margin_pts"] = number("base_margin_pts", "Base: net margin change, points", -50, 50, 0.5)
-        params["bull_margin_pts"] = number("bull_margin_pts", "Bull: net margin change, points", -50, 50, 0.5)
-        st.markdown("**Risk and product items** · Triage gate, Item router")
-        forward_items_editor()
+        # The growth/margin and item tables need the model's current values, so they are drawn here after the run.
+        global FORWARD_TABLES_BOX
+        FORWARD_TABLES_BOX = st.container()
+        for name in CASE_TABLE_PARAMS:
+            params[name] = st.session_state.get(model_param_key(name), MODEL_DEFAULTS[name])
     with settings_panel("Earnings quality", expanded=False):
         show_model_equations("earnings_quality")
         params["eps_haircut_pct"] = number("eps_haircut_pct", "EPS haircut %", 0, 90, 1,
@@ -4720,7 +4782,13 @@ def model_settings():
         params["quality_pe_pts"] = number("quality_pe_pts", "P/E deduction, points", 0, 50, 0.5)
     with settings_panel("Scenario engine", expanded=False):
         show_model_equations("scenario_engine")
-        st.caption("The growth and margin cases are under Forward assumptions.")
+        st.caption("Your forward growth and margin and the bull/bear adjustments are under Forward assumptions. "
+                   "The auto rule below sets the forward values on every earlier quarter, and on the latest one "
+                   "when you leave Forward blank.")
+        params["growth_follow"] = number("growth_follow", "Auto rule: base growth as a share of trailing growth", 0, 2, 0.05)
+        params["growth_floor"] = number("growth_floor", "Auto rule: base growth floor %", -90, 0, 1)
+        params["growth_cap"] = number("growth_cap", "Auto rule: base growth cap %", 0, 300, 1)
+        params["base_margin_pts"] = number("base_margin_pts", "Auto rule: base net margin change, points", -50, 50, 0.5)
         params["fallback_yoy"] = number("fallback_yoy", "Trailing growth % when there is no revenue history", -90, 300, 1)
         params["fallback_margin"] = number("fallback_margin", "Net margin % when there is no net income", 0.5, 90, 0.5)
     with settings_panel("Risk weighting", expanded=False):
@@ -5020,6 +5088,8 @@ def render_model_register(result, tracked, candidates, ticker):
             "Since": st.column_config.TextColumn("Since"),
             "Keywords": st.column_config.TextColumn("Keywords"),
             "Source": st.column_config.TextColumn("Source"),
+            "Bull prob adj": st.column_config.NumberColumn("Bull prob adj", min_value=-100, max_value=100, format="%+.0f"),
+            "Bear prob adj": st.column_config.NumberColumn("Bear prob adj", min_value=-100, max_value=100, format="%+.0f"),
         })
     after = clean_register(edited)
     if not after.astype(str).equals(table.astype(str)):
@@ -5103,6 +5173,7 @@ def render_valuation_model():
     result = run_model(inputs.quarters, inputs.close, model_register(), params, inputs.peer_pe, start=inputs.start,
                        own_pe=inputs.own_pe, policy_rate=policy, market_yield=market_yield)
     values = latest_values(result)
+    render_forward_tables(result)
     st.caption(model_data_note(inputs.found, params) + (" " + rate_note if rate_note else ""))
 
     price = values.get("model_price", np.nan)

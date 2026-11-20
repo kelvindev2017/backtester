@@ -23,10 +23,12 @@ MODELLED, PARKED = "Modelled", "Parked"
 TO_SCENARIOS, TO_MULTIPLE = "Scenario engine", "Multiple builder"
 
 REGISTER_COLUMNS = ["Item", "Type", "Kind", "Timing", "Probability %", "EPS impact %", "P/E points", "Status",
-                    "Since", "Keywords", "Source"]
+                    "Since", "Keywords", "Source", "Bull prob adj", "Bear prob adj"]
 REGISTER_DEFAULTS = {"Item": "", "Type": RISK, "Kind": EVENT, "Timing": IN_HORIZON, "Probability %": np.nan,
                      "EPS impact %": np.nan, "P/E points": np.nan, "Status": PARKED, "Since": "", "Keywords": "",
-                     "Source": ""}
+                     "Source": "", "Bull prob adj": 0.0, "Bear prob adj": 0.0}
+# The probability of an event item in the bull and bear case: the forward probability plus these points (0 to 100).
+CASE_ADJUST = {"Bull": "Bull prob adj", "Bear": "Bear prob adj"}
 
 DEFAULT_PARAMS = {
     # Earnings quality
@@ -34,7 +36,9 @@ DEFAULT_PARAMS = {
     "manual_eps": 0.0,           # trailing 12-month EPS per share typed in; 0 = use the reported quarters
     "quality_pe_pts": 0.0,       # P/E points taken off the acceptable P/E for weak earnings quality
     # Scenario engine
-    "growth_follow": 0.5,        # base growth = this share of the trailing revenue growth
+    "forward_growth": np.nan,    # base (forward) revenue growth % for the latest quarter; NaN = the auto rule below
+    "forward_margin": np.nan,    # base (forward) net margin % for the latest quarter; NaN = current + base_margin_pts
+    "growth_follow": 0.5,        # auto rule: base growth = this share of the trailing revenue growth
     "growth_floor": -20.0,
     "growth_cap": 40.0,
     "fallback_yoy": 0.0,         # trailing revenue growth % assumed when there is no revenue history
@@ -70,8 +74,8 @@ DEFAULT_PARAMS = {
 YIELD_MATURITIES = [1, 2, 3, 5, 7, 10, 20, 30]
 
 # Assumptions about the future, set together in the Forward section; the other parameters describe today's data.
-FORWARD_PARAMS = ["use_forward_rate", "forward_rate", "growth_follow", "growth_floor", "growth_cap", "bear_growth_gap",
-                  "bull_growth_gap", "bear_margin_pts", "base_margin_pts", "bull_margin_pts"]  # maturities with a daily US Treasury yield on FRED (DGS1 ... DGS30)
+FORWARD_PARAMS = ["use_forward_rate", "forward_rate", "forward_growth", "forward_margin", "bear_growth_gap",
+                  "bull_growth_gap", "bear_margin_pts", "bull_margin_pts"]
 
 # name -> (frame, label, unit, axis). Signals with the same axis can share a chart panel.
 SIGNALS = {
@@ -87,6 +91,9 @@ SIGNALS = {
     "growth_base": ("quarterly", "Base growth", "%", "percent"),
     "growth_bull": ("quarterly", "Bull growth", "%", "percent"),
     "event_effect": ("quarterly", "Expected effect of event items", "%", "percent"),
+    "event_bear": ("quarterly", "Event items' effect, bear case", "%", "percent"),
+    "event_base": ("quarterly", "Event items' effect, base case", "%", "percent"),
+    "event_bull": ("quarterly", "Event items' effect, bull case", "%", "percent"),
     "eps_bear": ("quarterly", "Bear EPS", "", "eps"),
     "eps_base": ("quarterly", "Base EPS", "", "eps"),
     "eps_bull": ("quarterly", "Bull EPS", "", "eps"),
@@ -110,6 +117,7 @@ SIGNALS = {
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
     "rate_anchor": ("daily", "P/E anchor after the rate model", "x", "multiple"),
     "acceptable_pe": ("daily", "Acceptable P/E", "x", "multiple"),
+    "margin_base": ("quarterly", "Base (forward) net margin", "%", "share"),
     "held_clean_eps": ("daily", "Clean trailing EPS (held)", "", "eps"),
     "now_yield": ("daily", "Model N-year yield at today's rate", "%", "rate"),
     "now_anchor": ("daily", "P/E anchor at today's rate", "x", "multiple"),
@@ -146,11 +154,14 @@ BLOCKS = {
     "scenario_engine": dict(
         title="Scenario engine", rate="quarterly", role="Param: growth, margins",
         inputs=["clean_eps", "revenue_yoy", "net_margin", "event_effect"],
-        outputs=["growth_bear", "growth_base", "growth_bull", "eps_bear", "eps_base", "eps_bull"],
-        params={"growth_follow": "Base growth as a share of trailing growth", "growth_floor": "Base growth floor %",
-                "growth_cap": "Base growth cap %", "bear_growth_gap": "Bear: growth points below base",
-                "bull_growth_gap": "Bull: growth points above base", "bear_margin_pts": "Bear: margin change, points",
-                "base_margin_pts": "Base: margin change, points", "bull_margin_pts": "Bull: margin change, points"}),
+        outputs=["growth_bear", "growth_base", "growth_bull", "margin_base", "eps_bear", "eps_base", "eps_bull"],
+        params={"forward_growth": "Forward revenue growth % (blank = auto rule)",
+                "forward_margin": "Forward net margin % (blank = auto rule)",
+                "bear_growth_gap": "Bear: growth points below forward", "bull_growth_gap": "Bull: growth points above forward",
+                "bear_margin_pts": "Bear: margin points vs forward", "bull_margin_pts": "Bull: margin points vs forward",
+                "growth_follow": "Auto rule: base growth as a share of trailing growth",
+                "growth_floor": "Auto rule: base growth floor %", "growth_cap": "Auto rule: base growth cap %",
+                "base_margin_pts": "Auto rule: base margin change, points"}),
     "risk_weighting": dict(
         title="Risk weighting", rate="quarterly", role="Param: scenario weights",
         inputs=["eps_bear", "eps_base", "eps_bull"], outputs=["risk_adjusted_eps"],
@@ -187,8 +198,8 @@ PRESETS = {
                  "the bear case already carries them."),
         "params": {
             "manual_eps": 1.64, "eps_haircut_pct": 11.0, "growth_follow": 0.7, "fallback_yoy": 40.0,
-            "fallback_margin": 9.8, "bear_growth_gap": 28.0, "bull_growth_gap": 16.0, "bear_margin_pts": -1.0,
-            "base_margin_pts": 4.0, "bull_margin_pts": 7.0, "peer_weight": 1.0,
+            "fallback_margin": 9.8, "bear_growth_gap": 28.0, "bull_growth_gap": 16.0, "bear_margin_pts": -5.0,
+            "base_margin_pts": 4.0, "bull_margin_pts": 3.0, "peer_weight": 1.0,
         },
         "register": [
             ["Cyclicality: 2027 is probably near peak earnings", RISK, GENERAL, BEYOND, np.nan, np.nan, 3.0, MODELLED,
@@ -232,12 +243,13 @@ def preset_params(ticker):
 
 def empty_register():
     return pd.DataFrame(columns=REGISTER_COLUMNS).astype({column: float for column in
-                                                          ["Probability %", "EPS impact %", "P/E points"]})
+                                                          ["Probability %", "EPS impact %", "P/E points",
+                                                           "Bull prob adj", "Bear prob adj"]})
 
 
 def preset_register(ticker):
     rows = PRESETS.get(str(ticker).upper(), {}).get("register")
-    return clean_register(pd.DataFrame(rows, columns=REGISTER_COLUMNS)) if rows else empty_register()
+    return clean_register(pd.DataFrame(rows, columns=REGISTER_COLUMNS[:len(rows[0])])) if rows else empty_register()
 
 
 def _choice(value, choices, default):
@@ -269,6 +281,8 @@ def clean_register(register):
     for column in ["Probability %", "EPS impact %", "P/E points"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").abs()
     frame["Probability %"] = frame["Probability %"].clip(upper=100)
+    for column in CASE_ADJUST.values():
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0).clip(-100, 100)
     return frame[frame["Item"] != ""].reset_index(drop=True)
 
 
@@ -276,26 +290,32 @@ def route_items(register, params=None):
     """Triage gate and item router for every item.
 
     Adds ``Route`` (which block the item feeds), ``Effect`` (expected EPS change in % for the scenario engine, P/E
-    points for the multiple builder; negative for a risk, positive for a product) and ``Gate`` (``Modelled`` or the
+    points for the multiple builder; negative for a risk, positive for a product), ``Effect Bear/Base/Bull`` (the
+    same at each case's probability: the forward one plus the item's bull or bear adjustment) and ``Gate`` (``Modelled`` or the
     reason the item is parked). An event inside the forecast year goes to the scenario engine; a general item or
     anything beyond the horizon goes to the multiple builder.
     """
 
     params = model_params(params)
     frame = clean_register(register)
-    routes, effects, gates = [], [], []
+    routes, effects, gates, by_case = [], [], [], {name: [] for name in SCENARIOS}
     for row in frame.to_dict("records"):
         sign = -1.0 if row["Type"] == RISK else 1.0
-        probability = row["Probability %"] / 100 if pd.notna(row["Probability %"]) else np.nan
+        forward = row["Probability %"]
+        case_probability = {"Base": forward, **{name: float(np.clip(forward + row[column], 0, 100))
+                                                if pd.notna(forward) else np.nan
+                                                for name, column in CASE_ADJUST.items()}}
         if row["Kind"] == EVENT and row["Timing"] == IN_HORIZON:
             route, bar, unit = TO_SCENARIOS, params["materiality_eps_pct"], "% of EPS"
-            effect = sign * probability * row["EPS impact %"]
+            case_effect = {name: sign * value / 100 * row["EPS impact %"] for name, value in case_probability.items()}
             needs = "a probability and an EPS impact"
         else:
             route, bar, unit = TO_MULTIPLE, params["materiality_pe"], "P/E points"
-            weight = probability if row["Kind"] == EVENT and pd.notna(probability) else 1.0
-            effect = sign * weight * row["P/E points"]
+            event = row["Kind"] == EVENT and pd.notna(forward)
+            case_effect = {name: sign * (value / 100 if event else 1.0) * row["P/E points"]
+                           for name, value in case_probability.items()}
             needs = "P/E points"
+        effect = case_effect["Base"]
         if not np.isfinite(effect):
             gate, effect = f"Parked: not sized (needs {needs})", np.nan
         elif row["Status"] != MODELLED:
@@ -307,7 +327,11 @@ def route_items(register, params=None):
         routes.append(route)
         effects.append(effect)
         gates.append(gate)
+        for name in SCENARIOS:
+            by_case[name].append(case_effect[name] if np.isfinite(effect) else np.nan)
     frame["Route"], frame["Effect"], frame["Gate"] = routes, effects, gates
+    for name in SCENARIOS:
+        frame[f"Effect {name}"] = by_case[name]
     return frame
 
 
@@ -332,6 +356,27 @@ def item_effects(routed, on=None):
     return max(-1.0, float(events)), float(points)
 
 
+def case_effects(routed, on, params):
+    """Modelled items in force on ``on``, per case: ({case: EPS change as a fraction}, P/E points).
+
+    The EPS change differs by case (each case has its own probability); the P/E points are the scenario-weighted
+    average over the cases, because there is one acceptable P/E.
+    """
+
+    if routed is None or routed.empty:
+        return {name: 0.0 for name in SCENARIOS}, 0.0
+    active = routed[routed["Gate"] == MODELLED]
+    if on is not None and not active.empty:
+        since = _since_dates(active)
+        active = active[since.isna() | (since <= pd.Timestamp(on))]
+    column = {name: f"Effect {name}" if f"Effect {name}" in active else "Effect" for name in SCENARIOS}
+    events = {name: max(-1.0, float(active.loc[active["Route"] == TO_SCENARIOS, column[name]].sum() / 100))
+              for name in SCENARIOS}
+    points = sum(weight * float(active.loc[active["Route"] == TO_MULTIPLE, column[name]].sum())
+                 for weight, name in zip(scenario_weights(params), SCENARIOS))
+    return events, float(points)
+
+
 def scenario_weights(params):
     """Bear, base and bull weights as fractions that sum to 1 (equal weights when all are zero)."""
 
@@ -339,26 +384,50 @@ def scenario_weights(params):
     return raw / raw.sum() if raw.sum() > 0 else np.full(len(SCENARIOS), 1 / len(SCENARIOS))
 
 
-def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0):
+def base_growth_and_margin(revenue_yoy, net_margin, params, forward=False):
+    """(trailing growth, base growth, current margin, base margin), all in %.
+
+    The base (forward) growth and margin are yours on the latest quarter (``forward``) when set; otherwise, and on
+    every earlier quarter, the auto rule: a share of the trailing growth within a floor and cap, and the current margin
+    plus the base margin change.
+    """
+
+    yoy = revenue_yoy if np.isfinite(revenue_yoy) else params["fallback_yoy"]
+    margin = net_margin if np.isfinite(net_margin) and net_margin > 0 else params["fallback_margin"]
+    growth = float(np.clip(params["growth_follow"] * yoy, params["growth_floor"], params["growth_cap"]))
+    base_margin = margin + params["base_margin_pts"]
+    if forward and np.isfinite(params.get("forward_growth", np.nan)):
+        growth = float(params["forward_growth"])
+    if forward and np.isfinite(params.get("forward_margin", np.nan)):
+        base_margin = float(params["forward_margin"])
+    return yoy, growth, margin, base_margin
+
+
+def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, forward=False):
     """The quarterly chain for one date: earnings quality, scenario engine and risk weighting.
 
     ``revenue_yoy`` and ``net_margin`` are in %; ``event_effect`` is the fraction of EPS the modelled event items are
-    expected to add or remove. Each case grows the clean EPS with revenue and scales it by the change in net margin.
+    expected to add or remove, one number or one per case. Each case grows the clean EPS with its revenue growth (the
+    base growth plus or minus the case's adjustment) and scales it by its net margin (the base margin plus the case's
+    adjustment) over the current one. ``forward``: the latest quarter, where your forward growth and margin apply.
     """
 
     clean = ttm_eps * (1 - params["eps_haircut_pct"] / 100)
-    yoy = revenue_yoy if np.isfinite(revenue_yoy) else params["fallback_yoy"]
-    margin = net_margin if np.isfinite(net_margin) and net_margin > 0 else params["fallback_margin"]
-    base_growth = float(np.clip(params["growth_follow"] * yoy, params["growth_floor"], params["growth_cap"]))
+    _, base_growth, margin, base_margin = base_growth_and_margin(revenue_yoy, net_margin, params, forward)
     growth = {"Bear": base_growth - params["bear_growth_gap"], "Base": base_growth,
               "Bull": base_growth + params["bull_growth_gap"]}
-    point = {"clean_eps": clean, "event_effect": event_effect * 100, "quality_pe": -abs(float(params["quality_pe_pts"]))}
+    case_margin = {"Bear": base_margin + params["bear_margin_pts"], "Base": base_margin,
+                   "Bull": base_margin + params["bull_margin_pts"]}
+    events = event_effect if isinstance(event_effect, dict) else {name: event_effect for name in SCENARIOS}
+    weights = scenario_weights(params)
+    point = {"clean_eps": clean, "event_effect": float(sum(w * events[n] for w, n in zip(weights, SCENARIOS))) * 100,
+             "quality_pe": -abs(float(params["quality_pe_pts"])), "margin_base": base_margin}
     for name in SCENARIOS:
         key = name.lower()
-        margin_ratio = max(0.0, margin + params[f"{key}_margin_pts"]) / margin if margin > 0 else 1.0
+        margin_ratio = max(0.0, case_margin[name]) / margin if margin > 0 else 1.0
         point[f"growth_{key}"] = growth[name]
-        point[f"eps_{key}"] = clean * (1 + growth[name] / 100) * margin_ratio * (1 + event_effect)
-    weights = scenario_weights(params)
+        point[f"event_{key}"] = events[name] * 100
+        point[f"eps_{key}"] = clean * (1 + growth[name] / 100) * margin_ratio * (1 + events[name])
     point["risk_adjusted_eps"] = float(sum(weight * point[f"eps_{name.lower()}"]
                                            for weight, name in zip(weights, SCENARIOS)))
     return point
@@ -489,10 +558,13 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     updates = updates.sort_values().unique()
     held = inputs.reindex(inputs.index.union(updates)).ffill().reindex(updates) if len(updates) else inputs
     rows = []
+    last_release = inputs.index.max() if len(inputs) else None
     for when, row in held.iterrows():
         ttm_eps = params["manual_eps"] if params["manual_eps"] > 0 else row.get("ttm_eps", np.nan)
-        events, points = item_effects(routed, when)
-        point = scenario_point(ttm_eps, row.get("revenue_yoy", np.nan), row.get("net_margin", np.nan), params, events)
+        events, points = case_effects(routed, when, params)
+        forward = last_release is None or when >= last_release
+        point = scenario_point(ttm_eps, row.get("revenue_yoy", np.nan), row.get("net_margin", np.nan), params, events,
+                               forward)
         since = _since_dates(routed)
         in_force = (routed["Gate"] == MODELLED) & (since.isna() | (since <= when))
         rows.append({**row.to_dict(), "ttm_eps": ttm_eps, **point, "pe_adjust": points,
@@ -579,7 +651,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         # Keep the update in force on the first day shown.
         before = quarterly.loc[:pd.Timestamp(start)]
         quarterly = quarterly.loc[before.index[-1]:] if len(before) else quarterly
-    return {"quarterly": quarterly, "daily": daily, "items": routed, "params": params}
+    return {"quarterly": quarterly, "daily": daily, "items": routed, "params": params, "forward_from": last_release}
 
 
 def latest_values(result, on=None):
@@ -604,8 +676,9 @@ def latest_values(result, on=None):
 def _point_price(state, params, routed):
     """Model price from one day's held inputs: the whole chain as one function of the parameters and items."""
 
-    events, points = item_effects(routed, state["on"])
-    point = scenario_point(state["ttm_eps"], state["revenue_yoy"], state["net_margin"], params, events)
+    events, points = case_effects(routed, state["on"], params)
+    point = scenario_point(state["ttm_eps"], state["revenue_yoy"], state["net_margin"], params, events,
+                           state.get("forward", True))
     eps = point["risk_adjusted_eps"]
     if not np.isfinite(eps) or not np.isfinite(state["anchor"]):
         return np.nan
@@ -622,7 +695,15 @@ def _day_state(result, values, on):
     return {"on": on, "ttm_eps": values.get("ttm_eps", np.nan), "revenue_yoy": values.get("revenue_yoy", np.nan),
             "net_margin": values.get("net_margin", np.nan), "anchor": anchor,
             "own_anchor": day.get("own_anchor", np.nan), "peer_anchor": day.get("peer_anchor", np.nan),
-            "policy_rate": day.get("policy_rate", np.nan), "yield_ref": day.get("yield_ref", np.nan)}
+            "policy_rate": day.get("policy_rate", np.nan), "yield_ref": day.get("yield_ref", np.nan),
+            "forward": _is_forward(result, on)}
+
+
+def _is_forward(result, on):
+    """True on and after the latest release, where your forward growth and margin apply."""
+
+    start = result.get("forward_from")
+    return start is None or pd.Timestamp(on) >= start
 
 
 def has_rates(result):
@@ -710,11 +791,10 @@ def implied_dials(result, on=None):
     add("Growth in every case", "Scenario engine", 0.0, -60, 60, (-15, 15), "pts",
         lambda shift: _shifted_growth_price(state, params, routed, shift))
     add("Net margin in every case", "Scenario engine", 0.0, -30, 30, (-5, 5), "pts",
-        lambda shift: _point_price(state, {**params, **{f"{name.lower()}_margin_pts": params[f"{name.lower()}_margin_pts"] + shift
-                                                        for name in SCENARIOS}}, routed))
+        lambda shift: _point_price(state, _shifted_margin_params(state, params, shift), routed))
     add("EPS haircut", "Earnings quality", params["eps_haircut_pct"], 0, 90, (0, 30), "%",
         lambda haircut: _point_price(state, {**params, "eps_haircut_pct": haircut}, routed))
-    events, points = item_effects(routed, on)
+    events, points = case_effects(routed, on, params)
     points -= abs(float(params["quality_pe_pts"]))
     add("Acceptable P/E", "Multiple builder", float(np.clip(anchor + points, params["pe_floor"], params["pe_cap"])),
         1, 100, (params["pe_floor"], params["pe_cap"]), "x",
@@ -732,15 +812,10 @@ def implied_dials(result, on=None):
         # A risk can only pull the model price down, a product can only lift it.
         helps = (row["Type"] == RISK) == model_above if parked else True
         if row["Route"] == TO_SCENARIOS:
-            impact = row["EPS impact %"] if pd.notna(row["EPS impact %"]) else 10.0
             now = 0.0 if parked else row["Probability %"]
 
-            def with_probability(probability, position=position, impact=impact):
-                trial = routed.copy()
-                sign = -1.0 if trial.at[position, "Type"] == RISK else 1.0
-                trial.at[position, "Effect"], trial.at[position, "Gate"] = sign * probability / 100 * impact, MODELLED
-                trial.at[position, "Since"] = ""
-                return _point_price(state, params, trial)
+            def with_probability(probability, position=position):
+                return _point_price(state, params, _reroute(routed, position, params, probability=probability))
 
             if helps:
                 add(f"{label}: probability", TO_SCENARIOS, now, 0, 100, (max(0, now - 30), min(100, now + 30)), "%",
@@ -752,11 +827,7 @@ def implied_dials(result, on=None):
             now = 0.0 if parked else abs(row["Effect"])
 
             def with_points(size, position=position):
-                trial = routed.copy()
-                sign = -1.0 if trial.at[position, "Type"] == RISK else 1.0
-                trial.at[position, "Effect"], trial.at[position, "Gate"] = sign * size, MODELLED
-                trial.at[position, "Since"] = ""
-                return _point_price(state, params, trial)
+                return _point_price(state, params, _reroute(routed, position, params, effect=size))
 
             if helps:
                 add(f"{label}: P/E points", TO_MULTIPLE, now, 0, 30, (0, now + 3), "pts", with_points)
@@ -766,13 +837,131 @@ def implied_dials(result, on=None):
     return pd.DataFrame(rows, columns=DIAL_COLUMNS)
 
 
+def _reroute(routed, position, params, probability=None, effect=None):
+    """The routed items with one item modelled from the day it is tried, at a trial probability or P/E size.
+
+    ``probability``: the item's forward probability (its bull and bear adjustments still apply; an item without an
+    EPS impact is tried at 10%). ``effect``: the item's P/E points at the forward probability, the cases scaled alike.
+    """
+
+    trial = routed.copy()
+    row = trial.loc[[position]].copy()
+    row["Status"], row["Since"] = MODELLED, ""
+    if probability is not None:
+        row["Probability %"] = probability
+        if row.at[position, "Route"] == TO_SCENARIOS and not pd.notna(row.at[position, "EPS impact %"]):
+            row["EPS impact %"] = 10.0
+    redone = route_items(row, params).iloc[0]
+    columns = ["Effect"] + [f"Effect {name}" for name in SCENARIOS]
+    values = {column: redone[column] for column in columns}
+    if effect is not None:
+        sign = -1.0 if row.at[position, "Type"] == RISK else 1.0
+        base = values["Effect"]
+        scale = {column: (values[column] / base if np.isfinite(base) and base != 0 and np.isfinite(values[column]) else 1.0)
+                 for column in columns}
+        values = {column: sign * abs(effect) * scale[column] for column in columns}
+    for column, value in values.items():
+        trial.at[position, column] = value
+    trial.at[position, "Gate"], trial.at[position, "Since"] = MODELLED, ""
+    return trial
+
+
+def market_implied_probabilities(result, on=None):
+    """For each item with a probability to set: the probability that alone makes the model price equal the close.
+
+    Everything else stays as set (the item's own bull and bear adjustments included). NaN when no probability from 0
+    to 100% does it alone, or when the item has no probability (a general item, or no EPS impact or P/E points).
+    Indexed like the register.
+    """
+
+    values = latest_values(result, on)
+    routed = result["items"]
+    out = pd.Series(np.nan, index=routed.index, dtype=float)
+    if not values or not np.isfinite(values.get("close", np.nan)) or not np.isfinite(values.get("model_price", np.nan)):
+        return out
+    params = result["params"]
+    on = pd.Timestamp(on) if on is not None else result["daily"].index[-1]
+    state = _day_state(result, values, on)
+    for position, row in routed.iterrows():
+        sized = (row["Route"] == TO_SCENARIOS
+                 or (row["Kind"] == EVENT and pd.notna(row["P/E points"])))
+        if not sized:
+            continue
+        needed = _solve(lambda p, position=position: _point_price(state, params, _reroute(routed, position, params, probability=p)),
+                        0, 100, values["close"])
+        out[position] = needed if needed is not None else np.nan
+    return out
+
+
+CASE_ROWS = {"Revenue growth %": ("revenue_yoy", "growth_base", "forward_growth", "bull_growth_gap", "bear_growth_gap"),
+             "Net margin %": ("net_margin", "margin_base", "forward_margin", "bull_margin_pts", "bear_margin_pts")}
+CASE_COLUMNS = ["Metric", "Current", "Forward", "Bull adj", "Bear adj", "Forward from"]
+
+
+def case_table(result, params=None):
+    """Growth and margin now and forward, with the bull and bear adjustments, as the Forward table shows them.
+
+    Current: the latest reported trailing value. Forward: yours if set, else the auto rule. Bull and bear adjustments
+    are points added to the forward value (the bear growth gap shows as a negative number).
+    """
+
+    params = model_params(params if params is not None else result["params"])
+    values = latest_values(result)
+    yoy, growth, margin, base_margin = base_growth_and_margin(values.get("revenue_yoy", np.nan),
+                                                              values.get("net_margin", np.nan), params, forward=True)
+    current = {"Revenue growth %": values.get("revenue_yoy", np.nan), "Net margin %": values.get("net_margin", np.nan)}
+    forward = {"Revenue growth %": growth, "Net margin %": base_margin}
+    rows = []
+    for metric, (_, _, key, bull, bear) in CASE_ROWS.items():
+        bear_value = -abs(params[bear]) if key == "forward_growth" else params[bear]
+        rows.append({"Metric": metric, "Current": current[metric], "Forward": forward[metric],
+                     "Bull adj": params[bull], "Bear adj": bear_value,
+                     "Forward from": "you" if np.isfinite(params.get(key, np.nan)) else "auto rule"})
+    return pd.DataFrame(rows, columns=CASE_COLUMNS)
+
+
+def case_table_changes(before, after, params):
+    """Parameter updates from an edited case table (``before`` as ``case_table`` drew it, ``after`` as edited).
+
+    A forward value left as drawn keeps its source (auto stays auto); a changed one becomes yours; a cleared one goes
+    back to the auto rule. Returns {parameter: value}.
+    """
+
+    updates = {}
+    before, after = before.set_index("Metric"), pd.DataFrame(after).set_index("Metric")
+    for metric, (_, _, key, bull, bear) in CASE_ROWS.items():
+        if metric not in after.index:
+            continue
+        old, new = before.loc[metric], after.loc[metric]
+        if pd.isna(new["Forward"]):
+            if np.isfinite(params.get(key, np.nan)):
+                updates[key] = np.nan
+        elif pd.isna(old["Forward"]) or abs(float(new["Forward"]) - float(old["Forward"])) > 1e-9:
+            updates[key] = float(new["Forward"])
+        for column, name in [("Bull adj", bull), ("Bear adj", bear)]:
+            value = new[column]
+            if pd.notna(value) and abs(float(value) - float(old[column])) > 1e-9:
+                updates[name] = abs(float(value)) if key == "forward_growth" else float(value)
+    return updates
+
+
 def _shifted_growth_price(state, params, routed, shift):
     """Model price with ``shift`` points added to the growth of every case."""
 
-    yoy = state["revenue_yoy"] if np.isfinite(state["revenue_yoy"]) else params["fallback_yoy"]
-    base = float(np.clip(params["growth_follow"] * yoy, params["growth_floor"], params["growth_cap"])) + shift
-    fixed = {**params, "growth_follow": 1.0, "growth_floor": base, "growth_cap": base}
+    _, base, _, _ = base_growth_and_margin(state["revenue_yoy"], state["net_margin"], params, state.get("forward", True))
+    base += shift
+    fixed = {**params, "growth_follow": 1.0, "growth_floor": base, "growth_cap": base, "fallback_yoy": base,
+             "forward_growth": base}
+    state = {**state, "revenue_yoy": base}
     return _point_price(state, fixed, routed)
+
+
+def _shifted_margin_params(state, params, shift):
+    """Parameters with ``shift`` points added to the net margin of every case (the base, which the cases follow)."""
+
+    if state.get("forward", True) and np.isfinite(params.get("forward_margin", np.nan)):
+        return {**params, "forward_margin": params["forward_margin"] + shift}
+    return {**params, "base_margin_pts": params["base_margin_pts"] + shift}
 
 
 def sensitivities(result, on=None):
@@ -794,8 +983,7 @@ def sensitivities(result, on=None):
         "10 points more bear weight": _point_price(state, more_bear, routed) - base,
         "1x more P/E": values.get("held_eps", np.nan),
         "1 point more growth": _shifted_growth_price(state, params, routed, 1.0) - base,
-        "1 point more net margin": _point_price(state, {**params, **{
-            f"{name.lower()}_margin_pts": params[f"{name.lower()}_margin_pts"] + 1 for name in SCENARIOS}}, routed) - base,
+        "1 point more net margin": _point_price(state, _shifted_margin_params(state, params, 1.0), routed) - base,
     }
     if has_rates(result):
         used = result["daily"].loc[:on, "forward_rate"].iloc[-1]
@@ -899,7 +1087,8 @@ def register_changes(before, after):
     for name in new:
         if name not in old:
             continue
-        for column in ["Type", "Kind", "Timing", "Probability %", "EPS impact %", "P/E points", "Status", "Since"]:
+        for column in ["Type", "Kind", "Timing", "Probability %", "Bull prob adj", "Bear prob adj", "EPS impact %",
+                       "P/E points", "Status", "Since"]:
             was, now = old[name][column], new[name][column]
             both_empty = _is_empty(was) and _is_empty(now)
             if not both_empty and was != now:
