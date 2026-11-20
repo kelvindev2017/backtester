@@ -1178,6 +1178,7 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     assert app.metric[0].value != before
     # The forward assumptions sit together; the Now vs forward table shows what they do.
     assert any(expander.label == "Forward assumptions" for expander in app.expander)
+    assert any(expander.label.startswith("Model check") for expander in app.expander)
     headings = [element.value for element in app.markdown]
     assert "**Growth and margin** · Scenario engine" in headings
     assert "**ASMVY price against growth and gross margin**" in headings

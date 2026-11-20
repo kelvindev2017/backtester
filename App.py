@@ -159,6 +159,13 @@ from analysis.signal_groups import (
     overlay_frame,
     period_start,
 )
+from analysis.model_advisor import (
+    MARKET_SYMBOL,
+    fundamental_pe_with,
+    market_beta,
+    model_checks,
+    suggestions,
+)
 from analysis.valuation_chart import (
     DOWN_COLOR,
     expected_growth_check,
@@ -4991,8 +4998,10 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing",
                  revenue_quarters=int(quarters["Revenue"].notna().sum()) if "Revenue" in quarters else 0,
                  source=source, peers_found=list(peer_pe), peers_missing=[peer for peer in peers if peer not in peer_pe],
                  growth_check=growth_check)
+    market = load_data(MARKET_SYMBOL, load_start, end, "Daily")
+    market_close = market["Close"] if not market.empty and "Close" in market else pd.Series(dtype=float)
     return SimpleNamespace(close=prices["Close"], quarters=quarters, peer_pe=pd.DataFrame(peer_pe), own_pe=own_pe,
-                           start=start, found=found)
+                           start=start, found=found, market_close=market_close)
 
 
 def model_data_note(found, params):
@@ -5108,6 +5117,44 @@ def render_market_check(result):
                    + "; ".join(f"{name} {value:+,.2f}" for name, value in steps.items() if np.isfinite(value))
                    + ". Use the table to decide which assumption to look at again, not to fit the model to the "
                      "price: a model tuned until the gap is zero can only ever say the stock is fairly priced.")
+
+
+def render_model_check(result, inputs):
+    """Where the model is likely off for this stock, and forward values worked out from its data, ready to apply."""
+
+    beta = market_beta(inputs.close, getattr(inputs, "market_close", None))
+    analysts = inputs.found.get("growth_check", (np.nan, np.nan))[0]
+    checks = model_checks(result, beta, analysts)
+    proposed = suggestions(result, beta, analysts)
+    fixes = int((checks["Level"] == "Fix").sum()) if not checks.empty else 0
+    label = (f"Model check: {len(checks)} thing{'s' if len(checks) != 1 else ''} to look at"
+             + (f", {fixes} to fix" if fixes else "") if len(checks) else "Model check: nothing stands out")
+    with st.expander(label, expanded=bool(fixes)):
+        if not checks.empty:
+            st.dataframe(checks, hide_index=True, width="stretch")
+        if proposed.empty:
+            st.caption("No suggestions: the forward values already match what the data points to.")
+            return
+        st.markdown("**Suggested forward values** (from the stock's own data, never from its price)")
+        st.dataframe(proposed[["Label", "Now", "Suggested", "Why"]], hide_index=True, width="stretch",
+                     column_config={"Now": st.column_config.NumberColumn(format="%.1f"),
+                                    "Suggested": st.column_config.NumberColumn(format="%.1f")})
+        after = fundamental_pe_with(result, {row["Parameter"]: row["Suggested"] for row in proposed.to_dict("records")
+                                             if row["Parameter"].startswith("forward_")})
+        now = latest_values(result).get("outside_forward", np.nan)
+        if np.isfinite(after) and np.isfinite(now) and result["params"]["anchor_source"] == "Fundamentals":
+            st.caption(f"With them the fundamental P/E goes from {now:.1f}x to {after:.1f}x (before register items, "
+                       "quality and premium).")
+        if st.button("Apply the suggestions", key="model_apply_suggestions",
+                     help="Fills them in under Forward assumptions, where you can still change each one."):
+            for row in proposed.to_dict("records"):
+                st.session_state[model_param_key(row["Parameter"])] = float(row["Suggested"])
+            log_model_change([f"{row['Label']}: {row['Suggested']:g} (suggested)" for row in proposed.to_dict("records")],
+                             st.session_state.get("model_last_price"))
+            bump_forward_version()
+            st.rerun()
+        st.caption("Starting points, not answers: the suggestions keep the market price out on purpose, so whatever "
+                   "gap is left shows up as the market premium.")
 
 
 def render_now_and_forward(result):
@@ -5339,6 +5386,7 @@ def render_valuation_model():
     tiles[2].metric("Risk-adjusted EPS", signal_text(values, "risk_adjusted_eps"))
     tiles[3].metric("Acceptable P/E", signal_text(values, "acceptable_pe"))
     render_now_and_forward(result)
+    render_model_check(result, inputs)
 
     blocks = list(MODEL_BLOCKS)
     if st.session_state.get("model_block") not in blocks:
