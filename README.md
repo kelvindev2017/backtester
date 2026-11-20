@@ -156,9 +156,11 @@ numbers sums it up, and the price chart adds the "now" price as a dotted line.
 
 With the **Forward** P/E basis, past forward P/Es carry no hindsight: before the latest report they use the trailing
 EPS grown by half of its past year's growth (within -20% and +100% by default, settable in the Multiple builder so
-a fast grower is not cut to an ordinary one), not the EPS reported later, which would make the past P/E collapse
+a fast grower is not cut to an ordinary one) or, when trailing EPS is below its 3-year average, half of the gap
+back (whichever is higher, as the market values a cyclical in a slump), not the EPS reported later, which would make the past P/E collapse
 before a boom and explode before a slump. Analyst estimates are used from the latest report on; the data note
-compares the rule's growth with the analysts' on that day, to help tune it.
+compares the rule's growth with the analysts' on that day, to help tune it. A peer P/E above the P/E cap (earnings
+near zero) sits out that day's peer median, like a loss; the Multiple builder's inspector charts each peer's P/E.
 
 Inputs are signals (results, prices, the risk and product register); everything you choose is a parameter of the
 block that owns it, set in the settings: the EPS haircut, the growth and margin of each case, the scenario weights,

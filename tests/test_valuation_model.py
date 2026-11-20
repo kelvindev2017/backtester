@@ -467,3 +467,20 @@ def test_item_probability_moves_with_the_case_and_the_market_implies_one():
     # A general item has no probability to imply.
     general = register([["Cycle", "Risk", "General", "In horizon", None, None, 2, "Modelled", "", ""]])
     assert market_implied_probabilities(run_model(quarters, close, general, flat, peers)).isna().all()
+
+
+def test_a_peer_p_e_above_the_cap_sits_out_the_median():
+    from analysis.valuation_model import case_table
+    quarters = make_quarters()
+    close = make_close(quarters)
+    peers = pd.DataFrame({"AAA": 20.0, "BBB": 30.0, "CCC": 400.0}, index=close.index)
+    result = run_model(quarters, close, None, model_params({"pe_cap": 100.0}), peers)
+    values = latest_values(result)
+    assert values["peer_anchor"] == pytest.approx(25.0) and values["peers_used"] == 2
+    assert list(result["peer_pe"].columns) == ["AAA", "BBB", "CCC"] and result["peer_pe"]["CCC"].iloc[-1] == 400.0
+    # Without a reported growth or margin, Current shows the fallback the model runs on, and says so.
+    no_revenue = run_model(quarters[["EPS"]], close, None, model_params({"fallback_yoy": 40.0, "fallback_margin": 9.8}), peers)
+    table = case_table(no_revenue).set_index("Metric")
+    assert table.loc["Revenue growth %", "Current"] == 40.0 and table.loc["Net margin %", "Current"] == 9.8
+    assert (table["Current from"] == "fallback").all()
+    assert (case_table(result)["Current from"] == "reported").all()
