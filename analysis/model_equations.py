@@ -48,8 +48,12 @@ EQUATIONS = {
         r"\Delta y_{\text{peers}} = y_N(r_f) - y_N(r_{\text{today}})",
     ],
     "multiple_builder": [
-        r"\text{P/E}^{r}_{x} = \frac{1}{1 / \text{P/E}_{x} + t \times \Delta y_{x} / 100}",
-        r"\begin{aligned} \text{anchor} = {} & k \times \text{P/E}^{r}_{\text{peers}} \\ & + (1 - k) \times \text{P/E}^{r}_{\text{own}} \end{aligned}",
+        r"h = h_{\min} + (h_{\max} - h_{\min}) \times \operatorname{clip}\!\left(\frac{GM - GM_{\text{low}}}{GM_{\text{high}} - GM_{\text{low}}}, 0, 1\right)",
+        r"\ln(1 + g_t) = \ln(1 + g_T) + \big(\ln(1 + g) - \ln(1 + g_T)\big)\, 0.5^{t/h}",
+        r"E_1 = 1, \quad E_{t+1} = E_t (1 + g_t)",
+        r"\text{P/E}_{\text{fund}} = \sum_{t=1}^{40} \frac{E_t}{(1+r)^t} + \frac{E_{41}}{(r - g_T)(1+r)^{40}}, \qquad r = y_N + \text{ERP}",
+        r"\text{P/E}^{r}_{\text{own}} = \frac{1}{1 / \text{P/E}_{\text{own}} + t \times \Delta y_{\text{own}} / 100}",
+        r"\begin{aligned} \text{anchor} = {} & k \times \text{P/E}_{\text{outside}} \\ & + (1 - k) \times \text{P/E}^{r}_{\text{own}} \end{aligned}",
         r"\begin{aligned} \text{P/E}_{\text{acc}} = {} & \text{anchor} + a - d_q, \\ & \text{kept between floor and cap} \end{aligned}",
     ],
     "product": [r"\text{Model price} = \text{EPS}_{\text{risk}} \times \text{P/E}_{\text{acc}}"],
@@ -73,7 +77,10 @@ SYMBOLS = {
                   "the policy rate that reaches the N-year yield, tp: term premium (it cancels out of both Δy). "
                   "Δy_own compares with the years the own P/E median covers; Δy_peers is only the forward rate's "
                   "surprise, because the peers' P/E is today's and already prices today's rate.",
-    "multiple_builder": "x: own or peers, Δy_x: yield change from the Rate model, t: share of it passed to the P/E "
+    "multiple_builder": "Outside view: P/E_fund (default) or the peers' median P/E (moved by the forward rate's yield change "
+                        "like the own one). g: revenue growth a year over the growth history (within floor and cap), GM: gross "
+                        "margin %, h: half-life in years of the growth above g_T (longer with a higher gross margin), g_T: terminal growth, y_N: the Rate model's yield (or the "
+                        "base yield), ERP: equity risk premium. x: own or peers, Δy_x: yield change from the Rate model, t: share of it passed to the P/E "
                         "(the earnings yield 1/P/E moves point for point with the required return). k: share of the anchor from peers, P/E peers and own: their medians over the look-back, "
                         "a: P/E points from register items, d_q: earnings quality P/E deduction. P/E is trailing or "
                         "forward, as chosen.",
@@ -161,18 +168,31 @@ def worked_equations(result, block, on=None):
         anchor = get("rate_anchor")
         sign = '+' if not get('held_pe_adjust') < 0 else '-'
         passed = params["rate_pass_through"]
-        raw_peer, raw_own = get('peer_anchor'), get('own_anchor')
+        fundamentals = params["anchor_source"] == "Fundamentals"
+        raw_peer, raw_own = get('outside_anchor'), get('own_anchor')
         # The anchors after the rate model (the same as before it when no policy rate is loaded).
-        peer = rate_adjusted_pe(raw_peer, get("forward_gap") if np.isfinite(get("forward_gap")) else 0.0, passed)
+        peer = (get("fundamental_pe") if fundamentals else
+                rate_adjusted_pe(raw_peer, get("forward_gap") if np.isfinite(get("forward_gap")) else 0.0, passed))
+        if fundamentals and np.isfinite(get("forward_gap")) and get("forward_gap") != 0:
+            peer = np.nan  # shown below: the fundamental P/E at the forward yield
         own = rate_adjusted_pe(raw_own, get("yield_gap") if np.isfinite(get("yield_gap")) else 0.0, passed)
         if np.isfinite(peer) and np.isfinite(own):
             mix = rf"{_n(share)} \times {_n(peer, 1)} + {_n(1 - share)} \times {_n(own, 1)}"
         else:  # only one of them exists: the anchor is that one
-            mix = rf"\text{{{'peers' if np.isfinite(peer) else 'own'} only: }} {_n(peer if np.isfinite(peer) else own, 1)}"
+            mix = rf"\text{{{'outside' if np.isfinite(peer) else 'own'} only: }} {_n(peer if np.isfinite(peer) else own, 1)}"
         lines = [rf"\begin{{aligned}} \text{{anchor}} = {{}} & {mix} \\ = {{}} & {_n(anchor, 1)} \end{{aligned}}",
                 rf"\begin{{aligned}} \text{{P/E}}_{{\text{{acc}}}} = {{}} & {_n(anchor, 1)} {sign} {_n(abs(get('held_pe_adjust')), 1)} - {_n(abs(get('held_quality_pe')), 1)} \\ "
                 rf"& \text{{kept in }} {_n(params['pe_floor'], 0)} \text{{ to }} {_n(params['pe_cap'], 0)} \\ = {{}} & {_n(get('acceptable_pe'), 1)} \end{{aligned}}"]
-        for label, raw, gap in [("own", raw_own, get("yield_gap")), ("peers", raw_peer, get("forward_gap"))]:
+        if fundamentals and np.isfinite(get("fundamental_pe")):
+            margin = get("held_gross_margin")
+            margin_text = _n(margin, 1) + r"\%" if np.isfinite(margin) else r"\text{n/a}"
+            growth = get("held_cagr") if np.isfinite(get("held_cagr")) else params["fallback_yoy"]
+            required = (get("now_yield") if np.isfinite(get("now_yield")) else params["base_yield"]) + params["equity_premium"]
+            years_text, pe_text = _n(get("growth_half_life"), 2), _n(get("fundamental_pe"), 1)
+            lines.insert(0, rf"h = {years_text} \text{{ years}} \quad (GM = {margin_text}), \qquad g = {_n(growth, 1)}\%")
+            lines.insert(1, rf"\text{{P/E}}_{{\text{{fund}}}} = {pe_text} \quad (r = {_n(required, 2)}\%)")
+        pairs = [("own", raw_own, get("yield_gap"))] + ([] if fundamentals else [("peers", raw_peer, get("forward_gap"))])
+        for label, raw, gap in pairs:
             if np.isfinite(raw) and np.isfinite(get("policy_rate")):
                 lines.append(rf"\text{{P/E}}^{{r}}_{{\text{{{label}}}}} = \frac{{1}}{{1 / {_n(raw, 1)} + {_n(passed)} \times {_n(gap, 2)} / 100}}"
                              rf" = {_n(rate_adjusted_pe(raw, gap, passed), 1)}")

@@ -20,7 +20,7 @@ def result():
         ["Cyclicality", "Risk", "General", "Beyond horizon", None, None, 2, "Modelled", "", ""],
         ["Export rules", "Risk", "Event", "In horizon", 20, 60, None, "Parked", "", ""],
     ])
-    return run_model(quarters, close, items, model_params({"peer_weight": 1.0}), peers)
+    return run_model(quarters, close, items, model_params({"peer_weight": 1.0, "anchor_source": "Peers"}), peers)
 
 
 def texts(fig):
@@ -103,3 +103,15 @@ def test_blocks_with_forward_assumptions_show_now_and_forward(result):
     assert now_and_forward_text("rate_model", latest_values(result)) is None
     assert now_and_forward_text("income_map", latest_values(result)) is None
     assert any("(forward)" in label for label in parameter_table(result, "scenario_engine")["Parameter"])
+
+
+def test_price_against_growth_and_gross_margin_on_two_axes():
+    from analysis.model_diagram import price_and_fundamentals_figure
+    quarters = make_quarters().assign(Gross_Profit=lambda frame: frame["Revenue"] * 0.45)
+    close = make_close(quarters)
+    result = run_model(quarters, close, None, model_params({"anchor_source": "Fundamentals", "peer_weight": 1.0}))
+    fig = price_and_fundamentals_figure(result, "TEST")
+    axes = {trace.name: trace.yaxis for trace in fig.data}
+    assert axes["Close"] == axes["Model price"] == "y"
+    assert axes["Revenue growth a year (history)"] == axes["Gross margin"] == "y2"
+    assert fig.data[-1].y[-1] == pytest.approx(45.0)

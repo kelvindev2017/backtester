@@ -993,7 +993,15 @@ def test_valuation_model_tab(offline, monkeypatch):
     assert app.session_state["model_peers"] == "BESIY, KLIC, AMAT, COHU, CAMT"
     assert len(app.session_state["model_register"]) == 10
     rendered = " ".join(element.value for element in app.caption)
-    assert "a typed-in trailing EPS of 1.64" in rendered and "peer P/E from BESIY" in rendered
+    assert "a typed-in trailing EPS of 1.64" in rendered
+    # The P/E's outside view is the company's own growth and gross margin, not the peers.
+    assert "growth and gross margin (no peers)" in rendered
+    app.radio(key="model_ASMVY_anchor_source").set_value("Peers")
+    open_tab(app, "Valuation Model")
+    rendered = " ".join(element.value for element in app.caption)
+    assert "peer P/E from BESIY" in rendered
+    app.radio(key="model_ASMVY_anchor_source").set_value("Fundamentals")
+    open_tab(app, "Valuation Model")
     charts = [chart.proto.spec for chart in app.get("plotly_chart")]
     # The block diagram, the open block's signals and the model price against the close.
     assert any("Quarterly rate" in spec and "Risk weighting" in spec and "Price per share" in spec for spec in charts)
@@ -1172,6 +1180,7 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     assert any(expander.label == "Forward assumptions" for expander in app.expander)
     headings = [element.value for element in app.markdown]
     assert "**Growth and margin** · Scenario engine" in headings
+    assert "**ASMVY price against growth and gross margin**" in headings
     assert "**Risk and product items** · Triage gate, Item router" in headings
     steps = next(frame.value for frame in app.dataframe if list(frame.value.columns) == ["Step", "Now", "Forward", "Change"])
     steps = steps.set_index("Step")

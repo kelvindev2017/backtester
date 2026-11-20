@@ -154,6 +154,15 @@ change, the diagram shows **now** (today's data: today's rate, no items, the cle
 margin change) and **fwd** (with the assumptions), down to the price; a **Now vs forward** table under the headline
 numbers sums it up, and the price chart adds the "now" price as a dotted line.
 
+The P/E anchor's outside view is, by default, the **fundamental P/E**: the P/E the company's own revenue growth
+(a year, over the last 3 years, within -50% and +300%: some companies grow over 100% a year) and gross margin justify.
+Next year's earnings grow at that rate and the growth above a 3% terminal rate fades in log terms, halving every
+half-life: 0.5 years at a gross margin of 20% or less, up to 2 years at 60% or more (pricing power keeps growth going).
+The stream is discounted at the Rate model's yield plus a 4.5% equity risk premium. At a 4.3% yield and a 60%+ gross
+margin: 8% growth gives about 19x, 30% about 28x, 100% about 71x, 300% about 340x; at an 18% gross margin 100% growth
+gives about 21x. The peers' median P/E is still available as the outside view; the rest of the anchor can come from
+the stock's own P/E history.
+
 With the **Forward** P/E basis, past forward P/Es carry no hindsight: before the latest report they use the trailing
 EPS grown by half of its past year's growth (within -20% and +100% by default, settable in the Multiple builder so
 a fast grower is not cut to an ordinary one) or, when trailing EPS is below its 3-year average, half of the gap
