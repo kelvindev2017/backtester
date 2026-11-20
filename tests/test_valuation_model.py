@@ -545,3 +545,50 @@ def test_the_fundamental_anchor_replaces_the_peers_and_follows_the_rate():
     from analysis.valuation_model import default_rate_cases, rate_cases
     table, _ = rate_cases(result, default_rate_cases(4.0))
     assert table["P/E anchor"].iloc[0] == pytest.approx(values["rate_anchor"]) and table["P/E anchor"].is_monotonic_decreasing
+
+
+def test_forward_view_of_the_p_e_and_a_separate_market_premium():
+    from analysis.valuation_model import fundamental_pe, pe_table, pe_table_changes
+    quarters = make_quarters().assign(Gross_Profit=lambda frame: frame["Revenue"] * 0.12)
+    close = make_close(quarters)
+    rates = pd.Series(4.0, index=close.index)
+    base = {"anchor_source": "Fundamentals", "peer_weight": 1.0}
+    plain = run_model(quarters, close, None, model_params(base), None, policy_rate=rates)
+    before = latest_values(plain)
+    assert before["premium_pct"] == 0 and before["acceptable_pe"] == pytest.approx(before["pe_before_premium"])
+    # The market premium: what the close pays over the model before any premium of yours.
+    assert before["implied_premium_pct"] == pytest.approx((before["close"] / before["model_price"] - 1) * 100)
+    # Your forward growth and half-life replace the history from the latest release; the premium multiplies the P/E.
+    mine = run_model(quarters, close, None, model_params({**base, "forward_pe_growth": 12.0, "forward_half_life": 6.0,
+                                                          "forward_equity_premium": 3.5, "market_premium": 50.0}),
+                     None, policy_rate=rates)
+    after = latest_values(mine)
+    params = model_params({**base, "equity_premium": 3.5})
+    expected = fundamental_pe(12.0, None, after["model_yield"], params, half_life=6.0)
+    assert after["rate_anchor"] == pytest.approx(expected)
+    assert after["acceptable_pe"] == pytest.approx(after["pe_before_premium"] * 1.5)
+    assert after["model_price"] == pytest.approx(after["held_eps"] * after["acceptable_pe"])
+    # 'Now' keeps neither: the history's fundamental P/E, no premium.
+    assert after["now_pe"] == pytest.approx(before["now_pe"])
+    # Earlier quarters keep the history: the day before the latest release is unchanged.
+    day = mine["forward_from"] - pd.Timedelta(days=1)
+    earlier = mine["daily"].loc[:day].iloc[-1]
+    assert earlier["acceptable_pe"] == pytest.approx(plain["daily"].loc[:day].iloc[-1]["acceptable_pe"])
+    # The dials and rate cases see the same price.
+    assert sensitivities(mine)
+    # The table: current from the history (and the market's premium), forward yours; edits round-trip.
+    table = pe_table(mine).set_index("Metric")
+    assert table.loc["Growth for the P/E %", "Forward"] == 12.0 and table.loc["Market premium %", "Forward"] == 50.0
+    assert table.loc["Growth half-life, years", "Current"] == pytest.approx(0.5)
+    drawn = pe_table(plain)
+    edited = drawn.copy()
+    edited.loc[edited["Metric"] == "Market premium %", "Forward"] = 20.0
+    assert pe_table_changes(drawn, edited, plain["params"]) == {"market_premium": 20.0}
+    cleared = pe_table(mine)
+    cleared.loc[cleared["Metric"] == "Growth for the P/E %", "Forward"] = np.nan
+    cleared.loc[cleared["Metric"] == "Market premium %", "Forward"] = np.nan
+    changes = pe_table_changes(pe_table(mine), cleared, mine["params"])
+    assert np.isnan(changes["forward_pe_growth"]) and changes["market_premium"] == 0.0
+    # With peers as the outside view only the premium row is shown.
+    peers = run_model(quarters, close, None, model_params({"anchor_source": "Peers"}), pd.DataFrame({"A": 20.0}, index=close.index))
+    assert pe_table(peers)["Metric"].tolist() == ["Market premium %"]

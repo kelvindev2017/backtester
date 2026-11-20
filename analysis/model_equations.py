@@ -54,7 +54,7 @@ EQUATIONS = {
         r"\text{P/E}_{\text{fund}} = \sum_{t=1}^{40} \frac{E_t}{(1+r)^t} + \frac{E_{41}}{(r - g_T)(1+r)^{40}}, \qquad r = y_N + \text{ERP}",
         r"\text{P/E}^{r}_{\text{own}} = \frac{1}{1 / \text{P/E}_{\text{own}} + t \times \Delta y_{\text{own}} / 100}",
         r"\begin{aligned} \text{anchor} = {} & k \times \text{P/E}_{\text{outside}} \\ & + (1 - k) \times \text{P/E}^{r}_{\text{own}} \end{aligned}",
-        r"\begin{aligned} \text{P/E}_{\text{acc}} = {} & \text{anchor} + a - d_q, \\ & \text{kept between floor and cap} \end{aligned}",
+        r"\begin{aligned} \text{P/E}_{\text{acc}} = {} & \operatorname{clip}(\text{anchor} + a - d_q) \\ & \times (1 + p / 100) \end{aligned}",
     ],
     "product": [r"\text{Model price} = \text{EPS}_{\text{risk}} \times \text{P/E}_{\text{acc}}"],
     "market_check": [r"\text{Gap} = \left(\frac{\text{Model price}}{\text{Close}} - 1\right) \times 100"],
@@ -80,7 +80,8 @@ SYMBOLS = {
     "multiple_builder": "Outside view: P/E_fund (default) or the peers' median P/E (moved by the forward rate's yield change "
                         "like the own one). g: revenue growth a year over the growth history (within floor and cap), GM: gross "
                         "margin %, h: half-life in years of the growth above g_T (longer with a higher gross margin), g_T: terminal growth, y_N: the Rate model's yield (or the "
-                        "base yield), ERP: equity risk premium. x: own or peers, Δy_x: yield change from the Rate model, t: share of it passed to the P/E "
+                        "base yield), ERP: equity risk premium; from the latest release g, h and ERP are your forward values where set. "
+                        "p: your market premium % (kept apart from the fundamentals). x: own or peers, Δy_x: yield change from the Rate model, t: share of it passed to the P/E "
                         "(the earnings yield 1/P/E moves point for point with the required return). k: share of the anchor from peers, P/E peers and own: their medians over the look-back, "
                         "a: P/E points from register items, d_q: earnings quality P/E deduction. P/E is trailing or "
                         "forward, as chosen.",
@@ -171,10 +172,8 @@ def worked_equations(result, block, on=None):
         fundamentals = params["anchor_source"] == "Fundamentals"
         raw_peer, raw_own = get('outside_anchor'), get('own_anchor')
         # The anchors after the rate model (the same as before it when no policy rate is loaded).
-        peer = (get("fundamental_pe") if fundamentals else
+        peer = (get("outside_forward") if fundamentals else
                 rate_adjusted_pe(raw_peer, get("forward_gap") if np.isfinite(get("forward_gap")) else 0.0, passed))
-        if fundamentals and np.isfinite(get("forward_gap")) and get("forward_gap") != 0:
-            peer = np.nan  # shown below: the fundamental P/E at the forward yield
         own = rate_adjusted_pe(raw_own, get("yield_gap") if np.isfinite(get("yield_gap")) else 0.0, passed)
         if np.isfinite(peer) and np.isfinite(own):
             mix = rf"{_n(share)} \times {_n(peer, 1)} + {_n(1 - share)} \times {_n(own, 1)}"
@@ -182,13 +181,16 @@ def worked_equations(result, block, on=None):
             mix = rf"\text{{{'outside' if np.isfinite(peer) else 'own'} only: }} {_n(peer if np.isfinite(peer) else own, 1)}"
         lines = [rf"\begin{{aligned}} \text{{anchor}} = {{}} & {mix} \\ = {{}} & {_n(anchor, 1)} \end{{aligned}}",
                 rf"\begin{{aligned}} \text{{P/E}}_{{\text{{acc}}}} = {{}} & {_n(anchor, 1)} {sign} {_n(abs(get('held_pe_adjust')), 1)} - {_n(abs(get('held_quality_pe')), 1)} \\ "
-                rf"& \text{{kept in }} {_n(params['pe_floor'], 0)} \text{{ to }} {_n(params['pe_cap'], 0)} \\ = {{}} & {_n(get('acceptable_pe'), 1)} \end{{aligned}}"]
+                rf"& \text{{kept in }} {_n(params['pe_floor'], 0)} \text{{ to }} {_n(params['pe_cap'], 0)} \\ "
+                rf"& \times (1 + {_n(get('premium_pct') if np.isfinite(get('premium_pct')) else 0.0, 1)} / 100) \\ = {{}} & {_n(get('acceptable_pe'), 1)} \end{{aligned}}"]
         if fundamentals and np.isfinite(get("fundamental_pe")):
             margin = get("held_gross_margin")
             margin_text = _n(margin, 1) + r"\%" if np.isfinite(margin) else r"\text{n/a}"
-            growth = get("held_cagr") if np.isfinite(get("held_cagr")) else params["fallback_yoy"]
-            required = (get("now_yield") if np.isfinite(get("now_yield")) else params["base_yield"]) + params["equity_premium"]
-            years_text, pe_text = _n(get("growth_half_life"), 2), _n(get("fundamental_pe"), 1)
+            growth = get("pe_growth") if np.isfinite(get("pe_growth")) else params["fallback_yoy"]
+            erp = params["forward_equity_premium"] if np.isfinite(params.get("forward_equity_premium", np.nan)) else params["equity_premium"]
+            required = (get("model_yield") if np.isfinite(get("model_yield")) else params["base_yield"]) + erp
+            years_text = _n(get("pe_half_life") if np.isfinite(get("pe_half_life")) else get("growth_half_life"), 2)
+            pe_text = _n(get("outside_forward"), 1)
             lines.insert(0, rf"h = {years_text} \text{{ years}} \quad (GM = {margin_text}), \qquad g = {_n(growth, 1)}\%")
             lines.insert(1, rf"\text{{P/E}}_{{\text{{fund}}}} = {pe_text} \quad (r = {_n(required, 2)}\%)")
         pairs = [("own", raw_own, get("yield_gap"))] + ([] if fundamentals else [("peers", raw_peer, get("forward_gap"))])
