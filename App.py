@@ -4648,7 +4648,7 @@ def render_case_table(result):
     st.markdown("**Growth and margin** · Scenario engine")
     drawn = case_table(result)
     edited = st.data_editor(
-        drawn, hide_index=True, width="stretch", num_rows="fixed", key=f"model_case_table_{forward_version()}",
+        drawn, hide_index=True, width="stretch", num_rows="fixed", key=f"model_case_{forward_version()}_table",
         column_config={
             "Metric": st.column_config.TextColumn("Metric", disabled=True),
             "Current": st.column_config.NumberColumn("Current", disabled=True, format="%.1f",
@@ -4684,7 +4684,7 @@ def render_forward_items(result):
         "EPS impact %": table["EPS impact %"], "P/E points": table["P/E points"]})
     edited = st.data_editor(
         drawn, hide_index=True, width="stretch", num_rows="fixed",
-        key=f"model_forward_items_{st.session_state.get('model_register_version', 0)}_{forward_version()}",
+        key=f"model_forward_items_{st.session_state.get('model_register_version', 0)}_{forward_version()}_table",
         column_config={
             "Item": st.column_config.TextColumn("Item", disabled=True),
             "Status": st.column_config.SelectboxColumn("Status", options=["Modelled", "Parked"], required=True),
