@@ -25,7 +25,8 @@ PARKED_WIRE = "rgba(110, 110, 110, 0.6)"
 REGION_LINE = "rgba(128, 128, 128, 0.6)"
 SCENARIO_COLORS = {"Bear": "indianred", "Base": "royalblue", "Bull": "seagreen"}
 AXIS_TITLES = {"amount": "Reporting currency", "eps": "Per share", "price": "Price", "percent": "%", "share": "%",
-               "multiple": "P/E (x)", "points": "P/E points", "count": "Items"}
+               "multiple": "P/E (x)", "points": "P/E points", "count": "Items", "rate": "% a year",
+               "rate_change": "% points"}
 
 LEFT, RIGHT = 2.8, 7.4          # column centres
 HALF_WIDTH, HALF_HEIGHT = 1.9, 0.5
@@ -37,12 +38,14 @@ POSITIONS = {
     "risk_weighting": (LEFT, 7.2),
     "hold_eps": (LEFT, 8.7), "hold_pe": (RIGHT, 8.7),
     "product": (LEFT, 10.4), "multiple_builder": (RIGHT, 10.4),
-    "market_data": (RIGHT, 11.9),
-    "price": (LEFT, 13.4), "market_check": (RIGHT, 13.4),
+    "rate_model": (RIGHT, 12.0),
+    "market_data": (RIGHT, 13.6),
+    "price": (LEFT, 15.1), "market_check": (RIGHT, 15.1),
 }
 PLAIN_BLOCKS = {"documents": "Filings, calls, news", "market_data": "Market data", "hold_eps": "Hold",
                 "hold_pe": "Hold", "price": "Price per share"}
-QUARTERLY_REGION, DAILY_REGION = (0.3, 7.95), (9.55, 14.2)
+QUARTERLY_REGION, DAILY_REGION = (0.3, 7.95), (9.55, 15.9)
+BOTTOM = 16.1
 
 
 def format_value(value, unit="", axis=""):
@@ -51,6 +54,10 @@ def format_value(value, unit="", axis=""):
     if value is None or not np.isfinite(value):
         return "n/a"
     if unit == "%":
+        if axis == "rate":
+            return f"{value:.2f}%"
+        if axis == "rate_change":
+            return f"{value:+.2f}%"
         return f"{value:+.1f}%" if axis == "percent" else f"{value:.1f}%"
     if unit == "x":
         return f"{value:.1f}x"
@@ -85,7 +92,10 @@ def block_summary(block, values):
         "product": lambda: f"{signal_text(values, 'held_eps')} x {signal_text(values, 'acceptable_pe')}",
         "market_check": lambda: f"Model vs close {signal_text(values, 'residual_pct')}",
         "price": lambda: signal_text(values, "model_price"),
-        "market_data": lambda: f"Close {signal_text(values, 'close')}",
+        "market_data": lambda: f"Close {signal_text(values, 'close')}" + (
+            f" · rate {signal_text(values, 'policy_rate')}" if np.isfinite(values.get("policy_rate", np.nan)) else ""),
+        "rate_model": lambda: (f"Yield {signal_text(values, 'model_yield')} · Δ {signal_text(values, 'yield_gap')}"
+                               if np.isfinite(values.get("policy_rate", np.nan)) else "Off: no policy rate"),
     }
     return lines[block]() if block in lines else ""
 
@@ -94,7 +104,8 @@ def parameter_table(result, block):
     """The parameters one block owns, with the values in use."""
 
     params = result["params"]
-    rows = [{"Parameter": label, "Value": params[key]} for key, label in BLOCKS[block]["params"].items()]
+    rows = [{"Parameter": label, "Value": int(params[key]) if isinstance(params[key], bool) else params[key]}
+            for key, label in BLOCKS[block]["params"].items()]
     if block == "risk_weighting":
         rows += [{"Parameter": f"{name} weight, normalised %", "Value": round(float(weight) * 100, 1)}
                  for name, weight in zip(SCENARIOS, scenario_weights(params))]
@@ -110,7 +121,9 @@ def block_hover(result, block, values):
         for name in names:
             lines.append(f"{title}: {SIGNALS[name][1]} {signal_text(values, name)}")
     for row in parameter_table(result, block).to_dict("records"):
-        lines.append(f"Param: {row['Parameter']} = {row['Value']:g}")
+        value = row["Value"]
+        lines.append(f"Param: {row['Parameter']} = {value:g}" if isinstance(value, (int, float, np.number))
+                     else f"Param: {row['Parameter']} = {value}")
     return "<br>".join(lines)
 
 
@@ -195,19 +208,28 @@ def model_diagram(result, selected=None, on=None, mobile=False):
           f"P/E {text('held_pe_adjust')}<br>quality {text('held_quality_pe')}")
     _wire(fig, [edge("multiple_builder", "left"), edge("product", "right")], f"P/E {text('acceptable_pe')}",
           label_at=(LEFT + HALF_WIDTH - 0.05, POSITIONS["product"][1] - 0.25))
-    _wire(fig, [edge("market_data", "top"), edge("multiple_builder", "bottom")], "peer P/E")
+    # The peers' P/E runs up the right-hand side, past the rate model, into the multiple builder.
+    peer_x = RIGHT + HALF_WIDTH + 0.3
+    market_y, builder_y = POSITIONS["market_data"][1], POSITIONS["multiple_builder"][1]
+    _wire(fig, [(RIGHT + HALF_WIDTH, market_y - 0.2), (peer_x, market_y - 0.2), (peer_x, builder_y + 0.25),
+                (RIGHT + HALF_WIDTH, builder_y + 0.25)])
+    fig.add_annotation(x=peer_x - 0.14, y=POSITIONS["rate_model"][1], text="peer P/E", showarrow=False,
+                       textangle=-90, font=dict(size=small))
+    _wire(fig, [edge("market_data", "top"), edge("rate_model", "bottom")], f"rate {text('policy_rate')}<br>N-year yield")
+    _wire(fig, [edge("rate_model", "top"), edge("multiple_builder", "bottom")],
+          f"Δy own {text('yield_gap')}<br>peers {text('forward_gap')}")
     _wire(fig, [edge("market_data", "bottom"), edge("market_check", "top")], f"close {text('close')}")
     _wire(fig, [edge("product", "bottom"), edge("price", "top")], f"price {text('model_price')}")
     # The model price branches to the market check.
-    branch_y = POSITIONS["market_data"][1]
+    branch_y = POSITIONS["market_data"][1] + 0.55
     middle_x = (LEFT + RIGHT) / 2 + 0.15
-    fig.add_trace(go.Scatter(x=[LEFT], y=[branch_y + 0.55], mode="markers", marker=dict(size=7, color=WIRE),
+    fig.add_trace(go.Scatter(x=[LEFT], y=[branch_y], mode="markers", marker=dict(size=7, color=WIRE),
                              hoverinfo="skip", showlegend=False))
-    _wire(fig, [(LEFT, branch_y + 0.55), (middle_x, branch_y + 0.55), (middle_x, POSITIONS["market_check"][1]),
+    _wire(fig, [(LEFT, branch_y), (middle_x, branch_y), (middle_x, POSITIONS["market_check"][1]),
                 edge("market_check", "left")])
     # Parked items reach the market check without touching the price.
     tracker_right = edge("item_tracker", "right")
-    _wire(fig, [tracker_right, (9.75, tracker_right[1]), (9.75, POSITIONS["market_check"][1]), edge("market_check", "right")],
+    _wire(fig, [tracker_right, (9.8, tracker_right[1]), (9.8, POSITIONS["market_check"][1]), edge("market_check", "right")],
           dashed=True)
 
     for block, centre in POSITIONS.items():
@@ -235,9 +257,9 @@ def model_diagram(result, selected=None, on=None, mobile=False):
         hoverinfo="text", showlegend=False, name="blocks"))
 
     hidden = dict(visible=False, fixedrange=True)
-    fig.update_layout(height=760 if mobile else 900, margin=dict(l=5, r=5, t=10, b=10), dragmode=False,
+    fig.update_layout(height=840 if mobile else 1000, margin=dict(l=5, r=5, t=10, b=10), dragmode=False,
                       clickmode="event+select", xaxis=dict(range=[0, 10.1], **hidden),
-                      yaxis=dict(range=[14.4, 0.1], **hidden), hoverlabel=dict(align="left"), showlegend=False)
+                      yaxis=dict(range=[BOTTOM, 0.1], **hidden), hoverlabel=dict(align="left"), showlegend=False)
     return fig
 
 

@@ -8,7 +8,9 @@ is the default EPS haircut: stock-based pay as a share of net income.
 import numpy as np
 import pandas as pd
 
-from analysis.valuation_model import SCENARIOS, item_effects, latest_values, scenario_weights
+from analysis.valuation_model import (
+    SCENARIOS, item_effects, latest_values, rate_adjusted_pe, rate_weight, scenario_weights,
+)
 
 # Each string is one display line, kept short enough for a phone; aligned blocks break longer ones.
 EQUATIONS = {
@@ -39,8 +41,15 @@ EQUATIONS = {
         r"\begin{aligned} \text{EPS}_{\text{risk}} = {} & w_{\text{bear}} \times \text{EPS}_{\text{bear}} \\ "
         r"& + w_{\text{base}} \times \text{EPS}_{\text{base}} \\ & + w_{\text{bull}} \times \text{EPS}_{\text{bull}} \end{aligned}",
     ],
+    "rate_model": [
+        r"w_N = \frac{1 - e^{-\lambda N}}{\lambda N}, \qquad \lambda = \frac{\ln 2}{h}",
+        r"y_N = r_n + (r_f - r_n) \times w_N + tp",
+        r"\Delta y_{\text{own}} = y_N - \operatorname{median}_{\text{look-back}}(y_N)",
+        r"\Delta y_{\text{peers}} = y_N(r_f) - y_N(r_{\text{today}})",
+    ],
     "multiple_builder": [
-        r"\begin{aligned} \text{anchor} = {} & k \times \text{P/E}_{\text{peers}} \\ & + (1 - k) \times \text{P/E}_{\text{own}} \end{aligned}",
+        r"\text{P/E}^{r}_{x} = \frac{1}{1 / \text{P/E}_{x} + t \times \Delta y_{x} / 100}",
+        r"\begin{aligned} \text{anchor} = {} & k \times \text{P/E}^{r}_{\text{peers}} \\ & + (1 - k) \times \text{P/E}^{r}_{\text{own}} \end{aligned}",
         r"\begin{aligned} \text{P/E}_{\text{acc}} = {} & \text{anchor} + a - d_q, \\ & \text{kept between floor and cap} \end{aligned}",
     ],
     "product": [r"\text{Model price} = \text{EPS}_{\text{risk}} \times \text{P/E}_{\text{acc}}"],
@@ -56,7 +65,13 @@ SYMBOLS = {
     "scenario_engine": "s: base growth as a share of trailing growth, g: revenue growth %, c: bear, base or bull, "
                        "Δm_c: that case's net margin change in points, m: net margin %, e: event items' EPS change %.",
     "risk_weighting": "w: scenario weights, rescaled to add up to 1.",
-    "multiple_builder": "k: share of the anchor from peers, P/E peers and own: their medians over the look-back, "
+    "rate_model": "r_f: policy rate used (your forward rate on the last day, the actual rate before), r_n: neutral "
+                  "rate, h: half-life of a rate's gap to neutral in years, N: yield maturity in years, w_N: share of "
+                  "the policy rate that reaches the N-year yield, tp: term premium (it cancels out of both Δy). "
+                  "Δy_own compares with the years the own P/E median covers; Δy_peers is only the forward rate's "
+                  "surprise, because the peers' P/E is today's and already prices today's rate.",
+    "multiple_builder": "x: own or peers, Δy_x: yield change from the Rate model, t: share of it passed to the P/E "
+                        "(the earnings yield 1/P/E moves point for point with the required return). k: share of the anchor from peers, P/E peers and own: their medians over the look-back, "
                         "a: P/E points from register items, d_q: earnings quality P/E deduction. P/E is trailing or "
                         "forward, as chosen.",
 }
@@ -125,17 +140,36 @@ def worked_equations(result, block, on=None):
                 rf"\text{{{int(get('items_modelled') or 0)} modelled, {int(get('items_parked') or 0)} parked}}"]
     if block == "multiple_builder":
         share = float(np.clip(params["peer_weight"], 0, 1))
-        anchor = result["daily"]["anchor"].dropna()
-        anchor = float(anchor.iloc[-1]) if len(anchor) else np.nan
+        anchor = get("rate_anchor")
         sign = '+' if not get('held_pe_adjust') < 0 else '-'
-        peer, own = get('peer_anchor'), get('own_anchor')
+        passed = params["rate_pass_through"]
+        raw_peer, raw_own = get('peer_anchor'), get('own_anchor')
+        # The anchors after the rate model (the same as before it when no policy rate is loaded).
+        peer = rate_adjusted_pe(raw_peer, get("forward_gap") if np.isfinite(get("forward_gap")) else 0.0, passed)
+        own = rate_adjusted_pe(raw_own, get("yield_gap") if np.isfinite(get("yield_gap")) else 0.0, passed)
         if np.isfinite(peer) and np.isfinite(own):
             mix = rf"{_n(share)} \times {_n(peer, 1)} + {_n(1 - share)} \times {_n(own, 1)}"
         else:  # only one of them exists: the anchor is that one
             mix = rf"\text{{{'peers' if np.isfinite(peer) else 'own'} only: }} {_n(peer if np.isfinite(peer) else own, 1)}"
-        return [rf"\begin{{aligned}} \text{{anchor}} = {{}} & {mix} \\ = {{}} & {_n(anchor, 1)} \end{{aligned}}",
+        lines = [rf"\begin{{aligned}} \text{{anchor}} = {{}} & {mix} \\ = {{}} & {_n(anchor, 1)} \end{{aligned}}",
                 rf"\begin{{aligned}} \text{{P/E}}_{{\text{{acc}}}} = {{}} & {_n(anchor, 1)} {sign} {_n(abs(get('held_pe_adjust')), 1)} - {_n(abs(get('held_quality_pe')), 1)} \\ "
                 rf"& \text{{kept in }} {_n(params['pe_floor'], 0)} \text{{ to }} {_n(params['pe_cap'], 0)} \\ = {{}} & {_n(get('acceptable_pe'), 1)} \end{{aligned}}"]
+        for label, raw, gap in [("own", raw_own, get("yield_gap")), ("peers", raw_peer, get("forward_gap"))]:
+            if np.isfinite(raw) and np.isfinite(get("policy_rate")):
+                lines.append(rf"\text{{P/E}}^{{r}}_{{\text{{{label}}}}} = \frac{{1}}{{1 / {_n(raw, 1)} + {_n(passed)} \times {_n(gap, 2)} / 100}}"
+                             rf" = {_n(rate_adjusted_pe(raw, gap, passed), 1)}")
+        return lines
+    if block == "rate_model":
+        if not np.isfinite(get("policy_rate")):
+            return [r"\text{No policy rate loaded: the rate model is off } (\Delta y = 0)"]
+        weight = rate_weight(params["yield_years"], params["rate_half_life"])
+        lines = [rf"w_{{{int(params['yield_years'])}}} = {_n(weight, 3)} \qquad r_f = {_n(get('forward_rate'))}\%",
+                 rf"\begin{{aligned}} y_N = {{}} & {_n(params['neutral_rate'])} + ({_n(get('forward_rate'))} - {_n(params['neutral_rate'])}) \times {_n(weight, 3)} + {_n(params['term_premium'])} \\ = {{}} & {_n(get('model_yield'))}\% \end{{aligned}}",
+                 rf"\Delta y_{{\text{{own}}}} = {_n(get('model_yield'))} - {_n(get('yield_ref'))} = {_n(get('yield_gap'))}",
+                 rf"\Delta y_{{\text{{peers}}}} = {_n(get('forward_gap'))}"]
+        if np.isfinite(get("market_yield")):
+            lines.append(rf"\text{{Market }} {int(params['yield_years'])}\text{{-year yield: }} {_n(get('market_yield'))}\%")
+        return lines
     if block == "product":
         return [rf"{_n(get('held_eps'))} \times {_n(get('acceptable_pe'), 1)} = {_n(get('model_price'))}"]
     if block == "market_check":

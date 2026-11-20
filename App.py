@@ -198,15 +198,20 @@ from analysis.what_happened_next import (
 from analysis.valuation_model import (
     BLOCKS as MODEL_BLOCKS,
     PRESETS as MODEL_PRESETS,
+    RATE_CASE_COLUMNS,
     REGISTER_DEFAULTS,
     SCENARIOS as MODEL_SCENARIOS,
     SIGNALS as MODEL_SIGNALS,
+    YIELD_MATURITIES,
     clean_register,
+    default_rate_cases,
+    has_rates,
     implied_dials,
     latest_values,
     model_params,
     preset_params,
     preset_register,
+    rate_cases,
     register_changes,
     run_model,
     sensitivities,
@@ -4454,8 +4459,16 @@ MODEL_BLOCK_NOTES = {
     "scenario_engine": "Builds next year's EPS in a bear, base and bull case: the clean EPS grows with revenue and is "
                        "scaled by the change in net margin, then takes the expected hit or gain from the event items.",
     "risk_weighting": "Multiplies each case by its weight and adds them up.",
-    "multiple_builder": "Starts from the median P/E of the peers and of the stock's own past, then adds the P/E "
-                        "points of the general items and takes off the earnings quality deduction. Recomputed every day, because peer prices move every day.",
+    "rate_model": "Turns a policy rate into an N-year yield: the short rate is expected to drift back to a neutral "
+                  "rate, so only part of a rate change reaches a long yield (about 28% for a 10-year yield with a "
+                  "2-year half-life). Before the last day it uses the actual US policy rate (FRED's effective Fed "
+                  "funds rate); on the last day, your forward rate if you set one. It sends the Multiple builder "
+                  "how far the yield is from the years the own P/E median covers, and how far your forward rate "
+                  "moves it from today's.",
+    "multiple_builder": "Starts from the median P/E of the peers and of the stock's own past, each moved by the "
+                        "Rate model's yield change (a higher yield lifts the earnings yield 1/P/E point for point), "
+                        "then adds the P/E points of the general items and takes off the earnings quality "
+                        "deduction. Recomputed every day, because peer prices move every day.",
     "product": "Risk-adjusted EPS, held since the last release, times the day's acceptable P/E.",
     "market_check": "Compares the model price with the close, and works backwards from the close to the value each "
                     "dial would need to explain the gap.",
@@ -4490,6 +4503,21 @@ def model_param_key(name, ticker=None):
     return f"model_{ticker}_{name}"
 
 
+def model_box_value(name, value):
+    """A parameter as its setting box holds it: text and on/off as they are, whole years as int, the rest float."""
+
+    if isinstance(value, (str, bool)):
+        return value
+    return int(value) if name in ("pe_lookback_years", "yield_years") else float(value)
+
+
+def fill_missing_model_boxes(ticker):
+    """Boxes added since the ticker's preset was applied (e.g. a new block) start at the preset or the defaults."""
+
+    for name, value in preset_params(ticker).items():
+        st.session_state.setdefault(model_param_key(name, ticker), model_box_value(name, value))
+
+
 def apply_model_preset(ticker=None):
     """Set every model parameter, the peers and the register to the ticker's preset, or to the defaults."""
 
@@ -4503,8 +4531,7 @@ def apply_model_preset(ticker=None):
     else:
         st.session_state["model_haircut_source"] = (ticker, f"the {ticker} worked example")
     for name, value in params.items():
-        st.session_state[model_param_key(name, ticker)] = (value if isinstance(value, str) else
-                                                   int(value) if name == "pe_lookback_years" else float(value))
+        st.session_state[model_param_key(name, ticker)] = model_box_value(name, value)
     preset_peers = MODEL_PRESETS.get(ticker, {}).get("peers", [])
     if preset_peers:
         st.session_state["model_peers"] = ", ".join(preset_peers)
@@ -4515,6 +4542,29 @@ def apply_model_preset(ticker=None):
     store_model_register(preset_register(ticker))
     st.session_state["model_log"] = []
     st.session_state["model_preset_for"] = ticker
+
+
+def start_forward_rate():
+    """Ticking the forward rate box fills in today's policy rate, so the forward rate starts as 'no change'."""
+
+    if st.session_state.get(model_param_key("use_forward_rate")):
+        today = st.session_state.get("model_policy_rate_now")
+        if today is not None and np.isfinite(today):
+            st.session_state[model_param_key("forward_rate")] = round(float(today), 2)
+
+
+POLICY_RATE_SERIES = "DFF"  # effective Fed funds rate, daily
+
+
+def load_model_rates(years):
+    """(policy rate, market N-year yield, note) from FRED; empty Series and a note when FRED cannot be reached."""
+
+    policy, error = load_fred(POLICY_RATE_SERIES)
+    market, _ = load_fred(f"DGS{int(years)}")
+    if policy.empty:
+        return policy, market, f"No policy rate from FRED ({error}), so the rate model is off."
+    st.session_state["model_policy_rate_now"] = float(policy.iloc[-1])
+    return policy, market, ""
 
 
 def model_ticker_changed():
@@ -4583,6 +4633,7 @@ def model_settings():
         # A new ticker gets its preset (or the defaults) here, before the parameter boxes below are drawn.
         if ticker != st.session_state.get("model_preset_for"):
             apply_model_preset(ticker)
+        fill_missing_model_boxes(ticker)
         years = st.select_slider("History (years)", MODEL_YEARS, value=3, key="model_years")
         peers_text = st.text_input("Peers for the P/E anchor", key="model_peers",
                                    help="Yahoo symbols separated by commas. Their median P/E (trailing or forward) is one half of "
@@ -4626,6 +4677,30 @@ def model_settings():
             key = f"weight_{name.lower()}"
             params[key] = number(key, f"{name} weight", 0, 100, 5)
         st.caption("Weights are rescaled to add up to 100%.")
+    with settings_panel("Rate model", expanded=False):
+        show_model_equations("rate_model")
+        params["use_forward_rate"] = st.checkbox(
+            "Use a forward policy rate on the last day", key=model_param_key("use_forward_rate"),
+            on_change=start_forward_rate,
+            help="Off: every day uses the actual US policy rate (effective Fed funds, FRED). On: the last day uses "
+                 "the rate below instead, e.g. the rate you expect after the next Fed meeting.")
+        params["forward_rate"] = number("forward_rate", "Forward policy rate %", -1, 20, 0.25,
+                                        "The policy rate you expect. Filled in with today's rate when you tick the box.")
+        params["yield_years"] = st.select_slider("Yield maturity N (years)", YIELD_MATURITIES,
+                                                 key=model_param_key("yield_years"),
+                                                 help="The yield the stock is valued against; 10 is the usual choice. "
+                                                      "The market's N-year Treasury yield is shown as a check.")
+        params["neutral_rate"] = number("neutral_rate", "Neutral policy rate %", 0, 10, 0.25,
+                                        "Where the policy rate settles in the long run.")
+        params["rate_half_life"] = number("rate_half_life", "Rate half-life, years", 0.25, 30, 0.25,
+                                          "Years for half of a rate's gap to neutral to fade. Longer: a rate change "
+                                          "reaches long yields more.")
+        params["term_premium"] = number("term_premium", "Term premium %", -2, 5, 0.1,
+                                        "Added to the model yield so it can be compared with the market's; it "
+                                        "cancels out of the yield changes that move the P/E.")
+        params["rate_pass_through"] = number("rate_pass_through", "Share of a yield change passed to the P/E", 0, 2, 0.1,
+                                             "1: the stock's required return moves point for point with the yield. "
+                                             "0 switches the rate model's effect off.")
     with settings_panel("Multiple builder", expanded=False):
         show_model_equations("multiple_builder")
         params["pe_basis"] = st.radio(
@@ -4783,6 +4858,46 @@ def render_market_check(result):
                      "price: a model tuned until the gap is zero can only ever say the stock is fairly priced.")
 
 
+def render_rate_cases(result):
+    """The model price in a few policy rate cases and their probability-weighted expected value."""
+
+    st.markdown("**Rate cases: expected value**")
+    if not has_rates(result):
+        st.caption("No policy rate loaded, so there are no rate cases.")
+        return
+    today = float(result["daily"]["policy_rate"].iloc[-1])
+    stored = st.session_state.get("model_rate_cases")
+    if stored is None or stored.get("base") != round(today, 2):
+        # New cases around today's rate whenever the actual rate moves.
+        stored = {"base": round(today, 2), "table": default_rate_cases(round(today, 2)), "version": 0}
+        st.session_state["model_rate_cases"] = stored
+    st.caption(
+        f"Today's policy rate is {today:.2f}%. Each row reruns the rate model and the multiple builder with that "
+        "rate on the last day, everything else held. Use the market's odds for the next meeting (e.g. CME "
+        "FedWatch) as probabilities; they are rescaled to add up to 100%. Only a rate that differs from what the "
+        "market expects should move the price, so the hold case is not 'no news'.")
+    edited = st.data_editor(
+        stored["table"], hide_index=True, width="stretch", num_rows="dynamic",
+        key=f"model_rate_cases_{stored['version']}_table",
+        column_config={"Case": st.column_config.TextColumn("Case", required=True),
+                       "Policy rate %": st.column_config.NumberColumn("Policy rate %", min_value=-1.0, max_value=20.0,
+                                                                      format="%.2f", required=True),
+                       "Probability %": st.column_config.NumberColumn("Probability %", min_value=0.0, max_value=100.0,
+                                                                      format="%.0f")})
+    edited = pd.DataFrame(edited, columns=RATE_CASE_COLUMNS)
+    table, expected = rate_cases(result, edited)
+    if table.empty:
+        st.caption("No model price yet, so there is nothing to weigh.")
+        return
+    st.dataframe(table, hide_index=True, width="stretch", column_config={
+        column: st.column_config.NumberColumn(format="%.2f")
+        for column in ["Policy rate %", "N-year yield %", "P/E anchor", "Model price", "vs close %"]})
+    close = latest_values(result).get("close", np.nan)
+    if np.isfinite(expected):
+        st.metric("Expected model price", f"{expected:,.2f}",
+                  f"{(expected / close - 1) * 100:+.1f}% vs close" if np.isfinite(close) else None)
+
+
 def add_model_candidate(title, url):
     table = model_register()
     row = {**REGISTER_DEFAULTS, "Item": title[:80], "Source": url, "Since": f"{pd.Timestamp(date.today()):%Y-%m-%d}"}
@@ -4924,10 +5039,11 @@ def render_valuation_model():
     tracked, candidates = track_items(model_register(), news)
     # A story already parked as an item is no longer unexplained.
     candidates = candidates[~candidates["title"].str[:80].isin(set(model_register()["Item"]))].reset_index(drop=True)
+    policy, market_yield, rate_note = load_model_rates(params["yield_years"])
     result = run_model(inputs.quarters, inputs.close, model_register(), params, inputs.peer_pe, start=inputs.start,
-                       own_pe=inputs.own_pe)
+                       own_pe=inputs.own_pe, policy_rate=policy, market_yield=market_yield)
     values = latest_values(result)
-    st.caption(model_data_note(inputs.found, params))
+    st.caption(model_data_note(inputs.found, params) + (" " + rate_note if rate_note else ""))
 
     price = values.get("model_price", np.nan)
     # The change log's "after" price is the first model price computed after the change.
@@ -4980,6 +5096,7 @@ def render_valuation_model():
             "P/E deductions with that in mind, or switch the P/E basis to Forward under Multiple builder. ")
         + "An estimate from stated assumptions, not investment advice.")
     render_market_check(result)
+    render_rate_cases(result)
     render_model_register(result, tracked, candidates, ticker)
 
 

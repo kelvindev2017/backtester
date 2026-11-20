@@ -282,3 +282,93 @@ def test_worked_equations_end_in_the_model_values():
     for name in ["bear", "base", "bull"]:
         line = [eq for eq in worked_equations(result, "scenario_engine") if rf"\text{{EPS}}_{{\text{{{name}}}}}" in eq][0]
         assert f"& {values[f'eps_{name}']:,.2f} \\end{{aligned}}" in line
+
+
+def test_rate_model_turns_a_policy_rate_into_a_yield_and_a_pe():
+    from analysis.valuation_model import model_yield, rate_adjusted_pe, rate_weight
+    # A 10-year yield with a 2-year half-life carries about 28% of a policy rate change; a 0-year one all of it.
+    assert rate_weight(10, 2) == pytest.approx((1 - np.exp(-np.log(2) * 5)) / (np.log(2) * 5))
+    assert rate_weight(10, 2) == pytest.approx(0.2795, abs=1e-4)
+    assert rate_weight(0, 2) == 1.0 and rate_weight(1, 1000) == pytest.approx(1.0, abs=1e-3)
+    params = model_params({"neutral_rate": 3.0, "term_premium": 0.5})
+    assert model_yield(3.0, params) == pytest.approx(3.5)
+    assert model_yield(5.0, params) - model_yield(4.5, params) == pytest.approx(0.5 * rate_weight(10, 2))
+    # The earnings yield moves point for point: 25x is a 4% earnings yield, +0.15 points makes it 4.15%.
+    assert rate_adjusted_pe(25.0, 0.15) == pytest.approx(1 / 0.0415)
+    assert rate_adjusted_pe(25.0, 0.15, pass_through=0) == pytest.approx(25.0)
+    assert rate_adjusted_pe(25.0, -5.0) == np.inf and np.isnan(rate_adjusted_pe(np.nan, 0.1))
+    series = rate_adjusted_pe(pd.Series([20.0, np.nan]), pd.Series([1.0, 1.0]))
+    assert series.iloc[0] == pytest.approx(1 / 0.06) and np.isnan(series.iloc[1])
+
+
+def rate_run(policy_rate, **overrides):
+    quarters = make_quarters()
+    close = make_close(quarters)
+    peers = pd.DataFrame({"AAA": 24.0, "BBB": 16.0}, index=close.index)
+    rates = pd.Series(policy_rate, index=close.index) if np.ndim(policy_rate) == 0 else policy_rate
+    return run_model(quarters, close, None, model_params(overrides), peers, policy_rate=rates,
+                     market_yield=pd.Series(4.2, index=close.index))
+
+
+def test_a_steady_policy_rate_leaves_the_price_alone_and_a_forward_rate_moves_it():
+    quarters = make_quarters()
+    close = make_close(quarters)
+    peers = pd.DataFrame({"AAA": 24.0, "BBB": 16.0}, index=close.index)
+    plain = latest_values(run_model(quarters, close, None, model_params(), peers))
+    steady = latest_values(rate_run(4.0))
+    assert steady["model_price"] == pytest.approx(plain["model_price"])
+    assert steady["yield_gap"] == 0 and steady["forward_gap"] == 0 and steady["market_yield"] == 4.2
+
+    hiked = rate_run(4.0, use_forward_rate=True, forward_rate=4.5)
+    values = latest_values(hiked)
+    shift = 0.5 * 0.2795
+    assert values["forward_rate"] == 4.5 and values["policy_rate"] == 4.0
+    assert values["forward_gap"] == pytest.approx(shift, abs=1e-3) and values["yield_gap"] == pytest.approx(shift, abs=1e-3)
+    # Both anchors move: own and peers' P/E each get the higher earnings yield, then the half-half blend.
+    daily = hiked["daily"].iloc[-1]
+    expected = 0.5 * (1 / (1 / daily["peer_anchor"] + shift / 100)) + 0.5 * (1 / (1 / daily["own_anchor"] + shift / 100))
+    assert values["rate_anchor"] == pytest.approx(expected, rel=1e-3)
+    assert values["model_price"] < plain["model_price"]
+    # Only the last day uses the forward rate: the day before is untouched.
+    assert hiked["daily"]["model_price"].iloc[-2] == pytest.approx(plain_series(quarters, close, peers).iloc[-2])
+
+
+def plain_series(quarters, close, peers):
+    return run_model(quarters, close, None, model_params(), peers)["daily"]["model_price"]
+
+
+def test_a_rate_above_the_look_back_lowers_the_own_anchor_only():
+    quarters = make_quarters()
+    close = make_close(quarters)
+    rates = pd.Series(np.where(close.index < close.index[-20], 2.0, 5.0), index=close.index)
+    result = rate_run(rates, peer_weight=0.0)
+    values = latest_values(result)
+    # The own P/E's look-back sat mostly at 2%: today's 5% is a higher yield, so a lower own anchor.
+    assert values["yield_gap"] == pytest.approx(3.0 * 0.2795, abs=1e-3) and values["forward_gap"] == 0
+    assert values["rate_anchor"] < result["daily"]["own_anchor"].iloc[-1]
+    # Peers price today's rate already: with all of the anchor from peers, only a forward rate would move it.
+    peers_only = latest_values(rate_run(rates, peer_weight=1.0))
+    assert peers_only["rate_anchor"] == pytest.approx(20.0)
+
+
+def test_rate_dial_sensitivity_and_cases():
+    from analysis.valuation_model import default_rate_cases, rate_cases
+    result = rate_run(4.0)
+    values = latest_values(result)
+    dials = implied_dials(result).set_index("Dial")
+    assert "Policy rate" in dials.index and dials.loc["Policy rate", "Block"] == "Rate model"
+    # The model price is above the close here, so the rate that explains the close is higher than today's.
+    if values["model_price"] > values["close"]:
+        assert dials.loc["Policy rate", "Needed"] > 4.0
+    steps = sensitivities(result)
+    assert steps["0.5 point higher policy rate"] < 0
+    table, expected = rate_cases(result, default_rate_cases(4.0))
+    assert table["Policy rate %"].tolist() == [4.0, 4.25, 4.5]
+    assert table["Model price"].iloc[0] == pytest.approx(values["model_price"])
+    assert table["Model price"].is_monotonic_decreasing
+    assert expected == pytest.approx((table["Model price"] * table["Probability %"]).sum() / 100)
+    # Without a policy rate there is no rate dial and no cases.
+    off = run_model(make_quarters(), make_close(make_quarters()), None, model_params(),
+                    pd.DataFrame({"AAA": 20.0}, index=make_close(make_quarters()).index))
+    assert "Policy rate" not in implied_dials(off)["Dial"].tolist()
+    assert rate_cases(off, default_rate_cases(4.0))[0].empty

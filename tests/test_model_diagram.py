@@ -5,7 +5,7 @@ import pytest
 pytest.importorskip("plotly")
 
 from analysis.model_diagram import (  # noqa: E402
-    POSITIONS, block_signals_figure, format_value, items_table, model_diagram, model_price_figure, parameter_table,
+    BOTTOM, POSITIONS, block_signals_figure, format_value, items_table, model_diagram, model_price_figure, parameter_table,
 )
 from analysis.valuation_model import BLOCKS, model_params, preset_params, preset_register, run_model  # noqa: E402
 from tests.test_valuation_model import make_close, make_quarters, register  # noqa: E402
@@ -41,7 +41,7 @@ def test_diagram_shows_every_block_with_its_value_and_both_rates(result):
     assert "In: Bear EPS" in hover and "Out: Risk-adjusted EPS" in hover and "Param: Bear weight = 25" in hover
     # The chosen block has the heavy border; every block sits inside the drawing.
     assert sum(shape.line.width == 3 for shape in fig.layout.shapes) == 1
-    assert all(0 < x < 10 and 0 < y < 14.4 for x, y in POSITIONS.values())
+    assert all(0 < x < 10 and 0 < y < BOTTOM for x, y in POSITIONS.values())
     assert fig.layout.dragmode is False and fig.layout.clickmode == "event+select"
 
 
