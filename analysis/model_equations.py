@@ -172,10 +172,8 @@ def worked_equations(result, block, on=None):
         fundamentals = params["anchor_source"] == "Fundamentals"
         raw_peer, raw_own = get('outside_anchor'), get('own_anchor')
         # The anchors after the rate model (the same as before it when no policy rate is loaded).
-        peer = (get("fundamental_pe") if fundamentals else
+        peer = (get("outside_forward") if fundamentals else
                 rate_adjusted_pe(raw_peer, get("forward_gap") if np.isfinite(get("forward_gap")) else 0.0, passed))
-        if fundamentals and np.isfinite(get("forward_gap")) and get("forward_gap") != 0:
-            peer = np.nan  # shown below: the fundamental P/E at the forward yield
         own = rate_adjusted_pe(raw_own, get("yield_gap") if np.isfinite(get("yield_gap")) else 0.0, passed)
         if np.isfinite(peer) and np.isfinite(own):
             mix = rf"{_n(share)} \times {_n(peer, 1)} + {_n(1 - share)} \times {_n(own, 1)}"
@@ -192,7 +190,7 @@ def worked_equations(result, block, on=None):
             erp = params["forward_equity_premium"] if np.isfinite(params.get("forward_equity_premium", np.nan)) else params["equity_premium"]
             required = (get("model_yield") if np.isfinite(get("model_yield")) else params["base_yield"]) + erp
             years_text = _n(get("pe_half_life") if np.isfinite(get("pe_half_life")) else get("growth_half_life"), 2)
-            pe_text = _n(get("outside_anchor") if not np.isfinite(get("pe_growth")) else get("rate_anchor"), 1)
+            pe_text = _n(get("outside_forward"), 1)
             lines.insert(0, rf"h = {years_text} \text{{ years}} \quad (GM = {margin_text}), \qquad g = {_n(growth, 1)}\%")
             lines.insert(1, rf"\text{{P/E}}_{{\text{{fund}}}} = {pe_text} \quad (r = {_n(required, 2)}\%)")
         pairs = [("own", raw_own, get("yield_gap"))] + ([] if fundamentals else [("peers", raw_peer, get("forward_gap"))])

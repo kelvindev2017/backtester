@@ -143,6 +143,7 @@ SIGNALS = {
     "growth_half_life": ("daily", "Half-life of the extra growth, years (from gross margin)", "", "count"),
     "fundamental_pe": ("daily", "Fundamental P/E (growth, gross margin, yield)", "x", "multiple"),
     "outside_anchor": ("daily", "Outside view P/E (fundamental or peers)", "x", "multiple"),
+    "outside_forward": ("daily", "Outside view P/E with your forward view and rate", "x", "multiple"),
     "pe_growth": ("daily", "Growth the fundamental P/E rests on (yours from the latest release)", "%", "percent"),
     "pe_half_life": ("daily", "Growth half-life used, years", "", "count"),
     "pe_before_premium": ("daily", "P/E before the market premium", "x", "multiple"),
@@ -790,7 +791,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     else:
         outside_now = daily["peer_anchor"]
         outside_rate = rate_adjusted_pe(daily["peer_anchor"], daily["forward_gap"], passed)
-    daily["outside_anchor"] = outside_now
+    daily["outside_anchor"], daily["outside_forward"] = outside_now, outside_rate
     own_rate = rate_adjusted_pe(daily["own_anchor"], daily["yield_gap"], passed)
     daily["anchor"] = blend_anchor(daily["own_anchor"], outside_now, params["peer_weight"])
     daily["rate_anchor"] = blend_anchor(own_rate, outside_rate, params["peer_weight"])
