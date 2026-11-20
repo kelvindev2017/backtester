@@ -135,10 +135,14 @@ and look-ahead return behind any one dot. Code in `analysis/what_happened_next.p
 diagram. Results and prices go in, an estimated price per share comes out, and every block shows the value it
 produces. The model runs at two rates. On each earnings release: **income and cost map** (trailing revenue growth and
 net margin) -> **earnings quality** (reported EPS of the last four quarters less a haircut) -> **scenario engine**
-(next year's EPS in a bear, base and bull case) -> **risk weighting** (the weighted EPS). On each close: **multiple
-builder** (median P/E of the peers and of the stock's own past, plus or minus P/E points) -> **product** (EPS x
-acceptable P/E = price per share) -> **market check** (the gap to the close). Hold blocks keep the quarterly outputs
-until the next release.
+(next year's EPS in a bear, base and bull case) -> **risk weighting** (the weighted EPS). On each close: **rate
+model** (the US policy rate from FRED, or your forward rate on the last day, turned into an N-year yield: the short
+rate drifts back to a neutral rate, so only part of a rate change reaches a long yield) -> **multiple builder**
+(median P/E of the peers and of the stock's own past, each moved by the yield change so that the earnings yield 1/P/E
+rises point for point with it, plus or minus P/E points) -> **product** (EPS x acceptable P/E = price per share) ->
+**market check** (the gap to the close, including the policy rate that would explain it). Hold blocks keep the
+quarterly outputs until the next release. **Rate cases** price the stock under a few policy rates (hold, +0.25,
++0.50 by default) and weigh them by your probabilities into an expected model price.
 
 Inputs are signals (results, prices, the risk and product register); everything you choose is a parameter of the
 block that owns it, set in the settings: the EPS haircut, the growth and margin of each case, the scenario weights,

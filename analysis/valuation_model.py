@@ -2,7 +2,8 @@
 
 The model has two sample rates. The quarterly part runs on every earnings release (and on the day a risk or product
 item starts to apply): income and cost map -> earnings quality -> scenario engine -> risk weighting. Its outputs are
-held between releases. The daily part runs on every close: multiple builder -> product -> market check.
+held between releases. The daily part runs on every close: rate model -> multiple builder -> product -> market check.
+The rate model turns a forward policy rate into an N-year yield and moves the P/E anchor by the change in yield.
 
 Signals are what the world supplies (quarterly results, prices, the list of risk and product items). Parameters are
 what the analyst chooses (adjustment rules, growth and margin cases, scenario weights, P/E deductions). Every item
@@ -56,7 +57,17 @@ DEFAULT_PARAMS = {
     # Triage gate
     "materiality_eps_pct": 1.0,  # smallest expected EPS effect (probability x impact) that enters the model
     "materiality_pe": 0.5,       # smallest P/E effect, in points, that enters the model
+    # Rate model
+    "use_forward_rate": False,   # True: the last day uses forward_rate instead of the policy rate on the day
+    "forward_rate": 0.0,         # the policy rate % you expect (e.g. after the next central bank meeting)
+    "yield_years": 10,           # N: maturity of the yield the stock is valued against
+    "neutral_rate": 3.0,         # policy rate % the short rate drifts back to in the long run
+    "rate_half_life": 2.0,       # years for half of a rate's gap to the neutral rate to fade
+    "term_premium": 0.5,         # extra % a year for holding an N-year bond; cancels out of the yield changes
+    "rate_pass_through": 1.0,    # share of a yield change that reaches the stock's required return
 }
+
+YIELD_MATURITIES = [1, 2, 3, 5, 7, 10, 20, 30]  # maturities with a daily US Treasury yield on FRED (DGS1 ... DGS30)
 
 # name -> (frame, label, unit, axis). Signals with the same axis can share a chart panel.
 SIGNALS = {
@@ -81,11 +92,19 @@ SIGNALS = {
     "items_modelled": ("quarterly", "Items in the model", "", "count"),
     "items_parked": ("quarterly", "Items parked", "", "count"),
     "close": ("daily", "Close", "", "price"),
+    "policy_rate": ("daily", "Policy rate", "%", "rate"),
+    "market_yield": ("daily", "Market N-year yield", "%", "rate"),
+    "forward_rate": ("daily", "Policy rate used (forward on the last day)", "%", "rate"),
+    "model_yield": ("daily", "Model N-year yield", "%", "rate"),
+    "yield_ref": ("daily", "Model yield, median over the P/E look-back", "%", "rate"),
+    "yield_gap": ("daily", "Yield vs the own P/E's look-back", "%", "rate_change"),
+    "forward_gap": ("daily", "Yield change from the forward rate", "%", "rate_change"),
     "held_eps": ("daily", "Risk-adjusted EPS (held)", "", "eps"),
     "held_pe_adjust": ("daily", "P/E points (held)", "pts", "points"),
     "held_quality_pe": ("daily", "Earnings quality P/E points (held)", "pts", "points"),
     "own_anchor": ("daily", "Own median P/E", "x", "multiple"),
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
+    "rate_anchor": ("daily", "P/E anchor after the rate model", "x", "multiple"),
     "acceptable_pe": ("daily", "Acceptable P/E", "x", "multiple"),
     "model_price": ("daily", "Model price per share", "", "price"),
     "market_pe": ("daily", "Market price / risk-adjusted EPS", "x", "multiple"),
@@ -126,9 +145,18 @@ BLOCKS = {
         title="Risk weighting", rate="quarterly", role="Param: scenario weights",
         inputs=["eps_bear", "eps_base", "eps_bull"], outputs=["risk_adjusted_eps"],
         params={"weight_bear": "Bear weight", "weight_base": "Base weight", "weight_bull": "Bull weight"}),
+    "rate_model": dict(
+        title="Rate model", rate="daily", role="Param: forward rate, N",
+        inputs=["policy_rate", "market_yield"], outputs=["forward_rate", "model_yield", "yield_ref", "yield_gap",
+                                                         "forward_gap"],
+        params={"use_forward_rate": "Use the forward rate on the last day (1 = yes)",
+                "forward_rate": "Forward policy rate %", "yield_years": "Yield maturity N, years",
+                "neutral_rate": "Neutral policy rate %", "rate_half_life": "Rate half-life, years",
+                "term_premium": "Term premium %", "rate_pass_through": "Share of a yield change passed to the P/E"}),
     "multiple_builder": dict(
         title="Multiple builder", rate="daily", role="Param: P/E deductions",
-        inputs=["own_anchor", "peer_anchor", "held_pe_adjust", "held_quality_pe"], outputs=["acceptable_pe"],
+        inputs=["own_anchor", "peer_anchor", "yield_gap", "forward_gap", "held_pe_adjust", "held_quality_pe"],
+        outputs=["rate_anchor", "acceptable_pe"],
         params={"pe_lookback_years": "Own P/E look-back, years", "peer_weight": "Share of the anchor from peers",
                 "pe_floor": "P/E floor", "pe_cap": "P/E cap"}),
     "product": dict(
@@ -362,14 +390,75 @@ def quarterly_inputs(quarters):
     return frame
 
 
-def run_model(quarters, close, register=None, params=None, peer_pe=None, start=None, own_pe=None):
+def rate_weight(years, half_life):
+    """Share of a policy rate change that shows up in the N-year yield.
+
+    The expected short rate starts at the policy rate and drifts back to the neutral rate, losing half its gap every
+    ``half_life`` years; the N-year yield is the average of that path (plus a term premium). The weight is the
+    average of exp(-lambda t) over 0..N: 1 for an instant maturity or a rate that never fades, about 0.28 for a
+    10-year yield with a 2-year half-life.
+    """
+
+    years, half_life = float(years), float(half_life)
+    if years <= 0 or half_life <= 0:
+        return 1.0 if years <= 0 else 0.0
+    decay = np.log(2) / half_life * years
+    return float((1 - np.exp(-decay)) / decay)
+
+
+def model_yield(policy_rate, params):
+    """The N-year yield implied by a policy rate (a number or a Series), in %."""
+
+    params = model_params(params)
+    weight = rate_weight(params["yield_years"], params["rate_half_life"])
+    return params["neutral_rate"] + (policy_rate - params["neutral_rate"]) * weight + params["term_premium"]
+
+
+def rate_adjusted_pe(pe, yield_change, pass_through=1.0):
+    """A P/E after a change in yield (in % points): the earnings yield 1/P/E moves by the same amount.
+
+    For a stock valued as earnings / (required return - growth), the earnings yield is required return minus growth,
+    so a rise in the required return lifts it point for point. A long-duration stock (high P/E) loses more: at 25x a
+    yield up 0.15 points takes the P/E to 24.1x, at 50x to 46.5x. An earnings yield pushed to zero or below leaves
+    the P/E unbounded (the multiple builder's cap then applies).
+    """
+
+    if isinstance(pe, pd.Series):
+        change = pd.Series(yield_change, index=pe.index, dtype=float) if np.ndim(yield_change) else yield_change
+        earnings_yield = 1 / pe + float(pass_through) * change / 100
+        return (1 / earnings_yield).where(earnings_yield > 0, np.inf).where(pe.notna())
+    if pe is None or not np.isfinite(pe) or pe <= 0:
+        return np.nan
+    earnings_yield = 1 / pe + float(pass_through) * yield_change / 100
+    return 1 / earnings_yield if earnings_yield > 0 else np.inf
+
+
+def blend_anchor(own, peer, share):
+    """The P/E anchor: ``share`` of the peers' P/E and the rest of the own one; either alone when the other is missing."""
+
+    share = float(np.clip(share, 0, 1))
+    own_series, peer_series = pd.Series(own, dtype=float), pd.Series(peer, dtype=float)
+    if share >= 1:
+        anchor = peer_series.combine_first(own_series)
+    elif share <= 0:
+        anchor = own_series.combine_first(peer_series)
+    else:
+        blended = share * peer_series + (1 - share) * own_series
+        anchor = blended.where(peer_series.notna() & own_series.notna(), peer_series.combine_first(own_series))
+    return anchor if np.ndim(own) or np.ndim(peer) else float(anchor.iloc[0])
+
+
+def run_model(quarters, close, register=None, params=None, peer_pe=None, start=None, own_pe=None, policy_rate=None,
+              market_yield=None):
     """Run the whole model over history.
 
     quarters: results by the date they became public (columns Revenue, Net_Income, EPS; any may be missing).
     close: daily close of the share. register: the risk and product items. peer_pe: daily P/E of each peer, one
     column per peer, on the basis the anchor uses. start: first day to report (earlier data still feeds the trailing
     sums and medians). own_pe: the share's own daily P/E for its anchor; None uses the trailing P/E from ``quarters``
-    (pass a forward P/E here, with the peers' forward P/E, for a forward anchor).
+    (pass a forward P/E here, with the peers' forward P/E, for a forward anchor). policy_rate: the central bank rate
+    in % by date; None (or empty) switches the rate model off. market_yield: the market's N-year yield in %, shown
+    next to the model's yield as a check (it does not feed the price).
 
     Returns a dict with ``quarterly`` (one row per update of the quarterly part), ``daily`` (one row per close),
     ``items`` (the register after the triage gate and router) and ``params``. Nothing on a date uses data from later.
@@ -427,15 +516,37 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         daily["peer_anchor"] = peers.median(axis=1, skipna=True)
     else:
         daily["peer_anchor"] = np.nan
-    share = float(np.clip(params["peer_weight"], 0, 1))
-    blended = share * daily["peer_anchor"] + (1 - share) * daily["own_anchor"]
-    anchor = blended.where(daily["peer_anchor"].notna() & daily["own_anchor"].notna(),
-                           daily["peer_anchor"].combine_first(daily["own_anchor"]))
-    if share >= 1:
-        anchor = daily["peer_anchor"].combine_first(daily["own_anchor"])
-    elif share <= 0:
-        anchor = daily["own_anchor"].combine_first(daily["peer_anchor"])
-    daily["anchor"] = anchor
+
+    # Rate model. The own anchor is a median over years of past rates, so it moves with the yield against the median
+    # yield of those years; the peers' P/E is today's and already prices today's rate, so it moves only with the
+    # forward rate's surprise.
+    for name in ["policy_rate", "forward_rate", "model_yield", "yield_ref", "market_yield"]:
+        daily[name] = np.nan
+    daily["yield_gap"], daily["forward_gap"] = 0.0, 0.0
+    rates = pd.to_numeric(pd.Series(policy_rate, dtype=float), errors="coerce").dropna() if policy_rate is not None else pd.Series(dtype=float)
+    if len(rates) and len(close):
+        rates = rates.sort_index()
+        rates = rates.loc[~rates.index.duplicated(keep="last")]
+        on_day = rates.reindex(rates.index.union(close.index)).ffill().reindex(close.index)
+        used = on_day.copy()
+        if params["use_forward_rate"]:
+            used.iloc[-1] = float(params["forward_rate"])
+        actual_yield = model_yield(on_day, params)
+        daily["policy_rate"], daily["forward_rate"] = on_day, used
+        daily["model_yield"] = model_yield(used, params)
+        daily["yield_ref"] = actual_yield.shift(1).rolling(window, min_periods=min(window, 60)).median()
+        daily["yield_gap"] = (daily["model_yield"] - daily["yield_ref"]).fillna(0.0)
+        daily["forward_gap"] = (daily["model_yield"] - actual_yield).fillna(0.0)
+    if market_yield is not None and len(pd.Series(market_yield, dtype=float).dropna()) and len(close):
+        market = pd.to_numeric(pd.Series(market_yield, dtype=float), errors="coerce").dropna().sort_index()
+        market = market.loc[~market.index.duplicated(keep="last")]
+        daily["market_yield"] = market.reindex(market.index.union(close.index)).ffill(limit=10).reindex(close.index)
+    passed = float(params["rate_pass_through"])
+    own_rate = rate_adjusted_pe(daily["own_anchor"], daily["yield_gap"], passed)
+    peer_rate = rate_adjusted_pe(daily["peer_anchor"], daily["forward_gap"], passed)
+    daily["anchor"] = blend_anchor(daily["own_anchor"], daily["peer_anchor"], params["peer_weight"])
+    daily["rate_anchor"] = blend_anchor(own_rate, peer_rate, params["peer_weight"])
+    anchor = daily["rate_anchor"]
     daily["acceptable_pe"] = (anchor + daily["held_pe_adjust"] + daily["held_quality_pe"]).clip(lower=params["pe_floor"], upper=params["pe_cap"])
 
     # Product and market check.
@@ -483,6 +594,38 @@ def _point_price(state, params, routed):
     return eps * float(np.clip(state["anchor"] + points + point["quality_pe"], params["pe_floor"], params["pe_cap"]))
 
 
+def _day_state(result, values, on):
+    """One day's held inputs for ``_point_price``, plus what the rate model needs to redo the anchor."""
+
+    day = result["daily"].loc[:on].iloc[-1]
+    anchor = day["rate_anchor"] if "rate_anchor" in day else day["anchor"]
+    return {"on": on, "ttm_eps": values.get("ttm_eps", np.nan), "revenue_yoy": values.get("revenue_yoy", np.nan),
+            "net_margin": values.get("net_margin", np.nan), "anchor": anchor,
+            "own_anchor": day.get("own_anchor", np.nan), "peer_anchor": day.get("peer_anchor", np.nan),
+            "policy_rate": day.get("policy_rate", np.nan), "yield_ref": day.get("yield_ref", np.nan)}
+
+
+def has_rates(result):
+    """True when the run had a policy rate on its last day, so the rate model is live."""
+
+    daily = result["daily"]
+    return "policy_rate" in daily and len(daily) > 0 and bool(np.isfinite(daily["policy_rate"].iloc[-1]))
+
+
+def anchor_at_rate(state, params, rate):
+    """The day's P/E anchor (after the rate model) if the policy rate were ``rate`` instead."""
+
+    if not np.isfinite(state.get("policy_rate", np.nan)):
+        return state["anchor"]
+    expected = model_yield(rate, params)
+    actual = model_yield(state["policy_rate"], params)
+    own_gap = expected - state["yield_ref"] if np.isfinite(state["yield_ref"]) else 0.0
+    passed = params["rate_pass_through"]
+    own = rate_adjusted_pe(state["own_anchor"], own_gap, passed)
+    peer = rate_adjusted_pe(state["peer_anchor"], expected - actual, passed)
+    return blend_anchor(own, peer, params["peer_weight"])
+
+
 def _solve(price_at, low, high, target, steps=60):
     """The value in [low, high] where ``price_at`` equals ``target``, or None when it is never reached."""
 
@@ -523,9 +666,8 @@ def implied_dials(result, on=None):
         return pd.DataFrame(columns=DIAL_COLUMNS)
     params, routed = result["params"], result["items"]
     on = pd.Timestamp(on) if on is not None else result["daily"].index[-1]
-    anchor = result["daily"].loc[:on, "anchor"].iloc[-1]
-    state = {"on": on, "ttm_eps": values.get("ttm_eps", np.nan), "revenue_yoy": values.get("revenue_yoy", np.nan),
-             "net_margin": values.get("net_margin", np.nan), "anchor": anchor}
+    state = _day_state(result, values, on)
+    anchor = state["anchor"]
     target = values["close"]
     rows = []
 
@@ -557,6 +699,11 @@ def implied_dials(result, on=None):
     add("Acceptable P/E", "Multiple builder", float(np.clip(anchor + points, params["pe_floor"], params["pe_cap"])),
         1, 100, (params["pe_floor"], params["pe_cap"]), "x",
         lambda multiple: _point_price(state, {**params, "pe_floor": multiple, "pe_cap": multiple}, routed))
+
+    if has_rates(result):
+        used = result["daily"].loc[:on, "forward_rate"].iloc[-1]
+        add("Policy rate", "Rate model", used, -1, 20, (max(0.0, used - 1.5), used + 1.5), "%",
+            lambda rate: _point_price({**state, "anchor": anchor_at_rate(state, params, rate)}, params, routed))
 
     model_above = values["model_price"] > target
     for position, row in routed.iterrows():
@@ -617,20 +764,66 @@ def sensitivities(result, on=None):
         return {}
     params, routed = result["params"], result["items"]
     on = pd.Timestamp(on) if on is not None else result["daily"].index[-1]
-    state = {"on": on, "ttm_eps": values.get("ttm_eps", np.nan), "revenue_yoy": values.get("revenue_yoy", np.nan),
-             "net_margin": values.get("net_margin", np.nan), "anchor": result["daily"].loc[:on, "anchor"].iloc[-1]}
+    state = _day_state(result, values, on)
     base = _point_price(state, params, routed)
     weights = scenario_weights(params) * 100
     rest = weights[1] + weights[2]
     scale = (100 - weights[0] - 10) / rest if rest > 0 else 0
     more_bear = {**params, "weight_bear": weights[0] + 10, "weight_base": weights[1] * scale, "weight_bull": weights[2] * scale}
-    return {
+    steps = {
         "10 points more bear weight": _point_price(state, more_bear, routed) - base,
         "1x more P/E": values.get("held_eps", np.nan),
         "1 point more growth": _shifted_growth_price(state, params, routed, 1.0) - base,
         "1 point more net margin": _point_price(state, {**params, **{
             f"{name.lower()}_margin_pts": params[f"{name.lower()}_margin_pts"] + 1 for name in SCENARIOS}}, routed) - base,
     }
+    if has_rates(result):
+        used = result["daily"].loc[:on, "forward_rate"].iloc[-1]
+        higher = {**state, "anchor": anchor_at_rate(state, params, used + 0.5)}
+        steps["0.5 point higher policy rate"] = _point_price(higher, params, routed) - base
+    return steps
+
+
+RATE_CASE_COLUMNS = ["Case", "Policy rate %", "Probability %"]
+
+
+def default_rate_cases(rate):
+    """Three cases around a policy rate: hold, +0.25 and +0.50 points."""
+
+    return pd.DataFrame([["Hold", rate, 50.0], ["+0.25", rate + 0.25, 30.0], ["+0.50", rate + 0.5, 20.0]],
+                        columns=RATE_CASE_COLUMNS)
+
+
+def rate_cases(result, cases, on=None):
+    """The model price in each policy rate case and their probability-weighted expected value.
+
+    ``cases`` has the columns Case, Policy rate % and Probability % (rescaled to add up to 100). Each case reruns the
+    rate model and the multiple builder for the day with that rate on it; everything else is held. Returns
+    ``(table, expected)``: the table adds the case's N-year yield, anchor, model price and change vs the close;
+    ``expected`` is the weighted model price (NaN when there is nothing to weigh).
+    """
+
+    columns = RATE_CASE_COLUMNS + ["N-year yield %", "P/E anchor", "Model price", "vs close %"]
+    values = latest_values(result, on)
+    frame = pd.DataFrame(cases, columns=RATE_CASE_COLUMNS) if cases is not None else pd.DataFrame(columns=RATE_CASE_COLUMNS)
+    frame = frame.dropna(subset=["Policy rate %"]).reset_index(drop=True)
+    if not values or frame.empty or not has_rates(result):
+        return pd.DataFrame(columns=columns), np.nan
+    params, routed = result["params"], result["items"]
+    on = pd.Timestamp(on) if on is not None else result["daily"].index[-1]
+    state = _day_state(result, values, on)
+    rows = []
+    for row in frame.to_dict("records"):
+        rate = float(row["Policy rate %"])
+        anchor = anchor_at_rate(state, params, rate)
+        price = _point_price({**state, "anchor": anchor}, params, routed)
+        rows.append({**row, "N-year yield %": float(model_yield(rate, params)), "P/E anchor": anchor,
+                     "Model price": price, "vs close %": (price / values["close"] - 1) * 100})
+    table = pd.DataFrame(rows, columns=columns)
+    weights = pd.to_numeric(table["Probability %"], errors="coerce").fillna(0).clip(lower=0)
+    usable = weights.where(table["Model price"].notna(), 0)
+    expected = float((usable * table["Model price"].fillna(0)).sum() / usable.sum()) if usable.sum() > 0 else np.nan
+    return table, expected
 
 
 def track_items(register, news=None, now=None, stale_days=90):

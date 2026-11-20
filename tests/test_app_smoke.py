@@ -1133,3 +1133,40 @@ def test_model_haircut_starts_at_stock_pay_and_equations_show(offline, monkeypat
     formulas = [element.value for element in app.get("latex")]
     assert any("EPS}_{\\text{clean}}" in formula for formula in formulas)
     assert any("P/E}_{\\text{acc}}" in formula for formula in formulas)
+
+
+def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
+    import analysis.economy
+    days = pd.bdate_range("2015-01-01", pd.Timestamp.today())
+    fred = {"DFF": pd.Series(np.where(days < days[-300], 2.0, 4.0), index=days, dtype=float),
+            "DGS10": pd.Series(4.3, index=days)}
+
+    def fake_fred(series_id, timeout=30):
+        if series_id not in fred:
+            raise OSError("not in the test data")
+        return fred[series_id]
+
+    monkeypatch.setattr(analysis.economy, "fred_series", fake_fred)
+    monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
+    st.cache_data.clear()
+    app = open_tab(start_app(), "Valuation Model")
+    charts = [chart.proto.spec for chart in app.get("plotly_chart")]
+    assert any("Rate model" in spec and "Price per share" in spec for spec in charts)
+    assert any("Policy rate" in frame.value.get("Dial", pd.Series(dtype=str)).tolist() for frame in app.dataframe)
+    cases = next(frame.value for frame in app.dataframe if "N-year yield %" in frame.value.columns)
+    assert cases["Policy rate %"].tolist() == [4.0, 4.25, 4.5]
+    assert "Expected model price" in [metric.label for metric in app.metric]
+
+    # Ticking the forward rate starts it at today's rate; a higher forward rate lowers the model price.
+    before = app.metric[0].value
+    app.checkbox(key="model_ASMVY_use_forward_rate").check()
+    open_tab(app, "Valuation Model")
+    assert app.session_state["model_ASMVY_forward_rate"] == pytest.approx(4.0)
+    assert app.metric[0].value == before
+    app.number_input(key="model_ASMVY_forward_rate").set_value(5.0)
+    open_tab(app, "Valuation Model")
+    assert app.metric[0].value != before
+    app.selectbox(key="model_block").select("rate_model")
+    open_tab(app, "Valuation Model")
+    formulas = [element.value for element in app.get("latex")]
+    assert any("y_N" in formula and "5.00" in formula for formula in formulas)
