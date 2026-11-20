@@ -13,6 +13,7 @@ from analysis.valuation_chart import (
     forward_eps,
     forward_valuation,
     no_hindsight_forward_pe,
+    expected_growth_check,
     quarterly_eps,
     break_long_gaps,
     gap_spans,
@@ -367,3 +368,17 @@ def test_past_forward_pe_uses_no_later_reported_eps():
     # A loss has no P/E.
     loss = valuation.assign(TTM_Reported_EPS=-1.0)
     assert no_hindsight_forward_pe(loss, None).isna().all()
+
+
+def test_fast_growers_keep_their_growth_and_the_rule_is_checked_against_analysts():
+    days = pd.bdate_range("2023-01-02", "2024-12-31")
+    # EPS tripled on a year back (+200%): half is +100%, which the default cap keeps; a 40% cap would not.
+    ttm = pd.Series(np.where(days < "2024-01-01", 1.0, 3.0), index=days)
+    valuation = pd.DataFrame({"Close": 120.0, "TTM_Reported_EPS": ttm}, index=days)
+    day = pd.Timestamp("2024-06-03")
+    assert no_hindsight_forward_pe(valuation, None)[day] == pytest.approx(120 / 6.0)
+    assert no_hindsight_forward_pe(valuation, None, cap=40.0)[day] == pytest.approx(120 / 4.2)
+    forward = pd.DataFrame({"Forward_EPS": 4.5, "Forward_PE": 120 / 4.5, "Estimated": True}, index=days)
+    analysts, rule = expected_growth_check(valuation, forward, pd.Timestamp("2024-11-01"))
+    assert analysts == pytest.approx(50.0) and rule == pytest.approx(100.0)
+    assert np.isnan(expected_growth_check(valuation, forward, None)[0])

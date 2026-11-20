@@ -155,8 +155,10 @@ margin change) and **fwd** (with the assumptions), down to the price; a **Now vs
 numbers sums it up, and the price chart adds the "now" price as a dotted line.
 
 With the **Forward** P/E basis, past forward P/Es carry no hindsight: before the latest report they use the trailing
-EPS grown by half of its past year's growth (within -20% and +40%), not the EPS reported later, which would make the
-past P/E collapse before a boom and explode before a slump. Analyst estimates are used from the latest report on.
+EPS grown by half of its past year's growth (within -20% and +100% by default, settable in the Multiple builder so
+a fast grower is not cut to an ordinary one), not the EPS reported later, which would make the past P/E collapse
+before a boom and explode before a slump. Analyst estimates are used from the latest report on; the data note
+compares the rule's growth with the analysts' on that day, to help tune it.
 
 Inputs are signals (results, prices, the risk and product register); everything you choose is a parameter of the
 block that owns it, set in the settings: the EPS haircut, the growth and margin of each case, the scenario weights,

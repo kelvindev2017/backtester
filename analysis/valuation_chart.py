@@ -232,13 +232,15 @@ def forward_eps(earnings, estimates=None, quarter_days=91, fiscal_year_end=None)
     return frame
 
 
-def no_hindsight_forward_pe(valuation, forward, last_report=None, follow=0.5, floor=-20.0, cap=40.0, year_days=365):
+def no_hindsight_forward_pe(valuation, forward, last_report=None, follow=0.5, floor=-20.0, cap=100.0, year_days=365):
     """Daily forward P/E with no hindsight: what could have been known on each day.
 
     :func:`forward_eps` fills past quarters with the EPS reported later, so a past forward P/E knows the coming
     boom or bust (low before a boom, high before a slump) and swings far more than the market's own forward P/E
     did. Here, days that rest on any later-reported quarter use an expected forward EPS instead: the trailing EPS
-    grown by ``follow`` x its growth over the past year, kept within ``floor`` and ``cap`` %. Only days from
+    grown by ``follow`` x its growth over the past year, kept within ``floor`` and ``cap`` % (the cap is high so a
+    fast grower is not cut to an ordinary one; the floor assumes a slump does not keep going at full speed). Only
+    days from
     ``last_report`` (the latest announcement), when all four quarters ahead are analyst estimates, keep the
     estimate-based forward P/E; without ``last_report``, days flagged ``Estimated`` (any estimate) keep it.
 
@@ -266,6 +268,30 @@ def no_hindsight_forward_pe(valuation, forward, last_report=None, follow=0.5, fl
     else:
         estimated = forward["Estimated"].reindex(days).astype("boolean").fillna(False).astype(bool)
     return forward["Forward_PE"].reindex(days).where(estimated, proxy)
+
+
+def expected_growth_check(valuation, forward, last_report, follow=0.5, floor=-20.0, cap=100.0, year_days=365):
+    """(analysts' expected EPS growth %, the history rule's growth %) on the latest report day, to tune the rule.
+
+    Analysts': the estimate-based forward EPS over the trailing EPS. The rule's: ``follow`` x the trailing EPS growth
+    over the past year, within ``floor`` and ``cap``. NaN where it cannot be worked out.
+    """
+
+    if valuation is None or valuation.empty or forward is None or forward.empty or last_report is None:
+        return np.nan, np.nan
+    ttm = pd.to_numeric(valuation["TTM_Reported_EPS"], errors="coerce").dropna()
+    on = ttm.index[ttm.index >= pd.Timestamp(last_report)]
+    if not len(on):
+        return np.nan, np.nan
+    day = on[0]
+    now = ttm[day]
+    before = ttm.loc[:day - pd.Timedelta(days=year_days)]
+    forward_eps_now = pd.to_numeric(forward["Forward_EPS"], errors="coerce").get(day, np.nan)
+    analysts = (forward_eps_now / now - 1) * 100 if now > 0 and np.isfinite(forward_eps_now) else np.nan
+    rule = np.nan
+    if now > 0 and len(before) and before.iloc[-1] > 0:
+        rule = float(np.clip(follow * (now / before.iloc[-1] - 1) * 100, floor, cap))
+    return analysts, rule
 
 
 def forward_valuation(valuation, forward):
