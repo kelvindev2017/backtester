@@ -207,6 +207,7 @@ from analysis.valuation_model import (
     default_rate_cases,
     has_rates,
     implied_dials,
+    now_and_forward,
     latest_values,
     model_params,
     preset_params,
@@ -4614,6 +4615,41 @@ def show_model_equations(block):
         st.caption(MODEL_SYMBOLS[block])
 
 
+FORWARD_ITEM_COLUMNS = ["Item", "Status", "Probability %", "EPS impact %", "P/E points"]
+
+
+def forward_items_editor():
+    """The register's sizes and status, editable next to the other forward assumptions.
+
+    Same table as the full register below the chart (which also adds, removes and describes items): an edit here is
+    written back to it row by row.
+    """
+
+    table = model_register()
+    if table.empty:
+        st.caption("No items yet: add risks and products in the register under the chart.")
+        return
+    edited = st.data_editor(
+        table[FORWARD_ITEM_COLUMNS], hide_index=True, width="stretch", num_rows="fixed",
+        key=f"model_forward_items_{st.session_state.get('model_register_version', 0)}_table",
+        column_config={
+            "Item": st.column_config.TextColumn("Item", disabled=True),
+            "Status": st.column_config.SelectboxColumn("Status", options=["Modelled", "Parked"], required=True),
+            "Probability %": st.column_config.NumberColumn("Prob. %", min_value=0, max_value=100, format="%.0f"),
+            "EPS impact %": st.column_config.NumberColumn("EPS %", min_value=0, max_value=100, format="%.1f"),
+            "P/E points": st.column_config.NumberColumn("P/E pts", min_value=0, max_value=50, format="%.1f"),
+        })
+    after = table.copy()
+    for column in FORWARD_ITEM_COLUMNS[1:]:
+        after[column] = pd.DataFrame(edited)[column].to_numpy()
+    after = clean_register(after)
+    if not after.astype(str).equals(table.astype(str)):
+        log_model_change(register_changes(table, after) or ["Register edited"], st.session_state.get("model_last_price"))
+        store_model_register(after)
+        st.rerun()
+    st.caption("Add, remove or describe items in the register under the chart.")
+
+
 def model_settings():
     """The model's parameters, one settings group per block that owns them. Returns (ticker, years, peers, params)."""
 
@@ -4649,6 +4685,28 @@ def model_settings():
                                "the Yahoo industry by closeness in size.")
         buttons[1].button("Reset parameters and register", on_click=apply_model_preset, key="model_reset_btn",
                           help="Back to the ticker's preset, or to the defaults when it has none.")
+    with settings_panel("Forward assumptions"):
+        st.caption("Everything the model assumes about the future, in one place. Beside each block of the diagram, "
+                   "'now' is today's data without these and 'fwd' is with them; the Now vs forward table sums it up.")
+        st.markdown("**Policy rate** · Rate model")
+        params["use_forward_rate"] = st.checkbox(
+            "Use a forward policy rate on the last day", key=model_param_key("use_forward_rate"),
+            on_change=start_forward_rate,
+            help="Off: every day uses the actual US policy rate (effective Fed funds, FRED). On: the last day uses "
+                 "the rate below instead, e.g. the rate you expect after the next Fed meeting.")
+        params["forward_rate"] = number("forward_rate", "Forward policy rate %", -1, 20, 0.25,
+                                        "The policy rate you expect. Filled in with today's rate when you tick the box.")
+        st.markdown("**Growth and margin cases** · Scenario engine")
+        params["growth_follow"] = number("growth_follow", "Base growth as a share of trailing growth", 0, 2, 0.05)
+        params["growth_floor"] = number("growth_floor", "Base growth floor %", -90, 0, 1)
+        params["growth_cap"] = number("growth_cap", "Base growth cap %", 0, 300, 1)
+        params["bear_growth_gap"] = number("bear_growth_gap", "Bear: growth points below base", 0, 100, 1)
+        params["bull_growth_gap"] = number("bull_growth_gap", "Bull: growth points above base", 0, 100, 1)
+        params["bear_margin_pts"] = number("bear_margin_pts", "Bear: net margin change, points", -50, 50, 0.5)
+        params["base_margin_pts"] = number("base_margin_pts", "Base: net margin change, points", -50, 50, 0.5)
+        params["bull_margin_pts"] = number("bull_margin_pts", "Bull: net margin change, points", -50, 50, 0.5)
+        st.markdown("**Risk and product items** · Triage gate, Item router")
+        forward_items_editor()
     with settings_panel("Earnings quality", expanded=False):
         show_model_equations("earnings_quality")
         params["eps_haircut_pct"] = number("eps_haircut_pct", "EPS haircut %", 0, 90, 1,
@@ -4662,14 +4720,7 @@ def model_settings():
         params["quality_pe_pts"] = number("quality_pe_pts", "P/E deduction, points", 0, 50, 0.5)
     with settings_panel("Scenario engine", expanded=False):
         show_model_equations("scenario_engine")
-        params["growth_follow"] = number("growth_follow", "Base growth as a share of trailing growth", 0, 2, 0.05)
-        params["growth_floor"] = number("growth_floor", "Base growth floor %", -90, 0, 1)
-        params["growth_cap"] = number("growth_cap", "Base growth cap %", 0, 300, 1)
-        params["bear_growth_gap"] = number("bear_growth_gap", "Bear: growth points below base", 0, 100, 1)
-        params["bull_growth_gap"] = number("bull_growth_gap", "Bull: growth points above base", 0, 100, 1)
-        params["bear_margin_pts"] = number("bear_margin_pts", "Bear: net margin change, points", -50, 50, 0.5)
-        params["base_margin_pts"] = number("base_margin_pts", "Base: net margin change, points", -50, 50, 0.5)
-        params["bull_margin_pts"] = number("bull_margin_pts", "Bull: net margin change, points", -50, 50, 0.5)
+        st.caption("The growth and margin cases are under Forward assumptions.")
         params["fallback_yoy"] = number("fallback_yoy", "Trailing growth % when there is no revenue history", -90, 300, 1)
         params["fallback_margin"] = number("fallback_margin", "Net margin % when there is no net income", 0.5, 90, 0.5)
     with settings_panel("Risk weighting", expanded=False):
@@ -4680,13 +4731,7 @@ def model_settings():
         st.caption("Weights are rescaled to add up to 100%.")
     with settings_panel("Rate model", expanded=False):
         show_model_equations("rate_model")
-        params["use_forward_rate"] = st.checkbox(
-            "Use a forward policy rate on the last day", key=model_param_key("use_forward_rate"),
-            on_change=start_forward_rate,
-            help="Off: every day uses the actual US policy rate (effective Fed funds, FRED). On: the last day uses "
-                 "the rate below instead, e.g. the rate you expect after the next Fed meeting.")
-        params["forward_rate"] = number("forward_rate", "Forward policy rate %", -1, 20, 0.25,
-                                        "The policy rate you expect. Filled in with today's rate when you tick the box.")
+        st.caption("The forward policy rate is under Forward assumptions.")
         params["yield_years"] = st.select_slider("Yield maturity N (years)", YIELD_MATURITIES,
                                                  key=model_param_key("yield_years"),
                                                  help="The yield the stock is valued against; 10 is the usual choice. "
@@ -4857,6 +4902,20 @@ def render_market_check(result):
                    + "; ".join(f"{name} {value:+,.2f}" for name, value in steps.items() if np.isfinite(value))
                    + ". Use the table to decide which assumption to look at again, not to fit the model to the "
                      "price: a model tuned until the gap is zero can only ever say the stock is fairly priced.")
+
+
+def render_now_and_forward(result):
+    """What the forward assumptions do: each step now (today's data) and forward (with the assumptions)."""
+
+    table = now_and_forward(result)
+    if table.empty:
+        return
+    st.markdown("**Now vs forward**")
+    st.dataframe(table, hide_index=True, width="stretch",
+                 column_config={column: st.column_config.NumberColumn(format="%.2f") for column in ["Now", "Forward", "Change"]})
+    st.caption("Now: today's policy rate, no register items, and the clean trailing EPS with no growth or margin "
+               "change. Forward: the same with the Forward assumptions (forward rate, growth and margin cases and "
+               "their weights, register items).")
 
 
 def render_rate_cases(result):
@@ -5067,6 +5126,7 @@ def render_valuation_model():
     tiles[1].metric("Close", f"{values['close']:,.2f}" if np.isfinite(values.get("close", np.nan)) else "n/a")
     tiles[2].metric("Risk-adjusted EPS", signal_text(values, "risk_adjusted_eps"))
     tiles[3].metric("Acceptable P/E", signal_text(values, "acceptable_pe"))
+    render_now_and_forward(result)
 
     blocks = list(MODEL_BLOCKS)
     if st.session_state.get("model_block") not in blocks:

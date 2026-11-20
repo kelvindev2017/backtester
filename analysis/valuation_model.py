@@ -67,7 +67,11 @@ DEFAULT_PARAMS = {
     "rate_pass_through": 1.0,    # share of a yield change that reaches the stock's required return
 }
 
-YIELD_MATURITIES = [1, 2, 3, 5, 7, 10, 20, 30]  # maturities with a daily US Treasury yield on FRED (DGS1 ... DGS30)
+YIELD_MATURITIES = [1, 2, 3, 5, 7, 10, 20, 30]
+
+# Assumptions about the future, set together in the Forward section; the other parameters describe today's data.
+FORWARD_PARAMS = ["use_forward_rate", "forward_rate", "growth_follow", "growth_floor", "growth_cap", "bear_growth_gap",
+                  "bull_growth_gap", "bear_margin_pts", "base_margin_pts", "bull_margin_pts"]  # maturities with a daily US Treasury yield on FRED (DGS1 ... DGS30)
 
 # name -> (frame, label, unit, axis). Signals with the same axis can share a chart panel.
 SIGNALS = {
@@ -106,6 +110,12 @@ SIGNALS = {
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
     "rate_anchor": ("daily", "P/E anchor after the rate model", "x", "multiple"),
     "acceptable_pe": ("daily", "Acceptable P/E", "x", "multiple"),
+    "held_clean_eps": ("daily", "Clean trailing EPS (held)", "", "eps"),
+    "now_yield": ("daily", "Model N-year yield at today's rate", "%", "rate"),
+    "now_anchor": ("daily", "P/E anchor at today's rate", "x", "multiple"),
+    "now_pe": ("daily", "P/E now (today's rate, no register items)", "x", "multiple"),
+    "now_price": ("daily", "Model price now (no forward assumptions)", "", "price"),
+    "now_residual_pct": ("daily", "Model price now vs close", "%", "percent"),
     "model_price": ("daily", "Model price per share", "", "price"),
     "market_pe": ("daily", "Market price / risk-adjusted EPS", "x", "multiple"),
     "residual_pct": ("daily", "Model price vs close", "%", "percent"),
@@ -147,8 +157,8 @@ BLOCKS = {
         params={"weight_bear": "Bear weight", "weight_base": "Base weight", "weight_bull": "Bull weight"}),
     "rate_model": dict(
         title="Rate model", rate="daily", role="Param: forward rate, N",
-        inputs=["policy_rate", "market_yield"], outputs=["forward_rate", "model_yield", "yield_ref", "yield_gap",
-                                                         "forward_gap"],
+        inputs=["policy_rate", "market_yield"], outputs=["forward_rate", "now_yield", "model_yield", "yield_ref",
+                                                         "yield_gap", "forward_gap"],
         params={"use_forward_rate": "Use the forward rate on the last day (1 = yes)",
                 "forward_rate": "Forward policy rate %", "yield_years": "Yield maturity N, years",
                 "neutral_rate": "Neutral policy rate %", "rate_half_life": "Rate half-life, years",
@@ -156,15 +166,15 @@ BLOCKS = {
     "multiple_builder": dict(
         title="Multiple builder", rate="daily", role="Param: P/E deductions",
         inputs=["own_anchor", "peer_anchor", "yield_gap", "forward_gap", "held_pe_adjust", "held_quality_pe"],
-        outputs=["rate_anchor", "acceptable_pe"],
+        outputs=["now_pe", "rate_anchor", "acceptable_pe"],
         params={"pe_lookback_years": "Own P/E look-back, years", "peer_weight": "Share of the anchor from peers",
                 "pe_floor": "P/E floor", "pe_cap": "P/E cap"}),
     "product": dict(
         title="Product", rate="daily", role="EPS x acceptable P/E",
-        inputs=["held_eps", "acceptable_pe"], outputs=["model_price"], params={}),
+        inputs=["held_clean_eps", "held_eps", "now_pe", "acceptable_pe"], outputs=["now_price", "model_price"], params={}),
     "market_check": dict(
         title="Market check", rate="daily", role="Out: implied dials",
-        inputs=["model_price", "close"], outputs=["residual_pct", "market_pe"], params={}),
+        inputs=["model_price", "close"], outputs=["now_residual_pct", "residual_pct", "market_pe"], params={}),
 }
 
 # The doc's ASMPT case, per ADR in US dollars (1 ADR = 3 Hong Kong shares). The event items stay parked because the
@@ -495,11 +505,13 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     if quarterly.empty:
         daily["held_eps"], daily["held_pe_adjust"], held_ttm = np.nan, 0.0, pd.Series(np.nan, index=close.index)
         daily["held_quality_pe"] = -abs(float(params["quality_pe_pts"]))
+        daily["held_clean_eps"] = np.nan
     else:
         # Hold blocks: each quarterly output keeps its last value until the next update.
         both = quarterly.reindex(quarterly.index.union(close.index)).ffill().reindex(close.index)
         daily["held_eps"], daily["held_pe_adjust"], held_ttm = both["risk_adjusted_eps"], both["pe_adjust"].fillna(0.0), both["ttm_eps"]
         daily["held_quality_pe"] = both["quality_pe"].fillna(0.0)
+        daily["held_clean_eps"] = both["clean_eps"]
 
     # Multiple builder. The own anchor is the median trailing P/E of the look-back, up to the day before, so the
     # day's own price does not set its own fair multiple.
@@ -520,7 +532,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     # Rate model. The own anchor is a median over years of past rates, so it moves with the yield against the median
     # yield of those years; the peers' P/E is today's and already prices today's rate, so it moves only with the
     # forward rate's surprise.
-    for name in ["policy_rate", "forward_rate", "model_yield", "yield_ref", "market_yield"]:
+    for name in ["policy_rate", "forward_rate", "model_yield", "now_yield", "yield_ref", "market_yield"]:
         daily[name] = np.nan
     daily["yield_gap"], daily["forward_gap"] = 0.0, 0.0
     rates = pd.to_numeric(pd.Series(policy_rate, dtype=float), errors="coerce").dropna() if policy_rate is not None else pd.Series(dtype=float)
@@ -534,6 +546,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         actual_yield = model_yield(on_day, params)
         daily["policy_rate"], daily["forward_rate"] = on_day, used
         daily["model_yield"] = model_yield(used, params)
+        daily["now_yield"] = actual_yield
         daily["yield_ref"] = actual_yield.shift(1).rolling(window, min_periods=min(window, 60)).median()
         daily["yield_gap"] = (daily["model_yield"] - daily["yield_ref"]).fillna(0.0)
         daily["forward_gap"] = (daily["model_yield"] - actual_yield).fillna(0.0)
@@ -548,12 +561,19 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     daily["rate_anchor"] = blend_anchor(own_rate, peer_rate, params["peer_weight"])
     anchor = daily["rate_anchor"]
     daily["acceptable_pe"] = (anchor + daily["held_pe_adjust"] + daily["held_quality_pe"]).clip(lower=params["pe_floor"], upper=params["pe_cap"])
+    # "Now": the same chain with no forward assumption, i.e. today's policy rate, no register items and the clean
+    # trailing EPS with no growth or margin change. Next to the model price it shows what the forward inputs add.
+    own_now = rate_adjusted_pe(daily["own_anchor"], daily["yield_gap"] - daily["forward_gap"], passed)
+    daily["now_anchor"] = blend_anchor(own_now, daily["peer_anchor"], params["peer_weight"])
+    daily["now_pe"] = (daily["now_anchor"] + daily["held_quality_pe"]).clip(lower=params["pe_floor"], upper=params["pe_cap"])
 
     # Product and market check.
     positive_eps = daily["held_eps"].where(daily["held_eps"] > 0)
     daily["model_price"] = positive_eps * daily["acceptable_pe"]
     daily["market_pe"] = daily["close"] / positive_eps
     daily["residual_pct"] = (daily["model_price"] / daily["close"] - 1) * 100
+    daily["now_price"] = daily["held_clean_eps"].where(daily["held_clean_eps"] > 0) * daily["now_pe"]
+    daily["now_residual_pct"] = (daily["now_price"] / daily["close"] - 1) * 100
     if start is not None:
         daily = daily.loc[pd.Timestamp(start):]
         # Keep the update in force on the first day shown.
@@ -895,3 +915,24 @@ def _show(value):
     if _is_empty(value):
         return "-"
     return f"{value:g}" if isinstance(value, (float, np.floating)) else str(value)
+
+
+def now_and_forward(result, on=None):
+    """Each step of the chain now (today's data, no forward assumption) and forward (with them), side by side.
+
+    Rows: policy rate, N-year yield, EPS, P/E, model price and its gap to the close. Columns: Now, Forward, Change.
+    """
+
+    values = latest_values(result, on)
+    columns = ["Step", "Now", "Forward", "Change"]
+    if not values:
+        return pd.DataFrame(columns=columns)
+    rows = [("Policy rate %", "policy_rate", "forward_rate"), ("N-year yield %", "now_yield", "model_yield"),
+            ("EPS", "held_clean_eps", "held_eps"), ("P/E", "now_pe", "acceptable_pe"),
+            ("Model price", "now_price", "model_price"), ("vs close %", "now_residual_pct", "residual_pct")]
+    table = [{"Step": label, "Now": values.get(now, np.nan), "Forward": values.get(forward, np.nan)}
+             for label, now, forward in rows]
+    frame = pd.DataFrame(table, columns=columns[:3])
+    frame = frame[frame[["Now", "Forward"]].notna().any(axis=1)].reset_index(drop=True)
+    frame["Change"] = frame["Forward"] - frame["Now"]
+    return frame
