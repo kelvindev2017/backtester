@@ -208,6 +208,8 @@ from analysis.valuation_model import (
     YIELD_MATURITIES,
     case_table,
     case_table_changes,
+    pe_table,
+    pe_table_changes,
     clean_register,
     default_rate_cases,
     has_rates,
@@ -4635,7 +4637,8 @@ def show_model_equations(block):
 
 FORWARD_TABLES_BOX = None  # set by model_settings: where the Forward tables go once the model has run
 CASE_TABLE_PARAMS = ["forward_growth", "forward_margin", "bull_growth_gap", "bear_growth_gap", "bull_margin_pts",
-                     "bear_margin_pts"]
+                     "bear_margin_pts", "forward_pe_growth", "forward_half_life", "forward_equity_premium",
+                     "market_premium"]
 FORWARD_ITEM_COLUMNS = ["Item", "Status", "Current %", "Forward %", "Bull adj", "Bear adj", "EPS impact %", "P/E points"]
 
 
@@ -4655,6 +4658,7 @@ def render_forward_tables(result):
         return
     with FORWARD_TABLES_BOX:
         render_case_table(result)
+        render_pe_table(result)
         render_forward_items(result)
 
 
@@ -4686,6 +4690,37 @@ def render_case_table(result):
         st.rerun()
     st.caption("Each case grows the clean EPS by its growth and scales it by its margin over the current one. Your "
                "Forward values apply from the latest release; earlier quarters use the auto rule.")
+
+
+def render_pe_table(result):
+    st.markdown("**P/E** · Multiple builder")
+    drawn = pe_table(result)
+    edited = st.data_editor(
+        drawn, hide_index=True, width="stretch", num_rows="fixed", key=f"model_pe_{forward_version()}_table",
+        column_config={
+            "Metric": st.column_config.TextColumn("Metric", disabled=True),
+            "Current": st.column_config.NumberColumn(
+                "Current", disabled=True, format="%.1f",
+                help="From the history: revenue growth a year over the growth history, half-life from the gross "
+                     "margin, the default risk premium. For the market premium: what the market pays over the "
+                     "model before your premium."),
+            "Forward": st.column_config.NumberColumn(
+                "Forward", format="%.1f",
+                help="Your reasonable guess, used from the latest release. Clear it to go back to the history "
+                     "(the premium to 0)."),
+            "Forward from": st.column_config.TextColumn("Forward from", disabled=True),
+        })
+    updates = pe_table_changes(drawn, edited, result["params"])
+    if updates:
+        for name, value in updates.items():
+            st.session_state[model_param_key(name)] = float(value)
+        log_model_change([f"{name}: {value:g}" for name, value in updates.items()], st.session_state.get("model_last_price"))
+        bump_forward_version()
+        st.rerun()
+    st.caption("Growth, half-life and risk premium are what the fundamental P/E rests on; your forward guesses "
+               "replace the history from the latest release. The market premium is kept apart: a % on the P/E for "
+               "what no fundamental explains (brand, scarcity, a story). Current shows how much the market pays "
+               "today; Forward is what you choose to accept (0 = none).")
 
 
 def render_forward_items(result):
@@ -5060,6 +5095,13 @@ def render_market_check(result):
         "price that is too high, a product one that is too low.")
     st.dataframe(dials, hide_index=True, width="stretch", column_config={
         column: st.column_config.NumberColumn(format="%.1f") for column in ["Now", "Needed", "Change"]})
+    implied, applied = values.get("implied_premium_pct", np.nan), values.get("premium_pct", 0.0)
+    if np.isfinite(implied):
+        st.caption(f"Market premium: before any premium of yours, the close is {implied:+.0f}% from the model. "
+                   + (f"You accept {applied:+.0f}% (Forward assumptions, P/E table). " if applied else
+                      "You accept none (Forward assumptions, P/E table). ")
+                   + "That premium is what the market pays for what the fundamentals and your forward guesses "
+                     "do not explain; keep it apart rather than stretching growth to fit it.")
     steps = sensitivities(result)
     if steps:
         st.caption("One step of each main dial moves the model price by: "

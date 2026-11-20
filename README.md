@@ -160,7 +160,11 @@ Next year's earnings grow at that rate and the growth above a 3% terminal rate f
 half-life: 0.5 years at a gross margin of 20% or less, up to 2 years at 60% or more (pricing power keeps growth going).
 The stream is discounted at the Rate model's yield plus a 4.5% equity risk premium. At a 4.3% yield and a 60%+ gross
 margin: 8% growth gives about 19x, 30% about 28x, 100% about 71x, 300% about 340x; at an 18% gross margin 100% growth
-gives about 21x. The peers' median P/E is still available as the outside view; the rest of the anchor can come from
+gives about 21x. Under Forward assumptions a **P/E table** puts each input of the fundamental P/E next to your reasonable forward guess
+(growth, growth half-life, equity risk premium; used from the latest release, blank = the history), and keeps a
+**market premium** apart: a % on the P/E for what no fundamental explains (brand, scarcity, a story). Its Current
+column shows how much the market pays over the model today; Forward is what you choose to accept (0 by default), so
+the premium never hides inside a stretched growth rate. The peers' median P/E is still available as the outside view; the rest of the anchor can come from
 the stock's own P/E history.
 
 With the **Forward** P/E basis, past forward P/Es carry no hindsight: before the latest report they use the trailing
