@@ -90,3 +90,15 @@ def test_values_are_formatted_by_unit():
     assert format_value(12.345, "%", "percent") == "+12.3%" and format_value(20.0, "%", "share") == "20.0%"
     assert format_value(17.54, "x") == "17.5x" and format_value(-6, "pts") == "-6.0 pts"
     assert format_value(2.5e9) == "2.50B" and format_value(3, "", "count") == "3" and format_value(np.nan) == "n/a"
+
+
+def test_blocks_with_forward_assumptions_show_now_and_forward(result):
+    text = texts(model_diagram(result))
+    assert text.count("now ") >= 6 and "fwd " in text
+    assert "fwd base" in text and "now none" in text
+    # No policy rate in this run: the rate model has no now/fwd pair.
+    from analysis.model_diagram import now_and_forward_text
+    from analysis.valuation_model import latest_values
+    assert now_and_forward_text("rate_model", latest_values(result)) is None
+    assert now_and_forward_text("income_map", latest_values(result)) is None
+    assert any("(forward)" in label for label in parameter_table(result, "scenario_engine")["Parameter"])

@@ -144,6 +144,12 @@ rises point for point with it, plus or minus P/E points) -> **product** (EPS x a
 quarterly outputs until the next release. **Rate cases** price the stock under a few policy rates (hold, +0.25,
 +0.50 by default) and weigh them by your probabilities into an expected model price.
 
+The assumptions about the future sit together under **Forward assumptions** at the top of the settings: the
+forward policy rate, the growth and margin cases, and the register items' status and sizes. Beside each block they
+change, the diagram shows **now** (today's data: today's rate, no items, the clean trailing EPS with no growth or
+margin change) and **fwd** (with the assumptions), down to the price; a **Now vs forward** table under the headline
+numbers sums it up, and the price chart adds the "now" price as a dotted line.
+
 Inputs are signals (results, prices, the risk and product register); everything you choose is a parameter of the
 block that owns it, set in the settings: the EPS haircut, the growth and margin of each case, the scenario weights,
 the P/E look-back and peer share, the materiality bar. Tap a block (or pick it under the diagram) to see its

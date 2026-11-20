@@ -375,3 +375,30 @@ def test_rate_dial_sensitivity_and_cases():
                     pd.DataFrame({"AAA": 20.0}, index=make_close(make_quarters()).index))
     assert "Policy rate" not in implied_dials(off)["Dial"].tolist()
     assert rate_cases(off, default_rate_cases(4.0))[0].empty
+
+
+def test_now_is_the_chain_without_forward_assumptions():
+    from analysis.valuation_model import FORWARD_PARAMS, now_and_forward
+    flat = {"growth_follow": 0.0, "bear_growth_gap": 0.0, "bull_growth_gap": 0.0, "bear_margin_pts": 0.0,
+            "base_margin_pts": 0.0, "bull_margin_pts": 0.0}
+    assert set(flat) <= set(FORWARD_PARAMS) and "forward_rate" in FORWARD_PARAMS
+    # With no growth, margin change, items or forward rate, now and forward are the same price.
+    values = latest_values(rate_run(4.0, **flat))
+    assert values["now_price"] == pytest.approx(values["model_price"])
+    assert values["held_clean_eps"] == pytest.approx(values["held_eps"]) and values["now_pe"] == pytest.approx(values["acceptable_pe"])
+    # A forward rate moves only the forward side.
+    hiked = rate_run(4.0, use_forward_rate=True, forward_rate=4.5, **flat)
+    moved = latest_values(hiked)
+    assert moved["now_price"] == pytest.approx(values["now_price"]) and moved["model_price"] < values["model_price"]
+    table = now_and_forward(hiked).set_index("Step")
+    assert table.loc["Policy rate %", "Now"] == 4.0 and table.loc["Policy rate %", "Forward"] == 4.5
+    assert table.loc["Model price", "Change"] == pytest.approx(moved["model_price"] - moved["now_price"])
+    # Growth is forward too: the default cases lift the forward EPS above the clean trailing EPS.
+    grown = latest_values(rate_run(4.0))
+    assert grown["held_eps"] > grown["held_clean_eps"] and grown["now_price"] == pytest.approx(values["now_price"])
+    # Register items count only forward.
+    items = register([["Cyclicality", "Risk", "General", "Beyond horizon", None, None, 3, "Modelled", "", ""]])
+    quarters = make_quarters()
+    close = make_close(quarters)
+    with_items = latest_values(run_model(quarters, close, items, model_params(flat), pd.DataFrame({"AAA": 20.0}, index=close.index)))
+    assert with_items["now_pe"] - with_items["acceptable_pe"] == pytest.approx(3.0)

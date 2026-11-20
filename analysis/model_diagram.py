@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from analysis.valuation_chart import legends_under_panels
-from analysis.valuation_model import BLOCKS, MODELLED, SCENARIOS, SIGNALS, latest_values, scenario_weights
+from analysis.valuation_model import BLOCKS, FORWARD_PARAMS, MODELLED, SCENARIOS, SIGNALS, latest_values, scenario_weights
 
 BLOCK_FILL = "rgba(65, 105, 225, 0.12)"
 BLOCK_LINE = "royalblue"
@@ -44,8 +44,9 @@ POSITIONS = {
 }
 PLAIN_BLOCKS = {"documents": "Filings, calls, news", "market_data": "Market data", "hold_eps": "Hold",
                 "hold_pe": "Hold", "price": "Price per share"}
-QUARTERLY_REGION, DAILY_REGION = (0.3, 7.95), (9.55, 15.9)
-BOTTOM = 16.1
+QUARTERLY_REGION, DAILY_REGION = (0.3, 7.95), (9.55, 16.1)
+BOTTOM = 16.3
+NOW_COLOR, FORWARD_COLOR = "gray", "royalblue"
 
 
 def format_value(value, unit="", axis=""):
@@ -100,11 +101,38 @@ def block_summary(block, values):
     return lines[block]() if block in lines else ""
 
 
+def now_and_forward_text(block, values):
+    """(now, forward) for a block that a forward assumption changes, or None.
+
+    Now is today's data with no forward assumption (today's policy rate, no register items, the clean trailing EPS
+    with no growth or margin change); forward is the block's output with them.
+    """
+
+    rates = np.isfinite(values.get("policy_rate", np.nan))
+    pairs = {
+        "rate_model": ("now_yield", "model_yield") if rates else None,
+        "scenario_engine": ("clean_eps", "eps_base"),
+        "risk_weighting": ("clean_eps", "risk_adjusted_eps"),
+        "multiple_builder": ("now_pe", "acceptable_pe"),
+        "product": ("now_price", "model_price"),
+        "price": ("now_price", "model_price"),
+        "market_check": ("now_residual_pct", "residual_pct"),
+    }
+    if block == "item_router":
+        return "none", f"EPS {signal_text(values, 'event_effect')}, P/E {signal_text(values, 'pe_adjust')}"
+    names = pairs.get(block)
+    if names is None:
+        return None
+    forward = signal_text(values, names[1])
+    return signal_text(values, names[0]), (f"base {forward}" if block == "scenario_engine" else forward)
+
+
 def parameter_table(result, block):
     """The parameters one block owns, with the values in use."""
 
     params = result["params"]
-    rows = [{"Parameter": label, "Value": int(params[key]) if isinstance(params[key], bool) else params[key]}
+    rows = [{"Parameter": label + (" (forward)" if key in FORWARD_PARAMS else ""),
+             "Value": int(params[key]) if isinstance(params[key], bool) else params[key]}
             for key, label in BLOCKS[block]["params"].items()]
     if block == "risk_weighting":
         rows += [{"Parameter": f"{name} weight, normalised %", "Value": round(float(weight) * 100, 1)}
@@ -249,6 +277,18 @@ def model_diagram(result, selected=None, on=None, mobile=False):
         fig.add_annotation(x=centre[0], y=centre[1], text=label, showarrow=False, font=dict(size=title_size),
                            align="center")
 
+    # Now and forward, outside each block a forward assumption changes: under it, left of the wire leaving it.
+    for block, (x, y) in POSITIONS.items():
+        pair = now_and_forward_text(block, values)
+        if pair is None:
+            continue
+        bottom = y + (0.36 if block in ("documents", "market_data", "price") else HALF_HEIGHT)
+        fig.add_annotation(
+            x=x - 0.12, y=bottom + 0.04, xanchor="right", yanchor="top", showarrow=False, align="right",
+            font=dict(size=9 if mobile else 10),
+            text=(f"<span style='color:{NOW_COLOR}'>now {pair[0]}</span><br>"
+                  f"<b><span style='color:{FORWARD_COLOR}'>fwd {pair[1]}</span></b>"))
+
     keys = list(BLOCKS)
     fig.add_trace(go.Scatter(
         x=[POSITIONS[key][0] for key in keys], y=[POSITIONS[key][1] for key in keys], mode="markers",
@@ -339,6 +379,10 @@ def model_price_figure(result, ticker="", mobile=False):
     fig.add_trace(go.Scatter(x=daily.index, y=daily["model_price"], name="Model price", mode="lines",
                              line=dict(width=2, color="royalblue"),
                              hovertemplate="Model price: %{y:,.2f}<extra></extra>"), row=1, col=1)
+    if "now_price" in daily:
+        fig.add_trace(go.Scatter(x=daily.index, y=daily["now_price"], name="Model price now (no forward assumptions)",
+                                 mode="lines", line=dict(width=1.2, color="royalblue", dash="dot"),
+                                 hovertemplate="Model price now: %{y:,.2f}<extra></extra>"), row=1, col=1)
     fig.add_trace(go.Scatter(x=daily.index, y=daily["close"], name="Close", mode="lines",
                              line=dict(width=1.6, color="dimgray"),
                              hovertemplate="Close: %{y:,.2f}<extra></extra>"), row=1, col=1)

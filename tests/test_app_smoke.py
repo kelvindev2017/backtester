@@ -1167,6 +1167,13 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     app.number_input(key="model_ASMVY_forward_rate").set_value(5.0)
     open_tab(app, "Valuation Model")
     assert app.metric[0].value != before
+    # The forward assumptions sit together; the Now vs forward table shows what they do.
+    assert any(expander.label == "Forward assumptions" for expander in app.expander)
+    steps = next(frame.value for frame in app.dataframe if list(frame.value.columns) == ["Step", "Now", "Forward", "Change"])
+    steps = steps.set_index("Step")
+    assert steps.loc["Policy rate %", "Now"] == pytest.approx(4.0) and steps.loc["Policy rate %", "Forward"] == pytest.approx(5.0)
+    assert steps.loc["Model price", "Change"] < 0
+    assert any("fwd " in spec and "now " in spec for spec in (chart.proto.spec for chart in app.get("plotly_chart")))
     app.selectbox(key="model_block").select("rate_model")
     open_tab(app, "Valuation Model")
     formulas = [element.value for element in app.get("latex")]
