@@ -118,3 +118,14 @@ def test_price_against_growth_margin_and_earnings():
     earnings = next(trace for trace in fig.data if trace.name == "Earnings (highest = 100)")
     assert np.nanmax(np.asarray(earnings.y, dtype=float)) == pytest.approx(100.0)
     assert next(trace for trace in fig.data if trace.name == "Gross margin").y[-1] == pytest.approx(45.0)
+
+
+def test_premium_figure_shows_market_against_model_and_the_next_quarter():
+    from analysis.model_diagram import premium_figure
+    from analysis.premium_model import calibrate
+    from tests.test_premium_model import cyclical_stock, run
+    results, close = cyclical_stock()
+    fig = premium_figure(calibrate(run(results, close)), "TEST")
+    names = [trace.name for trace in fig.data]
+    assert {"Market trailing P/E", "Justified by fundamentals", "Justified + explained premium", "Close",
+            "Forecast a quarter before", "Base next quarter"} <= set(names)

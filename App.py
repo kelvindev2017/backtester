@@ -159,6 +159,7 @@ from analysis.signal_groups import (
     overlay_frame,
     period_start,
 )
+from analysis.premium_model import calibrate
 from analysis.model_advisor import (
     MARKET_SYMBOL,
     market_beta,
@@ -239,6 +240,7 @@ from analysis.model_diagram import (
     items_table,
     model_diagram,
     model_price_figure,
+    premium_figure,
     price_and_fundamentals_figure,
     parameter_table,
     signal_text,
@@ -5132,6 +5134,56 @@ def render_market_check(result):
                      "price: a model tuned until the gap is zero can only ever say the stock is fairly priced.")
 
 
+def render_premium_model(result, ticker):
+    """Part 1: the market premium calibrated on the stock's history (walk-forward). Part 2: today's close against
+    it, and next quarter's price with a bull and a bear case."""
+
+    st.markdown(f"**Market premium model** · calibrated on {ticker}'s history")
+    if result["params"]["anchor_source"] != "Fundamentals":
+        st.caption("Needs the fundamental P/E: set the outside view to Fundamentals in the Multiple builder.")
+        return
+    calibration = calibrate(result)
+    if not calibration:
+        st.caption("Not enough history with reported EPS and revenue (about 2.5 years of month-ends with a "
+                   "positive trailing EPS) to calibrate the premium.")
+        return
+    today, quality = calibration["today"], calibration["quality"]
+    tiles = st.columns(2 if MOBILE else 4)
+    tiles[0].metric("Market trailing P/E", f"{today['actual_pe']:.1f}x")
+    tiles[1].metric("Justified by fundamentals", f"{today['justified_pe']:.1f}x")
+    tiles[2 % len(tiles)].metric("Premium: market / explained", f"{today['premium_pct']:+.0f}% / {today['explained_premium_pct']:+.0f}%")
+    tiles[3 % len(tiles)].metric("Today", today["side"].split(" ")[0].capitalize(),
+                                 f"{today['gap_pct']:+.0f}% vs fair {today['fair_price']:,.2f}", delta_color="inverse")
+    horizon = today["horizon"].strftime("%d %b %Y")
+    cases = st.columns(3)
+    for column, (label, key) in zip(cases, [("Bear", "bear"), ("Base", "base"), ("Bull", "bull")]):
+        value = today[key]
+        column.metric(f"{label}, {horizon}", f"{value:,.2f}" if np.isfinite(value) else "n/a",
+                      f"{(value / today['close'] - 1) * 100:+.1f}%" if np.isfinite(value) else None)
+    beats = np.isfinite(quality["price_error_pct"]) and quality["price_error_pct"] < quality["naive_error_pct"]
+    st.caption(
+        f"Ground truth: the trailing P/E the market paid (close / reported EPS of the last four quarters). The premium "
+        f"is that against the P/E the fundamentals justify, explained by revenue growth, its change of pace, the "
+        f"gross-margin trend, the net margin and EPS growth. Walk-forward over {quality['months']} month-ends (each fit "
+        f"only on the months before): the explained premium was off by a median {quality['premium_error_pct']:.0f}%; "
+        f"the price a quarter on by {quality['price_error_pct']:.1f}% against {quality['naive_error_pct']:.1f}% for "
+        f"'no change'; the direction was right {quality['direction_hit']:.0%} of the time; the bear-to-bull band "
+        f"(20th to 80th percentile of those errors) held {quality['band_coverage']:.0%} of the outcomes (60% expected). "
+        f"Today's gap to the explained premium is assumed to keep {today['keep']:.0%} of itself after a quarter, as in "
+        "the history.")
+    if not beats:
+        st.warning("For this stock the forecast has not beaten 'no change' in the walk-forward history: read the "
+                   "bull and bear range, not the base, and look at the Model check.")
+    show_chart(premium_figure(calibration, ticker, mobile=MOBILE), width="stretch")
+    if not calibration["coefficients"].empty:
+        with st.expander("What explains the premium"):
+            st.dataframe(calibration["coefficients"], hide_index=True, width="stretch",
+                         column_config={"Today": st.column_config.NumberColumn(format="%.1f"),
+                                        "Effect of +1 st. dev. on premium %": st.column_config.NumberColumn(format="%+.1f")})
+            st.caption("A ridge regression on the stock's own history, refitted with all months. Effects are per "
+                       "standard deviation of each feature; features that never moved are left out.")
+
+
 RULE_PARAMS = ("half_life_from_steadiness", "erp_from_beta")
 
 
@@ -5417,6 +5469,7 @@ def render_valuation_model():
     tiles[1].metric("Close", f"{values['close']:,.2f}" if np.isfinite(values.get("close", np.nan)) else "n/a")
     tiles[2].metric("Risk-adjusted EPS", signal_text(values, "risk_adjusted_eps"))
     tiles[3].metric("Acceptable P/E", signal_text(values, "acceptable_pe"))
+    render_premium_model(result, ticker)
     render_now_and_forward(result)
     render_model_check(result, inputs, rerun_with)
 

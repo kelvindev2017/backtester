@@ -451,6 +451,42 @@ def price_and_fundamentals_figure(result, ticker="", mobile=False):
     return fig
 
 
+def premium_figure(calibration, ticker="", mobile=False):
+    """Calibration on history: the trailing P/E the market paid against the one the fundamentals and the explained
+    premium give (both walk-forward), and the close against the price forecast a quarter earlier."""
+
+    history = calibration["history"]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=("Trailing P/E: market against model", "Close against the forecast made a quarter before"))
+    explained_pe = history["justified_pe"] * np.exp(history["explained_premium"])
+    for y, name, style in [(history["actual_pe"], "Market trailing P/E", dict(width=1.8, color="dimgray")),
+                           (history["justified_pe"], "Justified by fundamentals", dict(width=1.2, color="seagreen", dash="dot")),
+                           (explained_pe, "Justified + explained premium", dict(width=2, color="royalblue"))]:
+        fig.add_trace(go.Scatter(x=history.index, y=y, name=name, mode="lines", line=style,
+                                 hovertemplate=f"{name}: %{{y:.1f}}x<extra></extra>"), row=1, col=1)
+    forecast_for = history["forecast"].copy()
+    forecast_for.index = forecast_for.index + pd.DateOffset(months=3)
+    fig.add_trace(go.Scatter(x=history.index, y=history["close"], name="Close", mode="lines",
+                             line=dict(width=1.8, color="dimgray"), showlegend=False,
+                             hovertemplate="Close: %{y:,.2f}<extra></extra>"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=forecast_for.index, y=forecast_for, name="Forecast a quarter before", mode="lines+markers",
+                             marker=dict(size=4), line=dict(width=1.4, color="royalblue"),
+                             hovertemplate="Forecast: %{y:,.2f}<extra></extra>"), row=2, col=1)
+    today = calibration["today"]
+    for value, label, color in [(today["bear"], "Bear", "firebrick"), (today["base"], "Base", "royalblue"),
+                                (today["bull"], "Bull", "seagreen")]:
+        if np.isfinite(value):
+            fig.add_trace(go.Scatter(x=[today["date"], today["horizon"]], y=[today["close"], value], mode="lines+markers",
+                                     name=f"{label} next quarter", line=dict(width=1.4, color=color, dash="dash"),
+                                     hovertemplate=f"{label}: %{{y:,.2f}}<extra></extra>"), row=2, col=1)
+    small = 9 if mobile else 11
+    fig.update_layout(height=560 if mobile else 620, hovermode="x unified", margin=dict(l=10, r=10, t=40, b=10),
+                      legend=dict(orientation="h", yanchor="top", y=-0.06, x=0, entrywidth=0.5,
+                                  entrywidthmode="fraction", font=dict(size=small)))
+    fig.update_annotations(font=dict(size=small))
+    return fig
+
+
 def items_table(result, tracked=None):
     """The register after the gate and router, for display: where each item goes and what it does."""
 
