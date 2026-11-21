@@ -5,7 +5,7 @@ import pytest
 from analysis.valuation_model import (
     BLOCKS, MODELLED, SIGNALS, TO_MULTIPLE, TO_SCENARIOS, clean_register, implied_dials, item_effects, latest_values,
     model_params, preset_params, preset_register, quarterly_inputs, register_changes, route_items, run_model,
-    scenario_point, scenario_weights, sensitivities, track_items,
+    scenario_point, through_cycle_eps, scenario_weights, sensitivities, track_items,
 )
 
 
@@ -204,10 +204,12 @@ def test_item_tracker_counts_mentions_and_collects_unexplained_stories():
 
 
 def test_asmvy_preset_runs_on_a_typed_in_eps():
+    # The preset takes its results from the Hong Kong listing; a typed-in EPS still works when you set one.
     params, items = preset_params("asmvy"), preset_register("ASMVY")
-    assert params["manual_eps"] == pytest.approx(1.64) and params["weight_base"] == 50
+    assert params["manual_eps"] == 0 and params["weight_base"] == 50
+    params = {**params, "manual_eps": 1.64}
     routed = route_items(items, params)
-    assert (routed["Gate"] == MODELLED).sum() == 3 and item_effects(routed)[1] == pytest.approx(-6.0)
+    assert (routed["Gate"] == MODELLED).sum() == 2 and item_effects(routed)[1] == pytest.approx(-3.0)
     days = pd.bdate_range("2026-01-02", "2026-11-10")
     close = pd.Series(np.linspace(30, 37.5, len(days)), index=days)
     peers = pd.DataFrame({"KLIC": 14.4, "CAMT": 26.5, "AMAT": 26.5}, index=days)
@@ -217,8 +219,23 @@ def test_asmvy_preset_runs_on_a_typed_in_eps():
     clean = 1.64 * 0.89
     expected = 0.25 * clean * 8.8 / 9.8 + 0.5 * clean * 1.28 * 13.8 / 9.8 + 0.25 * clean * 1.44 * 16.8 / 9.8
     assert values["risk_adjusted_eps"] == pytest.approx(expected)
-    assert values["acceptable_pe"] == pytest.approx(26.5 - 6) and values["model_price"] == pytest.approx(expected * 20.5)
+    assert values["acceptable_pe"] == pytest.approx(26.5 - 3) and values["model_price"] == pytest.approx(expected * 23.5)
     assert preset_register("NVDA").empty and preset_params("NVDA") == model_params()
+
+
+def test_deep_cycle_is_valued_on_through_cycle_eps():
+    # Yearly EPS 4, 6, 8, 2, 1, 1.5 and next year 3: it fell over 50% from a high with no trend, so Auto turns it on.
+    past = pd.Series(np.repeat([4.0, 6.0, 8.0, 2.0, 1.0, 1.5], 4))
+    params = model_params({"cycle_eps": "Auto", "cycle_years": 7})
+    cycle, trend, on = through_cycle_eps(past, 3.0, 1.0, params)
+    assert on and cycle == pytest.approx((4 + 6 + 8 + 2 + 1 + 1.5 + 3) / 7) and trend < 10
+    # A steady grower is left on next year's EPS.
+    grower = pd.Series(np.repeat([1.0, 1.3, 1.7, 2.2, 2.9, 3.7], 4))
+    assert not through_cycle_eps(grower, 4.8, 1.0, params)[2]
+    assert not through_cycle_eps(past, 3.0, 1.0, model_params({"cycle_eps": "Off"}))[2]
+    assert through_cycle_eps(grower, 4.8, 1.0, model_params({"cycle_eps": "On"}))[2]
+    # Too little history: off.
+    assert not through_cycle_eps(past.iloc[-6:], 3.0, 1.0, params)[2]
 
 
 def test_register_is_cleaned_and_changes_are_listed():

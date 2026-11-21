@@ -989,11 +989,12 @@ def test_valuation_model_tab(offline, monkeypatch):
     assert app.sidebar.header[0].value == "Valuation Model"
     # The tab opens on the worked example: its preset fills the parameters, the peers and the register.
     assert app.subheader[0].value == "ASMVY"
-    assert app.session_state["model_ASMVY_manual_eps"] == pytest.approx(1.64)
+    assert app.session_state["model_ASMVY_growth_follow"] == pytest.approx(0.7)
+    assert app.session_state["model_ASMVY_manual_eps"] == 0  # results come from the Hong Kong listing
     assert app.session_state["model_peers"] == "BESIY, KLIC, AMAT, COHU, CAMT"
     assert len(app.session_state["model_register"]) == 10
     rendered = " ".join(element.value for element in app.caption)
-    assert "a typed-in trailing EPS of 1.64" in rendered
+    assert "typed-in trailing EPS" not in rendered
     # The P/E's outside view is the company's own growth and gross margin, not the peers.
     assert "growth and gross margin (no peers)" in rendered
     app.radio(key="model_ASMVY_anchor_source").set_value("Peers")
@@ -1013,7 +1014,7 @@ def test_valuation_model_tab(offline, monkeypatch):
     assert all(metric.value != "n/a" for metric in app.metric[:4])
     assert any(list(frame.value.columns) == ["Dial", "Block", "Current", "Needed", "Change", "Unit", "Read"]
                and "Bear weight" in frame.value["Dial"].tolist() for frame in app.dataframe)
-    assert any("Goes to" in frame.value.columns and frame.value["In the model"].sum() == 3 for frame in app.dataframe)
+    assert any("Goes to" in frame.value.columns and frame.value["In the model"].sum() == 2 for frame in app.dataframe)
 
     # Opening another block shows its parameters and signals.
     app.selectbox(key="model_block").select("scenario_engine")
@@ -1093,12 +1094,13 @@ def test_new_model_ticker_resets_the_preset_even_when_another_tab_opens_first(of
     monkeypatch.setattr(yf, "Ticker", FakeTickerWithRevenue)
     st.cache_data.clear()
     app = open_tab(start_app(), "Valuation Model")
-    assert app.session_state["model_ASMVY_manual_eps"] == pytest.approx(1.64)
+    assert app.session_state["model_ASMVY_growth_follow"] == pytest.approx(0.7)
     app.text_input(key="model_ticker").input("NVDA")
     open_tab(app, "News")
     open_tab(app, "Valuation Model")
     assert app.subheader[0].value == "NVDA"
     assert app.session_state["model_NVDA_manual_eps"] == 0
+    assert app.session_state["model_NVDA_growth_follow"] == pytest.approx(0.5)
     assert not any("typed-in trailing EPS" in element.value for element in app.caption)
 
 
