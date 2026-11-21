@@ -36,6 +36,8 @@ DEFAULT_PARAMS = {
     "manual_eps": 0.0,           # trailing 12-month EPS per share typed in; 0 = use the reported quarters
     "quality_pe_pts": 0.0,       # P/E points taken off the acceptable P/E for weak earnings quality
     # Scenario engine
+    "analyst_base": False,       # set by run_model: True when the latest base case is the analysts' EPS
+    "base_eps_source": "Analysts",  # latest quarter's base EPS: Analysts (next 4 quarters' estimates) or Own rule
     "forward_growth": np.nan,    # base (forward) revenue growth % for the latest quarter; NaN = the auto rule below
     "forward_margin": np.nan,    # base (forward) net margin % for the latest quarter; NaN = current + base_margin_pts
     "growth_follow": 0.5,        # auto rule: base growth = this share of the trailing revenue growth
@@ -89,6 +91,7 @@ DEFAULT_PARAMS = {
     "materiality_eps_pct": 1.0,  # smallest expected EPS effect (probability x impact) that enters the model
     "materiality_pe": 0.5,       # smallest P/E effect, in points, that enters the model
     # Rate model
+    "yield_source": "Market",    # Market: the actual N-year Treasury yield; Policy model: built from the policy rate
     "use_forward_rate": False,   # True: the last day uses forward_rate instead of the policy rate on the day
     "forward_rate": 0.0,         # the policy rate % you expect (e.g. after the next central bank meeting)
     "yield_years": 10,           # N: maturity of the yield the stock is valued against
@@ -721,7 +724,7 @@ def blend_anchor(own, peer, share):
 
 
 def run_model(quarters, close, register=None, params=None, peer_pe=None, start=None, own_pe=None, policy_rate=None,
-              market_yield=None, market_close=None):
+              market_yield=None, market_close=None, analyst_growth=None):
     """Run the whole model over history.
 
     quarters: results by the date they became public (columns Revenue, Net_Income, EPS; any may be missing).
@@ -731,7 +734,10 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     P/E for its anchor; None uses the trailing P/E from ``quarters``
     (pass a forward P/E here, with the peers' forward P/E, for a forward anchor). policy_rate: the central bank rate
     in % by date; None (or empty) switches the rate model off. market_yield: the market's N-year yield in %, shown
-    next to the model's yield as a check (it does not feed the price).
+    next to the model's yield as a check; with ``yield_source`` Market it is the yield the stock is discounted at, and
+    the policy-rate model only adds the change a forward rate would make. analyst_growth: analysts' EPS growth %,
+    next four quarters over the last four; with ``base_eps_source`` Analysts it sets the latest quarter's base case
+    (growth = that, net margin held), so base EPS = analysts' EPS less the haircut.
 
     Returns a dict with ``quarterly`` (one row per update of the quarterly part), ``daily`` (one row per close),
     ``items`` (the register after the triage gate and router) and ``params``. Nothing on a date uses data from later.
@@ -742,6 +748,15 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     close = close.loc[~close.index.duplicated(keep="last")]
     routed = route_items(register, params)
     inputs = quarterly_inputs(quarters, params["growth_history_years"])
+    params["analyst_base"] = False
+    if (params["base_eps_source"] == "Analysts" and analyst_growth is not None and np.isfinite(analyst_growth)
+            and len(inputs)):
+        # The base case is the analysts' EPS: their growth, with the net margin held (margin ratio 1).
+        latest_margin = inputs["net_margin"].dropna() if "net_margin" in inputs else pd.Series(dtype=float)
+        params["forward_growth"] = float(analyst_growth)
+        params["forward_margin"] = (float(latest_margin.iloc[-1]) if len(latest_margin) and latest_margin.iloc[-1] > 0
+                                    else float(params["fallback_margin"]))
+        params["analyst_base"] = True
 
     # The quarterly part also runs on the day an item starts to apply, with the last results held.
     item_dates = _since_dates(routed[routed["Gate"] == MODELLED]).dropna()
@@ -822,16 +837,22 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         if params["use_forward_rate"]:
             used.iloc[-1] = float(params["forward_rate"])
         actual_yield = model_yield(on_day, params)
+        market_now = _market_yield_on(market_yield, close.index) if params["yield_source"] == "Market" else None
+        if market_now is not None:
+            # Discount at the market's yield; the policy-rate model only adds what a forward rate would change.
+            actual_yield = market_now.combine_first(actual_yield)
         daily["policy_rate"], daily["forward_rate"] = on_day, used
-        daily["model_yield"] = model_yield(used, params)
+        daily["model_yield"] = actual_yield + (model_yield(used, params) - model_yield(on_day, params))
         daily["now_yield"] = actual_yield
         daily["yield_ref"] = actual_yield.shift(1).rolling(window, min_periods=min(window, 60)).median()
         daily["yield_gap"] = (daily["model_yield"] - daily["yield_ref"]).fillna(0.0)
         daily["forward_gap"] = (daily["model_yield"] - actual_yield).fillna(0.0)
-    if market_yield is not None and len(pd.Series(market_yield, dtype=float).dropna()) and len(close):
-        market = pd.to_numeric(pd.Series(market_yield, dtype=float), errors="coerce").dropna().sort_index()
-        market = market.loc[~market.index.duplicated(keep="last")]
-        daily["market_yield"] = market.reindex(market.index.union(close.index)).ffill(limit=10).reindex(close.index)
+    market_on_day = _market_yield_on(market_yield, close.index)
+    if market_on_day is not None:
+        daily["market_yield"] = market_on_day
+        if not len(rates) and params["yield_source"] == "Market":
+            # No policy rate: the rate model is off, but the stock is still discounted at the market's yield.
+            daily["now_yield"], daily["model_yield"] = market_on_day, market_on_day
     passed = float(params["rate_pass_through"])
     # The outside view: the P/E the company's growth and gross margin justify at the day's yield, or the peers'.
     # The rules below use only what was known on each day, so they hold for the whole history.
@@ -907,6 +928,18 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
             "peer_pe": peers.reindex(daily.index)}
 
 
+def _market_yield_on(market_yield, days):
+    """The market's N-year yield on each of ``days`` (held up to 10 days), or None when there is none."""
+
+    if market_yield is None or not len(days):
+        return None
+    market = pd.to_numeric(pd.Series(market_yield, dtype=float), errors="coerce").dropna().sort_index()
+    if market.empty:
+        return None
+    market = market.loc[~market.index.duplicated(keep="last")]
+    return market.reindex(market.index.union(days)).ffill(limit=10).reindex(days)
+
+
 def latest_values(result, on=None):
     """The value of every signal on ``on`` (default: the last close), quarterly ones held from their last update."""
 
@@ -955,6 +988,7 @@ def _day_state(result, values, on):
             "premium": float(day.get("premium_pct", 0.0)) if np.isfinite(day.get("premium_pct", np.nan)) else 0.0,
             "pe_erp": day.get("pe_erp", np.nan),
             "policy_rate": day.get("policy_rate", np.nan), "yield_ref": day.get("yield_ref", np.nan),
+            "now_yield": day.get("now_yield", np.nan),
             "forward": _is_forward(result, on)}
 
 
@@ -979,6 +1013,9 @@ def anchor_at_rate(state, params, rate):
         return state["anchor"]
     expected = model_yield(rate, params)
     actual = model_yield(state["policy_rate"], params)
+    if np.isfinite(state.get("now_yield", np.nan)):
+        # The day's yield (the market's, when that is the source) moved by what the other rate would change.
+        expected, actual = state["now_yield"] + expected - actual, state["now_yield"]
     own_gap = expected - state["yield_ref"] if np.isfinite(state["yield_ref"]) else 0.0
     passed = params["rate_pass_through"]
     own = rate_adjusted_pe(state["own_anchor"], own_gap, passed)
@@ -1185,7 +1222,8 @@ def case_table(result, params=None):
                      "Bull adj": params[bull], "Bear adj": bear_value,
                      "Current from": "reported" if np.isfinite(reported[metric]) and (
                          metric == "Revenue growth %" or reported[metric] > 0) else "fallback",
-                     "Forward from": "you" if np.isfinite(params.get(key, np.nan)) else "auto rule"})
+                     "Forward from": ("analysts" if params.get("analyst_base") else
+                                      "you" if np.isfinite(params.get(key, np.nan)) else "auto rule")})
     return pd.DataFrame(rows, columns=CASE_COLUMNS)
 
 
