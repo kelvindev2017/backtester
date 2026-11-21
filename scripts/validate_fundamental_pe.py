@@ -44,7 +44,7 @@ def get(url):
 def annual(facts, tags):
     """Fiscal-year values (10-K, ~12-month periods) by period end, the first tag that has each year."""
 
-    out = pd.Series(dtype=float)
+    out = pd.Series(dtype=float, index=pd.DatetimeIndex([]))
     for tag in tags:
         units = facts.get("facts", {}).get("us-gaap", {}).get(tag, {}).get("units", {}).get("USD", [])
         rows = [u for u in units if u.get("form") == "10-K" and u.get("start") and u.get("end")]
@@ -63,6 +63,8 @@ def yearly(series):
     """One value per fiscal year (the last period ending in each calendar year)."""
 
     series = series.dropna()
+    if series.empty or not isinstance(series.index, pd.DatetimeIndex):
+        return pd.Series(dtype=float)
     return series.groupby(series.index.year).last()
 
 
