@@ -320,6 +320,8 @@ def rate_run(policy_rate, **overrides):
     close = make_close(quarters)
     peers = pd.DataFrame({"AAA": 24.0, "BBB": 16.0}, index=close.index)
     rates = pd.Series(policy_rate, index=close.index) if np.ndim(policy_rate) == 0 else policy_rate
+    # These tests are about the policy-rate model; the market yield is only shown as a check.
+    overrides = {"yield_source": "Policy model", **overrides}
     return run_model(quarters, close, None, model_params(overrides), peers, policy_rate=rates,
                      market_yield=pd.Series(4.2, index=close.index))
 
@@ -626,3 +628,76 @@ def test_rules_from_data_known_at_the_time_hold_for_the_whole_history():
                               half_life=last["growth_half_life"])
     assert last["fundamental_pe"] == pytest.approx(expected)
     assert daily.loc[known, "fundamental_pe"].mean() > plain["daily"].loc[known, "fundamental_pe"].mean()
+
+
+def test_worked_fundamental_pe_shows_the_risk_premium_the_run_used():
+    # With beta scaling on, the shown required return must be the yield plus the beta-scaled premium, not the plain one.
+    from analysis.model_equations import worked_equations
+    quarters = make_quarters()
+    stock = make_close(quarters)
+    rng = np.random.default_rng(3)
+    market = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(stock)))), index=stock.index)
+    stock = stock * (market / market.iloc[0]) ** 1.5
+    result = run_model(quarters, stock, None, model_params({"anchor_source": "Fundamentals"}), market_close=market)
+    values = latest_values(result)
+    assert abs(values["pe_erp"] - model_params()["equity_premium"]) > 0.1
+    line = [eq for eq in worked_equations(result, "multiple_builder") if r"\text{P/E}_{\text{fund}}" in eq][0]
+    required = model_params()["base_yield"] + values["pe_erp"]
+    assert f"= {required:,.2f}\\%)" in line
+
+
+def test_market_yield_is_the_discount_rate_and_a_forward_rate_moves_it_by_the_model_weight():
+    from analysis.valuation_model import rate_weight
+    quarters = make_quarters()
+    close = make_close(quarters)
+    market = pd.Series(5.0, index=close.index)
+    policy = pd.Series(3.9, index=close.index)
+    params = {"anchor_source": "Fundamentals", "erp_from_beta": False}
+    result = run_model(quarters, close, None, model_params(params), policy_rate=policy, market_yield=market)
+    values = latest_values(result)
+    assert values["now_yield"] == pytest.approx(5.0) and values["model_yield"] == pytest.approx(5.0)
+    old = run_model(quarters, close, None, model_params({**params, "yield_source": "Policy model"}),
+                    policy_rate=policy, market_yield=market)
+    # A higher discount rate gives a lower fundamental P/E than the policy model's 3.9 -> ~3.75% yield.
+    assert values["fundamental_pe"] < latest_values(old)["fundamental_pe"]
+    forward = run_model(quarters, close, None, model_params({**params, "use_forward_rate": True, "forward_rate": 4.9}),
+                        policy_rate=policy, market_yield=market)
+    assert latest_values(forward)["model_yield"] == pytest.approx(5.0 + 1.0 * rate_weight(10, 2.0))
+    # No policy rate at all: still discounted at the market yield.
+    alone = run_model(quarters, close, None, model_params(params), market_yield=market)
+    assert latest_values(alone)["now_yield"] == pytest.approx(5.0)
+
+
+def test_analysts_base_case_makes_base_eps_the_analysts_eps_less_the_haircut():
+    from analysis.valuation_model import case_table
+    quarters = make_quarters()
+    close = make_close(quarters)
+    params = model_params({"eps_haircut_pct": 10.0, "base_margin_pts": 2.0})
+    result = run_model(quarters, close, None, params, analyst_growth=30.0)
+    values = latest_values(result)
+    assert values["eps_base"] == pytest.approx(values["ttm_eps"] * 1.3 * 0.9)
+    assert values["eps_bear"] < values["eps_base"] < values["eps_bull"]
+    assert case_table(result).set_index("Metric").loc["Revenue growth %", "Forward from"] == "analysts"
+    own = run_model(quarters, close, None, model_params({**params, "base_eps_source": "Own rule"}), analyst_growth=30.0)
+    assert latest_values(own)["growth_base"] != pytest.approx(30.0)
+    # Earlier quarters keep the auto rule: only the latest one knows today's estimates.
+    assert result["quarterly"]["growth_base"].iloc[0] == pytest.approx(own["quarterly"]["growth_base"].iloc[0])
+
+
+def test_per_share_haircut_skips_gaap_reporters_and_ignores_a_gaap_loss():
+    from analysis.model_equations import stock_pay_haircut_per_share
+    ends = pd.date_range("2025-03-31", periods=4, freq="QE")
+    announced = ends + pd.Timedelta(days=30)
+    pay, shares = pd.Series(100.0, index=ends), pd.Series(1000.0, index=ends)  # 0.10 a share a quarter
+    reported = pd.Series(1.0, index=announced)  # 4.00 over the year
+    # Reported equals GAAP: the pay is already a cost (Apple-like), nothing to take off.
+    assert stock_pay_haircut_per_share(pay, shares, reported, pd.Series(1.0, index=ends))[0] == 0.0
+    # Adjusted above GAAP: 0.40 a share x (1 - 25%) = 0.30 of 4.00.
+    share, reason = stock_pay_haircut_per_share(pay, shares, reported, pd.Series(0.8, index=ends), tax_rate=0.25)
+    assert share == pytest.approx(7.5) and "after 25% tax" in reason
+    # A GAAP loss from write-offs (Intel-like) does not blow the haircut up to the cap.
+    assert stock_pay_haircut_per_share(pay, shares, reported, pd.Series(-0.6, index=ends), tax_rate=0.25)[0] == pytest.approx(7.5)
+    # Never more than the gap between reported and GAAP EPS.
+    assert stock_pay_haircut_per_share(pay, shares, reported, pd.Series(0.99, index=ends) * 1.0, tax_rate=0.0)[0] == pytest.approx(0.0)
+    assert stock_pay_haircut_per_share(pay, shares, reported, pd.Series(0.95, index=ends), tax_rate=0.0)[0] == pytest.approx(5.0)
+    assert np.isnan(stock_pay_haircut_per_share(pay, shares, -reported)[0])

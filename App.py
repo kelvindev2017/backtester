@@ -234,7 +234,7 @@ from analysis.valuation_model import (
     sensitivities,
     track_items,
 )
-from analysis.model_equations import EQUATIONS as MODEL_EQUATIONS, SYMBOLS as MODEL_SYMBOLS, stock_pay_haircut, worked_equations
+from analysis.model_equations import EQUATIONS as MODEL_EQUATIONS, SYMBOLS as MODEL_SYMBOLS, stock_pay_haircut_per_share, worked_equations
 from analysis.model_diagram import (
     block_signals_figure,
     items_table,
@@ -4508,23 +4508,29 @@ MODEL_BLOCK_NOTES = {
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_stock_pay_haircut(symbol):
-    """(stock-based pay as a % of net income plus that pay, where it came from), or (NaN, reason) when Yahoo lacks either."""
+    """(the stock-based pay per share that reported EPS leaves out, after tax, as a % of it; where it came from), or
+    (NaN, reason) when Yahoo lacks the numbers. Zero when reported EPS is not above GAAP EPS (the pay is already in)."""
 
     try:
         stock = yf.Ticker(symbol)
-        for income_names, cash_names, periods, label in [
-                (["quarterly_income_stmt", "quarterly_financials"], ["quarterly_cashflow", "quarterly_cash_flow"], 4,
-                 "last 4 quarters"),
-                (["income_stmt", "financials"], ["cashflow", "cash_flow"], 1, "last fiscal year")]:
-            income = extract_statement_row(first_available_statement(stock, income_names),
-                                           ["Net Income", "Net Income Common Stockholders"])
-            pay = extract_statement_row(first_available_statement(stock, cash_names), ["Stock Based Compensation"])
-            share = stock_pay_haircut(pay, income, periods)
-            if np.isfinite(share):
-                return share, f"stock-based pay / (net income + stock-based pay), {label} (Yahoo cash flow)"
+        income = first_available_statement(stock, ["quarterly_income_stmt", "quarterly_financials"])
+        cash = first_available_statement(stock, ["quarterly_cashflow", "quarterly_cash_flow"])
+        pay = extract_statement_row(cash, ["Stock Based Compensation"])
+        shares = extract_statement_row(income, ["Diluted Average Shares", "Basic Average Shares"])
+        gaap = extract_statement_row(income, ["Diluted EPS", "Basic EPS"])
+        tax = extract_statement_row(income, ["Tax Rate For Calcs"])
+        tax = pd.to_numeric(tax, errors="coerce").dropna().sort_index().tail(4) if tax is not None else pd.Series(dtype=float)
+        tax_rate = float(tax.clip(0, 0.35).mean()) if len(tax) else 0.21
+        dates = stock.get_earnings_dates(limit=12)
+        reported = (pd.to_numeric(dates["Reported EPS"], errors="coerce").dropna().sort_index()
+                    if dates is not None and "Reported EPS" in dates else pd.Series(dtype=float))
+        share, reason = stock_pay_haircut_per_share(pay, shares, reported, gaap, tax_rate)
+        if np.isfinite(share):
+            return share, reason + " (Yahoo)"
+        return np.nan, f"Yahoo data: {reason}"
     except Exception:
         pass
-    return np.nan, "Yahoo has no stock-based pay or no earnings to compare it with"
+    return np.nan, "Yahoo has no stock-based pay, shares or EPS to compare"
 
 
 def model_param_key(name, ticker=None):
@@ -4844,6 +4850,13 @@ def model_settings():
         params["quality_pe_pts"] = number("quality_pe_pts", "P/E deduction, points", 0, 50, 0.5)
     with settings_panel("Scenario engine", expanded=False):
         show_model_equations("scenario_engine")
+        params["base_eps_source"] = st.radio(
+            "Base case EPS (latest quarter)", ["Analysts", "Own rule"], key=model_param_key("base_eps_source"),
+            horizontal=True,
+            help="Analysts: base EPS = analysts' EPS for the next four quarters (Yahoo), less the haircut, with the net "
+                 "margin held; bear and bull keep their gaps around it. Own rule: base growth from the auto rule or "
+                 "your forward growth. Earlier quarters always use the auto rule, since today's estimates were not "
+                 "known then. Falls back to the own rule when Yahoo has no estimates.")
         st.caption("Your forward growth and margin and the bull/bear adjustments are under Forward assumptions. "
                    "The auto rule below sets the forward values on every earlier quarter, and on the latest one "
                    "when you leave Forward blank.")
@@ -4861,11 +4874,16 @@ def model_settings():
         st.caption("Weights are rescaled to add up to 100%.")
     with settings_panel("Rate model", expanded=False):
         show_model_equations("rate_model")
+        params["yield_source"] = st.radio(
+            "Yield the stock is discounted at", ["Market", "Policy model"], key=model_param_key("yield_source"),
+            horizontal=True,
+            help="Market: the actual N-year Treasury yield (FRED), as analysts and DCF tools use; a forward policy rate "
+                 "moves it by the model's weight. Policy model: the yield built from the Fed funds rate, the neutral "
+                 "rate and the term premium below.")
         st.caption("The forward policy rate is under Forward assumptions.")
         params["yield_years"] = st.select_slider("Yield maturity N (years)", YIELD_MATURITIES,
                                                  key=model_param_key("yield_years"),
-                                                 help="The yield the stock is valued against; 10 is the usual choice. "
-                                                      "The market's N-year Treasury yield is shown as a check.")
+                                                 help="The yield the stock is valued against; 10 is the usual choice.")
         params["neutral_rate"] = number("neutral_rate", "Neutral policy rate %", 0, 10, 0.25,
                                         "Where the policy rate settles in the long run.")
         params["rate_half_life"] = number("rate_half_life", "Rate half-life, years", 0.25, 30, 0.25,
@@ -4996,8 +5014,9 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing",
             quarters[column] = released[column]
     quarters["EPS"] = eps
     forward = pe_basis == "Forward"
-    own_pe, growth_check = (daily_forward_pe(ticker, build_valuation_data(prices, earnings)[0], earnings, history_rule)
-                            if forward else (None, (np.nan, np.nan)))
+    # Analysts' EPS growth (next four quarters over the last four) is needed for the base case on either basis.
+    own_pe, growth_check = daily_forward_pe(ticker, build_valuation_data(prices, earnings)[0], earnings, history_rule)
+    own_pe = own_pe if forward else None
     peer_pe = {}
     for peer in peers:
         peer_prices = load_data(peer, load_start, end, "Daily")
@@ -5456,7 +5475,8 @@ def render_valuation_model():
     def rerun_with(other_params):
         return run_model(inputs.quarters, inputs.close, model_register(), other_params, inputs.peer_pe,
                          start=inputs.start, own_pe=inputs.own_pe, policy_rate=policy, market_yield=market_yield,
-                         market_close=getattr(inputs, "market_close", None))
+                         market_close=getattr(inputs, "market_close", None),
+                         analyst_growth=inputs.found.get("growth_check", (np.nan, np.nan))[0])
 
     result = rerun_with(params)
     values = latest_values(result)
