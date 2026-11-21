@@ -45,7 +45,7 @@ def main():
 
     policy, _ = app["load_fred"]("DFF")
     market_yield, _ = app["load_fred"]("DGS10")
-    rows = []
+    rows, diagnostics = [], []
     for ticker in TICKERS:
         started = time.time()
         try:
@@ -74,6 +74,9 @@ def main():
             "direction": quality["direction_hit"], "band held": quality["band_coverage"],
             "today": today["side"].split(" ")[0], "gap %": today["gap_pct"],
             "next Q base %": (today["base"] / today["close"] - 1) * 100, "seconds": time.time() - started})
+        history = calibration["history"].dropna(subset=["explained_premium", "realised", "premium", "ttm_eps"])
+        history = history.assign(ticker=ticker)
+        diagnostics.append(history)
         print(f"{ticker}: done in {time.time() - started:.0f}s")
     table = pd.DataFrame(rows)
     pd.set_option("display.width", 220)
@@ -87,6 +90,31 @@ def main():
               f"{table['band held'].median():.0%} (60% expected); premium explained to within "
               f"{table['premium err %'].median():.0f}% (median).")
     table.to_csv("validation_premium.csv", index=False)
+    if not diagnostics:
+        return
+    pooled = pd.concat(diagnostics)
+    pooled = pooled[pooled["ttm_eps"] > 0]
+    actual = np.log(pooled["realised"] / pooled["close"])
+    gap = pooled["premium"] - pooled["explained_premium"]
+    growth = pooled["growth"].fillna(0)
+    print(f"\n=== Diagnostics, {len(pooled)} stock-months pooled ===")
+    print("Median abs error of the next-quarter price (%), by how much of today's gap to the explained premium is "
+          "kept and whether EPS growth is added:")
+    for keep in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        for with_growth in (True, False):
+            eps_factor = np.log1p(growth / 100) * 0.25 if with_growth else 0.0
+            predicted = eps_factor + (keep - 1) * gap   # log change from today's close
+            error = (np.exp((predicted - actual).abs().median()) - 1) * 100
+            hit = ((predicted > 0) == (actual > 0)).mean()
+            print(f"  keep {keep:.2f}, EPS growth {'on ' if with_growth else 'off'}: error {error:5.2f}%, direction {hit:.0%}")
+    print(f"Does the gap predict the next quarter's return? corr(-gap, return) = {np.corrcoef(-gap, actual)[0, 1]:.3f}; "
+          f"cheapest fifth of months returned {actual[gap <= gap.quantile(0.2)].mean() * 100:+.1f}% a quarter, the "
+          f"richest fifth {actual[gap >= gap.quantile(0.8)].mean() * 100:+.1f}% (all months {actual.mean() * 100:+.1f}%).")
+    per_stock = pooled.groupby("ticker").apply(
+        lambda part: np.corrcoef(-(part["premium"] - part["explained_premium"]), np.log(part["realised"] / part["close"]))[0, 1],
+        include_groups=False)
+    print(f"Per stock corr(-gap, next-quarter return): median {per_stock.median():.3f}, positive on "
+          f"{(per_stock > 0).sum()} of {len(per_stock)} stocks.")
 
 
 if __name__ == "__main__":
