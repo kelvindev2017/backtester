@@ -36,6 +36,8 @@ DEFAULT_PARAMS = {
     "manual_eps": 0.0,           # trailing 12-month EPS per share typed in; 0 = use the reported quarters
     "quality_pe_pts": 0.0,       # P/E points taken off the acceptable P/E for weak earnings quality
     # Scenario engine
+    "analyst_base": False,       # set by run_model: True when the latest base case is the analysts' EPS
+    "base_eps_source": "Analysts",  # latest quarter's base EPS: Analysts (next 4 quarters' estimates) or Own rule
     "forward_growth": np.nan,    # base (forward) revenue growth % for the latest quarter; NaN = the auto rule below
     "forward_margin": np.nan,    # base (forward) net margin % for the latest quarter; NaN = current + base_margin_pts
     "growth_follow": 0.5,        # auto rule: base growth = this share of the trailing revenue growth
@@ -43,6 +45,10 @@ DEFAULT_PARAMS = {
     "growth_cap": 40.0,
     "fallback_yoy": 0.0,         # trailing revenue growth % assumed when there is no revenue history
     "fallback_margin": 10.0,     # net margin % assumed when there is no revenue or net income
+    "case_spread": "EPS volatility",  # how bear and bull differ from base: EPS volatility or Fixed gaps (below)
+    "spread_k": 2.4,             # EPS volatility: bear/bull EPS = base EPS x exp(-/+ k x s)
+    "spread_own_share": 0.25,    # ... s = this share of the company's own EPS volatility + the rest of the typical one
+    "spread_typical": 0.073,     # ... typical (median) volatility of the yearly log change in trailing EPS
     "bear_growth_gap": 25.0,     # bear growth = base growth minus this many points
     "bull_growth_gap": 15.0,     # bull growth = base growth plus this many points
     "bear_margin_pts": -3.0,     # net margin change in each case, in points
@@ -89,6 +95,7 @@ DEFAULT_PARAMS = {
     "materiality_eps_pct": 1.0,  # smallest expected EPS effect (probability x impact) that enters the model
     "materiality_pe": 0.5,       # smallest P/E effect, in points, that enters the model
     # Rate model
+    "yield_source": "Market",    # Market: the actual N-year Treasury yield; Policy model: built from the policy rate
     "use_forward_rate": False,   # True: the last day uses forward_rate instead of the policy rate on the day
     "forward_rate": 0.0,         # the policy rate % you expect (e.g. after the next central bank meeting)
     "yield_years": 10,           # N: maturity of the yield the stock is valued against
@@ -116,6 +123,8 @@ SIGNALS = {
     "gross_margin": ("quarterly", "Gross margin, last 4 quarters", "%", "share"),
     "revenue_cagr": ("quarterly", "Revenue growth a year over the growth history", "%", "percent"),
     "ttm_eps": ("quarterly", "Reported EPS, last 4 quarters", "", "eps"),
+    "eps_spread": ("quarterly", "Own EPS volatility (std of the yearly log change, last 12 releases)", "", "count"),
+    "case_spread": ("quarterly", "Case spread s used (EPS volatility)", "", "count"),
     "clean_eps": ("quarterly", "Clean base EPS", "", "eps"),
     "growth_bear": ("quarterly", "Bear growth", "%", "percent"),
     "growth_base": ("quarterly", "Base growth", "%", "percent"),
@@ -202,9 +211,14 @@ BLOCKS = {
         inputs=["items_modelled"], outputs=["event_effect", "pe_adjust"], params={}),
     "scenario_engine": dict(
         title="Scenario engine", rate="quarterly", role="Param: growth, margins",
-        inputs=["clean_eps", "revenue_yoy", "net_margin", "event_effect"],
-        outputs=["growth_bear", "growth_base", "growth_bull", "margin_base", "eps_bear", "eps_base", "eps_bull"],
-        params={"forward_growth": "Forward revenue growth % (blank = auto rule)",
+        inputs=["clean_eps", "revenue_yoy", "net_margin", "event_effect", "eps_spread"],
+        outputs=["growth_bear", "growth_base", "growth_bull", "margin_base", "case_spread", "eps_bear", "eps_base",
+                 "eps_bull"],
+        params={"case_spread": "Bear and bull from: EPS volatility or Fixed gaps",
+                "spread_k": "EPS volatility: k (cases at exp(-/+ k x s))",
+                "spread_own_share": "EPS volatility: share of the own volatility in s",
+                "spread_typical": "EPS volatility: typical volatility",
+                "forward_growth": "Forward revenue growth % (blank = auto rule)",
                 "forward_margin": "Forward net margin % (blank = auto rule)",
                 "bear_growth_gap": "Bear: growth points below forward", "bull_growth_gap": "Bull: growth points above forward",
                 "bear_margin_pts": "Bear: margin points vs forward", "bull_margin_pts": "Bull: margin points vs forward",
@@ -268,7 +282,7 @@ PRESETS = {
         "params": {
             "manual_eps": 1.64, "eps_haircut_pct": 11.0, "growth_follow": 0.7, "fallback_yoy": 40.0,
             "fallback_margin": 9.8, "bear_growth_gap": 28.0, "bull_growth_gap": 16.0, "bear_margin_pts": -5.0,
-            "base_margin_pts": 4.0, "bull_margin_pts": 3.0, "peer_weight": 1.0,
+            "base_margin_pts": 4.0, "bull_margin_pts": 3.0, "peer_weight": 1.0, "case_spread": "Fixed gaps",
         },
         "register": [
             ["Cyclicality: 2027 is probably near peak earnings", RISK, GENERAL, BEYOND, np.nan, np.nan, 3.0, MODELLED,
@@ -472,13 +486,26 @@ def base_growth_and_margin(revenue_yoy, net_margin, params, forward=False):
     return yoy, growth, margin, base_margin
 
 
-def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, forward=False):
+def case_spread(eps_spread, params):
+    """The case spread s: a share of the company's own EPS volatility plus the rest of the typical one (the typical
+    one alone without enough history)."""
+
+    typical = float(params["spread_typical"])
+    if eps_spread is None or not np.isfinite(eps_spread) or eps_spread < 0:
+        return typical
+    share = float(np.clip(params["spread_own_share"], 0, 1))
+    return share * float(eps_spread) + (1 - share) * typical
+
+
+def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, forward=False, eps_spread=np.nan):
     """The quarterly chain for one date: earnings quality, scenario engine and risk weighting.
 
     ``revenue_yoy`` and ``net_margin`` are in %; ``event_effect`` is the fraction of EPS the modelled event items are
-    expected to add or remove, one number or one per case. Each case grows the clean EPS with its revenue growth (the
-    base growth plus or minus the case's adjustment) and scales it by its net margin (the base margin plus the case's
-    adjustment) over the current one. ``forward``: the latest quarter, where your forward growth and margin apply.
+    expected to add or remove, one number or one per case. The base case grows the clean EPS with the base revenue
+    growth and scales it by the base net margin over the current one. With ``case_spread`` Fixed gaps, bear and bull
+    do the same with their own growth and margin (the base plus or minus the gaps); with EPS volatility, they are the
+    base EPS times exp(-k s) and exp(+k s), s from ``case_spread`` and ``eps_spread`` (the company's own EPS
+    volatility; a forward test on 60 stocks, 2019-2025, set k, the share and the typical volatility). ``forward``: the latest quarter, where your forward growth and margin apply.
     """
 
     clean = ttm_eps * (1 - params["eps_haircut_pct"] / 100)
@@ -491,12 +518,23 @@ def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, f
     weights = scenario_weights(params)
     point = {"clean_eps": clean, "event_effect": float(sum(w * events[n] for w, n in zip(weights, SCENARIOS))) * 100,
              "quality_pe": -abs(float(params["quality_pe_pts"])), "margin_base": base_margin}
+    by_volatility = params.get("case_spread", "Fixed gaps") == "EPS volatility"
+    spread = case_spread(eps_spread, params)
+    point["case_spread"] = spread if by_volatility else np.nan
+    factor = {"Bear": np.exp(-params["spread_k"] * spread), "Base": 1.0, "Bull": np.exp(params["spread_k"] * spread)}
     for name in SCENARIOS:
         key = name.lower()
-        margin_ratio = max(0.0, case_margin[name]) / margin if margin > 0 else 1.0
-        point[f"growth_{key}"] = growth[name]
+        if by_volatility:
+            # One spread on EPS, from how much the company's earnings have moved in a year.
+            margin_ratio = max(0.0, base_margin) / margin if margin > 0 else 1.0
+            point[f"growth_{key}"] = base_growth
+            case_eps = clean * (1 + base_growth / 100) * margin_ratio * factor[name]
+        else:
+            margin_ratio = max(0.0, case_margin[name]) / margin if margin > 0 else 1.0
+            point[f"growth_{key}"] = growth[name]
+            case_eps = clean * (1 + growth[name] / 100) * margin_ratio
         point[f"event_{key}"] = events[name] * 100
-        point[f"eps_{key}"] = clean * (1 + growth[name] / 100) * margin_ratio * (1 + events[name])
+        point[f"eps_{key}"] = case_eps * (1 + events[name])
     point["risk_adjusted_eps"] = float(sum(weight * point[f"eps_{name.lower()}"]
                                            for weight, name in zip(weights, SCENARIOS)))
     return point
@@ -518,7 +556,7 @@ def quarterly_inputs(quarters, growth_years=3):
     frame = pd.DataFrame(index=pd.DatetimeIndex(quarters.index).sort_values().unique()) if quarters is not None else pd.DataFrame()
     if quarters is None or quarters.empty:
         return pd.DataFrame(columns=["revenue", "net_income", "eps", "ttm_revenue", "revenue_yoy", "net_margin", "ttm_eps",
-                                     "gross_margin", "revenue_cagr", "growth_spread"])
+                                     "gross_margin", "revenue_cagr", "growth_spread", "eps_spread"])
     quarters = quarters.sort_index()
     quarters = quarters.loc[~quarters.index.duplicated(keep="last")]
 
@@ -540,11 +578,16 @@ def quarterly_inputs(quarters, growth_years=3):
         ratio = ttm_revenue / earlier.where(earlier > 0)
         cagr = cagr.combine_first((ratio.where(ratio > 0) ** (1 / years) - 1) * 100)
     frame["revenue"], frame["net_income"], frame["eps"] = revenue, net_income, eps
+    ttm_eps = _trailing(eps)
+    log_eps = np.log(ttm_eps.where(ttm_eps > 0))
+    # How much trailing EPS moved in a year (log change), its spread over the last 12 releases (at least 8).
+    eps_spread = (log_eps - log_eps.shift(4)).rolling(12, min_periods=8).std()
     for name, series in [("ttm_revenue", ttm_revenue), ("revenue_yoy", yoy), ("net_margin", margin),
                          ("ttm_eps", _trailing(eps)), ("gross_margin", gross_margin.dropna()),
                          ("revenue_cagr", cagr.dropna()),
                          # How much the yearly growth varied over the last 12 releases (at least 8), as known then.
-                         ("growth_spread", yoy.dropna().rolling(12, min_periods=8).std().dropna())]:
+                         ("growth_spread", yoy.dropna().rolling(12, min_periods=8).std().dropna()),
+                         ("eps_spread", eps_spread.dropna())]:
         # A quarter known for one measure but not another keeps the last value of the other.
         frame[name] = series.reindex(frame.index.union(series.index)).ffill().reindex(frame.index)
     return frame
@@ -721,7 +764,7 @@ def blend_anchor(own, peer, share):
 
 
 def run_model(quarters, close, register=None, params=None, peer_pe=None, start=None, own_pe=None, policy_rate=None,
-              market_yield=None, market_close=None):
+              market_yield=None, market_close=None, analyst_growth=None):
     """Run the whole model over history.
 
     quarters: results by the date they became public (columns Revenue, Net_Income, EPS; any may be missing).
@@ -731,7 +774,10 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     P/E for its anchor; None uses the trailing P/E from ``quarters``
     (pass a forward P/E here, with the peers' forward P/E, for a forward anchor). policy_rate: the central bank rate
     in % by date; None (or empty) switches the rate model off. market_yield: the market's N-year yield in %, shown
-    next to the model's yield as a check (it does not feed the price).
+    next to the model's yield as a check; with ``yield_source`` Market it is the yield the stock is discounted at, and
+    the policy-rate model only adds the change a forward rate would make. analyst_growth: analysts' EPS growth %,
+    next four quarters over the last four; with ``base_eps_source`` Analysts it sets the latest quarter's base case
+    (growth = that, net margin held), so base EPS = analysts' EPS less the haircut.
 
     Returns a dict with ``quarterly`` (one row per update of the quarterly part), ``daily`` (one row per close),
     ``items`` (the register after the triage gate and router) and ``params``. Nothing on a date uses data from later.
@@ -742,6 +788,15 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     close = close.loc[~close.index.duplicated(keep="last")]
     routed = route_items(register, params)
     inputs = quarterly_inputs(quarters, params["growth_history_years"])
+    params["analyst_base"] = False
+    if (params["base_eps_source"] == "Analysts" and analyst_growth is not None and np.isfinite(analyst_growth)
+            and len(inputs)):
+        # The base case is the analysts' EPS: their growth, with the net margin held (margin ratio 1).
+        latest_margin = inputs["net_margin"].dropna() if "net_margin" in inputs else pd.Series(dtype=float)
+        params["forward_growth"] = float(analyst_growth)
+        params["forward_margin"] = (float(latest_margin.iloc[-1]) if len(latest_margin) and latest_margin.iloc[-1] > 0
+                                    else float(params["fallback_margin"]))
+        params["analyst_base"] = True
 
     # The quarterly part also runs on the day an item starts to apply, with the last results held.
     item_dates = _since_dates(routed[routed["Gate"] == MODELLED]).dropna()
@@ -758,7 +813,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         events, points = case_effects(routed, when, params)
         forward = last_release is None or when >= last_release
         point = scenario_point(ttm_eps, row.get("revenue_yoy", np.nan), row.get("net_margin", np.nan), params, events,
-                               forward)
+                               forward, row.get("eps_spread", np.nan) if params["manual_eps"] <= 0 else np.nan)
         since = _since_dates(routed)
         in_force = (routed["Gate"] == MODELLED) & (since.isna() | (since <= when))
         rows.append({**row.to_dict(), "ttm_eps": ttm_eps, **point, "pe_adjust": points,
@@ -822,16 +877,22 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         if params["use_forward_rate"]:
             used.iloc[-1] = float(params["forward_rate"])
         actual_yield = model_yield(on_day, params)
+        market_now = _market_yield_on(market_yield, close.index) if params["yield_source"] == "Market" else None
+        if market_now is not None:
+            # Discount at the market's yield; the policy-rate model only adds what a forward rate would change.
+            actual_yield = market_now.combine_first(actual_yield)
         daily["policy_rate"], daily["forward_rate"] = on_day, used
-        daily["model_yield"] = model_yield(used, params)
+        daily["model_yield"] = actual_yield + (model_yield(used, params) - model_yield(on_day, params))
         daily["now_yield"] = actual_yield
         daily["yield_ref"] = actual_yield.shift(1).rolling(window, min_periods=min(window, 60)).median()
         daily["yield_gap"] = (daily["model_yield"] - daily["yield_ref"]).fillna(0.0)
         daily["forward_gap"] = (daily["model_yield"] - actual_yield).fillna(0.0)
-    if market_yield is not None and len(pd.Series(market_yield, dtype=float).dropna()) and len(close):
-        market = pd.to_numeric(pd.Series(market_yield, dtype=float), errors="coerce").dropna().sort_index()
-        market = market.loc[~market.index.duplicated(keep="last")]
-        daily["market_yield"] = market.reindex(market.index.union(close.index)).ffill(limit=10).reindex(close.index)
+    market_on_day = _market_yield_on(market_yield, close.index)
+    if market_on_day is not None:
+        daily["market_yield"] = market_on_day
+        if not len(rates) and params["yield_source"] == "Market":
+            # No policy rate: the rate model is off, but the stock is still discounted at the market's yield.
+            daily["now_yield"], daily["model_yield"] = market_on_day, market_on_day
     passed = float(params["rate_pass_through"])
     # The outside view: the P/E the company's growth and gross margin justify at the day's yield, or the peers'.
     # The rules below use only what was known on each day, so they hold for the whole history.
@@ -907,6 +968,18 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
             "peer_pe": peers.reindex(daily.index)}
 
 
+def _market_yield_on(market_yield, days):
+    """The market's N-year yield on each of ``days`` (held up to 10 days), or None when there is none."""
+
+    if market_yield is None or not len(days):
+        return None
+    market = pd.to_numeric(pd.Series(market_yield, dtype=float), errors="coerce").dropna().sort_index()
+    if market.empty:
+        return None
+    market = market.loc[~market.index.duplicated(keep="last")]
+    return market.reindex(market.index.union(days)).ffill(limit=10).reindex(days)
+
+
 def latest_values(result, on=None):
     """The value of every signal on ``on`` (default: the last close), quarterly ones held from their last update."""
 
@@ -931,7 +1004,7 @@ def _point_price(state, params, routed):
 
     events, points = case_effects(routed, state["on"], params)
     point = scenario_point(state["ttm_eps"], state["revenue_yoy"], state["net_margin"], params, events,
-                           state.get("forward", True))
+                           state.get("forward", True), state.get("eps_spread", np.nan))
     eps = point["risk_adjusted_eps"]
     if not np.isfinite(eps) or not np.isfinite(state["anchor"]):
         return np.nan
@@ -948,6 +1021,7 @@ def _day_state(result, values, on):
     anchor = day["rate_anchor"] if "rate_anchor" in day else day["anchor"]
     return {"on": on, "ttm_eps": values.get("ttm_eps", np.nan), "revenue_yoy": values.get("revenue_yoy", np.nan),
             "net_margin": values.get("net_margin", np.nan), "anchor": anchor,
+            "eps_spread": values.get("eps_spread", np.nan) if result["params"]["manual_eps"] <= 0 else np.nan,
             "own_anchor": day.get("own_anchor", np.nan),
             "peer_anchor": day.get("outside_anchor", day.get("peer_anchor", np.nan)),
             "held_cagr": day.get("pe_growth", day.get("held_cagr", np.nan)),
@@ -955,6 +1029,7 @@ def _day_state(result, values, on):
             "premium": float(day.get("premium_pct", 0.0)) if np.isfinite(day.get("premium_pct", np.nan)) else 0.0,
             "pe_erp": day.get("pe_erp", np.nan),
             "policy_rate": day.get("policy_rate", np.nan), "yield_ref": day.get("yield_ref", np.nan),
+            "now_yield": day.get("now_yield", np.nan),
             "forward": _is_forward(result, on)}
 
 
@@ -979,6 +1054,9 @@ def anchor_at_rate(state, params, rate):
         return state["anchor"]
     expected = model_yield(rate, params)
     actual = model_yield(state["policy_rate"], params)
+    if np.isfinite(state.get("now_yield", np.nan)):
+        # The day's yield (the market's, when that is the source) moved by what the other rate would change.
+        expected, actual = state["now_yield"] + expected - actual, state["now_yield"]
     own_gap = expected - state["yield_ref"] if np.isfinite(state["yield_ref"]) else 0.0
     passed = params["rate_pass_through"]
     own = rate_adjusted_pe(state["own_anchor"], own_gap, passed)
@@ -1185,7 +1263,8 @@ def case_table(result, params=None):
                      "Bull adj": params[bull], "Bear adj": bear_value,
                      "Current from": "reported" if np.isfinite(reported[metric]) and (
                          metric == "Revenue growth %" or reported[metric] > 0) else "fallback",
-                     "Forward from": "you" if np.isfinite(params.get(key, np.nan)) else "auto rule"})
+                     "Forward from": ("analysts" if params.get("analyst_base") else
+                                      "you" if np.isfinite(params.get(key, np.nan)) else "auto rule")})
     return pd.DataFrame(rows, columns=CASE_COLUMNS)
 
 
