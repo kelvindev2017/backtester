@@ -20,7 +20,7 @@ EQUATIONS = {
     ],
     "earnings_quality": [
         r"\text{EPS}_{\text{clean}} = \text{EPS}_{\text{last 4q}} \times \left(1 - \frac{h}{100}\right)",
-        r"h_{\text{default}} = \frac{\text{SBC}_{\text{last 4q}}}{\text{Net income}_{\text{last 4q}} + \text{SBC}_{\text{last 4q}}} \times 100",
+        r"h_{\text{default}} = \frac{\min\!\big(\sum \frac{\text{SBC}_q}{\text{shares}_q}(1 - \tau),\ \text{EPS}_{\text{rep}} - \text{EPS}_{\text{GAAP}}\big)}{\text{EPS}_{\text{rep}}} \times 100",
     ],
     "item_tracker": [r"\text{Items} = \text{modelled} + \text{parked}"],
     "triage_gate": [
@@ -43,7 +43,8 @@ EQUATIONS = {
     ],
     "rate_model": [
         r"w_N = \frac{1 - e^{-\lambda N}}{\lambda N}, \qquad \lambda = \frac{\ln 2}{h}",
-        r"y_N = r_n + (r_f - r_n) \times w_N + tp",
+        r"\text{Market (default): } y_N = y_{\text{market}} + (r_f - r_{\text{today}}) \times w_N",
+        r"\text{Policy model: } y_N = r_n + (r_f - r_n) \times w_N + tp",
         r"\Delta y_{\text{own}} = y_N - \operatorname{median}_{\text{look-back}}(y_N)",
         r"\Delta y_{\text{peers}} = y_N(r_f) - y_N(r_{\text{today}})",
     ],
@@ -66,7 +67,7 @@ EQUATIONS = {
 # What each symbol stands for, shown under the equations.
 SYMBOLS = {
     "income_map": "g: revenue growth %, m: net margin %.",
-    "earnings_quality": "h: EPS haircut %, SBC: stock-based pay (adjusted EPS leaves it out, so h_default takes it back). The P/E deduction d_q goes to the Multiple builder.",
+    "earnings_quality": "h: EPS haircut %, SBC_q: a quarter's stock-based pay, shares_q: its diluted shares, τ: tax rate, EPS_rep and EPS_GAAP: reported (street) and GAAP EPS over the last 4 quarters. h_default = 0 when EPS_rep is not above EPS_GAAP: the company's figure already counts the pay. The P/E deduction d_q goes to the Multiple builder.",
     "triage_gate": "p: probability, impact: EPS impact %, points: P/E points.",
     "item_router": "e: expected EPS change % from event items (per case: the forward probability plus the item's bull "
                    "or bear adjustment; shown weighted), a: P/E points (+ product, - risk), weighted over the cases.",
@@ -75,7 +76,7 @@ SYMBOLS = {
                        "bull, adj_c and Δm_c: the case's growth and margin adjustment in points (0 for base), e_c: event "
                        "items' EPS change % at that case's probability.",
     "risk_weighting": "w: scenario weights, rescaled to add up to 1.",
-    "rate_model": "r_f: policy rate used (your forward rate on the last day, the actual rate before), r_n: neutral "
+    "rate_model": "y_market: the market's N-year Treasury yield (FRED), r_today: today's policy rate. r_f: policy rate used (your forward rate on the last day, the actual rate before), r_n: neutral "
                   "rate, h: half-life of a rate's gap to neutral in years, N: yield maturity in years, w_N: share of "
                   "the policy rate that reaches the N-year yield, tp: term premium (it cancels out of both Δy). "
                   "Δy_own compares with the years the own P/E median covers; Δy_peers is only the forward rate's "
@@ -119,6 +120,42 @@ def stock_pay_haircut(stock_pay, net_income, periods=4):
     return float(np.clip(total_pay / adjusted * 100, 0, 90))
 
 
+def stock_pay_haircut_per_share(stock_pay, shares, reported_eps, gaap_eps=None, tax_rate=0.21, periods=4):
+    """(haircut %, reason): the after-tax stock-based pay per share that reported EPS leaves out, as a % of it.
+
+    ``stock_pay`` and ``shares`` (diluted average shares) are by quarter end, ``reported_eps`` (the street figure
+    Yahoo reports, usually adjusted) by announcement date and ``gaap_eps`` (diluted GAAP EPS) by quarter end; the
+    last ``periods`` of each are summed. When reported EPS is not above GAAP EPS (within 2%), the company's figure
+    already counts stock pay as a cost (Apple, Microsoft, Coca-Cola), so nothing is taken off. Otherwise the
+    haircut is the stock pay per share after tax, no more than the gap between reported and GAAP EPS. A GAAP loss
+    from write-offs therefore cannot inflate it the way a share of net income does. NaN when the data are missing
+    or reported EPS is not positive; capped at 90, the haircut box's limit.
+    """
+
+    pay = pd.to_numeric(pd.Series(stock_pay, dtype=float), errors="coerce").dropna().sort_index()
+    count = pd.to_numeric(pd.Series(shares, dtype=float), errors="coerce").dropna().sort_index()
+    reported = pd.to_numeric(pd.Series(reported_eps, dtype=float), errors="coerce").dropna().sort_index()
+    gaap = pd.to_numeric(pd.Series(gaap_eps, dtype=float), errors="coerce").dropna().sort_index() if gaap_eps is not None else pd.Series(dtype=float)
+    shared = pay.index.intersection(count.index[count > 0])
+    if len(shared) < periods or len(reported) < periods:
+        return np.nan, "not enough quarters of stock-based pay, shares or reported EPS"
+    reported_sum = float(reported.iloc[-periods:].sum())
+    if not reported_sum > 0:
+        return np.nan, "reported EPS over the last 4 quarters is not positive"
+    gaap_sum = float(gaap.iloc[-periods:].sum()) if len(gaap) >= periods else np.nan
+    if np.isfinite(gaap_sum) and reported_sum <= gaap_sum + 0.02 * abs(gaap_sum):
+        return 0.0, (f"reported EPS ({reported_sum:.2f}) is not above GAAP EPS ({gaap_sum:.2f}), so it already counts "
+                     "stock-based pay")
+    shared = shared.sort_values()[-periods:]
+    tax = float(np.clip(tax_rate, 0, 0.5)) if tax_rate is not None and np.isfinite(tax_rate) else 0.21
+    per_share = float((pay.loc[shared].abs() / count.loc[shared]).sum()) * (1 - tax)
+    reason = f"stock-based pay of {per_share:.2f} a share after {tax * 100:.0f}% tax over reported EPS of {reported_sum:.2f}"
+    if np.isfinite(gaap_sum) and reported_sum - gaap_sum < per_share:
+        per_share = reported_sum - gaap_sum
+        reason += f", limited to the gap to GAAP EPS ({gaap_sum:.2f})"
+    return float(np.clip(per_share / reported_sum * 100, 0, 90)), reason + " (last 4 quarters)"
+
+
 def _n(value, digits=2):
     return f"{value:,.{digits}f}" if value is not None and np.isfinite(value) else r"\text{n/a}"
 
@@ -144,12 +181,16 @@ def worked_equations(result, block, on=None):
     if block == "scenario_engine":
         base, base_margin = get("growth_base"), get("margin_base")
         forward = result.get("forward_from") is None or (on is None or pd.Timestamp(on) >= result["forward_from"])
-        if forward and np.isfinite(params.get("forward_growth", np.nan)):
+        if forward and params.get("analyst_base"):
+            lines = [rf"g_{{\text{{base}}}} = {_n(base, 1)}\% \ \text{{(analysts' EPS, next 4q vs last 4q)}}"]
+        elif forward and np.isfinite(params.get("forward_growth", np.nan)):
             lines = [rf"g_{{\text{{base}}}} = {_n(base, 1)}\% \ \text{{(yours)}}"]
         else:
             lines = [rf"\begin{{aligned}} g_{{\text{{base}}}} = {{}} & \min\!\big({_n(params['growth_cap'], 0)},\ \max({_n(params['growth_floor'], 0)},\ "
                      rf"{_n(params['growth_follow'])} \times {_n(used_growth, 1)})\big) \\ = {{}} & {_n(base, 1)}\% \end{{aligned}}"]
-        source = r"\ \text{(yours)}" if forward and np.isfinite(params.get("forward_margin", np.nan)) else (
+        source = (r"\ \text{(held)}" if forward and params.get("analyst_base") else
+                  r"\ \text{(yours)}" if forward and np.isfinite(params.get("forward_margin", np.nan)) else None)
+        source = source or (
             rf" = {_n(used_margin, 1)} + {_n(params['base_margin_pts'], 1)}")
         lines.append(rf"m_{{\text{{base}}}}{source} = {_n(base_margin, 1)}\%")
         for name in SCENARIOS:
@@ -213,8 +254,12 @@ def worked_equations(result, block, on=None):
         if not np.isfinite(get("policy_rate")):
             return [r"\text{No policy rate loaded: the rate model is off } (\Delta y = 0)"]
         weight = rate_weight(params["yield_years"], params["rate_half_life"])
-        lines = [rf"w_{{{int(params['yield_years'])}}} = {_n(weight, 3)} \qquad r_f = {_n(get('forward_rate'))}\%",
-                 rf"\begin{{aligned}} y_N = {{}} & {_n(params['neutral_rate'])} + ({_n(get('forward_rate'))} - {_n(params['neutral_rate'])}) \times {_n(weight, 3)} + {_n(params['term_premium'])} \\ = {{}} & {_n(get('model_yield'))}\% \end{{aligned}}",
+        lines = [rf"w_{{{int(params['yield_years'])}}} = {_n(weight, 3)} \qquad r_f = {_n(get('forward_rate'))}\%"]
+        if params.get("yield_source") == "Market" and np.isfinite(get("market_yield")):
+            lines.append(rf"\begin{{aligned}} y_N = {{}} & y_{{\text{{market}}}} + (r_f - r_{{\text{{today}}}}) \times w_N \\ = {{}} & {_n(get('market_yield'))} + ({_n(get('forward_rate'))} - {_n(get('policy_rate'))}) \times {_n(weight, 3)} \\ = {{}} & {_n(get('model_yield'))}\% \end{{aligned}}")
+        else:
+            lines.append(rf"\begin{{aligned}} y_N = {{}} & {_n(params['neutral_rate'])} + ({_n(get('forward_rate'))} - {_n(params['neutral_rate'])}) \times {_n(weight, 3)} + {_n(params['term_premium'])} \\ = {{}} & {_n(get('model_yield'))}\% \end{{aligned}}")
+        lines += [
                  rf"\Delta y_{{\text{{own}}}} = {_n(get('model_yield'))} - {_n(get('yield_ref'))} = {_n(get('yield_gap'))}",
                  rf"\Delta y_{{\text{{peers}}}} = {_n(get('forward_gap'))}"]
         if np.isfinite(get("market_yield")):

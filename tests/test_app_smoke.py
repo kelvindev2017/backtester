@@ -1125,10 +1125,12 @@ def test_model_haircut_starts_at_stock_pay_and_equations_show(offline, monkeypat
         def __init__(self, symbol):
             super().__init__(symbol)
             quarters = self.quarterly_income_stmt.columns
-            # Net income of the last 4 quarters: 2.57e9 + ... ; stock pay 10% of each quarter's net income.
-            self.quarterly_cashflow = pd.DataFrame(
-                [self.quarterly_income_stmt.loc["Net Income"].to_numpy() * 0.1], index=["Stock Based Compensation"],
-                columns=quarters)
+            # 0.25 of stock pay a share each quarter, 20% tax, GAAP EPS 1.00 a quarter (below the reported ~1.9).
+            extra = pd.DataFrame([[1e9] * len(quarters), [1.0] * len(quarters), [0.2] * len(quarters)],
+                                 index=["Diluted Average Shares", "Diluted EPS", "Tax Rate For Calcs"], columns=quarters)
+            self.quarterly_income_stmt = pd.concat([self.quarterly_income_stmt, extra])
+            self.quarterly_cashflow = pd.DataFrame([[0.25e9] * len(quarters)], index=["Stock Based Compensation"],
+                                                   columns=quarters)
 
     monkeypatch.setattr(yf, "Ticker", Ticker)
     st.cache_data.clear()
@@ -1137,9 +1139,10 @@ def test_model_haircut_starts_at_stock_pay_and_equations_show(offline, monkeypat
     assert app.session_state["model_ASMVY_eps_haircut_pct"] == pytest.approx(11.0)
     app.text_input(key="model_ticker").input("NVDA")
     open_tab(app, "Valuation Model")
-    # Stock pay is 10% of net income, so 0.1 / 1.1 = 9.1% of adjusted earnings (net income + stock pay).
-    assert app.session_state["model_NVDA_eps_haircut_pct"] == pytest.approx(9.1)
-    assert any("stock-based pay / (net income + stock-based pay)" in element.value for element in app.caption)
+    # 4 x 0.25 x (1 - 20%) = 0.80 a share, over the last four reported EPS.
+    reported = Ticker("NVDA").get_earnings_dates()["Reported EPS"].sort_index().iloc[-4:].sum()
+    assert app.session_state["model_NVDA_eps_haircut_pct"] == pytest.approx(round(0.8 / reported * 100, 1))
+    assert any("after 20% tax" in element.value for element in app.caption)
     formulas = [element.value for element in app.get("latex")]
     assert any("EPS}_{\\text{clean}}" in formula for formula in formulas)
     assert any("P/E}_{\\text{acc}}" in formula for formula in formulas)
