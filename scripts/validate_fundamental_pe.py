@@ -148,6 +148,24 @@ def main():
             errors = {rule: (part[rule] - part["actual"]).abs().median() for rule in rules}
             print(f"{name:28s} n={len(part):3d} persistence={s:.2f}  median abs error: "
                   + ", ".join(f"{rule} {value:.1f}" for rule, value in errors.items()))
+    print("\nGrid: gross-margin half-life low..high, steady half-life (median / mean abs error, bias):")
+    grid = []
+    for low in (0.5, 1.0, 1.5):
+        for high in (2.0, 3.0, 4.0):
+            for steady_max in (0.0, 4.0, 6.0, 8.0):
+                trial = {**params, "growth_half_life_min": low, "growth_half_life_max": high, "steady_half_life": max(steady_max, low)}
+                predicted = []
+                for row in fade_rows:
+                    margin_h = growth_half_life(row["gross_margin"], trial)
+                    steady_h = steady_half_life(row["spread"], row["past"], trial) if steady_max else np.nan
+                    h = max(margin_h, steady_h) if np.isfinite(steady_h) else margin_h
+                    predicted.append(fade_cagr(row["past"], h))
+                error = np.array(predicted) - fade["actual"].to_numpy()
+                grid.append({"low": low, "high": high, "steady": steady_max, "median": np.median(np.abs(error)),
+                             "mean": np.mean(np.abs(error)), "bias": np.mean(error)})
+    grid = pd.DataFrame(grid).sort_values("median")
+    print(grid.head(12).round(2).to_string(index=False))
+    print("current (0.5, 2.0, 6.0):", grid[(grid["low"] == 0.5) & (grid["high"] == 2.0) & (grid["steady"] == 6.0)].round(2).to_string(index=False, header=False))
     print("\nPer stock, median abs error of each rule (pts):")
     per = fade.groupby("ticker").apply(lambda part: pd.Series({rule: (part[rule] - part["actual"]).abs().median()
                                                                for rule in rules}), include_groups=False)
@@ -170,7 +188,8 @@ def main():
         both = pd.concat([prices.tz_localize(None), spy.tz_localize(None)], axis=1, join="inner").dropna()
         both = both[both.index >= both.index.max() - pd.DateOffset(years=3)]
         weekly = np.log(both.resample("W-FRI").last()).diff().dropna()
-        beta = weekly.iloc[:, 0].cov(weekly.iloc[:, 1]) / weekly.iloc[:, 1].var()
+        raw_beta = weekly.iloc[:, 0].cov(weekly.iloc[:, 1]) / weekly.iloc[:, 1].var()
+        beta = 0.67 * raw_beta + 0.33  # Blume-adjusted, as data vendors report it
         growth_off = row["cagr3"]
         growth_on = 0.5 * row["cagr3"] + 0.5 * row["yoy"]
         margin_h = growth_half_life(row["gross_margin"], params)
@@ -179,7 +198,10 @@ def main():
         erp_on = float(np.clip(4.5 * np.clip(beta, 0.5, 1.8), 2.5, 8.0))
         off = fundamental_pe(growth_off, None, ten_year, params, half_life=margin_h)
         on = fundamental_pe(growth_on, None, ten_year, {**params, "equity_premium": erp_on}, half_life=half_on)
-        rows.append({"ticker": ticker, "market fwd P/E": info.get("forwardPE"), "rules off": off, "rules on": on,
+        price, forward_eps = info.get("currentPrice") or info.get("regularMarketPrice"), info.get("forwardEps")
+        rows.append({"ticker": ticker, "market fwd P/E": info.get("forwardPE"), "trailing P/E": info.get("trailingPE"),
+                     "price/fwd EPS": price / forward_eps if price and forward_eps else np.nan,
+                     "rules off": off, "rules on": on, "raw beta": raw_beta,
                      "growth on": growth_on, "half-life on": half_on, "beta": beta, "GM": row["gross_margin"],
                      "spread": row["spread"]})
         time.sleep(0.3)
@@ -187,11 +209,13 @@ def main():
     now = now[now["market fwd P/E"] > 0]
     print(f"\n=== B. Cross-section today ({len(now)} stocks, 10-year yield {ten_year:.2f}%) ===")
     print(now.round(2).sort_values("market fwd P/E").to_string(index=False))
-    for column in ["rules off", "rules on"]:
-        ratio = np.log(now["market fwd P/E"] / now[column])
-        corr = np.corrcoef(np.log(now["market fwd P/E"]), np.log(now[column]))[0, 1]
-        print(f"{column:9s}: corr(log P/E) {corr:.2f}, median market/model {math.exp(ratio.median()):.2f}x, "
-              f"spread of log ratio {ratio.std():.2f}")
+    for market in ["market fwd P/E", "trailing P/E"]:
+        part = now[now[market].astype(float) > 0]
+        for column in ["rules off", "rules on"]:
+            ratio = np.log(part[market].astype(float) / part[column])
+            corr = np.corrcoef(np.log(part[market].astype(float)), np.log(part[column]))[0, 1]
+            print(f"{market:15s} vs {column:9s}: n={len(part)} corr(log P/E) {corr:.2f}, median market/model "
+                  f"{math.exp(ratio.median()):.2f}x, spread of log ratio {ratio.std():.2f}")
     fade.to_csv("validation_fade.csv", index=False)
     now.to_csv("validation_now.csv", index=False)
 
