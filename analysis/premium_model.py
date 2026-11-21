@@ -1,4 +1,4 @@
-"""Market premium model: calibrate on history, then judge today's close and the next quarter.
+"""Market premium model: calibrate on history, judge today's close, forecast the next quarter.
 
 Part 1, calibration. The ground truth is the trailing P/E the market actually paid: close / reported EPS of the last
 four quarters. The valuation model's fundamental P/E says what growth, gross margin, the yield and risk justify (on
@@ -11,9 +11,12 @@ trend, the net margin, EPS growth) with a ridge regression, fitted walk-forward:
 sees the months before it, so the history shows how it would have done in real time.
 
 Part 2, judgement and forecast. Today's premium against the one the fundamentals explain says whether the close
-sits on the rich (bearish) or cheap (bullish) side. The next quarter's price is the trailing EPS a quarter on, times
-the justified P/E, times the premium partly drifting back to the explained one at the speed seen in the history.
-The bull and bear prices are the 80th and 20th percentiles of the walk-forward errors of that same forecast.
+sits on the rich or the cheap side. A check on 39 large US stocks (2016-2026) found that this says nothing about the
+next quarter or year, and a little about the next 2-3 years (the cheapest fifth of months beat the richest by 4-6
+points), so it is shown as a 2-3 year signal, with the stock's own record next to it. The same check found that a
+premium does not drift back within a quarter: forecasts that assumed it did were worse than 'no change'. So the
+next-quarter forecast is the close grown by a quarter of the earnings growth, and the bear and bull prices are the
+20th and 80th percentile of this forecast's past errors, using only errors already known on each day.
 """
 
 import numpy as np
@@ -109,60 +112,78 @@ def predict(model, frame):
     return model["intercept"] + z @ pd.Series(model["beta"], index=model["columns"])
 
 
-def _reversion(residuals, lag):
-    """How much of a premium gap is left ``lag`` months on (0: gone, 1: stays), from the residuals' autocorrelation."""
+def forecast_price(close, growth):
+    """Next-quarter price: the close grown by a quarter of the yearly growth (no pull of the premium)."""
 
-    residuals = residuals.dropna()
-    if len(residuals) <= lag + 6:
-        return 0.5
-    now, later = residuals.iloc[:-lag].to_numpy(), residuals.iloc[lag:].to_numpy()
-    if np.std(now) == 0:
-        return 0.5
-    return float(np.clip(np.polyfit(now, later, 1)[0], 0, 1))
+    growth = float(np.clip(growth, -50, 100)) if np.isfinite(growth) else 0.0
+    return close * (1 + growth / 100) ** (HORIZON_MONTHS / 12)
 
 
-def forecast_price(row, explained, keep, growth):
-    """Next-quarter price from a month-end row: EPS a quarter on x justified P/E x the premium drifting back."""
-
-    eps = row["ttm_eps"] * (1 + growth / 100) ** (HORIZON_MONTHS / 12)
-    premium = explained + keep * (row["premium"] - explained)
-    return eps * row["justified_pe"] * np.exp(premium)
+def _band(errors, low=0.2, high=0.8):
+    errors = errors.dropna()
+    return (errors.quantile(low), errors.quantile(high)) if len(errors) >= 12 else (np.nan, np.nan)
 
 
 def walk_forward(frame):
-    """Real-time history: on each month-end fit on the months before it, explain the premium and forecast the price
-    a quarter on. Adds explained_premium, forecast (made then, for 3 months later) and the realised close."""
+    """Real-time history. On each month-end: fit on the months before it and explain the premium; forecast the price
+    a quarter on; and set the bear/bull band from the errors of forecasts already settled by then (made at least a
+    quarter earlier). Adds explained_premium, forecast, bear, bull, realised and error."""
 
     out = frame.copy()
-    out["explained_premium"], out["forecast"], out["keep"] = np.nan, np.nan, np.nan
+    for column in ["explained_premium", "forecast", "bear", "bull"]:
+        out[column] = np.nan
     usable = out.dropna(subset=["premium"])
-    for position, day in enumerate(out.index):
+    for day in out.index:
         before = usable[usable.index < day]
-        if len(before) < MIN_MONTHS:
-            continue
-        model = fit(before)
-        if model is None:
-            continue
+        if len(before) >= MIN_MONTHS:
+            model = fit(before)
+            if model is not None:
+                out.at[day, "explained_premium"] = predict(model, out.loc[[day]]).iloc[0]
         row = out.loc[day]
-        explained = predict(model, out.loc[[day]]).iloc[0]
-        out.at[day, "explained_premium"] = explained
-        residuals = before["premium"] - predict(model, before)
-        keep = _reversion(residuals, HORIZON_MONTHS)
-        out.at[day, "keep"] = keep
-        growth = row["growth"] if np.isfinite(row["growth"]) else 0.0
-        if np.isfinite(explained) and np.isfinite(row["premium"]) and row["ttm_eps"] > 0:
-            out.at[day, "forecast"] = forecast_price(row, explained, keep, growth)
+        if np.isfinite(row["close"]):
+            out.at[day, "forecast"] = forecast_price(row["close"], row["growth"])
     out["realised"] = out["close"].shift(-HORIZON_MONTHS)
     out["error"] = np.log(out["realised"] / out["forecast"])
+    settled_on = pd.Series(out.index, index=out.index) + pd.DateOffset(months=HORIZON_MONTHS)
+    for day in out.index:
+        low, high = _band(out["error"][settled_on <= day])
+        if np.isfinite(low):
+            out.at[day, "bear"], out.at[day, "bull"] = out.at[day, "forecast"] * np.exp(low), out.at[day, "forecast"] * np.exp(high)
     return out
+
+
+HORIZONS = (3, 12, 24, 36)
+
+
+def valuation_record(history):
+    """Has the rich/cheap gap told anything about this stock's later returns? For each horizon in months: the number
+    of months, the correlation of the cheapness (-gap) with the return, and the average return of the cheapest and
+    the richest fifth of months, against all months."""
+
+    rows = []
+    gap = history["premium"] - history["explained_premium"]
+    for months in HORIZONS:
+        later = np.log(history["close"].shift(-months) / history["close"])
+        both = pd.DataFrame({"gap": gap, "return": later}).dropna()
+        if len(both) < 25:
+            continue
+        cheap = both["return"][both["gap"] <= both["gap"].quantile(0.2)].mean()
+        rich = both["return"][both["gap"] >= both["gap"].quantile(0.8)].mean()
+        rows.append({"Horizon": f"{months} months", "Months": len(both),
+                     "Cheapness vs return (corr)": float(np.corrcoef(-both["gap"], both["return"])[0, 1]),
+                     "Cheapest fifth %": float((np.exp(cheap) - 1) * 100), "Richest fifth %": float((np.exp(rich) - 1) * 100),
+                     "All months %": float((np.exp(both["return"].mean()) - 1) * 100)})
+    return pd.DataFrame(rows, columns=["Horizon", "Months", "Cheapness vs return (corr)", "Cheapest fifth %",
+                                       "Richest fifth %", "All months %"])
 
 
 def calibrate(result):
     """Part 1 and Part 2 for a model run. Returns a dict (empty when the history is too short or has no EPS):
 
-    history: month-end frame with the walk-forward columns; model: the fit on all history; quality: walk-forward
-    error, direction hit rate against 'no change', band coverage; today: actual and explained premium, the gap, the
-    side (rich / cheap) and next quarter's base, bull and bear prices; coefficients: each feature's effect.
+    history: month-end frame with the walk-forward columns; model: the fit on all history; quality: the next-quarter
+    forecast's error against 'no change', its direction hit rate and how often the band (set from past errors only)
+    held; today: actual and explained premium, the gap, the side (rich / cheap, a 2-3 year signal), the fair price
+    and next quarter's base, bull and bear prices; record: ``valuation_record``; coefficients: each feature's effect.
     """
 
     frame = samples(result)
@@ -171,7 +192,7 @@ def calibrate(result):
     history = walk_forward(frame)
     tested = history.dropna(subset=["forecast", "realised"])
     errors = tested["error"]
-    low, high = (errors.quantile(0.2), errors.quantile(0.8)) if len(errors) >= 8 else (np.nan, np.nan)
+    banded = tested.dropna(subset=["bear", "bull"])
     quality = {
         "months": int(len(tested)),
         "premium_error_pct": float((np.exp((history["premium"] - history["explained_premium"]).abs().median()) - 1) * 100)
@@ -181,24 +202,22 @@ def calibrate(result):
         if len(tested) else np.nan,
         "direction_hit": float(((tested["forecast"] > tested["close"]) == (tested["realised"] > tested["close"])).mean())
         if len(tested) else np.nan,
-        "band_coverage": float(((tested["realised"] >= tested["forecast"] * np.exp(low))
-                                & (tested["realised"] <= tested["forecast"] * np.exp(high))).mean())
-        if len(tested) and np.isfinite(low) else np.nan,
+        "band_months": int(len(banded)),
+        "band_coverage": float(((banded["realised"] >= banded["bear"]) & (banded["realised"] <= banded["bull"])).mean())
+        if len(banded) else np.nan,
     }
     model = fit(history.dropna(subset=["premium"]))
     last = history.dropna(subset=["premium"]).iloc[-1]
     explained = predict(model, history.loc[[last.name]]).iloc[0]
-    residuals = history["premium"] - predict(model, history)
-    keep = _reversion(residuals, HORIZON_MONTHS)
-    growth = last["growth"] if np.isfinite(last["growth"]) else 0.0
-    base = forecast_price(last, explained, keep, growth)
+    low, high = _band(errors)
+    base = forecast_price(last["close"], last["growth"])
     gap = float(last["premium"] - explained)
     today = {
         "date": last.name, "close": float(last["close"]), "actual_pe": float(last["actual_pe"]),
         "justified_pe": float(last["justified_pe"]), "premium_pct": float((np.exp(last["premium"]) - 1) * 100),
         "explained_premium_pct": float((np.exp(explained) - 1) * 100),
-        "gap_pct": float((np.exp(gap) - 1) * 100), "side": "rich (bearish side)" if gap > 0 else "cheap (bullish side)",
-        "fair_price": float(last["close"] * np.exp(-gap)), "keep": keep,
+        "gap_pct": float((np.exp(gap) - 1) * 100), "side": "rich" if gap > 0 else "cheap",
+        "fair_price": float(last["close"] * np.exp(-gap)), "growth": float(last["growth"]) if np.isfinite(last["growth"]) else 0.0,
         "base": float(base), "bull": float(base * np.exp(high)) if np.isfinite(high) else np.nan,
         "bear": float(base * np.exp(low)) if np.isfinite(low) else np.nan,
         "horizon": last.name + pd.DateOffset(months=HORIZON_MONTHS),
@@ -207,4 +226,5 @@ def calibrate(result):
         [{"Feature": FEATURES[column], "Today": float(last[column]),
           "Effect of +1 st. dev. on premium %": float((np.exp(beta) - 1) * 100)}
          for column, beta in zip(model["columns"], model["beta"])]) if model and model["columns"] else pd.DataFrame()
-    return {"history": history, "model": model, "quality": quality, "today": today, "coefficients": coefficients}
+    return {"history": history, "model": model, "quality": quality, "today": today,
+            "record": valuation_record(history), "coefficients": coefficients}

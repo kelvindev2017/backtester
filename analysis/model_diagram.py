@@ -464,13 +464,19 @@ def premium_figure(calibration, ticker="", mobile=False):
                            (explained_pe, "Justified + explained premium", dict(width=2, color="royalblue"))]:
         fig.add_trace(go.Scatter(x=history.index, y=y, name=name, mode="lines", line=style,
                                  hovertemplate=f"{name}: %{{y:.1f}}x<extra></extra>"), row=1, col=1)
-    forecast_for = history["forecast"].copy()
-    forecast_for.index = forecast_for.index + pd.DateOffset(months=3)
+    shifted = history[["forecast", "bear", "bull"]].copy()
+    shifted.index = shifted.index + pd.DateOffset(months=3)
+    if shifted["bear"].notna().any():
+        fig.add_trace(go.Scatter(x=shifted.index, y=shifted["bull"], mode="lines", line=dict(width=0), showlegend=False,
+                                 hoverinfo="skip"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=shifted.index, y=shifted["bear"], mode="lines", line=dict(width=0), fill="tonexty",
+                                 fillcolor="rgba(65,105,225,0.12)", name="Bear-to-bull band (set then)",
+                                 hoverinfo="skip"), row=2, col=1)
     fig.add_trace(go.Scatter(x=history.index, y=history["close"], name="Close", mode="lines",
                              line=dict(width=1.8, color="dimgray"), showlegend=False,
                              hovertemplate="Close: %{y:,.2f}<extra></extra>"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=forecast_for.index, y=forecast_for, name="Forecast a quarter before", mode="lines+markers",
-                             marker=dict(size=4), line=dict(width=1.4, color="royalblue"),
+    fig.add_trace(go.Scatter(x=shifted.index, y=shifted["forecast"], name="Forecast a quarter before", mode="lines",
+                             line=dict(width=1.4, color="royalblue"),
                              hovertemplate="Forecast: %{y:,.2f}<extra></extra>"), row=2, col=1)
     today = calibration["today"]
     for value, label, color in [(today["bear"], "Bear", "firebrick"), (today["base"], "Base", "royalblue"),
