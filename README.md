@@ -184,12 +184,17 @@ The **Market premium model** runs by default for the selected stock, in two part
 the ground truth is the trailing P/E the market paid (close / reported EPS of the last four quarters); the premium
 is its log gap to the P/E the fundamentals justify (the fundamental P/E, on trailing earnings), and a ridge
 regression explains it with fundamentals known at the time (revenue growth, its change of pace, the gross-margin
-trend, the net margin, EPS growth), fitted walk-forward at each month-end on earlier months only. Part 2 judges
-today: today's premium against the explained one says whether the close is on the rich (bearish) or cheap (bullish)
-side, with the fair price; and the next quarter's price is the trailing EPS a quarter on x the justified P/E x the
-premium drifting back to the explained one at the speed seen in the history, with bear and bull prices at the 20th
-and 80th percentile of the walk-forward errors. It reports the walk-forward error against "no change", the direction
-hit rate and how often the bear-to-bull band held. The Model check and its Apply step stay as the update step.
+trend, the net margin, EPS growth), fitted walk-forward at each month-end on earlier months only. Part 2: today's
+premium against the explained one says whether the close is on the rich or the cheap side, shown as a **2-3 year
+signal** with the stock's own record (how cheap and rich months did 3, 12, 24 and 36 months later). The **next
+quarter** is the close grown by a quarter of the yearly growth, with bear and bull prices at the 20th and 80th
+percentile of this forecast's past errors, set each month from errors already known then.
+
+Why: a walk-forward check on 39 large US stocks (2016-2026, about 4,400 stock-months) found that the premium does
+not drift back within a quarter (assuming it did made the forecast worse than "no change"), and that the rich/cheap
+gap said nothing about the next quarter or year but a little about the next 2-3 years (the cheapest fifth of months
+beat the richest by 4-6 points). Rerun it from the Actions tab ("Validate the valuation model on real stocks").
+The Model check and its Apply step stay as the update step.
 
 "Last quarter" in the Last quarter vs forward table and beside the blocks ("last Q") is the last four quarters'
 results at today's rate, with no forward assumption. The peers' median P/E is still available as the outside view; the rest of the anchor can come from

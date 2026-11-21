@@ -5136,7 +5136,7 @@ def render_market_check(result):
 
 def render_premium_model(result, ticker):
     """Part 1: the market premium calibrated on the stock's history (walk-forward). Part 2: today's close against
-    it, and next quarter's price with a bull and a bear case."""
+    it (a 2-3 year signal) and next quarter's price with a bear and a bull case."""
 
     st.markdown(f"**Market premium model** · calibrated on {ticker}'s history")
     if result["params"]["anchor_source"] != "Fundamentals":
@@ -5147,34 +5147,49 @@ def render_premium_model(result, ticker):
         st.caption("Not enough history with reported EPS and revenue (about 2.5 years of month-ends with a "
                    "positive trailing EPS) to calibrate the premium.")
         return
-    today, quality = calibration["today"], calibration["quality"]
+    today, quality, record = calibration["today"], calibration["quality"], calibration["record"]
     tiles = st.columns(2 if MOBILE else 4)
     tiles[0].metric("Market trailing P/E", f"{today['actual_pe']:.1f}x")
     tiles[1].metric("Justified by fundamentals", f"{today['justified_pe']:.1f}x")
-    tiles[2 % len(tiles)].metric("Premium: market / explained", f"{today['premium_pct']:+.0f}% / {today['explained_premium_pct']:+.0f}%")
-    tiles[3 % len(tiles)].metric("Today", today["side"].split(" ")[0].capitalize(),
+    tiles[2 % len(tiles)].metric("Premium: market / explained",
+                                 f"{today['premium_pct']:+.0f}% / {today['explained_premium_pct']:+.0f}%")
+    tiles[3 % len(tiles)].metric("Valuation, 2-3 year signal", today["side"].capitalize(),
                                  f"{today['gap_pct']:+.0f}% vs fair {today['fair_price']:,.2f}", delta_color="inverse")
     horizon = today["horizon"].strftime("%d %b %Y")
+    st.markdown(f"**Next quarter** · to {horizon}")
     cases = st.columns(3)
     for column, (label, key) in zip(cases, [("Bear", "bear"), ("Base", "base"), ("Bull", "bull")]):
         value = today[key]
-        column.metric(f"{label}, {horizon}", f"{value:,.2f}" if np.isfinite(value) else "n/a",
+        column.metric(label, f"{value:,.2f}" if np.isfinite(value) else "n/a",
                       f"{(value / today['close'] - 1) * 100:+.1f}%" if np.isfinite(value) else None)
-    beats = np.isfinite(quality["price_error_pct"]) and quality["price_error_pct"] < quality["naive_error_pct"]
     st.caption(
-        f"Ground truth: the trailing P/E the market paid (close / reported EPS of the last four quarters). The premium "
-        f"is that against the P/E the fundamentals justify, explained by revenue growth, its change of pace, the "
-        f"gross-margin trend, the net margin and EPS growth. Walk-forward over {quality['months']} month-ends (each fit "
-        f"only on the months before): the explained premium was off by a median {quality['premium_error_pct']:.0f}%; "
-        f"the price a quarter on by {quality['price_error_pct']:.1f}% against {quality['naive_error_pct']:.1f}% for "
-        f"'no change'; the direction was right {quality['direction_hit']:.0%} of the time; the bear-to-bull band "
-        f"(20th to 80th percentile of those errors) held {quality['band_coverage']:.0%} of the outcomes (60% expected). "
-        f"Today's gap to the explained premium is assumed to keep {today['keep']:.0%} of itself after a quarter, as in "
-        "the history.")
-    if not beats:
-        st.warning("For this stock the forecast has not beaten 'no change' in the walk-forward history: read the "
-                   "bull and bear range, not the base, and look at the Model check.")
+        f"Base: today's close grown by a quarter of the {today['growth']:.1f}% yearly growth; the premium is assumed "
+        "to stay where it is (in a check on 39 large US stocks it did not drift back within a quarter, and forecasts "
+        "that assumed it would were worse than 'no change'). Bear and bull: the 20th and 80th percentile of this "
+        f"forecast's past errors for {ticker}. Walk-forward over {quality['months']} month-ends: off by a median "
+        f"{quality['price_error_pct']:.1f}% against {quality['naive_error_pct']:.1f}% for 'no change'; direction "
+        f"right {quality['direction_hit']:.0%}; the band, set each month from errors already known then, held "
+        f"{quality['band_coverage']:.0%} of {quality['band_months']} outcomes (60% if it is honest).")
+    st.caption(
+        "Valuation: today's premium against the one the fundamentals explain (revenue growth, its change of pace, the "
+        f"gross-margin trend, the net margin, EPS growth; explained to within a median {quality['premium_error_pct']:.0f}% "
+        "walk-forward). Across 39 large US stocks (2016-2026) the gap said nothing about the next quarter or year; over "
+        "2-3 years the cheapest fifth of months beat the richest by 4-6 points. Read it as a slow signal, and check "
+        "its record for this stock below.")
     show_chart(premium_figure(calibration, ticker, mobile=MOBILE), width="stretch")
+    with st.expander(f"Has rich or cheap worked for {ticker}?"):
+        if record.empty:
+            st.caption("Too little history to tell.")
+        else:
+            st.dataframe(record, hide_index=True, width="stretch", column_config={
+                "Cheapness vs return (corr)": st.column_config.NumberColumn(format="%+.2f"),
+                "Cheapest fifth %": st.column_config.NumberColumn(format="%+.1f"),
+                "Richest fifth %": st.column_config.NumberColumn(format="%+.1f"),
+                "All months %": st.column_config.NumberColumn(format="%+.1f")})
+            st.caption("For each horizon: how the cheapness (market premium below the explained one) went with the "
+                       "return that followed, and the average return after the cheapest and the richest fifth of "
+                       "month-ends. A positive correlation and cheap beating rich mean the signal has worked here; "
+                       "overlapping months make the numbers look surer than they are.")
     if not calibration["coefficients"].empty:
         with st.expander("What explains the premium"):
             st.dataframe(calibration["coefficients"], hide_index=True, width="stretch",

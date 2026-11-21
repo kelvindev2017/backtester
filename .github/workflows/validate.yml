@@ -1,0 +1,31 @@
+name: Validate the valuation model on real stocks
+
+# Run by hand from the Actions tab: walk-forward checks on ~40 large US stocks with live data.
+on:
+  workflow_dispatch:
+    inputs:
+      check:
+        description: "premium (premium model and next-quarter forecast) or growth (growth fade and fundamental P/E)"
+        default: premium
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: |
+          if [ "${{ inputs.check }}" = "growth" ]; then script=validate_fundamental_pe.py; else script=validate_premium_model.py; fi
+          python scripts/$script 2>&1 | tee validation.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation
+          path: |
+            validation.log
+            validation_*.csv
