@@ -129,3 +129,11 @@ def test_premium_figure_shows_market_against_model_and_the_next_quarter():
     names = [trace.name for trace in fig.data]
     assert {"Market trailing P/E", "Justified by fundamentals", "Justified + explained premium", "Close",
             "Forecast a quarter before", "Base next quarter"} <= set(names)
+
+
+def test_block_chart_hides_through_cycle_lines_when_unused(result):
+    fig = block_signals_figure(result, "risk_weighting")
+    names = {trace.name for trace in fig.data}
+    assert "Risk-adjusted EPS" in names
+    assert not names & {"Through-cycle EPS", "Through-cycle EPS on (1 = yes)", "Past years' EPS, summed",
+                        "Next year's EPS (risk-adjusted)"}
