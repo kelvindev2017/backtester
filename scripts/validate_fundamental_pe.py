@@ -22,7 +22,8 @@ from analysis.valuation_model import fundamental_pe, growth_half_life, model_par
 TICKERS = ["COST", "WMT", "KO", "PEP", "PG", "JNJ", "MCD", "HD", "NKE", "SBUX", "AAPL", "MSFT", "GOOGL", "AMZN",
            "META", "NVDA", "AVGO", "ADBE", "CRM", "ORCL", "INTC", "TXN", "AMAT", "KLAC", "LRCX", "TSLA", "XOM", "CVX",
            "UNH", "LLY", "MRK", "ABBV", "CAT", "DE", "HON", "NFLX", "ISRG", "TGT", "LOW", "QCOM"]
-UA = {"User-Agent": "backtester validation research kelvindev2017@users.noreply.github.com"}
+UA = {"User-Agent": "StreamlitBacktester/1.0 kelvin@example.com", "Accept": "application/json",
+      "Accept-Encoding": "identity"}
 REVENUE = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet",
            "RevenueFromContractWithCustomerIncludingAssessedTax"]
 COST = ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"]
@@ -34,7 +35,8 @@ def get(url):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as response:
                 return json.loads(response.read())
-        except Exception:
+        except Exception as error:
+            print(f"fetch failed ({attempt + 1}/3) {url}: {error}")
             time.sleep(1 + attempt)
     return None
 
