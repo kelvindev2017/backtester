@@ -1,0 +1,93 @@
+"""Walk-forward check of the market premium model on many real stocks (run in CI, which has the network).
+
+Loads each stock exactly as the app does (App.py's own loaders: Yahoo prices and EPS, SEC/Yahoo quarterly results),
+runs the valuation model with its defaults (fundamental P/E, rules on, FRED policy rate, SPY for beta) and the
+premium model's walk-forward test, and reports per stock and overall: the error of the next-quarter price forecast
+against 'no change', the direction hit rate and how often the bear-to-bull band held.
+"""
+
+import ast
+import sys
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, ".")
+warnings.filterwarnings("ignore")
+
+TICKERS = ["COST", "WMT", "KO", "PEP", "PG", "JNJ", "MCD", "HD", "NKE", "SBUX", "AAPL", "MSFT", "GOOGL", "AMZN",
+           "META", "NVDA", "AVGO", "ADBE", "CRM", "ORCL", "INTC", "TXN", "AMAT", "KLAC", "LRCX", "TSLA", "UNH", "LLY",
+           "MRK", "ABBV", "CAT", "DE", "HON", "NFLX", "ISRG", "TGT", "LOW", "QCOM", "CVX", "XOM"]
+
+
+def app_functions():
+    """App.py's imports, constants, functions and classes, without running its page."""
+
+    source = open("App.py").read()
+    tree = ast.parse(source)
+    namespace = {"__name__": "app_functions", "__file__": "App.py"}
+    kept = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign)
+    for node in tree.body:
+        if isinstance(node, kept):
+            try:
+                exec(compile(ast.Module([node], type_ignores=[]), "App.py", "exec"), namespace)
+            except Exception as error:
+                print(f"skipped a top-level statement at line {node.lineno}: {type(error).__name__}")
+    return namespace
+
+
+def main():
+    app = app_functions()
+    from analysis.premium_model import calibrate
+    from analysis.valuation_model import model_params, run_model
+
+    policy, _ = app["load_fred"]("DFF")
+    market_yield, _ = app["load_fred"]("DGS10")
+    rows = []
+    for ticker in TICKERS:
+        started = time.time()
+        try:
+            inputs = app["load_model_inputs"](ticker, 12, [], 5, "Trailing")
+        except Exception as error:
+            print(f"{ticker}: load failed {type(error).__name__}: {error}")
+            continue
+        if inputs is None or inputs.quarters.empty:
+            print(f"{ticker}: no data")
+            continue
+        params = model_params({"anchor_source": "Fundamentals", "peer_weight": 1.0})
+        result = run_model(inputs.quarters, inputs.close, None, params, None, start=inputs.start, policy_rate=policy,
+                           market_yield=market_yield, market_close=getattr(inputs, "market_close", None))
+        calibration = calibrate(result)
+        if not calibration:
+            print(f"{ticker}: too little history ({inputs.quarters['EPS'].notna().sum()} EPS quarters, "
+                  f"{inputs.quarters.get('Revenue', pd.Series(dtype=float)).notna().sum()} revenue quarters)")
+            continue
+        quality, today = calibration["quality"], calibration["today"]
+        tested = calibration["history"].dropna(subset=["forecast", "realised"])
+        rows.append({
+            "ticker": ticker, "months": quality["months"], "from": tested.index.min().strftime("%Y-%m"),
+            "premium err %": quality["premium_error_pct"], "price err %": quality["price_error_pct"],
+            "no-change err %": quality["naive_error_pct"],
+            "beats": quality["price_error_pct"] < quality["naive_error_pct"],
+            "direction": quality["direction_hit"], "band held": quality["band_coverage"],
+            "today": today["side"].split(" ")[0], "gap %": today["gap_pct"],
+            "next Q base %": (today["base"] / today["close"] - 1) * 100, "seconds": time.time() - started})
+        print(f"{ticker}: done in {time.time() - started:.0f}s")
+    table = pd.DataFrame(rows)
+    pd.set_option("display.width", 220)
+    pd.set_option("display.max_rows", 100)
+    print(f"\n=== Premium model, walk-forward, {len(table)} stocks ===")
+    print(table.drop(columns=["seconds"]).round(2).to_string(index=False))
+    if len(table):
+        print(f"\nBeats 'no change' on {table['beats'].sum()} of {len(table)} stocks; "
+              f"median price error {table['price err %'].median():.1f}% vs {table['no-change err %'].median():.1f}% "
+              f"for 'no change'; direction right {table['direction'].median():.0%} (median stock); band held "
+              f"{table['band held'].median():.0%} (60% expected); premium explained to within "
+              f"{table['premium err %'].median():.0f}% (median).")
+    table.to_csv("validation_premium.csv", index=False)
+
+
+if __name__ == "__main__":
+    main()
