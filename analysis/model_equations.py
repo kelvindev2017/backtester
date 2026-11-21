@@ -44,6 +44,10 @@ EQUATIONS = {
     "risk_weighting": [
         r"\begin{aligned} \text{EPS}_{\text{risk}} = {} & w_{\text{bear}} \times \text{EPS}_{\text{bear}} \\ "
         r"& + w_{\text{base}} \times \text{EPS}_{\text{base}} \\ & + w_{\text{bull}} \times \text{EPS}_{\text{bull}} \end{aligned}",
+        r"\text{Through-cycle (deep cycles): } \text{EPS}_{\text{cycle}} = \frac{1}{Y}\Big(\sum_{j=1}^{Y-1} \text{EPS}_{\text{4q}, t-4j+4} "
+        r"\times (1 - h) + \text{EPS}_{\text{risk}}\Big)",
+        r"\text{Auto: on when } \min_t \frac{\text{EPS}_t}{\max_{s \le t} \text{EPS}_s} \le 1 - \frac{F}{100} "
+        r"\text{ and trend } g_{\text{cycle}} < G",
     ],
     "rate_model": [
         r"w_N = \frac{1 - e^{-\lambda N}}{\lambda N}, \qquad \lambda = \frac{\ln 2}{h}",
@@ -85,7 +89,11 @@ SYMBOLS = {
                        "σ_typical: the typical one, w: share of the own one, k: how many s the bear and bull cases sit "
                        "from base. Defaults (k 2.4, w 0.25, σ_typical 0.073) come from a forward test on 60 stocks: "
                        "trained on 2010-2018, they beat the fixed gaps in each year 2019-2025.",
-    "risk_weighting": "w: scenario weights, rescaled to add up to 1.",
+    "risk_weighting": "w: scenario weights, rescaled to add up to 1. Through-cycle EPS: for a deep-cycle company "
+                      "the model values the mean of Y yearly EPS figures (the past Y - 1 years' trailing EPS after the "
+                      "haircut h, and next year's risk-adjusted EPS), and its fundamental P/E rests on their trend "
+                      "growth g_cycle (0 to G). F: the fall from an earlier high, G: the trend cap; Auto turns it on "
+                      "when the EPS fell at least F% and the trend is below G% a year.",
     "rate_model": "y_market: the market's N-year Treasury yield (FRED), r_today: today's policy rate. r_f: policy rate used (your forward rate on the last day, the actual rate before), r_n: neutral "
                   "rate, h: half-life of a rate's gap to neutral in years, N: yield maturity in years, w_N: share of "
                   "the policy rate that reaches the N-year yield, tp: term premium (it cancels out of both Δy). "
@@ -232,6 +240,12 @@ def worked_equations(result, block, on=None):
     if block == "risk_weighting":
         weights = scenario_weights(params)
         terms = r" \\ & + ".join(rf"{_n(weight, 2)} \times {_n(get(f'eps_{name.lower()}'))}" for weight, name in zip(weights, SCENARIOS))
+        if get("cycle_on") == 1:
+            years = int(get("cycle_years_used")) if np.isfinite(get("cycle_years_used")) else int(params["cycle_years"])
+            return [rf"\begin{{aligned}} \text{{EPS}}_{{\text{{risk}}}} = {{}} & {terms} \\ = {{}} & {_n(get('next_year_eps'))} \end{{aligned}}",
+                    rf"\begin{{aligned}} \text{{EPS}}_{{\text{{cycle}}}} = {{}} & ({_n(get('cycle_past_sum'))} + {_n(get('next_year_eps'))}) / {years} "
+                    rf"\\ = {{}} & {_n(get('cycle_eps'))} \quad (\text{{trend }} {_n(get('cycle_trend'), 1)}\%,\ "
+                    rf"g_{{\text{{cycle}}}} = {_n(float(np.clip(get('cycle_trend'), 0, params['cycle_trend_cap'])), 1)}\%) \end{{aligned}}"]
         return [rf"\begin{{aligned}} \text{{EPS}}_{{\text{{risk}}}} = {{}} & {terms} \\ = {{}} & {_n(get('risk_adjusted_eps'))} \end{{aligned}}"]
     if block in ("item_router", "triage_gate", "item_tracker"):
         _, points = case_effects(result["items"], result["daily"].index[-1] if on is None else on, params)

@@ -84,7 +84,7 @@ def test_parameter_and_item_tables(result):
     assert table["Effect"].tolist() == ["-2.0 P/E points", "-12.0 % of EPS"] and table["In the model"].tolist() == [True, False]
     preset = run_model(pd.DataFrame(), pd.Series([30.0, 31.0], index=pd.bdate_range("2026-11-09", periods=2)),
                        preset_register("ASMVY"), preset_params("ASMVY"))
-    assert items_table(preset)["In the model"].sum() == 3
+    assert items_table(preset)["In the model"].sum() == 2  # the cyclicality item is parked: through-cycle EPS covers it
 
 
 def test_values_are_formatted_by_unit():

@@ -4545,7 +4545,7 @@ def model_box_value(name, value):
 
     if isinstance(value, (str, bool)):
         return value
-    return int(value) if name in ("pe_lookback_years", "yield_years", "growth_history_years", "erp_lookback_years") else float(value)
+    return int(value) if name in ("pe_lookback_years", "yield_years", "growth_history_years", "erp_lookback_years", "cycle_years") else float(value)
 
 
 def fill_missing_model_boxes(ticker):
@@ -4874,6 +4874,18 @@ def model_settings():
             st.caption("Defaults from a forward test on 60 US stocks: set on 2010-2018 results, they scored better than "
                        "the fixed gaps in every year 2019-2025 (outcomes 4 quarters later). The bull/bear adjustments "
                        "in the Forward table are not used in this mode.")
+        params["cycle_eps"] = st.radio(
+            "Value on through-cycle EPS", ["Auto", "On", "Off"], key=model_param_key("cycle_eps"), horizontal=True,
+            help="For a deep-cycle company one year's EPS says little: at the bottom the P/E looks huge, at the top "
+                 "tiny. Through-cycle EPS is the mean of the past years' trailing EPS (after the haircut) and next "
+                 "year's risk-adjusted EPS, and the fundamental P/E rests on their trend growth. Auto turns it on when "
+                 "the EPS fell deeply from an earlier high and has no strong trend.")
+        if params["cycle_eps"] != "Off":
+            params["cycle_years"] = st.select_slider("Years in the through-cycle mean", [3, 5, 7, 10],
+                                                     key=model_param_key("cycle_years"))
+            if params["cycle_eps"] == "Auto":
+                params["cycle_fall"] = number("cycle_fall", "Auto: EPS fell at least this % from an earlier high", 10, 95, 5)
+                params["cycle_trend_cap"] = number("cycle_trend_cap", "Auto: and its trend growth is below, % a year", 0, 50, 1)
         params["growth_follow"] = number("growth_follow", "Auto rule: base growth as a share of trailing growth", 0, 2, 0.05)
         params["growth_floor"] = number("growth_floor", "Auto rule: base growth floor %", -90, 0, 1)
         params["growth_cap"] = number("growth_cap", "Auto rule: base growth cap %", 0, 300, 1)
@@ -5010,6 +5022,47 @@ def daily_forward_pe(symbol, valuation, earnings, rule=(0.5, -20.0, 100.0, 0.5))
                                      recovery=recovery)
 
 
+# ADRs whose results Yahoo only has under the home listing: ADR -> (home ticker, home currency). Per-share figures are
+# converted with the ADR ratio (read off the prices) and the day's exchange rate; growth, margins and P/E need no
+# conversion.
+ADR_HOME_LISTINGS = {"ASMVY": ("0522.HK", "HKD"), "BESIY": ("BESI.AS", "EUR")}
+
+
+def home_listing_results(ticker, adr_close, load_start, end):
+    """(earnings per ADR in US$, home prices, home earnings, home fundamentals, source, note) for an ADR in
+    ``ADR_HOME_LISTINGS``, or None when the home listing has no reported EPS."""
+
+    if ticker not in ADR_HOME_LISTINGS:
+        return None
+    home, currency = ADR_HOME_LISTINGS[ticker]
+    home_prices = load_data(home, load_start, end, "Daily")
+    rate = load_data(f"{currency}USD=X", load_start, end, "Daily")
+    home_earnings = load_earnings_data(home, load_start, end)
+    if (home_prices.empty or rate.empty or "Close" not in home_prices or "Close" not in rate
+            or "Reported EPS" not in home_earnings or home_earnings["Reported EPS"].notna().sum() < 4):
+        return None
+    usd = rate["Close"].dropna()
+    usd.index = pd.DatetimeIndex(usd.index).tz_localize(None).normalize() if getattr(usd.index, "tz", None) else pd.DatetimeIndex(usd.index).normalize()
+    both = pd.concat([adr_close.rename("adr"), home_prices["Close"].rename("home"), usd.rename("fx")], axis=1,
+                     join="inner").dropna()
+    if len(both) < 20:
+        return None
+    ratio = float((both["adr"] / (both["home"] * both["fx"])).tail(60).median())
+    # A whole number of home shares per ADR when the prices point to one (3 for ASMPT, 1 for BESI).
+    ratio = float(round(ratio)) if round(ratio) >= 1 and abs(ratio / round(ratio) - 1) < 0.05 else ratio
+    on_day = usd.reindex(usd.index.union(pd.DatetimeIndex(home_earnings.index).normalize())).ffill().bfill()
+    factor = pd.Series(on_day.reindex(pd.DatetimeIndex(home_earnings.index).normalize()).to_numpy(),
+                       index=home_earnings.index) * ratio
+    earnings = home_earnings.copy()
+    for column in ["Reported EPS", "EPS Estimate"]:
+        if column in earnings:
+            earnings[column] = pd.to_numeric(earnings[column], errors="coerce") * factor
+    fundamentals, _, source = load_quarterly_fundamentals(home, load_start, end)
+    note = (f"results from the home listing {home} ({currency}), {ratio:g} share{'s' if ratio != 1 else ''} per ADR, "
+            f"converted at each day's {currency}/USD rate")
+    return earnings, home_prices, home_earnings, fundamentals, source, note
+
+
 def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing", history_rule=(0.5, -20.0, 100.0, 0.5)):
     """Prices, results by release date and the share's and peers' P/E for the model, with a note on what was found.
 
@@ -5027,6 +5080,12 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing",
         return None
     earnings = load_earnings_data(ticker, load_start, end)
     fundamentals, _, source = load_quarterly_fundamentals(ticker, load_start, end)
+    home = None
+    if "Reported EPS" not in earnings or earnings["Reported EPS"].notna().sum() < 4:
+        home = home_listing_results(ticker, prices["Close"], load_start, end)
+    if home is not None:
+        earnings, home_prices, home_earnings, fundamentals, source, home_note = home
+        source = f"{source}; {home_note}"
     released = fundamentals_by_release_date(fundamentals, earnings)
     eps = earnings["Reported EPS"].dropna() if "Reported EPS" in earnings else pd.Series(dtype=float)
     release_dates = pd.DatetimeIndex(released.index) if len(released) else pd.DatetimeIndex([])
@@ -5038,7 +5097,14 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing",
     quarters["EPS"] = eps
     forward = pe_basis == "Forward"
     # Analysts' EPS growth (next four quarters over the last four) is needed for the base case on either basis.
-    own_pe, growth_check = daily_forward_pe(ticker, build_valuation_data(prices, earnings)[0], earnings, history_rule)
+    if home is not None:
+        # P/E and growth do not depend on the currency: work them out on the home listing.
+        own_pe, growth_check = daily_forward_pe(ADR_HOME_LISTINGS[ticker][0],
+                                                build_valuation_data(home_prices, home_earnings)[0], home_earnings,
+                                                history_rule)
+        own_pe.index = pd.DatetimeIndex(own_pe.index).normalize()
+    else:
+        own_pe, growth_check = daily_forward_pe(ticker, build_valuation_data(prices, earnings)[0], earnings, history_rule)
     own_pe = own_pe if forward else None
     peer_pe = {}
     for peer in peers:
