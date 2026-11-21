@@ -74,7 +74,10 @@ def main():
             "direction": quality["direction_hit"], "band held": quality["band_coverage"],
             "today": today["side"].split(" ")[0], "gap %": today["gap_pct"],
             "next Q base %": (today["base"] / today["close"] - 1) * 100, "seconds": time.time() - started})
-        history = calibration["history"].dropna(subset=["explained_premium", "realised", "premium", "ttm_eps"])
+        full = calibration["history"]
+        for months in (6, 12, 24, 36):
+            full[f"return_{months}"] = np.log(full["close"].shift(-months) / full["close"])
+        history = full.dropna(subset=["explained_premium", "realised", "premium", "ttm_eps"])
         history = history.assign(ticker=ticker)
         diagnostics.append(history)
         print(f"{ticker}: done in {time.time() - started:.0f}s")
@@ -110,6 +113,21 @@ def main():
     print(f"Does the gap predict the next quarter's return? corr(-gap, return) = {np.corrcoef(-gap, actual)[0, 1]:.3f}; "
           f"cheapest fifth of months returned {actual[gap <= gap.quantile(0.2)].mean() * 100:+.1f}% a quarter, the "
           f"richest fifth {actual[gap >= gap.quantile(0.8)].mean() * 100:+.1f}% (all months {actual.mean() * 100:+.1f}%).")
+    for months in (6, 12, 24, 36):
+        column = f"return_{months}"
+        part = pooled.dropna(subset=[column])
+        part_gap = part["premium"] - part["explained_premium"]
+        if len(part) < 100:
+            continue
+        cheap = part[column][part_gap <= part_gap.quantile(0.2)].mean()
+        rich = part[column][part_gap >= part_gap.quantile(0.8)].mean()
+        per = part.groupby("ticker").apply(
+            lambda frame: np.corrcoef(-(frame["premium"] - frame["explained_premium"]), frame[column])[0, 1]
+            if len(frame) > 12 else np.nan, include_groups=False)
+        print(f"{months:2d} months on: corr(-gap, return) pooled {np.corrcoef(-part_gap, part[column])[0, 1]:+.3f}, "
+              f"per stock median {per.median():+.3f} (positive on {(per > 0).sum()} of {per.notna().sum()}); cheapest fifth "
+              f"{cheap * 100:+.1f}%, richest fifth {rich * 100:+.1f}%, all {part[column].mean() * 100:+.1f}% "
+              f"(n={len(part)})")
     per_stock = pooled.groupby("ticker").apply(
         lambda part: np.corrcoef(-(part["premium"] - part["explained_premium"]), np.log(part["realised"] / part["close"]))[0, 1],
         include_groups=False)
