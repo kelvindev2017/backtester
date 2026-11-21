@@ -48,7 +48,10 @@ EQUATIONS = {
         r"\Delta y_{\text{peers}} = y_N(r_f) - y_N(r_{\text{today}})",
     ],
     "multiple_builder": [
-        r"h = h_{\min} + (h_{\max} - h_{\min}) \times \operatorname{clip}\!\left(\frac{GM - GM_{\text{low}}}{GM_{\text{high}} - GM_{\text{low}}}, 0, 1\right)",
+        r"g = s_g \times g_{\text{latest year}} + (1 - s_g) \times g_{\text{history}}",
+        r"h_{GM} = h_{\min} + (h_{\max} - h_{\min}) \times \operatorname{clip}\!\left(\frac{GM - GM_{\text{low}}}{GM_{\text{high}} - GM_{\text{low}}}, 0, 1\right)",
+        r"h = \max(h_{GM},\ h_{\text{steady}})",
+        r"\text{ERP} = \operatorname{clip}\big(\text{ERP}_0 \times \operatorname{clip}(0.67 \beta + 0.33,\ 0.5,\ 1.8),\ 2.5,\ 8\big)",
         r"\ln(1 + g_t) = \ln(1 + g_T) + \big(\ln(1 + g) - \ln(1 + g_T)\big)\, 0.5^{t/h}",
         r"E_1 = 1, \quad E_{t+1} = E_t (1 + g_t)",
         r"\text{P/E}_{\text{fund}} = \sum_{t=1}^{40} \frac{E_t}{(1+r)^t} + \frac{E_{41}}{(r - g_T)(1+r)^{40}}, \qquad r = y_N + \text{ERP}",
@@ -78,9 +81,12 @@ SYMBOLS = {
                   "Δy_own compares with the years the own P/E median covers; Δy_peers is only the forward rate's "
                   "surprise, because the peers' P/E is today's and already prices today's rate.",
     "multiple_builder": "Outside view: P/E_fund (default) or the peers' median P/E (moved by the forward rate's yield change "
-                        "like the own one). g: revenue growth a year over the growth history (within floor and cap), GM: gross "
-                        "margin %, h: half-life in years of the growth above g_T (longer with a higher gross margin), g_T: terminal growth, y_N: the Rate model's yield (or the "
-                        "base yield), ERP: equity risk premium; from the latest release g, h and ERP are your forward values where set. "
+                        "like the own one). g: growth for the P/E %, s_g: share from the latest year's revenue growth, g_history: revenue growth a year over the "
+                        "growth history (within floor and cap), GM: gross margin %, h: half-life in years of the growth above g_T (longer with "
+                        "a higher gross margin, or with steady growth: h_steady runs from the low half-life for choppy growth to the steady "
+                        "half-life), g_T: terminal growth, y_N: the Rate model's yield (or the base yield), ERP: equity risk premium, ERP_0 the "
+                        "plain one, β: the stock's 3-year weekly beta to the S&P 500 (when beta scaling is on); from the latest release g, h and "
+                        "ERP are your forward values where set. "
                         "p: your market premium % (kept apart from the fundamentals). x: own or peers, Δy_x: yield change from the Rate model, t: share of it passed to the P/E "
                         "(the earnings yield 1/P/E moves point for point with the required return). k: share of the anchor from peers, P/E peers and own: their medians over the look-back, "
                         "a: P/E points from register items, d_q: earnings quality P/E deduction. P/E is trailing or "
@@ -187,12 +193,16 @@ def worked_equations(result, block, on=None):
             margin = get("held_gross_margin")
             margin_text = _n(margin, 1) + r"\%" if np.isfinite(margin) else r"\text{n/a}"
             growth = get("pe_growth") if np.isfinite(get("pe_growth")) else params["fallback_yoy"]
-            erp = params["forward_equity_premium"] if np.isfinite(params.get("forward_equity_premium", np.nan)) else params["equity_premium"]
+            # The premium the run used: yours from the latest release, else the plain one scaled by beta.
+            erp = get("pe_erp")
+            if not np.isfinite(erp):
+                erp = (params["forward_equity_premium"] if np.isfinite(params.get("forward_equity_premium", np.nan))
+                       else params["equity_premium"])
             required = (get("model_yield") if np.isfinite(get("model_yield")) else params["base_yield"]) + erp
             years_text = _n(get("pe_half_life") if np.isfinite(get("pe_half_life")) else get("growth_half_life"), 2)
             pe_text = _n(get("outside_forward"), 1)
             lines.insert(0, rf"h = {years_text} \text{{ years}} \quad (GM = {margin_text}), \qquad g = {_n(growth, 1)}\%")
-            lines.insert(1, rf"\text{{P/E}}_{{\text{{fund}}}} = {pe_text} \quad (r = {_n(required, 2)}\%)")
+            lines.insert(1, rf"\text{{P/E}}_{{\text{{fund}}}} = {pe_text} \quad (r = {_n(required - erp, 2)} + {_n(erp, 2)} = {_n(required, 2)}\%)")
         pairs = [("own", raw_own, get("yield_gap"))] + ([] if fundamentals else [("peers", raw_peer, get("forward_gap"))])
         for label, raw, gap in pairs:
             if np.isfinite(raw) and np.isfinite(get("policy_rate")):
