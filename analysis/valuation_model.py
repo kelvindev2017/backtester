@@ -84,6 +84,7 @@ DEFAULT_PARAMS = {
     "erp_lookback_years": 2,         # ... the usual premium is the median over this many years of month-ends
     "implied_erp_floor": -2.0,       # ... the implied premium is solved within this floor
     "implied_erp_cap": 20.0,         # ... and this cap, in %
+    "usual_erp_floor": 2.5,          # ... and the usual premium is at least this, % (a bubble's premium is no guide)
     # Through-cycle EPS: a deep-cycle company is valued on its average EPS over a whole cycle, not one year's.
     "cycle_eps": "Auto",             # Auto (when the EPS fell deeply and has no strong trend), On or Off
     "cycle_years": 7,                # ... the average of this many yearly EPS figures (the past years + next year)
@@ -99,7 +100,8 @@ DEFAULT_PARAMS = {
     "history_growth_cap": 100.0,    # ... and this cap (%), so a fast grower is not cut to an ordinary one
     "history_recovery": 0.5,        # ... or, below its 3-year average EPS, this share of the gap back (the higher)
     "pe_floor": 5.0,
-    "pe_cap": 100.0,
+    "pe_cap": 300.0,                # room for a fast grower; the market premium floor keeps it from copying a bubble
+    "peer_pe_max": 100.0,           # a peer's P/E above this rests on earnings near zero: it sits out the median
     # Triage gate
     "materiality_eps_pct": 1.0,  # smallest expected EPS effect (probability x impact) that enters the model
     "materiality_pe": 0.5,       # smallest P/E effect, in points, that enters the model
@@ -269,6 +271,7 @@ BLOCKS = {
                 "equity_premium": "Fundamental P/E: equity risk premium %",
                 "market_implied_erp": "Fundamental P/E: use the market's usual implied risk premium (1 = yes)",
                 "erp_lookback_years": "Fundamental P/E: look-back for the usual implied premium, years",
+                "usual_erp_floor": "Fundamental P/E: floor on the usual implied premium, %",
                 "base_yield": "Fundamental P/E: yield without rate data %",
                 "terminal_growth": "Fundamental P/E: growth after the growth years %",
                 "growth_half_life_min": "Fundamental P/E: growth half-life at a low gross margin, years",
@@ -841,6 +844,8 @@ def usual_implied_erp(market_pe, growth, half_life, yields, params, lookback_yea
                         for day in ends], index=pd.DatetimeIndex(ends.values), dtype=float)
     months = max(1, int(round(12 * float(lookback_years))))
     usual = values.shift(1).rolling(months, min_periods=min(months, 12)).median()
+    if np.isfinite(params.get("usual_erp_floor", np.nan)):
+        usual = usual.clip(lower=float(params["usual_erp_floor"]))
     on_day = lambda series: series.reindex(series.index.union(days)).ffill().reindex(days)
     return on_day(values), on_day(usual)
 
@@ -975,7 +980,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         peers = peers.where(peers > 0).reindex(peers.index.union(close.index)).ffill(limit=5).reindex(close.index)
         # A P/E above the cap rests on earnings near zero and says nothing about a fair multiple: like a loss, it
         # sits out that day's median.
-        usable = peers.where(peers <= float(params["pe_cap"]))
+        usable = peers.where(peers <= float(params["peer_pe_max"]))
         daily["peer_anchor"] = usable.median(axis=1, skipna=True)
         daily["peers_used"] = usable.notna().sum(axis=1).astype(float)
     else:
@@ -1287,7 +1292,7 @@ def implied_dials(result, on=None):
     events, points = case_effects(routed, on, params)
     points -= abs(float(params["quality_pe_pts"]))
     add("Acceptable P/E", "Multiple builder", float(np.clip(anchor + points, params["pe_floor"], params["pe_cap"])),
-        1, 100, (params["pe_floor"], params["pe_cap"]), "x",
+        1, float(params["pe_cap"]), (params["pe_floor"], params["pe_cap"]), "x",
         lambda multiple: _point_price(state, {**params, "pe_floor": multiple, "pe_cap": multiple}, routed))
 
     if has_rates(result):

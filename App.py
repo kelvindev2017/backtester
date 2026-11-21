@@ -4956,6 +4956,10 @@ def model_settings():
             if params["market_implied_erp"]:
                 params["erp_lookback_years"] = st.select_slider("Usual premium look-back (years)", [1, 2, 3, 5, 10],
                                                                 key=model_param_key("erp_lookback_years"))
+                params["usual_erp_floor"] = number(
+                    "usual_erp_floor", "Usual premium at least (%)", 0, 8, 0.25,
+                    "When the market has priced the stock at a tiny premium (a run-up such as PLTR's in 2025), the "
+                    "model uses this floor instead of copying it. 2.5% matches the floor of the beta rule.")
             params["erp_from_beta"] = st.checkbox(
                 "Risk premium from beta", key=model_param_key("erp_from_beta"),
                 help="The risk premium times the stock's adjusted beta to the S&P 500 (0.67 x raw + 0.33; SPY, "
@@ -4980,7 +4984,7 @@ def model_settings():
                        "margin: 8% growth ≈ 19x, 30% ≈ 28x, 100% ≈ 71x, 200% ≈ 177x, 300% ≈ 340x; at an 18% gross "
                        "margin 100% growth ≈ 21x.")
         params["pe_floor"] = number("pe_floor", "P/E floor", 1, 100, 1)
-        params["pe_cap"] = number("pe_cap", "P/E cap", 1, 200, 1)
+        params["pe_cap"] = number("pe_cap", "P/E cap", 1, 1000, 10)
         st.caption("Forward P/E history (Forward basis): before the latest report, the forward EPS is the trailing "
                    "EPS grown by a share of its past year's growth, within a floor and cap, so the past P/E does not "
                    "know the EPS reported later. The data note under the title compares the rule with today's "
@@ -5153,7 +5157,7 @@ def render_peer_pe(result):
     peers = result.get("peer_pe")
     if peers is None or peers.empty or not len(peers.columns):
         return
-    cap = result["params"]["pe_cap"]
+    cap = result["params"]["peer_pe_max"]
     st.markdown("Peers' P/E")
     chart = peers.clip(upper=cap * 1.2).copy()
     chart["Median used (anchor)"] = result["daily"]["peer_anchor"]
