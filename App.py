@@ -4903,8 +4903,8 @@ def model_settings():
                      "half-life of up to 6 years, even with a low gross margin; the longer of the two counts.")
             params["erp_from_beta"] = st.checkbox(
                 "Risk premium from beta", key=model_param_key("erp_from_beta"),
-                help="The risk premium times the stock's beta to the S&P 500 (SPY, weekly, 3 years, as known on "
-                     "each day), within 2.5% and 8%.")
+                help="The risk premium times the stock's adjusted beta to the S&P 500 (0.67 x raw + 0.33; SPY, "
+                     "weekly, 3 years, as known on each day), within 2.5% and 8%.")
             params["fund_growth_floor"] = number("fund_growth_floor", "Growth floor %", -90, 0, 5)
             params["fund_growth_cap"] = number("fund_growth_cap", "Growth cap %", 0, 1000, 25,
                                                "High on purpose: some companies grow over 100% a year. The fade "

@@ -150,7 +150,7 @@ SIGNALS = {
     "growth_half_life": ("daily", "Half-life of the extra growth, years (gross margin and steadiness)", "", "count"),
     "held_yoy": ("daily", "Revenue growth, latest year (held)", "%", "percent"),
     "held_growth_spread": ("daily", "How much the yearly growth varies, points (held)", "", "count"),
-    "beta": ("daily", "Beta to the market, 3 years weekly", "", "count"),
+    "beta": ("daily", "Beta to the market, 3 years weekly (raw)", "", "count"),
     "pe_erp": ("daily", "Equity risk premium used", "%", "percent"),
     "rule_growth": ("daily", "Growth for the P/E by the rule (history and latest year)", "%", "percent"),
     "rule_erp": ("daily", "Equity risk premium by the rule", "%", "percent"),
@@ -681,14 +681,20 @@ def rolling_beta(close, market_close, days, years=3):
     return beta.reindex(beta.index.union(days)).ffill().reindex(days)
 
 
+def adjusted_beta(beta):
+    """Blume-adjusted beta, 0.67 x raw + 0.33 x 1, as data vendors report it: a raw beta measured over a few years
+    drifts towards 1, and a 3-year raw beta can be near 0 for a defensive stock (KO, PG, PEP were ~0.1 in 2023-26)."""
+
+    return 0.67 * pd.Series(beta, dtype=float) + 0.33
+
+
 def risk_premium_from_beta(beta, params):
-    """The equity risk premium scaled by beta (a calmer stock needs a lower return), within 2.5% and 8%; the plain
-    premium where beta is unknown."""
+    """The equity risk premium scaled by the adjusted beta (a calmer stock needs a lower return), within 2.5% and
+    8%; the plain premium where beta is unknown."""
 
     params = model_params(params)
     base = float(params["equity_premium"])
-    beta = pd.Series(beta, dtype=float)
-    return (base * beta.clip(0.5, 1.8)).clip(2.5, 8.0).fillna(base)
+    return (base * adjusted_beta(beta).clip(0.5, 1.8)).clip(2.5, 8.0).fillna(base)
 
 
 def forward_pe_params(params):

@@ -617,7 +617,8 @@ def test_rules_from_data_known_at_the_time_hold_for_the_whole_history():
     # Beta ~0.6 lowers the risk premium (rolling, as known on each day).
     beta = rolling_beta(stock, market, daily.index)
     assert beta.dropna().iloc[-1] == pytest.approx(0.6, abs=0.03)
-    assert daily["rule_erp"].iloc[-1] == pytest.approx(4.5 * beta.iloc[-1], rel=1e-6)
+    # Blume-adjusted: 0.67 x 0.6 + 0.33 = 0.73.
+    assert daily["rule_erp"].iloc[-1] == pytest.approx(4.5 * (0.67 * beta.iloc[-1] + 0.33), rel=1e-6)
     # Growth for the P/E blends the latest year and the history.
     last = daily.iloc[-1]
     assert last["rule_growth"] == pytest.approx(0.5 * last["held_yoy"] + 0.5 * last["held_cagr"])

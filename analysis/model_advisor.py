@@ -82,7 +82,8 @@ def suggestions(result, beta=np.nan, analyst_growth=np.nan):
             erp = float(risk_premium_from_beta([beta], params).iloc[0])
             if abs(erp - params["equity_premium"]) >= 0.5:
                 add("erp_from_beta", "Risk premium from beta (rule)", 0.0, 1.0, ALL_QUARTERS,
-                    f"Beta to the market is {beta:.2f}: the risk premium would be {erp:.1f}% instead of "
+                    f"Beta to the market is {beta:.2f} (adjusted {0.67 * beta + 0.33:.2f}): the risk premium would "
+                    f"be {erp:.1f}% instead of "
                     f"{params['equity_premium']:g}%.")
         if np.isfinite(analyst_growth) and np.isfinite(growth) and abs(analyst_growth - growth) >= 3 \
                 and not np.isfinite(params["forward_pe_growth"]):

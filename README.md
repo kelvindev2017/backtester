@@ -169,7 +169,8 @@ the premium never hides inside a stretched growth rate.
 The fundamental P/E also follows three **rules on data known at each date**, so they hold for the whole history:
 growth for the P/E is halfway between the latest year's growth and the history's; steady growth (yearly growth
 varying by 2 points or less over the last 12 releases) earns a half-life of up to 6 years even with a low gross
-margin; and the risk premium is scaled by the stock's beta to the S&P 500 (SPY, weekly, 3 years), within 2.5% and 8%.
+margin; and the risk premium is scaled by the stock's adjusted beta to the S&P 500 (0.67 x raw + 0.33, as data vendors
+report it; SPY, weekly, 3 years), within 2.5% and 8%.
 Each can be switched off in the Multiple builder settings.
 
 A **Model check** under the headline numbers reads each stock's own data and lists where the model is likely off
