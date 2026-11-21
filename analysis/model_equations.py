@@ -56,7 +56,9 @@ EQUATIONS = {
         r"g = s_g \times g_{\text{latest year}} + (1 - s_g) \times g_{\text{history}}",
         r"h_{GM} = h_{\min} + (h_{\max} - h_{\min}) \times \operatorname{clip}\!\left(\frac{GM - GM_{\text{low}}}{GM_{\text{high}} - GM_{\text{low}}}, 0, 1\right)",
         r"h = \max(h_{GM},\ h_{\text{steady}})",
-        r"\text{ERP} = \operatorname{clip}\big(\text{ERP}_0 \times \operatorname{clip}(0.67 \beta + 0.33,\ 0.5,\ 1.8),\ 2.5,\ 8\big)",
+        r"\text{Beta rule: ERP} = \operatorname{clip}\big(\text{ERP}_0 \times \operatorname{clip}(0.67 \beta + 0.33,\ 0.5,\ 1.8),\ 2.5,\ 8\big)",
+        r"\text{Market-implied (default): } \text{P/E}_{\text{fund}}(\text{ERP}^{*}_m) = \frac{\text{Close}_m}{\text{EPS}_{\text{risk}, m}} \text{ at each month-end } m",
+        r"\text{ERP} = \operatorname{median}_{\text{look-back}}\big(\text{ERP}^{*}_m\big)",
         r"\ln(1 + g_t) = \ln(1 + g_T) + \big(\ln(1 + g) - \ln(1 + g_T)\big)\, 0.5^{t/h}",
         r"E_1 = 1, \quad E_{t+1} = E_t (1 + g_t)",
         r"\text{P/E}_{\text{fund}} = \sum_{t=1}^{40} \frac{E_t}{(1+r)^t} + \frac{E_{41}}{(r - g_T)(1+r)^{40}}, \qquad r = y_N + \text{ERP}",
@@ -94,7 +96,7 @@ SYMBOLS = {
                         "growth history (within floor and cap), GM: gross margin %, h: half-life in years of the growth above g_T (longer with "
                         "a higher gross margin, or with steady growth: h_steady runs from the low half-life for choppy growth to the steady "
                         "half-life), g_T: terminal growth, y_N: the Rate model's yield (or the base yield), ERP: equity risk premium, ERP_0 the "
-                        "plain one, β: the stock's 3-year weekly beta to the S&P 500 (when beta scaling is on); from the latest release g, h and "
+                        "plain one, β: the stock's 3-year weekly beta to the S&P 500 (when beta scaling is on); ERP*_m: the premium at which the fundamental P/E equals the market's P/E on that month-end (solved within the floor and cap); with the market-implied premium on, the ERP is its median over the look-back months before the day, so a change in the yield moves the P/E as the market usually prices it, and the gap to the close says how far today's premium strays from the usual one; from the latest release g, h and "
                         "ERP are your forward values where set. "
                         "p: your market premium % (kept apart from the fundamentals). x: own or peers, Δy_x: yield change from the Rate model, t: share of it passed to the P/E "
                         "(the earnings yield 1/P/E moves point for point with the required return). k: share of the anchor from peers, P/E peers and own: their medians over the look-back, "
@@ -268,6 +270,8 @@ def worked_equations(result, block, on=None):
             pe_text = _n(get("outside_forward"), 1)
             lines.insert(0, rf"h = {years_text} \text{{ years}} \quad (GM = {margin_text}), \qquad g = {_n(growth, 1)}\%")
             lines.insert(1, rf"\text{{P/E}}_{{\text{{fund}}}} = {pe_text} \quad (r = {_n(required - erp, 2)} + {_n(erp, 2)} = {_n(required, 2)}\%)")
+            if np.isfinite(get("usual_erp")):
+                lines.insert(2, rf"\text{{ERP}} = \text{{usual implied }} {_n(get('usual_erp'), 2)}\% \quad (\text{{today's close implies }} {_n(get('implied_erp'), 2)}\%)")
         pairs = [("own", raw_own, get("yield_gap"))] + ([] if fundamentals else [("peers", raw_peer, get("forward_gap"))])
         for label, raw, gap in pairs:
             if np.isfinite(raw) and np.isfinite(get("policy_rate")):

@@ -4545,7 +4545,7 @@ def model_box_value(name, value):
 
     if isinstance(value, (str, bool)):
         return value
-    return int(value) if name in ("pe_lookback_years", "yield_years", "growth_history_years") else float(value)
+    return int(value) if name in ("pe_lookback_years", "yield_years", "growth_history_years", "erp_lookback_years") else float(value)
 
 
 def fill_missing_model_boxes(ticker):
@@ -4935,6 +4935,15 @@ def model_settings():
                 "Half-life from growth steadiness too", key=model_param_key("half_life_from_steadiness"),
                 help="Steady growth (yearly growth varying by 2 points or less over the last 12 releases) earns a "
                      "half-life of up to 6 years, even with a low gross margin; the longer of the two counts.")
+            params["market_implied_erp"] = st.checkbox(
+                "Risk premium the market usually asks of this stock", key=model_param_key("market_implied_erp"),
+                help="Each month-end, find the premium at which the fundamental P/E equals the market's P/E (close / "
+                     "risk-adjusted EPS); use its median over the look-back below. The model then respects how the "
+                     "market usually prices the stock: a change in the yield moves the P/E, and the gap to the close "
+                     "shows how far today's premium strays from the usual one. Off: the premium from the rule below.")
+            if params["market_implied_erp"]:
+                params["erp_lookback_years"] = st.select_slider("Usual premium look-back (years)", [1, 2, 3, 5, 10],
+                                                                key=model_param_key("erp_lookback_years"))
             params["erp_from_beta"] = st.checkbox(
                 "Risk premium from beta", key=model_param_key("erp_from_beta"),
                 help="The risk premium times the stock's adjusted beta to the S&P 500 (0.67 x raw + 0.33; SPY, "
