@@ -4860,6 +4860,20 @@ def model_settings():
         st.caption("Your forward growth and margin and the bull/bear adjustments are under Forward assumptions. "
                    "The auto rule below sets the forward values on every earlier quarter, and on the latest one "
                    "when you leave Forward blank.")
+        params["case_spread"] = st.radio(
+            "Bear and bull cases from", ["EPS volatility", "Fixed gaps"], key=model_param_key("case_spread"),
+            horizontal=True,
+            help="EPS volatility: bear and bull are the base EPS times exp(-k s) and exp(+k s), where s mixes how much "
+                 "this company's trailing EPS has moved in a year with the typical company's. Fixed gaps: the bull/bear "
+                 "growth and margin adjustments in the Forward table.")
+        if params["case_spread"] == "EPS volatility":
+            params["spread_k"] = number("spread_k", "k: spreads between base and bear or bull", 0, 6, 0.1)
+            params["spread_own_share"] = number("spread_own_share", "w: share of the company's own EPS volatility", 0, 1, 0.05)
+            params["spread_typical"] = st.number_input("Typical EPS volatility", min_value=0.0, max_value=2.0, step=0.005,
+                                                       format="%.3f", key=model_param_key("spread_typical"))
+            st.caption("Defaults from a forward test on 60 US stocks: set on 2010-2018 results, they scored better than "
+                       "the fixed gaps in every year 2019-2025 (outcomes 4 quarters later). The bull/bear adjustments "
+                       "in the Forward table are not used in this mode.")
         params["growth_follow"] = number("growth_follow", "Auto rule: base growth as a share of trailing growth", 0, 2, 0.05)
         params["growth_floor"] = number("growth_floor", "Auto rule: base growth floor %", -90, 0, 1)
         params["growth_cap"] = number("growth_cap", "Auto rule: base growth cap %", 0, 300, 1)

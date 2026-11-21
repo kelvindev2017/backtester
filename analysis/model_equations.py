@@ -33,7 +33,11 @@ EQUATIONS = {
     "scenario_engine": [
         r"g_{\text{base}} = g_{\text{fwd}} \ \text{(yours) or } \min\!\big(\text{cap},\ \max(\text{floor},\ s \times g)\big)",
         r"m_{\text{base}} = m_{\text{fwd}} \ \text{(yours) or } m + \Delta m_{\text{base}}",
-        r"g_c = g_{\text{base}} + \text{adj}_c \qquad m_c = m_{\text{base}} + \Delta m_c",
+        r"\begin{aligned} \text{EPS}_{\text{base}} = {} & \text{EPS}_{\text{clean}} \times \left(1 + \frac{g_{\text{base}}}{100}\right) \\ "
+        r"& \times \frac{m_{\text{base}}}{m} \times \left(1 + \frac{e_{\text{base}}}{100}\right) \end{aligned}",
+        r"\text{EPS volatility (default): } s = w\,\sigma_{\text{own}} + (1 - w)\,\sigma_{\text{typical}}",
+        r"\text{EPS}_{\text{bear, bull}} = \text{EPS}_{\text{base, before items}} \times e^{\mp k s} \times \left(1 + \frac{e_c}{100}\right)",
+        r"\text{Fixed gaps: } g_c = g_{\text{base}} + \text{adj}_c, \quad m_c = m_{\text{base}} + \Delta m_c",
         r"\begin{aligned} \text{EPS}_{c} = {} & \text{EPS}_{\text{clean}} \times \left(1 + \frac{g_c}{100}\right) \\ "
         r"& \times \frac{m_c}{m} \times \left(1 + \frac{e_c}{100}\right) \end{aligned}",
     ],
@@ -73,8 +77,12 @@ SYMBOLS = {
                    "or bear adjustment; shown weighted), a: P/E points (+ product, - risk), weighted over the cases.",
     "scenario_engine": "g, m: current (trailing) revenue growth and net margin %, g_fwd, m_fwd: your forward values "
                        "(latest quarter only; blank = the auto rule with s: share of trailing growth), c: bear, base or "
-                       "bull, adj_c and Δm_c: the case's growth and margin adjustment in points (0 for base), e_c: event "
-                       "items' EPS change % at that case's probability.",
+                       "bull, adj_c and Δm_c: the case's growth and margin adjustment in points (Fixed gaps only), e_c: event "
+                       "items' EPS change % at that case's probability. σ_own: the company's own EPS volatility (standard "
+                       "deviation of the yearly log change in trailing EPS over the last 12 releases, at least 8), "
+                       "σ_typical: the typical one, w: share of the own one, k: how many s the bear and bull cases sit "
+                       "from base. Defaults (k 2.4, w 0.25, σ_typical 0.073) come from a forward test on 60 stocks: "
+                       "trained on 2010-2018, they beat the fixed gaps in each year 2019-2025.",
     "risk_weighting": "w: scenario weights, rescaled to add up to 1.",
     "rate_model": "y_market: the market's N-year Treasury yield (FRED), r_today: today's policy rate. r_f: policy rate used (your forward rate on the last day, the actual rate before), r_n: neutral "
                   "rate, h: half-life of a rate's gap to neutral in years, N: yield maturity in years, w_N: share of "
@@ -193,6 +201,22 @@ def worked_equations(result, block, on=None):
         source = source or (
             rf" = {_n(used_margin, 1)} + {_n(params['base_margin_pts'], 1)}")
         lines.append(rf"m_{{\text{{base}}}}{source} = {_n(base_margin, 1)}\%")
+        if params.get("case_spread") == "EPS volatility" and np.isfinite(get("case_spread")):
+            spread, k = get("case_spread"), params["spread_k"]
+            own = get("eps_spread")
+            w = float(np.clip(params["spread_own_share"], 0, 1))
+            own_text = _n(own, 3) if np.isfinite(own) and params["manual_eps"] <= 0 else rf"{_n(params['spread_typical'], 3)}\ \text{{(no history)}}"
+            lines.append(rf"s = {_n(w)} \times {own_text} + {_n(1 - w)} \times {_n(params['spread_typical'], 3)} = {_n(spread, 3)}")
+            for name in SCENARIOS:
+                key = name.lower()
+                case_event = get(f"event_{key}")
+                case_event = case_event if np.isfinite(case_event) else 0.0
+                factor = {"bear": np.exp(-k * spread), "base": 1.0, "bull": np.exp(k * spread)}[key]
+                lines.append(
+                    rf"\begin{{aligned}} \text{{EPS}}_{{\text{{{key}}}}} = {{}} & {_n(get('clean_eps'))} \times {_n(1 + get('growth_base') / 100, 3)} "
+                    rf"\times \frac{{{_n(base_margin, 1)}}}{{{_n(used_margin, 1)}}} \\ & \times {_n(factor, 3)} "
+                    rf"\times {_n(1 + case_event / 100, 3)} \\ = {{}} & {_n(get(f'eps_{key}'))} \end{{aligned}}")
+            return lines
         for name in SCENARIOS:
             key = name.lower()
             case_margin = base_margin + (params[f"{key}_margin_pts"] if key != "base" else 0.0)

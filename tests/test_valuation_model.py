@@ -42,7 +42,7 @@ def register(rows):
 
 
 def test_scenario_point_grows_eps_with_revenue_and_scales_it_by_margin():
-    point = scenario_point(4.0, 20.0, 20.0, model_params())
+    point = scenario_point(4.0, 20.0, 20.0, model_params({"case_spread": "Fixed gaps"}))
     # Base growth is half the trailing 20%; bear is 25 points below it and loses 3 margin points of 20.
     assert point["growth_base"] == pytest.approx(10.0) and point["growth_bear"] == pytest.approx(-15.0)
     assert point["eps_bear"] == pytest.approx(4.0 * 0.85 * 17 / 20)
@@ -155,7 +155,7 @@ def test_implied_dials_match_the_market_price():
         ["Small risk", "Risk", "Event", "In horizon", 20, 5, None, "Parked", "", ""],
         ["New product", "Product", "Event", "In horizon", 30, 10, None, "Parked", "", ""],
     ])
-    params = model_params({"peer_weight": 1.0})
+    params = model_params({"peer_weight": 1.0, "case_spread": "Fixed gaps"})
     result = run_model(quarters, close, items, params, peers)
     values = latest_values(result)
     assert values["model_price"] > values["close"]
@@ -321,7 +321,7 @@ def rate_run(policy_rate, **overrides):
     peers = pd.DataFrame({"AAA": 24.0, "BBB": 16.0}, index=close.index)
     rates = pd.Series(policy_rate, index=close.index) if np.ndim(policy_rate) == 0 else policy_rate
     # These tests are about the policy-rate model; the market yield is only shown as a check.
-    overrides = {"yield_source": "Policy model", **overrides}
+    overrides = {"yield_source": "Policy model", "case_spread": "Fixed gaps", **overrides}
     return run_model(quarters, close, None, model_params(overrides), peers, policy_rate=rates,
                      market_yield=pd.Series(4.2, index=close.index))
 
@@ -330,7 +330,7 @@ def test_a_steady_policy_rate_leaves_the_price_alone_and_a_forward_rate_moves_it
     quarters = make_quarters()
     close = make_close(quarters)
     peers = pd.DataFrame({"AAA": 24.0, "BBB": 16.0}, index=close.index)
-    plain = latest_values(run_model(quarters, close, None, model_params(), peers))
+    plain = latest_values(run_model(quarters, close, None, model_params({"case_spread": "Fixed gaps"}), peers))
     steady = latest_values(rate_run(4.0))
     assert steady["model_price"] == pytest.approx(plain["model_price"])
     assert steady["yield_gap"] == 0 and steady["forward_gap"] == 0 and steady["market_yield"] == 4.2
@@ -350,7 +350,7 @@ def test_a_steady_policy_rate_leaves_the_price_alone_and_a_forward_rate_moves_it
 
 
 def plain_series(quarters, close, peers):
-    return run_model(quarters, close, None, model_params(), peers)["daily"]["model_price"]
+    return run_model(quarters, close, None, model_params({"case_spread": "Fixed gaps"}), peers)["daily"]["model_price"]
 
 
 def test_a_rate_above_the_look_back_lowers_the_own_anchor_only():
@@ -392,7 +392,7 @@ def test_rate_dial_sensitivity_and_cases():
 
 def test_now_is_the_chain_without_forward_assumptions():
     from analysis.valuation_model import FORWARD_PARAMS, now_and_forward
-    flat = {"growth_follow": 0.0, "bear_growth_gap": 0.0, "bull_growth_gap": 0.0, "bear_margin_pts": 0.0,
+    flat = {"case_spread": "Fixed gaps", "growth_follow": 0.0, "bear_growth_gap": 0.0, "bull_growth_gap": 0.0, "bear_margin_pts": 0.0,
             "base_margin_pts": 0.0, "bull_margin_pts": 0.0}
     assert {"bear_growth_gap", "bull_growth_gap", "bear_margin_pts", "bull_margin_pts", "forward_rate", "forward_growth",
             "forward_margin"} <= set(FORWARD_PARAMS)
@@ -701,3 +701,28 @@ def test_per_share_haircut_skips_gaap_reporters_and_ignores_a_gaap_loss():
     assert stock_pay_haircut_per_share(pay, shares, reported, pd.Series(0.99, index=ends) * 1.0, tax_rate=0.0)[0] == pytest.approx(0.0)
     assert stock_pay_haircut_per_share(pay, shares, reported, pd.Series(0.95, index=ends), tax_rate=0.0)[0] == pytest.approx(5.0)
     assert np.isnan(stock_pay_haircut_per_share(pay, shares, -reported)[0])
+
+
+def test_eps_volatility_cases_sit_k_spreads_either_side_of_base():
+    from analysis.valuation_model import case_spread
+    params = model_params()
+    assert params["case_spread"] == "EPS volatility"
+    # Own volatility 0.30: s = 0.25 x 0.30 + 0.75 x 0.073.
+    point = scenario_point(4.0, 20.0, 20.0, params, eps_spread=0.30)
+    s = 0.25 * 0.30 + 0.75 * 0.073
+    assert point["case_spread"] == pytest.approx(s)
+    assert point["eps_base"] == pytest.approx(4.0 * 1.10)
+    assert point["eps_bear"] == pytest.approx(4.0 * 1.10 * np.exp(-2.4 * s))
+    assert point["eps_bull"] == pytest.approx(4.0 * 1.10 * np.exp(2.4 * s))
+    # No history: the typical volatility alone; a calmer company gets narrower cases than a volatile one.
+    assert case_spread(np.nan, params) == pytest.approx(0.073)
+    calm, wild = scenario_point(4.0, 20.0, 20.0, params, eps_spread=0.01), scenario_point(4.0, 20.0, 20.0, params, eps_spread=0.6)
+    assert calm["eps_bull"] - calm["eps_bear"] < wild["eps_bull"] - wild["eps_bear"]
+    # The run feeds each quarter its own EPS volatility, known at that release.
+    quarters = make_quarters(count=24)
+    quarters["EPS"] = quarters["EPS"] * (1 + 0.3 * np.sin(np.arange(len(quarters))))
+    result = run_model(quarters, make_close(quarters), None, params)
+    last = result["quarterly"].iloc[-1]
+    assert np.isfinite(last["eps_spread"]) and last["case_spread"] == pytest.approx(case_spread(last["eps_spread"], params))
+    from analysis.model_equations import worked_equations
+    assert any(line.startswith("s = ") for line in worked_equations(result, "scenario_engine"))
