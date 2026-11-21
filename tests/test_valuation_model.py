@@ -168,7 +168,7 @@ def test_implied_dials_match_the_market_price():
                                                "weight_bull": 25 * rest}, peers)
     assert latest_values(again)["model_price"] == pytest.approx(values["close"], rel=1e-6)
     assert dials.at["Acceptable P/E", "Needed"] == pytest.approx(values["close"] / values["held_eps"], rel=1e-6)
-    assert dials.at["Acceptable P/E", "Now"] == pytest.approx(18.0)
+    assert dials.at["Acceptable P/E", "Current"] == pytest.approx(18.0)
     # The modelled general risk needs more points; the parked risk could explain the gap, the parked product cannot.
     assert dials.at["Cyclicality: P/E points", "Needed"] == pytest.approx(2 + 18.0 - values["close"] / values["held_eps"], rel=1e-6)
     assert 0 < dials.at["Export rules (parked): probability", "Needed"] < 100
@@ -264,7 +264,7 @@ def test_earnings_quality_takes_points_off_the_acceptable_pe():
     assert after["acceptable_pe"] == pytest.approx(before["acceptable_pe"] - 3.0)
     assert after["model_price"] == pytest.approx(after["held_eps"] * after["acceptable_pe"])
     dials = implied_dials(weak).set_index("Dial")
-    assert dials.at["Acceptable P/E", "Now"] == pytest.approx(after["acceptable_pe"])
+    assert dials.at["Acceptable P/E", "Current"] == pytest.approx(after["acceptable_pe"])
 
 
 def test_stock_pay_haircut_uses_the_last_quarters_of_both():
@@ -403,7 +403,7 @@ def test_now_is_the_chain_without_forward_assumptions():
     moved = latest_values(hiked)
     assert moved["now_price"] == pytest.approx(values["now_price"]) and moved["model_price"] < values["model_price"]
     table = now_and_forward(hiked).set_index("Step")
-    assert table.loc["Policy rate %", "Now"] == 4.0 and table.loc["Policy rate %", "Forward"] == 4.5
+    assert table.loc["Policy rate %", "Last quarter"] == 4.0 and table.loc["Policy rate %", "Forward"] == 4.5
     assert table.loc["Model price", "Change"] == pytest.approx(moved["model_price"] - moved["now_price"])
     # Growth is forward too: the default cases lift the forward EPS above the clean trailing EPS.
     grown = latest_values(rate_run(4.0))
@@ -529,7 +529,8 @@ def test_the_fundamental_anchor_replaces_the_peers_and_follows_the_rate():
     close = make_close(quarters)
     peers = pd.DataFrame({"AAA": 6.0}, index=close.index)
     rates = pd.Series(4.0, index=close.index)
-    base = {"anchor_source": "Fundamentals", "peer_weight": 1.0}
+    base = {"anchor_source": "Fundamentals", "peer_weight": 1.0, "pe_growth_latest_share": 0.0,
+            "half_life_from_steadiness": False}
     result = run_model(quarters, close, None, model_params(base), peers, policy_rate=rates)
     values = latest_values(result)
     # The peers are not used: the outside view is the fundamental P/E, worked out at the day's yield.
@@ -552,7 +553,8 @@ def test_forward_view_of_the_p_e_and_a_separate_market_premium():
     quarters = make_quarters().assign(Gross_Profit=lambda frame: frame["Revenue"] * 0.12)
     close = make_close(quarters)
     rates = pd.Series(4.0, index=close.index)
-    base = {"anchor_source": "Fundamentals", "peer_weight": 1.0}
+    base = {"anchor_source": "Fundamentals", "peer_weight": 1.0, "pe_growth_latest_share": 0.0,
+            "half_life_from_steadiness": False}
     plain = run_model(quarters, close, None, model_params(base), None, policy_rate=rates)
     before = latest_values(plain)
     assert before["premium_pct"] == 0 and before["acceptable_pe"] == pytest.approx(before["pe_before_premium"])
@@ -592,3 +594,35 @@ def test_forward_view_of_the_p_e_and_a_separate_market_premium():
     # With peers as the outside view only the premium row is shown.
     peers = run_model(quarters, close, None, model_params({"anchor_source": "Peers"}), pd.DataFrame({"A": 20.0}, index=close.index))
     assert pe_table(peers)["Metric"].tolist() == ["Market premium %"]
+
+
+def test_rules_from_data_known_at_the_time_hold_for_the_whole_history():
+    from analysis.valuation_model import fundamental_pe, rolling_beta
+    quarters = make_quarters()
+    quarters["Revenue"] = [1000 * 1.0194 ** step for step in range(len(quarters))]
+    quarters["Gross_Profit"] = quarters["Revenue"] * 0.12
+    close = make_close(quarters)
+    rng = np.random.default_rng(3)
+    market = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(close)))), index=close.index)
+    stock = pd.Series(50 * np.exp(0.6 * np.log(market / 100)), index=close.index)
+    on = {"anchor_source": "Fundamentals", "peer_weight": 1.0}
+    off = {**on, "half_life_from_steadiness": False, "erp_from_beta": False, "pe_growth_latest_share": 0.0}
+    ruled = run_model(quarters, stock, None, model_params(on), market_close=market)
+    plain = run_model(quarters, stock, None, model_params(off), market_close=market)
+    daily = ruled["daily"]
+    # Steady ~8% growth earns a long half-life on every day it is known, not only the latest quarter.
+    known = daily["held_growth_spread"].notna()
+    assert known.sum() > 50
+    assert (daily.loc[known, "growth_half_life"] > plain["daily"].loc[known, "growth_half_life"] + 1).all()
+    # Beta ~0.6 lowers the risk premium (rolling, as known on each day).
+    beta = rolling_beta(stock, market, daily.index)
+    assert beta.dropna().iloc[-1] == pytest.approx(0.6, abs=0.03)
+    # Blume-adjusted: 0.67 x 0.6 + 0.33 = 0.73.
+    assert daily["rule_erp"].iloc[-1] == pytest.approx(4.5 * (0.67 * beta.iloc[-1] + 0.33), rel=1e-6)
+    # Growth for the P/E blends the latest year and the history.
+    last = daily.iloc[-1]
+    assert last["rule_growth"] == pytest.approx(0.5 * last["held_yoy"] + 0.5 * last["held_cagr"])
+    expected = fundamental_pe(last["rule_growth"], None, 4.0, {**model_params(on), "equity_premium": last["rule_erp"]},
+                              half_life=last["growth_half_life"])
+    assert last["fundamental_pe"] == pytest.approx(expected)
+    assert daily.loc[known, "fundamental_pe"].mean() > plain["daily"].loc[known, "fundamental_pe"].mean()

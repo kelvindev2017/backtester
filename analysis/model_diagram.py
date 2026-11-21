@@ -291,7 +291,7 @@ def model_diagram(result, selected=None, on=None, mobile=False):
         fig.add_annotation(
             x=x - 0.12, y=bottom + 0.04, xanchor="right", yanchor="top", showarrow=False, align="right",
             font=dict(size=9 if mobile else 10),
-            text=(f"<span style='color:{NOW_COLOR}'>now {pair[0]}</span><br>"
+            text=(f"<span style='color:{NOW_COLOR}'>last Q {pair[0]}</span><br>"
                   f"<b><span style='color:{FORWARD_COLOR}'>fwd {pair[1]}</span></b>"))
 
     keys = list(BLOCKS)
@@ -385,9 +385,9 @@ def model_price_figure(result, ticker="", mobile=False):
                              line=dict(width=2, color="royalblue"),
                              hovertemplate="Model price: %{y:,.2f}<extra></extra>"), row=1, col=1)
     if "now_price" in daily:
-        fig.add_trace(go.Scatter(x=daily.index, y=daily["now_price"], name="Model price now (no forward assumptions)",
+        fig.add_trace(go.Scatter(x=daily.index, y=daily["now_price"], name="Model price, last quarter (no forward assumptions)",
                                  mode="lines", line=dict(width=1.2, color="royalblue", dash="dot"),
-                                 hovertemplate="Model price now: %{y:,.2f}<extra></extra>"), row=1, col=1)
+                                 hovertemplate="Model price, last quarter: %{y:,.2f}<extra></extra>"), row=1, col=1)
     fig.add_trace(go.Scatter(x=daily.index, y=daily["close"], name="Close", mode="lines",
                              line=dict(width=1.6, color="dimgray"),
                              hovertemplate="Close: %{y:,.2f}<extra></extra>"), row=1, col=1)
@@ -414,28 +414,40 @@ def model_price_figure(result, ticker="", mobile=False):
 
 
 def price_and_fundamentals_figure(result, ticker="", mobile=False):
-    """Close and model price on the left axis; the revenue growth (a year, over the growth history) and the gross
-    margin, both as held from the latest release, on the right one."""
+    """Close and model price on the left axis; revenue growth and gross margin (%) on the right; earnings as an
+    index (highest = 100) on a second right-hand axis. Growth, margin and earnings are held from each release."""
 
     daily = result["daily"]
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig = go.Figure()
     for name, label, style in [("close", "Close", dict(width=1.6, color="dimgray")),
                                ("model_price", "Model price", dict(width=2, color="royalblue"))]:
         if name in daily:
-            fig.add_trace(go.Scatter(x=daily.index, y=daily[name], name=label, mode="lines", line=style,
-                                     hovertemplate=f"{label}: %{{y:,.2f}}<extra></extra>"), secondary_y=False)
-    for name, label, color in [("held_cagr", "Revenue growth a year (history)", "seagreen"),
-                               ("held_gross_margin", "Gross margin", "darkorange")]:
+            fig.add_trace(go.Scatter(x=daily.index, y=daily[name], name=label, mode="lines", line=style, yaxis="y",
+                                     hovertemplate=f"{label}: %{{y:,.2f}}<extra></extra>"))
+    for name, label, color in [("held_cagr", "Revenue growth", "seagreen"), ("held_gross_margin", "Gross margin", "darkorange")]:
         if name in daily and daily[name].notna().any():
             fig.add_trace(go.Scatter(x=daily.index, y=daily[name], name=label, mode="lines", line_shape="hv",
-                                     line=dict(width=1.4, color=color, dash="dash"),
-                                     hovertemplate=f"{label}: %{{y:.1f}}%<extra></extra>"), secondary_y=True)
-    fig.update_yaxes(title_text="Price", secondary_y=False)
-    fig.update_yaxes(title_text="%", secondary_y=True, showgrid=False, zeroline=True, zerolinecolor="lightgray")
-    fig.update_layout(height=380 if mobile else 420, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10),
-                      title=dict(text=f"{ticker} price against growth and gross margin".strip(),
-                                 font=dict(size=10 if mobile else 12), x=0, xanchor="left"),
-                      legend=dict(orientation="h", yanchor="top", y=-0.12, x=0, xanchor="left"))
+                                     line=dict(width=1.4, color=color, dash="dash"), yaxis="y2",
+                                     hovertemplate=f"{label}: %{{y:.1f}}%<extra></extra>"))
+    earnings = daily["held_clean_eps"] if "held_clean_eps" in daily else pd.Series(dtype=float)
+    top = earnings.max() if len(earnings.dropna()) else np.nan
+    if np.isfinite(top) and top > 0:
+        fig.add_trace(go.Scatter(x=daily.index, y=earnings / top * 100, name="Earnings (highest = 100)", mode="lines",
+                                 line_shape="hv", line=dict(width=1.4, color="mediumpurple", dash="dot"), yaxis="y3",
+                                 hovertemplate="Earnings: %{y:.0f} (highest = 100)<extra></extra>"))
+    small = 9 if mobile else 11
+    fig.update_layout(
+        height=400 if mobile else 440, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10),
+        title=dict(text=f"{ticker} price against growth, gross margin and earnings".strip(),
+                   font=dict(size=10 if mobile else 12), x=0, xanchor="left"),
+        xaxis=dict(domain=[0, 0.86]),
+        yaxis=dict(title=dict(text="Price", font=dict(size=small))),
+        yaxis2=dict(title=dict(text="%", font=dict(size=small)), overlaying="y", side="right", anchor="x",
+                    showgrid=False, zeroline=True, zerolinecolor="lightgray"),
+        yaxis3=dict(title=dict(text="Earnings index", font=dict(size=small)), overlaying="y", side="right",
+                    anchor="free", position=1.0, showgrid=False, range=[0, 105]),
+        legend=dict(orientation="h", yanchor="top", y=-0.12, x=0, xanchor="left", entrywidth=0.5,
+                    entrywidthmode="fraction", font=dict(size=small)))
     return fig
 
 

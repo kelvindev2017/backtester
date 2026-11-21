@@ -1011,7 +1011,7 @@ def test_valuation_model_tab(offline, monkeypatch):
     labels = [metric.label for metric in app.metric]
     assert labels[:4] == ["Model price per share", "Close", "Risk-adjusted EPS", "Acceptable P/E"]
     assert all(metric.value != "n/a" for metric in app.metric[:4])
-    assert any(list(frame.value.columns) == ["Dial", "Block", "Now", "Needed", "Change", "Unit", "Read"]
+    assert any(list(frame.value.columns) == ["Dial", "Block", "Current", "Needed", "Change", "Unit", "Read"]
                and "Bear weight" in frame.value["Dial"].tolist() for frame in app.dataframe)
     assert any("Goes to" in frame.value.columns and frame.value["In the model"].sum() == 3 for frame in app.dataframe)
 
@@ -1181,14 +1181,14 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     assert any(expander.label.startswith("Model check") for expander in app.expander)
     headings = [element.value for element in app.markdown]
     assert "**Growth and margin** · Scenario engine" in headings
-    assert "**ASMVY price against growth and gross margin**" in headings
+    assert "**ASMVY price against growth, gross margin and earnings**" in headings
     assert "**P/E** · Multiple builder" in headings
     assert "**Risk and product items** · Triage gate, Item router" in headings
-    steps = next(frame.value for frame in app.dataframe if list(frame.value.columns) == ["Step", "Now", "Forward", "Change"])
+    steps = next(frame.value for frame in app.dataframe if list(frame.value.columns) == ["Step", "Last quarter", "Forward", "Change"])
     steps = steps.set_index("Step")
-    assert steps.loc["Policy rate %", "Now"] == pytest.approx(4.0) and steps.loc["Policy rate %", "Forward"] == pytest.approx(5.0)
+    assert steps.loc["Policy rate %", "Last quarter"] == pytest.approx(4.0) and steps.loc["Policy rate %", "Forward"] == pytest.approx(5.0)
     assert steps.loc["Model price", "Change"] < 0
-    assert any("fwd " in spec and "now " in spec for spec in (chart.proto.spec for chart in app.get("plotly_chart")))
+    assert any("fwd " in spec and "last Q " in spec for spec in (chart.proto.spec for chart in app.get("plotly_chart")))
     app.selectbox(key="model_block").select("rate_model")
     open_tab(app, "Valuation Model")
     formulas = [element.value for element in app.get("latex")]
