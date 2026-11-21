@@ -626,3 +626,19 @@ def test_rules_from_data_known_at_the_time_hold_for_the_whole_history():
                               half_life=last["growth_half_life"])
     assert last["fundamental_pe"] == pytest.approx(expected)
     assert daily.loc[known, "fundamental_pe"].mean() > plain["daily"].loc[known, "fundamental_pe"].mean()
+
+
+def test_worked_fundamental_pe_shows_the_risk_premium_the_run_used():
+    # With beta scaling on, the shown required return must be the yield plus the beta-scaled premium, not the plain one.
+    from analysis.model_equations import worked_equations
+    quarters = make_quarters()
+    stock = make_close(quarters)
+    rng = np.random.default_rng(3)
+    market = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(stock)))), index=stock.index)
+    stock = stock * (market / market.iloc[0]) ** 1.5
+    result = run_model(quarters, stock, None, model_params({"anchor_source": "Fundamentals"}), market_close=market)
+    values = latest_values(result)
+    assert abs(values["pe_erp"] - model_params()["equity_premium"]) > 0.1
+    line = [eq for eq in worked_equations(result, "multiple_builder") if r"\text{P/E}_{\text{fund}}" in eq][0]
+    required = model_params()["base_yield"] + values["pe_erp"]
+    assert f"= {required:,.2f}\\%)" in line
