@@ -532,7 +532,7 @@ def test_the_fundamental_anchor_replaces_the_peers_and_follows_the_rate():
     peers = pd.DataFrame({"AAA": 6.0}, index=close.index)
     rates = pd.Series(4.0, index=close.index)
     base = {"anchor_source": "Fundamentals", "peer_weight": 1.0, "pe_growth_latest_share": 0.0,
-            "half_life_from_steadiness": False}
+            "half_life_from_steadiness": False, "market_implied_erp": False}
     result = run_model(quarters, close, None, model_params(base), peers, policy_rate=rates)
     values = latest_values(result)
     # The peers are not used: the outside view is the fundamental P/E, worked out at the day's yield.
@@ -607,7 +607,7 @@ def test_rules_from_data_known_at_the_time_hold_for_the_whole_history():
     rng = np.random.default_rng(3)
     market = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(close)))), index=close.index)
     stock = pd.Series(50 * np.exp(0.6 * np.log(market / 100)), index=close.index)
-    on = {"anchor_source": "Fundamentals", "peer_weight": 1.0}
+    on = {"anchor_source": "Fundamentals", "peer_weight": 1.0, "market_implied_erp": False}
     off = {**on, "half_life_from_steadiness": False, "erp_from_beta": False, "pe_growth_latest_share": 0.0}
     ruled = run_model(quarters, stock, None, model_params(on), market_close=market)
     plain = run_model(quarters, stock, None, model_params(off), market_close=market)
@@ -652,7 +652,7 @@ def test_market_yield_is_the_discount_rate_and_a_forward_rate_moves_it_by_the_mo
     close = make_close(quarters)
     market = pd.Series(5.0, index=close.index)
     policy = pd.Series(3.9, index=close.index)
-    params = {"anchor_source": "Fundamentals", "erp_from_beta": False}
+    params = {"anchor_source": "Fundamentals", "erp_from_beta": False, "market_implied_erp": False}
     result = run_model(quarters, close, None, model_params(params), policy_rate=policy, market_yield=market)
     values = latest_values(result)
     assert values["now_yield"] == pytest.approx(5.0) and values["model_yield"] == pytest.approx(5.0)
@@ -726,3 +726,28 @@ def test_eps_volatility_cases_sit_k_spreads_either_side_of_base():
     assert np.isfinite(last["eps_spread"]) and last["case_spread"] == pytest.approx(case_spread(last["eps_spread"], params))
     from analysis.model_equations import worked_equations
     assert any(line.startswith("s = ") for line in worked_equations(result, "scenario_engine"))
+
+
+def test_market_implied_premium_respects_the_usual_market_pe_and_passes_rate_changes():
+    from analysis.valuation_model import fundamental_pe, implied_erp
+    params = model_params()
+    FUND = {"anchor_source": "Fundamentals", "case_spread": "Fixed gaps"}
+    # The solver inverts the fundamental P/E.
+    erp = implied_erp(30.0, 12.0, 3.0, 4.5, params)
+    assert fundamental_pe(12.0, None, 4.5, {**params, "equity_premium": erp}, half_life=3.0) == pytest.approx(30.0, rel=1e-4)
+    # A stock the market always prices at 1.5x what the rules justify: holding its usual premium puts the model
+    # near the close, and a jump in the yield on the last days lowers the P/E.
+    quarters = make_quarters(count=40, end="2026-10-28")
+    close = make_close(quarters, pe=40.0)
+    plain = run_model(quarters, close, None, model_params({**FUND, "market_implied_erp": False}))
+    implied = run_model(quarters, close, None, model_params(FUND))
+    last_plain, last = latest_values(plain), latest_values(implied)
+    assert np.isfinite(last["usual_erp"]) and np.isfinite(last["implied_erp"])
+    assert abs(last["residual_pct"]) < abs(last_plain["residual_pct"])
+    market = pd.Series(4.0, index=close.index)
+    market.iloc[-5:] = 5.0
+    risen = latest_values(run_model(quarters, close, None, model_params(FUND),
+                                    market_yield=market))
+    steady = latest_values(run_model(quarters, close, None, model_params(FUND),
+                                     market_yield=pd.Series(4.0, index=close.index)))
+    assert risen["acceptable_pe"] < steady["acceptable_pe"]

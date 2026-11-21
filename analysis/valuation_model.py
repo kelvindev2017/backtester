@@ -80,6 +80,10 @@ DEFAULT_PARAMS = {
     "choppy_spread": 15.0,           # ... and by this many or more earns nothing beyond the gross-margin rule
     "steady_half_life": 6.0,
     "erp_from_beta": True,           # equity risk premium x the stock's beta to the market (3 years, weekly)
+    "market_implied_erp": True,      # use the risk premium the market usually prices this stock at (below)
+    "erp_lookback_years": 5,         # ... the usual premium is the median over this many years of month-ends
+    "implied_erp_floor": -2.0,       # ... the implied premium is solved within this floor
+    "implied_erp_cap": 20.0,         # ... and this cap, in %
     # Forward view of the P/E (latest quarter on; NaN = the historical value) and a premium kept apart from it.
     "forward_pe_growth": np.nan,      # growth the fundamental P/E rests on, %
     "forward_half_life": np.nan,      # years for half of the extra growth to fade
@@ -160,6 +164,8 @@ SIGNALS = {
     "held_yoy": ("daily", "Revenue growth, latest year (held)", "%", "percent"),
     "held_growth_spread": ("daily", "How much the yearly growth varies, points (held)", "", "count"),
     "beta": ("daily", "Beta to the market, 3 years weekly (raw)", "", "count"),
+    "implied_erp": ("daily", "Risk premium the close implies (month-end)", "%", "percent"),
+    "usual_erp": ("daily", "Usual implied risk premium (median over the P/E look-back)", "%", "percent"),
     "pe_erp": ("daily", "Equity risk premium used", "%", "percent"),
     "rule_growth": ("daily", "Growth for the P/E by the rule (history and latest year)", "%", "percent"),
     "rule_erp": ("daily", "Equity risk premium by the rule", "%", "percent"),
@@ -241,7 +247,7 @@ BLOCKS = {
         title="Multiple builder", rate="daily", role="Param: P/E deductions",
         inputs=["own_anchor", "held_cagr", "held_gross_margin", "now_yield", "peer_anchor", "peers_used", "yield_gap",
                 "forward_gap", "held_pe_adjust", "held_quality_pe"],
-        outputs=["growth_half_life", "pe_growth", "pe_half_life", "fundamental_pe", "pe_before_premium", "premium_pct",
+        outputs=["growth_half_life", "implied_erp", "usual_erp", "pe_growth", "pe_half_life", "fundamental_pe", "pe_before_premium", "premium_pct",
                  "implied_premium_pct", "outside_anchor", "now_pe", "rate_anchor", "acceptable_pe"],
         params={"pe_lookback_years": "Own P/E look-back, years",
                 "peer_weight": "Share of the anchor from the outside view (rest: own P/E history)",
@@ -249,6 +255,8 @@ BLOCKS = {
                 "growth_history_years": "Fundamental P/E: growth history, years",
                 "fund_growth_cap": "Fundamental P/E: growth cap %", "fund_growth_floor": "Fundamental P/E: growth floor %",
                 "equity_premium": "Fundamental P/E: equity risk premium %",
+                "market_implied_erp": "Fundamental P/E: use the market's usual implied risk premium (1 = yes)",
+                "erp_lookback_years": "Fundamental P/E: look-back for the usual implied premium, years",
                 "base_yield": "Fundamental P/E: yield without rate data %",
                 "terminal_growth": "Fundamental P/E: growth after the growth years %",
                 "growth_half_life_min": "Fundamental P/E: growth half-life at a low gross margin, years",
@@ -740,6 +748,58 @@ def risk_premium_from_beta(beta, params):
     return (base * adjusted_beta(beta).clip(0.5, 1.8)).clip(2.5, 8.0).fillna(base)
 
 
+def implied_erp(market_pe, growth, half_life, yield_pct, params):
+    """The equity risk premium (%) at which the fundamental P/E equals ``market_pe``: what the price implies.
+
+    The fundamental P/E falls as the premium rises, so it is found by bisection within the floor and cap (and above
+    the premium that would put the required return at the terminal growth + 1 point). NaN without a market P/E or
+    growth; the floor or cap when the market P/E lies beyond what the range can reach.
+    """
+
+    params = model_params(params)
+    if not (market_pe is not None and np.isfinite(market_pe) and market_pe > 0 and growth is not None
+            and np.isfinite(growth) and half_life is not None and np.isfinite(half_life)):
+        return np.nan
+    yield_pct = yield_pct if yield_pct is not None and np.isfinite(yield_pct) else params["base_yield"]
+    low = max(float(params["implied_erp_floor"]), params["terminal_growth"] + 1.0 - yield_pct)
+    high = max(low, float(params["implied_erp_cap"]))
+
+    def pe_at(erp):
+        return fundamental_pe(growth, None, yield_pct, {**params, "equity_premium": erp}, half_life=half_life)
+
+    if market_pe >= pe_at(low):
+        return low
+    if market_pe <= pe_at(high):
+        return high
+    for _ in range(40):
+        middle = (low + high) / 2
+        if pe_at(middle) > market_pe:
+            low = middle
+        else:
+            high = middle
+    return (low + high) / 2
+
+
+def usual_implied_erp(market_pe, growth, half_life, yields, params, lookback_years):
+    """(implied premium at each month-end, its median over the look-back known the day before, by day).
+
+    The usual premium is what the market has been asking of this stock: holding it and moving the yield moves the
+    P/E as the market would for a change in rates, while today's own implied premium says how far the close strays.
+    """
+
+    days = market_pe.index
+    if not len(days):
+        empty = pd.Series(np.nan, index=days, dtype=float)
+        return empty, empty
+    ends = pd.Series(days, index=days).groupby(days.to_period("M")).last()
+    values = pd.Series([implied_erp(market_pe.get(day), growth.get(day), half_life.get(day), yields.get(day), params)
+                        for day in ends], index=pd.DatetimeIndex(ends.values), dtype=float)
+    months = max(1, int(round(12 * float(lookback_years))))
+    usual = values.shift(1).rolling(months, min_periods=min(months, 12)).median()
+    on_day = lambda series: series.reindex(series.index.union(days)).ffill().reindex(days)
+    return on_day(values), on_day(usual)
+
+
 def forward_pe_params(params):
     """The parameters for the forward fundamental P/E: your equity risk premium where you set one."""
 
@@ -911,8 +971,16 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     daily["beta"] = rolling_beta(close, market_close, daily.index)
     base_erp = (risk_premium_from_beta(daily["beta"], params) if params["erp_from_beta"]
                 else pd.Series(float(params["equity_premium"]), index=daily.index))
-    daily["rule_erp"] = base_erp
     now_yield = daily["now_yield"].astype(float)
+    daily["implied_erp"], daily["usual_erp"] = np.nan, np.nan
+    if params["market_implied_erp"] and params["anchor_source"] == "Fundamentals":
+        # Respect the market: the premium it has usually asked of this stock, with today's yield.
+        market_pe = daily["close"] / daily["held_eps"].where(daily["held_eps"] > 0)
+        implied, usual = usual_implied_erp(market_pe, growth, daily["growth_half_life"], now_yield, params,
+                                           params["erp_lookback_years"])
+        daily["implied_erp"], daily["usual_erp"] = implied, usual
+        base_erp = usual.combine_first(base_erp)
+    daily["rule_erp"] = base_erp
     daily["fundamental_pe"] = _fundamental_series(growth, daily["growth_half_life"], now_yield, params, base_erp)
     # Your forward view of the P/E applies from the latest release, like the other forward assumptions.
     forward_days = (pd.Series(daily.index >= last_release, index=daily.index) if last_release is not None
