@@ -161,9 +161,9 @@ from analysis.signal_groups import (
 )
 from analysis.model_advisor import (
     MARKET_SYMBOL,
-    fundamental_pe_with,
     market_beta,
     model_checks,
+    suggested_params,
     suggestions,
 )
 from analysis.valuation_chart import (
@@ -4814,7 +4814,8 @@ def model_settings():
                           help="Back to the ticker's preset, or to the defaults when it has none.")
     with settings_panel("Forward assumptions"):
         st.caption("Everything the model assumes about the future, in one place. Beside each block of the diagram, "
-                   "'now' is today's data without these and 'fwd' is with them; the Now vs forward table sums it up.")
+                   "'last Q' is the last quarter's results at today's rate without these, and 'fwd' is with them; the "
+                   "Last quarter vs forward table sums it up.")
         st.markdown("**Policy rate** · Rate model")
         params["use_forward_rate"] = st.checkbox(
             "Use a forward policy rate on the last day", key=model_param_key("use_forward_rate"),
@@ -4892,6 +4893,18 @@ def model_settings():
         if params["anchor_source"] == "Fundamentals":
             params["growth_history_years"] = st.select_slider("Growth history (years)", [1, 2, 3, 5],
                                                               key=model_param_key("growth_history_years"))
+            params["pe_growth_latest_share"] = number(
+                "pe_growth_latest_share", "Growth for the P/E: share of the latest year", 0, 1, 0.1,
+                "0: the history's growth a year only; 1: the latest year only; 0.5: halfway (less swayed by one "
+                "odd year, quicker to see a change of pace).")
+            params["half_life_from_steadiness"] = st.checkbox(
+                "Half-life from growth steadiness too", key=model_param_key("half_life_from_steadiness"),
+                help="Steady growth (yearly growth varying by 2 points or less over the last 12 releases) earns a "
+                     "half-life of up to 6 years, even with a low gross margin; the longer of the two counts.")
+            params["erp_from_beta"] = st.checkbox(
+                "Risk premium from beta", key=model_param_key("erp_from_beta"),
+                help="The risk premium times the stock's beta to the S&P 500 (SPY, weekly, 3 years, as known on "
+                     "each day), within 2.5% and 8%.")
             params["fund_growth_floor"] = number("fund_growth_floor", "Growth floor %", -90, 0, 5)
             params["fund_growth_cap"] = number("fund_growth_cap", "Growth cap %", 0, 1000, 25,
                                                "High on purpose: some companies grow over 100% a year. The fade "
@@ -5103,7 +5116,7 @@ def render_market_check(result):
         "alone' means no value of it closes the gap. A parked item is tried too: a risk can only explain a model "
         "price that is too high, a product one that is too low.")
     st.dataframe(dials, hide_index=True, width="stretch", column_config={
-        column: st.column_config.NumberColumn(format="%.1f") for column in ["Now", "Needed", "Change"]})
+        column: st.column_config.NumberColumn(format="%.1f") for column in ["Current", "Needed", "Change"]})
     implied, applied = values.get("implied_premium_pct", np.nan), values.get("premium_pct", 0.0)
     if np.isfinite(implied):
         st.caption(f"Market premium: before any premium of yours, the close is {implied:+.0f}% from the model. "
@@ -5119,8 +5132,14 @@ def render_market_check(result):
                      "price: a model tuned until the gap is zero can only ever say the stock is fairly priced.")
 
 
-def render_model_check(result, inputs):
-    """Where the model is likely off for this stock, and forward values worked out from its data, ready to apply."""
+RULE_PARAMS = ("half_life_from_steadiness", "erp_from_beta")
+
+
+def render_model_check(result, inputs, rerun_with):
+    """Where the model is likely off for this stock, and settings worked out from its data, ready to apply.
+
+    ``rerun_with(params)`` runs the model again with other parameters, to preview what the suggestions do.
+    """
 
     beta = market_beta(inputs.close, getattr(inputs, "market_close", None))
     analysts = inputs.found.get("growth_check", (np.nan, np.nan))[0]
@@ -5133,28 +5152,37 @@ def render_model_check(result, inputs):
         if not checks.empty:
             st.dataframe(checks, hide_index=True, width="stretch")
         if proposed.empty:
-            st.caption("No suggestions: the forward values already match what the data points to.")
+            st.caption("No suggestions: the settings already match what the data points to.")
             return
-        st.markdown("**Suggested forward values** (from the stock's own data, never from its price)")
-        st.dataframe(proposed[["Label", "Now", "Suggested", "Why"]], hide_index=True, width="stretch",
-                     column_config={"Now": st.column_config.NumberColumn(format="%.1f"),
-                                    "Suggested": st.column_config.NumberColumn(format="%.1f")})
-        after = fundamental_pe_with(result, {row["Parameter"]: row["Suggested"] for row in proposed.to_dict("records")
-                                             if row["Parameter"].startswith("forward_")})
-        now = latest_values(result).get("outside_forward", np.nan)
-        if np.isfinite(after) and np.isfinite(now) and result["params"]["anchor_source"] == "Fundamentals":
-            st.caption(f"With them the fundamental P/E goes from {now:.1f}x to {after:.1f}x (before register items, "
-                       "quality and premium).")
+        st.markdown("**Suggestions** (from the stock's own data, never from its price)")
+        st.dataframe(proposed[["Label", "Why"]], hide_index=True, width="stretch")
+
+        def shown(row, value):
+            return ("on" if value else "off") if row["Parameter"] in RULE_PARAMS else f"{value:g}"
+
+        changes = pd.DataFrame([{"Setting": row["Label"], "From": shown(row, row["Current"]), "To": shown(row, row["Suggested"]),
+                                 "Applies to": row["Applies to"]} for row in proposed.to_dict("records")])
+        before, after = latest_values(result), latest_values(rerun_with(suggested_params(result["params"], proposed)))
+        for name, label_text, digits in [("acceptable_pe", "Acceptable P/E", 1), ("model_price", "Model price", 2)]:
+            changes = pd.concat([changes, pd.DataFrame([{
+                "Setting": f"= {label_text}", "From": f"{before.get(name, np.nan):,.{digits}f}",
+                "To": f"{after.get(name, np.nan):,.{digits}f}", "Applies to": "result today"}])], ignore_index=True)
+        st.markdown("**What Apply changes**")
+        st.dataframe(changes, hide_index=True, width="stretch")
         if st.button("Apply the suggestions", key="model_apply_suggestions_btn",
-                     help="Fills them in under Forward assumptions, where you can still change each one."):
+                     help="Sets them in the settings (rules in the Multiple builder, forward values under Forward "
+                          "assumptions), where you can still change or switch off each one."):
             for row in proposed.to_dict("records"):
-                st.session_state[model_param_key(row["Parameter"])] = float(row["Suggested"])
-            log_model_change([f"{row['Label']}: {row['Suggested']:g} (suggested)" for row in proposed.to_dict("records")],
-                             st.session_state.get("model_last_price"))
+                value = row["Suggested"]
+                st.session_state[model_param_key(row["Parameter"])] = (
+                    bool(value) if row["Parameter"] in RULE_PARAMS else float(value))
+            log_model_change([f"{row['Label']}: {shown(row, row['Current'])} -> {shown(row, row['Suggested'])} (suggested)"
+                              for row in proposed.to_dict("records")], st.session_state.get("model_last_price"))
             bump_forward_version()
             st.rerun()
-        st.caption("Starting points, not answers: the suggestions keep the market price out on purpose, so whatever "
-                   "gap is left shows up as the market premium.")
+        st.caption("Rules apply to every quarter, because they use only what was known at the time; forward guesses "
+                   "apply from the latest release. Starting points, not answers: the market price is kept out on "
+                   "purpose, so whatever gap is left shows up as the market premium.")
 
 
 def render_now_and_forward(result):
@@ -5163,11 +5191,11 @@ def render_now_and_forward(result):
     table = now_and_forward(result)
     if table.empty:
         return
-    st.markdown("**Now vs forward**")
+    st.markdown("**Last quarter vs forward**")
     st.dataframe(table, hide_index=True, width="stretch",
-                 column_config={column: st.column_config.NumberColumn(format="%.2f") for column in ["Now", "Forward", "Change"]})
-    st.caption("Now: today's policy rate, no register items, and the clean trailing EPS with no growth or margin "
-               "change. Forward: the same with the Forward assumptions (forward rate, growth and margin cases and "
+                 column_config={column: st.column_config.NumberColumn(format="%.2f") for column in ["Last quarter", "Forward", "Change"]})
+    st.caption("Last quarter: the last four quarters' clean EPS with no growth or margin change, no register items, "
+               "at today's policy rate. Forward: the same with the Forward assumptions (forward rate, growth and margin cases and "
                "their weights, register items).")
 
 
@@ -5358,8 +5386,12 @@ def render_valuation_model():
     # A story already parked as an item is no longer unexplained.
     candidates = candidates[~candidates["title"].str[:80].isin(set(model_register()["Item"]))].reset_index(drop=True)
     policy, market_yield, rate_note = load_model_rates(params["yield_years"])
-    result = run_model(inputs.quarters, inputs.close, model_register(), params, inputs.peer_pe, start=inputs.start,
-                       own_pe=inputs.own_pe, policy_rate=policy, market_yield=market_yield)
+    def rerun_with(other_params):
+        return run_model(inputs.quarters, inputs.close, model_register(), other_params, inputs.peer_pe,
+                         start=inputs.start, own_pe=inputs.own_pe, policy_rate=policy, market_yield=market_yield,
+                         market_close=getattr(inputs, "market_close", None))
+
+    result = rerun_with(params)
     values = latest_values(result)
     render_forward_tables(result)
     st.caption(model_data_note(inputs.found, params) + (" " + rate_note if rate_note else ""))
@@ -5386,7 +5418,7 @@ def render_valuation_model():
     tiles[2].metric("Risk-adjusted EPS", signal_text(values, "risk_adjusted_eps"))
     tiles[3].metric("Acceptable P/E", signal_text(values, "acceptable_pe"))
     render_now_and_forward(result)
-    render_model_check(result, inputs)
+    render_model_check(result, inputs, rerun_with)
 
     blocks = list(MODEL_BLOCKS)
     if st.session_state.get("model_block") not in blocks:
@@ -5415,10 +5447,11 @@ def render_valuation_model():
             "The P/E anchors are trailing P/Es applied to next year's EPS, which favours a growing company: size the "
             "P/E deductions with that in mind, or switch the P/E basis to Forward under Multiple builder. ")
         + "An estimate from stated assumptions, not investment advice.")
-    st.markdown(f"**{ticker} price against growth and gross margin**")
+    st.markdown(f"**{ticker} price against growth, gross margin and earnings**")
     show_chart(price_and_fundamentals_figure(result, ticker, mobile=MOBILE), width="stretch")
     st.caption("Close and model price on the left axis; on the right, the revenue growth a year over the growth "
-               "history and the gross margin that feed the fundamental P/E, each held from the release it came from. "
+               "history and the gross margin that feed the fundamental P/E, and the clean trailing earnings as an "
+               "index (highest = 100) on the far right, each held from the release it came from. "
                "Without revenue or gross profit (e.g. an ADR reporting in another currency) those lines are missing.")
     render_market_check(result)
     render_rate_cases(result)

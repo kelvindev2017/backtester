@@ -67,6 +67,13 @@ DEFAULT_PARAMS = {
     "growth_half_life_max": 2.0,  # ... and at gm_high or more: a high gross margin is a moat, so growth lasts longer
     "gm_low": 20.0,
     "gm_high": 60.0,
+    # Rules worked out from the data known on each day, so they hold for the whole history, not only the latest quarter.
+    "pe_growth_latest_share": 0.5,   # growth for the P/E = this share of the latest year's growth + the rest of the history's
+    "half_life_from_steadiness": True,  # steady growth earns a longer half-life than a low gross margin gives
+    "steady_spread": 2.0,            # ... yearly growth varying by this many points or less earns steady_half_life
+    "choppy_spread": 15.0,           # ... and by this many or more earns nothing beyond the gross-margin rule
+    "steady_half_life": 6.0,
+    "erp_from_beta": True,           # equity risk premium x the stock's beta to the market (3 years, weekly)
     # Forward view of the P/E (latest quarter on; NaN = the historical value) and a premium kept apart from it.
     "forward_pe_growth": np.nan,      # growth the fundamental P/E rests on, %
     "forward_half_life": np.nan,      # years for half of the extra growth to fade
@@ -140,7 +147,13 @@ SIGNALS = {
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
     "held_cagr": ("daily", "Revenue growth a year over the growth history (held)", "%", "percent"),
     "held_gross_margin": ("daily", "Gross margin, last 4 quarters (held)", "%", "share"),
-    "growth_half_life": ("daily", "Half-life of the extra growth, years (from gross margin)", "", "count"),
+    "growth_half_life": ("daily", "Half-life of the extra growth, years (gross margin and steadiness)", "", "count"),
+    "held_yoy": ("daily", "Revenue growth, latest year (held)", "%", "percent"),
+    "held_growth_spread": ("daily", "How much the yearly growth varies, points (held)", "", "count"),
+    "beta": ("daily", "Beta to the market, 3 years weekly", "", "count"),
+    "pe_erp": ("daily", "Equity risk premium used", "%", "percent"),
+    "rule_growth": ("daily", "Growth for the P/E by the rule (history and latest year)", "%", "percent"),
+    "rule_erp": ("daily", "Equity risk premium by the rule", "%", "percent"),
     "fundamental_pe": ("daily", "Fundamental P/E (growth, gross margin, yield)", "x", "multiple"),
     "outside_anchor": ("daily", "Outside view P/E (fundamental or peers)", "x", "multiple"),
     "outside_forward": ("daily", "Outside view P/E with your forward view and rate", "x", "multiple"),
@@ -157,8 +170,8 @@ SIGNALS = {
     "now_yield": ("daily", "Model N-year yield at today's rate", "%", "rate"),
     "now_anchor": ("daily", "P/E anchor at today's rate", "x", "multiple"),
     "now_pe": ("daily", "P/E now (today's rate, no register items)", "x", "multiple"),
-    "now_price": ("daily", "Model price now (no forward assumptions)", "", "price"),
-    "now_residual_pct": ("daily", "Model price now vs close", "%", "percent"),
+    "now_price": ("daily", "Model price, last quarter (no forward assumptions)", "", "price"),
+    "now_residual_pct": ("daily", "Model price, last quarter, vs close", "%", "percent"),
     "model_price": ("daily", "Model price per share", "", "price"),
     "market_pe": ("daily", "Market price / risk-adjusted EPS", "x", "multiple"),
     "residual_pct": ("daily", "Model price vs close", "%", "percent"),
@@ -505,7 +518,7 @@ def quarterly_inputs(quarters, growth_years=3):
     frame = pd.DataFrame(index=pd.DatetimeIndex(quarters.index).sort_values().unique()) if quarters is not None else pd.DataFrame()
     if quarters is None or quarters.empty:
         return pd.DataFrame(columns=["revenue", "net_income", "eps", "ttm_revenue", "revenue_yoy", "net_margin", "ttm_eps",
-                                     "gross_margin", "revenue_cagr"])
+                                     "gross_margin", "revenue_cagr", "growth_spread"])
     quarters = quarters.sort_index()
     quarters = quarters.loc[~quarters.index.duplicated(keep="last")]
 
@@ -529,7 +542,9 @@ def quarterly_inputs(quarters, growth_years=3):
     frame["revenue"], frame["net_income"], frame["eps"] = revenue, net_income, eps
     for name, series in [("ttm_revenue", ttm_revenue), ("revenue_yoy", yoy), ("net_margin", margin),
                          ("ttm_eps", _trailing(eps)), ("gross_margin", gross_margin.dropna()),
-                         ("revenue_cagr", cagr.dropna())]:
+                         ("revenue_cagr", cagr.dropna()),
+                         # How much the yearly growth varied over the last 12 releases (at least 8), as known then.
+                         ("growth_spread", yoy.dropna().rolling(12, min_periods=8).std().dropna())]:
         # A quarter known for one measure but not another keeps the last value of the other.
         frame[name] = series.reindex(frame.index.union(series.index)).ffill().reindex(frame.index)
     return frame
@@ -620,17 +635,60 @@ def fundamental_pe(growth, gross_margin, yield_pct, params, horizon=40, half_lif
     return float(value)
 
 
-def _fundamental_series(growth, half_lives, yields, params):
-    """``fundamental_pe`` day by day (computed once per distinct growth, half-life and yield)."""
+def _fundamental_series(growth, half_lives, yields, params, erps=None):
+    """``fundamental_pe`` day by day (computed once per distinct growth, half-life, yield and risk premium)."""
 
     params = model_params(params)
+    erps = [params["equity_premium"]] * len(growth) if erps is None else list(erps)
     out, cache = [], {}
-    for g, h, y in zip(growth, half_lives, yields):
-        key = (round(g, 4) if np.isfinite(g) else None, round(h, 4), round(y, 4) if np.isfinite(y) else None)
+    for g, h, y, e in zip(growth, half_lives, yields, erps):
+        e = float(e) if e is not None and np.isfinite(e) else params["equity_premium"]
+        key = (round(g, 4) if np.isfinite(g) else None, round(h, 4), round(y, 4) if np.isfinite(y) else None, round(e, 4))
         if key not in cache:
-            cache[key] = fundamental_pe(g, None, y, params, half_life=h)
+            cache[key] = fundamental_pe(g, None, y, {**params, "equity_premium": e}, half_life=h)
         out.append(cache[key])
     return pd.Series(out, index=growth.index, dtype=float)
+
+
+def steady_half_life(spread, growth, params):
+    """Growth half-life that steady growth earns: ``steady_half_life`` years when the yearly growth varies by
+    ``steady_spread`` points or less, falling to the low gross-margin half-life at ``choppy_spread`` or more.
+    NaN without a spread or without positive growth."""
+
+    params = model_params(params)
+    if spread is None or growth is None or not np.isfinite(spread) or not np.isfinite(growth) or growth <= 0:
+        return np.nan
+    span = max(1e-9, params["choppy_spread"] - params["steady_spread"])
+    share = float(np.clip((params["choppy_spread"] - spread) / span, 0, 1))
+    low = params["growth_half_life_min"]
+    return low + (params["steady_half_life"] - low) * share
+
+
+def rolling_beta(close, market_close, days, years=3):
+    """The stock's beta to the market by day: weekly log returns over the past ``years`` years (156 weeks, at least
+    52), as known on each day. NaN without market prices."""
+
+    out = pd.Series(np.nan, index=days, dtype=float)
+    if close is None or market_close is None or not len(close) or not len(pd.Series(market_close).dropna()):
+        return out
+    both = pd.concat([pd.Series(close, dtype=float), pd.Series(market_close, dtype=float)], axis=1, join="inner").dropna()
+    if both.empty:
+        return out
+    weekly = np.log(both.resample("W-FRI").last()).diff().dropna()
+    window = 52 * years
+    beta = (weekly.iloc[:, 0].rolling(window, min_periods=52).cov(weekly.iloc[:, 1])
+            / weekly.iloc[:, 1].rolling(window, min_periods=52).var())
+    return beta.reindex(beta.index.union(days)).ffill().reindex(days)
+
+
+def risk_premium_from_beta(beta, params):
+    """The equity risk premium scaled by beta (a calmer stock needs a lower return), within 2.5% and 8%; the plain
+    premium where beta is unknown."""
+
+    params = model_params(params)
+    base = float(params["equity_premium"])
+    beta = pd.Series(beta, dtype=float)
+    return (base * beta.clip(0.5, 1.8)).clip(2.5, 8.0).fillna(base)
 
 
 def forward_pe_params(params):
@@ -657,13 +715,14 @@ def blend_anchor(own, peer, share):
 
 
 def run_model(quarters, close, register=None, params=None, peer_pe=None, start=None, own_pe=None, policy_rate=None,
-              market_yield=None):
+              market_yield=None, market_close=None):
     """Run the whole model over history.
 
     quarters: results by the date they became public (columns Revenue, Net_Income, EPS; any may be missing).
     close: daily close of the share. register: the risk and product items. peer_pe: daily P/E of each peer, one
     column per peer, on the basis the anchor uses. start: first day to report (earlier data still feeds the trailing
-    sums and medians). own_pe: the share's own daily P/E for its anchor; None uses the trailing P/E from ``quarters``
+    sums and medians). market_close: the market's close (SPY) for the stock's beta. own_pe: the share's own daily
+    P/E for its anchor; None uses the trailing P/E from ``quarters``
     (pass a forward P/E here, with the peers' forward P/E, for a forward anchor). policy_rate: the central bank rate
     in % by date; None (or empty) switches the rate model off. market_yield: the market's N-year yield in %, shown
     next to the model's yield as a check (it does not feed the price).
@@ -708,6 +767,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         daily["held_quality_pe"] = -abs(float(params["quality_pe_pts"]))
         daily["held_clean_eps"] = np.nan
         daily["held_cagr"], daily["held_gross_margin"] = np.nan, np.nan
+        daily["held_yoy"], daily["held_growth_spread"] = np.nan, np.nan
     else:
         # Hold blocks: each quarterly output keeps its last value until the next update.
         both = quarterly.reindex(quarterly.index.union(close.index)).ffill().reindex(close.index)
@@ -715,6 +775,8 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         daily["held_quality_pe"] = both["quality_pe"].fillna(0.0)
         daily["held_clean_eps"] = both["clean_eps"]
         daily["held_cagr"] = both["revenue_cagr"] if "revenue_cagr" in both else np.nan
+        daily["held_yoy"] = both["revenue_yoy"] if "revenue_yoy" in both else np.nan
+        daily["held_growth_spread"] = both["growth_spread"] if "growth_spread" in both else np.nan
         daily["held_gross_margin"] = both["gross_margin"] if "gross_margin" in both else np.nan
 
     # Multiple builder. The own anchor is the median trailing P/E of the look-back, up to the day before, so the
@@ -766,11 +828,25 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         daily["market_yield"] = market.reindex(market.index.union(close.index)).ffill(limit=10).reindex(close.index)
     passed = float(params["rate_pass_through"])
     # The outside view: the P/E the company's growth and gross margin justify at the day's yield, or the peers'.
-    daily["growth_half_life"] = [growth_half_life(margin, params) for margin in daily["held_gross_margin"].astype(float)]
-    growth = daily["held_cagr"].astype(float).fillna(float(params["fallback_yoy"]) if quarterly.empty or
-                                                     daily["held_cagr"].isna().all() else np.nan)
+    # The rules below use only what was known on each day, so they hold for the whole history.
+    margin_half = pd.Series([growth_half_life(margin, params) for margin in daily["held_gross_margin"].astype(float)],
+                            index=daily.index, dtype=float)
+    cagr, latest = daily["held_cagr"].astype(float), daily["held_yoy"].astype(float)
+    share = float(np.clip(params["pe_growth_latest_share"], 0, 1))
+    growth = (share * latest + (1 - share) * cagr).combine_first(cagr).combine_first(latest)
+    if growth.isna().all():
+        growth = growth.fillna(float(params["fallback_yoy"]))
+    if params["half_life_from_steadiness"]:
+        steady = pd.Series([steady_half_life(spread, g, params) for spread, g in
+                            zip(daily["held_growth_spread"].astype(float), growth)], index=daily.index, dtype=float)
+        margin_half = pd.concat([margin_half, steady], axis=1).max(axis=1)
+    daily["growth_half_life"], daily["rule_growth"] = margin_half, growth
+    daily["beta"] = rolling_beta(close, market_close, daily.index)
+    base_erp = (risk_premium_from_beta(daily["beta"], params) if params["erp_from_beta"]
+                else pd.Series(float(params["equity_premium"]), index=daily.index))
+    daily["rule_erp"] = base_erp
     now_yield = daily["now_yield"].astype(float)
-    daily["fundamental_pe"] = _fundamental_series(growth, daily["growth_half_life"], now_yield, params)
+    daily["fundamental_pe"] = _fundamental_series(growth, daily["growth_half_life"], now_yield, params, base_erp)
     # Your forward view of the P/E applies from the latest release, like the other forward assumptions.
     forward_days = (pd.Series(daily.index >= last_release, index=daily.index) if last_release is not None
                     else pd.Series(True, index=daily.index))
@@ -779,15 +855,16 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         pe_growth[forward_days] = float(params["forward_pe_growth"])
     if np.isfinite(params["forward_half_life"]):
         pe_half_life[forward_days] = float(params["forward_half_life"])
-    daily["pe_growth"], daily["pe_half_life"] = pe_growth, pe_half_life
+    pe_erp = base_erp.copy()
+    if np.isfinite(params["forward_equity_premium"]):
+        pe_erp[forward_days] = float(params["forward_equity_premium"])
+    daily["pe_growth"], daily["pe_half_life"], daily["pe_erp"] = pe_growth, pe_half_life, pe_erp
     daily["premium_pct"] = np.where(forward_days, float(params["market_premium"]), 0.0)
     fundamentals = params["anchor_source"] == "Fundamentals"
     if fundamentals:
         outside_now = daily["fundamental_pe"]
         rate_yield = daily["model_yield"].astype(float)
-        history_rate = _fundamental_series(growth, daily["growth_half_life"], rate_yield, params)
-        forward_rate_pe = _fundamental_series(pe_growth, pe_half_life, rate_yield, forward_pe_params(params))
-        outside_rate = forward_rate_pe.where(forward_days, history_rate)
+        outside_rate = _fundamental_series(pe_growth, pe_half_life, rate_yield, params, pe_erp)
     else:
         outside_now = daily["peer_anchor"]
         outside_rate = rate_adjusted_pe(daily["peer_anchor"], daily["forward_gap"], passed)
@@ -870,6 +947,7 @@ def _day_state(result, values, on):
             "held_cagr": day.get("pe_growth", day.get("held_cagr", np.nan)),
             "growth_half_life": day.get("pe_half_life", day.get("growth_half_life", np.nan)),
             "premium": float(day.get("premium_pct", 0.0)) if np.isfinite(day.get("premium_pct", np.nan)) else 0.0,
+            "pe_erp": day.get("pe_erp", np.nan),
             "policy_rate": day.get("policy_rate", np.nan), "yield_ref": day.get("yield_ref", np.nan),
             "forward": _is_forward(result, on)}
 
@@ -900,8 +978,8 @@ def anchor_at_rate(state, params, rate):
     own = rate_adjusted_pe(state["own_anchor"], own_gap, passed)
     if params["anchor_source"] == "Fundamentals" and np.isfinite(state.get("growth_half_life", np.nan)):
         growth = state["held_cagr"] if np.isfinite(state.get("held_cagr", np.nan)) else params["fallback_yoy"]
-        pe_params = forward_pe_params(params) if state.get("forward", True) else params
-        peer = _fundamental_series(pd.Series([growth]), [state["growth_half_life"]], [expected], pe_params).iloc[0]
+        peer = _fundamental_series(pd.Series([growth]), [state["growth_half_life"]], [expected], params,
+                                   [state.get("pe_erp", params["equity_premium"])]).iloc[0]
     else:
         peer = rate_adjusted_pe(state["peer_anchor"], expected - actual, passed)
     return blend_anchor(own, peer, params["peer_weight"])
@@ -925,7 +1003,7 @@ def _solve(price_at, low, high, target, steps=60):
     return (low + high) / 2
 
 
-DIAL_COLUMNS = ["Dial", "Block", "Now", "Needed", "Change", "Unit", "Read"]
+DIAL_COLUMNS = ["Dial", "Block", "Current", "Needed", "Change", "Unit", "Read"]
 
 
 def _read(needed, now, low, high):
@@ -954,7 +1032,7 @@ def implied_dials(result, on=None):
 
     def add(name, block, now, low, high, plausible, unit, price_at):
         needed = _solve(price_at, low, high, target)
-        rows.append({"Dial": name, "Block": block, "Now": now, "Needed": needed if needed is not None else np.nan,
+        rows.append({"Dial": name, "Block": block, "Current": now, "Needed": needed if needed is not None else np.nan,
                      "Change": needed - now if needed is not None else np.nan, "Unit": unit,
                      "Read": _read(needed, now, *plausible)})
 
@@ -1001,7 +1079,7 @@ def implied_dials(result, on=None):
                 add(f"{label}: probability", TO_SCENARIOS, now, 0, 100, (max(0, now - 30), min(100, now + 30)), "%",
                     with_probability)
             else:
-                rows.append({"Dial": f"{label}: probability", "Block": TO_SCENARIOS, "Now": now, "Needed": np.nan,
+                rows.append({"Dial": f"{label}: probability", "Block": TO_SCENARIOS, "Current": now, "Needed": np.nan,
                              "Change": np.nan, "Unit": "%", "Read": "Wrong direction"})
         else:
             now = 0.0 if parked else abs(row["Effect"])
@@ -1012,7 +1090,7 @@ def implied_dials(result, on=None):
             if helps:
                 add(f"{label}: P/E points", TO_MULTIPLE, now, 0, 30, (0, now + 3), "pts", with_points)
             else:
-                rows.append({"Dial": f"{label}: P/E points", "Block": TO_MULTIPLE, "Now": now, "Needed": np.nan,
+                rows.append({"Dial": f"{label}: P/E points", "Block": TO_MULTIPLE, "Current": now, "Needed": np.nan,
                              "Change": np.nan, "Unit": "pts", "Read": "Wrong direction"})
     return pd.DataFrame(rows, columns=DIAL_COLUMNS)
 
@@ -1130,7 +1208,7 @@ def case_table_changes(before, after, params):
     return updates
 
 
-PE_ROWS = {"Growth for the P/E %": ("held_cagr", "forward_pe_growth"),
+PE_ROWS = {"Growth for the P/E %": ("rule_growth", "forward_pe_growth"),
            "Growth half-life, years": ("growth_half_life", "forward_half_life"),
            "Equity risk premium %": (None, "forward_equity_premium"),
            "Market premium %": ("implied_premium_pct", "market_premium")}
@@ -1140,17 +1218,18 @@ PE_COLUMNS = ["Metric", "Current", "Forward", "Forward from"]
 def pe_table(result, params=None):
     """The fundamental P/E's inputs now and forward, and the market premium kept apart from them.
 
-    Current: from the history (growth a year over the growth history, half-life from the gross margin, the default
-    risk premium) and, for the premium, what the market pays over the model before your premium. Forward: yours,
+    Current: from the rules on data known today (growth from the history and the latest year, half-life from the
+    gross margin and growth steadiness, risk premium from beta) and, for the premium, what the market pays over the model before your premium. Forward: yours,
     used from the latest release. Only the premium row when the outside view is the peers.
     """
 
     params = model_params(params if params is not None else result["params"])
     values = latest_values(result)
-    growth = values.get("held_cagr", np.nan)
+    growth = values.get("rule_growth", np.nan)
     growth = growth if np.isfinite(growth) else params["fallback_yoy"]
+    erp = values.get("rule_erp", np.nan)
     current = {"Growth for the P/E %": growth, "Growth half-life, years": values.get("growth_half_life", np.nan),
-               "Equity risk premium %": params["equity_premium"],
+               "Equity risk premium %": erp if np.isfinite(erp) else params["equity_premium"],
                "Market premium %": values.get("implied_premium_pct", np.nan)}
     rows = []
     for metric, (_, key) in PE_ROWS.items():
@@ -1355,15 +1434,15 @@ def now_and_forward(result, on=None):
     """
 
     values = latest_values(result, on)
-    columns = ["Step", "Now", "Forward", "Change"]
+    columns = ["Step", "Last quarter", "Forward", "Change"]
     if not values:
         return pd.DataFrame(columns=columns)
     rows = [("Policy rate %", "policy_rate", "forward_rate"), ("N-year yield %", "now_yield", "model_yield"),
             ("EPS", "held_clean_eps", "held_eps"), ("P/E", "now_pe", "acceptable_pe"),
             ("Model price", "now_price", "model_price"), ("vs close %", "now_residual_pct", "residual_pct")]
-    table = [{"Step": label, "Now": values.get(now, np.nan), "Forward": values.get(forward, np.nan)}
+    table = [{"Step": label, "Last quarter": values.get(now, np.nan), "Forward": values.get(forward, np.nan)}
              for label, now, forward in rows]
     frame = pd.DataFrame(table, columns=columns[:3])
-    frame = frame[frame[["Now", "Forward"]].notna().any(axis=1)].reset_index(drop=True)
-    frame["Change"] = frame["Forward"] - frame["Now"]
+    frame = frame[frame[["Last quarter", "Forward"]].notna().any(axis=1)].reset_index(drop=True)
+    frame["Change"] = frame["Forward"] - frame["Last quarter"]
     return frame

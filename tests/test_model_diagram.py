@@ -68,7 +68,7 @@ def test_block_charts_split_inputs_and_outputs(result):
 def test_price_chart_has_the_model_the_close_and_the_range(result):
     fig = model_price_figure(result, "TEST")
     names = [trace.name for trace in fig.data]
-    assert names[:5] == ["Bull case", "Bear case", "Model price", "Model price now (no forward assumptions)", "Close"]
+    assert names[:5] == ["Bull case", "Bear case", "Model price", "Model price, last quarter (no forward assumptions)", "Close"]
     assert "Acceptable P/E" in names
     model = next(trace for trace in fig.data if trace.name == "Model price")
     assert np.nanmax(np.asarray(model.y, dtype=float)) == pytest.approx(result["daily"]["model_price"].max())
@@ -95,8 +95,8 @@ def test_values_are_formatted_by_unit():
 
 def test_blocks_with_forward_assumptions_show_now_and_forward(result):
     text = texts(model_diagram(result))
-    assert text.count("now ") >= 6 and "fwd " in text
-    assert "fwd base" in text and "now none" in text
+    assert text.count("last Q ") >= 6 and "fwd " in text
+    assert "fwd base" in text and "last Q none" in text
     # No policy rate in this run: the rate model has no now/fwd pair.
     from analysis.model_diagram import now_and_forward_text
     from analysis.valuation_model import latest_values
@@ -105,7 +105,7 @@ def test_blocks_with_forward_assumptions_show_now_and_forward(result):
     assert any("(forward)" in label for label in parameter_table(result, "scenario_engine")["Parameter"])
 
 
-def test_price_against_growth_and_gross_margin_on_two_axes():
+def test_price_against_growth_margin_and_earnings():
     from analysis.model_diagram import price_and_fundamentals_figure
     quarters = make_quarters().assign(Gross_Profit=lambda frame: frame["Revenue"] * 0.45)
     close = make_close(quarters)
@@ -113,5 +113,8 @@ def test_price_against_growth_and_gross_margin_on_two_axes():
     fig = price_and_fundamentals_figure(result, "TEST")
     axes = {trace.name: trace.yaxis for trace in fig.data}
     assert axes["Close"] == axes["Model price"] == "y"
-    assert axes["Revenue growth a year (history)"] == axes["Gross margin"] == "y2"
-    assert fig.data[-1].y[-1] == pytest.approx(45.0)
+    assert axes["Revenue growth"] == axes["Gross margin"] == "y2"
+    assert axes["Earnings (highest = 100)"] == "y3"
+    earnings = next(trace for trace in fig.data if trace.name == "Earnings (highest = 100)")
+    assert np.nanmax(np.asarray(earnings.y, dtype=float)) == pytest.approx(100.0)
+    assert next(trace for trace in fig.data if trace.name == "Gross margin").y[-1] == pytest.approx(45.0)

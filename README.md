@@ -166,14 +166,21 @@ gives about 21x. Under Forward assumptions a **P/E table** puts each input of th
 column shows how much the market pays over the model today; Forward is what you choose to accept (0 by default), so
 the premium never hides inside a stretched growth rate.
 
+The fundamental P/E also follows three **rules on data known at each date**, so they hold for the whole history:
+growth for the P/E is halfway between the latest year's growth and the history's; steady growth (yearly growth
+varying by 2 points or less over the last 12 releases) earns a half-life of up to 6 years even with a low gross
+margin; and the risk premium is scaled by the stock's beta to the S&P 500 (SPY, weekly, 3 years), within 2.5% and 8%.
+Each can be switched off in the Multiple builder settings.
+
 A **Model check** under the headline numbers reads each stock's own data and lists where the model is likely off
-(fallback data, a bear case that wipes out a thin margin, growth that changed pace, steady growth given a short
-half-life by a low gross margin, a beta far from 1, peers priced as a different business, a P/E held at the cap or
-floor, a large market premium), and proposes forward values worked out from the data: growth for the P/E (the middle
-of the history, the latest year and the analysts), a half-life that steady growth earns, a risk premium scaled by
-beta to the S&P 500 (SPY, weekly, 3 years) and a bear case of at most a third of the margin. **Apply the
-suggestions** fills them in under Forward assumptions. The price itself is never used, so what is left shows up as
-the market premium. The peers' median P/E is still available as the outside view; the rest of the anchor can come from
+(fallback data, a bear case that wipes out a thin margin, growth that changed pace, a rule switched off that the data
+calls for, peers priced as a different business, a P/E held at the cap or floor, a large market premium) and suggests
+settings, each marked as applying to every quarter (a rule) or from the latest release (a forward guess, e.g. halfway
+to the analysts' expected growth). A table shows what **Apply the suggestions** will change, including the acceptable
+P/E and model price before and after. The price itself is never used, so what is left shows up as the market premium.
+
+"Last quarter" in the Last quarter vs forward table and beside the blocks ("last Q") is the last four quarters'
+results at today's rate, with no forward assumption. The peers' median P/E is still available as the outside view; the rest of the anchor can come from
 the stock's own P/E history.
 
 With the **Forward** P/E basis, past forward P/Es carry no hindsight: before the latest report they use the trailing
