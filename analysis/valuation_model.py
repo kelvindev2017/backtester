@@ -203,11 +203,11 @@ SIGNALS = {
     "now_yield": ("daily", "Model N-year yield at today's rate", "%", "rate"),
     "now_anchor": ("daily", "P/E anchor at today's rate", "x", "multiple"),
     "now_pe": ("daily", "P/E now (today's rate, no register items)", "x", "multiple"),
-    "now_price": ("daily", "Model price, last quarter (no forward assumptions)", "", "price"),
-    "now_residual_pct": ("daily", "Model price, last quarter, vs close", "%", "percent"),
-    "model_price": ("daily", "Model price per share", "", "price"),
+    "now_price": ("daily", "Modeled fair value, last quarter (no forward assumptions)", "", "price"),
+    "now_residual_pct": ("daily", "Modeled fair value, last quarter, vs close", "%", "percent"),
+    "model_price": ("daily", "Modeled fair value per share", "", "price"),
     "market_pe": ("daily", "Market price / risk-adjusted EPS", "x", "multiple"),
-    "residual_pct": ("daily", "Model price vs close", "%", "percent"),
+    "residual_pct": ("daily", "Modeled fair value vs close", "%", "percent"),
 }
 
 # Each block: its sample rate, what it reads, what it writes and the parameters it owns (key -> label).
@@ -1187,7 +1187,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         lower=params["pe_floor"], upper=params["pe_cap"])
     daily["acceptable_pe"] = (daily["pe_before_premium"] * (1 + daily["premium_pct"] / 100)).clip(lower=0)
     # "Now": the same chain with no forward assumption, i.e. today's policy rate, no register items and the clean
-    # trailing EPS with no growth or margin change. Next to the model price it shows what the forward inputs add.
+    # trailing EPS with no growth or margin change. Next to the modeled fair value it shows what the forward inputs add.
     own_now = rate_adjusted_pe(daily["own_anchor"], daily["yield_gap"] - daily["forward_gap"], passed)
     daily["now_anchor"] = blend_anchor(own_now, outside_now, params["peer_weight"])
     daily["now_pe"] = (daily["now_anchor"] + daily["held_quality_pe"]).clip(lower=params["pe_floor"], upper=params["pe_cap"])
@@ -1243,7 +1243,7 @@ def latest_values(result, on=None):
 
 
 def _point_price(state, params, routed):
-    """Model price from one day's held inputs: the whole chain as one function of the parameters and items."""
+    """Modeled fair value from one day's held inputs: the whole chain as one function of the parameters and items."""
 
     events, points = case_effects(routed, state["on"], params)
     point = scenario_point(state["ttm_eps"], state["revenue_yoy"], state["net_margin"], params, events,
@@ -1352,7 +1352,7 @@ def implied_dials(result, on=None):
     """What the market price implies, one dial at a time.
 
     For each parameter and each risk or product item: holding everything else as it is, the value that makes the
-    model price equal the close on ``on`` (default: the last day), and whether that value is believable. A parked
+    modeled fair value equal the close on ``on`` (default: the last day), and whether that value is believable. A parked
     item is tried too: its row shows what it would have to be to explain the gap on its own.
     """
 
@@ -1403,7 +1403,7 @@ def implied_dials(result, on=None):
     for position, row in routed.iterrows():
         parked = row["Gate"] != MODELLED
         label = f"{row['Item']} (parked)" if parked else row["Item"]
-        # A risk can only pull the model price down, a product can only lift it.
+        # A risk can only pull the modeled fair value down, a product can only lift it.
         helps = (row["Type"] == RISK) == model_above if parked else True
         if row["Route"] == TO_SCENARIOS:
             now = 0.0 if parked else row["Probability %"]
@@ -1461,7 +1461,7 @@ def _reroute(routed, position, params, probability=None, effect=None):
 
 
 def market_implied_probabilities(result, on=None):
-    """For each item with a probability to set: the probability that alone makes the model price equal the close.
+    """For each item with a probability to set: the probability that alone makes the modeled fair value equal the close.
 
     Everything else stays as set (the item's own bull and bear adjustments included). NaN when no probability from 0
     to 100% does it alone, or when the item has no probability (a general item, or no EPS impact or P/E points).
@@ -1604,7 +1604,7 @@ def pe_table_changes(before, after, params):
 
 
 def _shifted_growth_price(state, params, routed, shift):
-    """Model price with ``shift`` points added to the growth of every case."""
+    """Modeled fair value with ``shift`` points added to the growth of every case."""
 
     _, base, _, _ = base_growth_and_margin(state["revenue_yoy"], state["net_margin"], params, state.get("forward", True))
     base += shift
@@ -1623,7 +1623,7 @@ def _shifted_margin_params(state, params, shift):
 
 
 def sensitivities(result, on=None):
-    """How far the model price moves for one step of each main dial (10 points of bear weight, 1x of P/E ...)."""
+    """How far the modeled fair value moves for one step of each main dial (10 points of bear weight, 1x of P/E ...)."""
 
     dials = implied_dials(result, on)
     values = latest_values(result, on)
@@ -1661,15 +1661,15 @@ def default_rate_cases(rate):
 
 
 def rate_cases(result, cases, on=None):
-    """The model price in each policy rate case and their probability-weighted expected value.
+    """The modeled fair value in each policy rate case and their probability-weighted expected value.
 
     ``cases`` has the columns Case, Policy rate % and Probability % (rescaled to add up to 100). Each case reruns the
     rate model and the multiple builder for the day with that rate on it; everything else is held. Returns
-    ``(table, expected)``: the table adds the case's N-year yield, anchor, model price and change vs the close;
-    ``expected`` is the weighted model price (NaN when there is nothing to weigh).
+    ``(table, expected)``: the table adds the case's N-year yield, anchor, modeled fair value and change vs the close;
+    ``expected`` is the weighted modeled fair value (NaN when there is nothing to weigh).
     """
 
-    columns = RATE_CASE_COLUMNS + ["N-year yield %", "P/E anchor", "Model price", "vs close %"]
+    columns = RATE_CASE_COLUMNS + ["N-year yield %", "P/E anchor", "Modeled fair value", "vs close %"]
     values = latest_values(result, on)
     frame = pd.DataFrame(cases, columns=RATE_CASE_COLUMNS) if cases is not None else pd.DataFrame(columns=RATE_CASE_COLUMNS)
     frame = frame.dropna(subset=["Policy rate %"]).reset_index(drop=True)
@@ -1684,11 +1684,11 @@ def rate_cases(result, cases, on=None):
         anchor = anchor_at_rate(state, params, rate)
         price = _point_price({**state, "anchor": anchor}, params, routed)
         rows.append({**row, "N-year yield %": float(model_yield(rate, params)), "P/E anchor": anchor,
-                     "Model price": price, "vs close %": (price / values["close"] - 1) * 100})
+                     "Modeled fair value": price, "vs close %": (price / values["close"] - 1) * 100})
     table = pd.DataFrame(rows, columns=columns)
     weights = pd.to_numeric(table["Probability %"], errors="coerce").fillna(0).clip(lower=0)
-    usable = weights.where(table["Model price"].notna(), 0)
-    expected = float((usable * table["Model price"].fillna(0)).sum() / usable.sum()) if usable.sum() > 0 else np.nan
+    usable = weights.where(table["Modeled fair value"].notna(), 0)
+    expected = float((usable * table["Modeled fair value"].fillna(0)).sum() / usable.sum()) if usable.sum() > 0 else np.nan
     return table, expected
 
 
@@ -1767,7 +1767,7 @@ def _show(value):
 def now_and_forward(result, on=None):
     """Each step of the chain now (today's data, no forward assumption) and forward (with them), side by side.
 
-    Rows: policy rate, N-year yield, EPS, P/E, model price and its gap to the close. Columns: Now, Forward, Change.
+    Rows: policy rate, N-year yield, EPS, P/E, modeled fair value and its gap to the close. Columns: Now, Forward, Change.
     """
 
     values = latest_values(result, on)
@@ -1776,7 +1776,7 @@ def now_and_forward(result, on=None):
         return pd.DataFrame(columns=columns)
     rows = [("Policy rate %", "policy_rate", "forward_rate"), ("N-year yield %", "now_yield", "model_yield"),
             ("EPS", "held_clean_eps", "held_eps"), ("P/E", "now_pe", "acceptable_pe"),
-            ("Model price", "now_price", "model_price"), ("vs close %", "now_residual_pct", "residual_pct")]
+            ("Modeled fair value", "now_price", "model_price"), ("vs close %", "now_residual_pct", "residual_pct")]
     table = [{"Step": label, "Last quarter": values.get(now, np.nan), "Forward": values.get(forward, np.nan)}
              for label, now, forward in rows]
     frame = pd.DataFrame(table, columns=columns[:3])

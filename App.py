@@ -4527,7 +4527,7 @@ MODEL_BLOCK_NOTES = {
                         "then adds the P/E points of the general items and takes off the earnings quality "
                         "deduction. Recomputed every day, because peer prices move every day.",
     "product": "Risk-adjusted EPS, held since the last release, times the day's acceptable P/E.",
-    "market_check": "Compares the model price with the close, and works backwards from the close to the value each "
+    "market_check": "Compares the modeled fair value with the close, and works backwards from the close to the value each "
                     "dial would need to explain the gap.",
 }
 
@@ -4783,7 +4783,7 @@ def render_forward_items(result):
             "Status": st.column_config.SelectboxColumn("Status", options=["Modelled", "Parked"], required=True),
             "Current %": st.column_config.NumberColumn(
                 "Current %", disabled=True, format="%.0f",
-                help="Market-implied: the probability that on its own makes the model price equal today's close "
+                help="Market-implied: the probability that on its own makes the modeled fair value equal today's close "
                      "(today's P/E), everything else as set. Blank: no probability does it alone, or the item has "
                      "no probability (a general item)."),
             "Forward %": st.column_config.NumberColumn("Forward %", min_value=0, max_value=100, format="%.0f",
@@ -5254,18 +5254,18 @@ def render_model_inspector(result, block):
 
 
 def render_market_check(result):
-    """What the close implies for each dial, and how far one step of the main dials moves the model price."""
+    """What the close implies for each dial, and how far one step of the main dials moves the modeled fair value."""
 
     st.markdown("**Market check: what the price implies**")
     dials = implied_dials(result)
     if dials.empty:
-        st.caption("No model price yet, so there is nothing to compare with the close.")
+        st.caption("No modeled fair value yet, so there is nothing to compare with the close.")
         return
     values = latest_values(result)
     above = values["model_price"] > values["close"]
     st.caption(
-        f"The model price is {abs(values['residual_pct']):.0f}% {'above' if above else 'below'} the close. Each row "
-        "holds everything else as it is and finds the value of that one dial that would make the model price equal "
+        f"The modeled fair value is {abs(values['residual_pct']):.0f}% {'above' if above else 'below'} the close. Each row "
+        "holds everything else as it is and finds the value of that one dial that would make the modeled fair value equal "
         "the close. 'Plausible' means the needed value is inside the range such a dial normally takes; 'Cannot match "
         "alone' means no value of it closes the gap. A parked item is tried too: a risk can only explain a model "
         "price that is too high, a product one that is too low.")
@@ -5280,7 +5280,7 @@ def render_market_check(result):
                      "do not explain; keep it apart rather than stretching growth to fit it.")
     steps = sensitivities(result)
     if steps:
-        st.caption("One step of each main dial moves the model price by: "
+        st.caption("One step of each main dial moves the modeled fair value by: "
                    + "; ".join(f"{name} {value:+,.2f}" for name, value in steps.items() if np.isfinite(value))
                    + ". Use the table to decide which assumption to look at again, not to fit the model to the "
                      "price: a model tuned until the gap is zero can only ever say the stock is fairly priced.")
@@ -5382,7 +5382,7 @@ def render_model_check(result, inputs, rerun_with):
         changes = pd.DataFrame([{"Setting": row["Label"], "From": shown(row, row["Current"]), "To": shown(row, row["Suggested"]),
                                  "Applies to": row["Applies to"]} for row in proposed.to_dict("records")])
         before, after = latest_values(result), latest_values(rerun_with(suggested_params(result["params"], proposed)))
-        for name, label_text, digits in [("acceptable_pe", "Acceptable P/E", 1), ("model_price", "Model price", 2)]:
+        for name, label_text, digits in [("acceptable_pe", "Acceptable P/E", 1), ("model_price", "Modeled fair value", 2)]:
             changes = pd.concat([changes, pd.DataFrame([{
                 "Setting": f"= {label_text}", "From": f"{before.get(name, np.nan):,.{digits}f}",
                 "To": f"{after.get(name, np.nan):,.{digits}f}", "Applies to": "result today"}])], ignore_index=True)
@@ -5419,7 +5419,7 @@ def render_now_and_forward(result):
 
 
 def render_rate_cases(result):
-    """The model price in a few policy rate cases and their probability-weighted expected value."""
+    """The modeled fair value in a few policy rate cases and their probability-weighted expected value."""
 
     st.markdown("**Rate cases: expected value**")
     if not has_rates(result):
@@ -5447,14 +5447,14 @@ def render_rate_cases(result):
     edited = pd.DataFrame(edited, columns=RATE_CASE_COLUMNS)
     table, expected = rate_cases(result, edited)
     if table.empty:
-        st.caption("No model price yet, so there is nothing to weigh.")
+        st.caption("No modeled fair value yet, so there is nothing to weigh.")
         return
     st.dataframe(table, hide_index=True, width="stretch", column_config={
         column: st.column_config.NumberColumn(format="%.2f")
-        for column in ["Policy rate %", "N-year yield %", "P/E anchor", "Model price", "vs close %"]})
+        for column in ["Policy rate %", "N-year yield %", "P/E anchor", "Modeled fair value", "vs close %"]})
     close = latest_values(result).get("close", np.nan)
     if np.isfinite(expected):
-        st.metric("Expected model price", f"{expected:,.2f}",
+        st.metric("Expected modeled fair value", f"{expected:,.2f}",
                   f"{(expected / close - 1) * 100:+.1f}% vs close" if np.isfinite(close) else None)
 
 
@@ -5468,7 +5468,7 @@ def add_model_candidate(title, url):
 def log_model_change(changes, price_before):
     log = list(st.session_state.get("model_log", []))
     when = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
-    log += [{"When": when, "Change": change, "Model price before": price_before, "Model price after": None}
+    log += [{"When": when, "Change": change, "Modeled fair value before": price_before, "Modeled fair value after": None}
             for change in changes]
     st.session_state["model_log"] = log
 
@@ -5565,11 +5565,11 @@ def render_model_register(result, tracked, candidates, ticker):
     log = pd.DataFrame(st.session_state.get("model_log", []))
     with st.expander(f"Change log ({len(log)})"):
         if log.empty:
-            st.caption("Changes to the register are listed here with the model price before and after.")
+            st.caption("Changes to the register are listed here with the modeled fair value before and after.")
         else:
             st.dataframe(log.iloc[::-1], hide_index=True, width="stretch", column_config={
                 column: st.column_config.NumberColumn(format="%.2f")
-                for column in ["Model price before", "Model price after"]})
+                for column in ["Modeled fair value before", "Modeled fair value after"]})
 
 
 def render_valuation_model():
@@ -5617,12 +5617,12 @@ def render_valuation_model():
     st.caption(model_data_note(inputs.found, params) + (" " + rate_note if rate_note else ""))
 
     price = values.get("model_price", np.nan)
-    # The change log's "after" price is the first model price computed after the change.
+    # The change log's "after" price is the first modeled fair value computed after the change.
     log = st.session_state.get("model_log", [])
     if log and np.isfinite(price):
         for entry in log:
-            if entry["Model price after"] is None:
-                entry["Model price after"] = float(price)
+            if entry["Modeled fair value after"] is None:
+                entry["Modeled fair value after"] = float(price)
     st.session_state["model_last_price"] = float(price) if np.isfinite(price) else None
     if not np.isfinite(price):
         held = values.get("held_eps", np.nan)
@@ -5638,7 +5638,7 @@ def render_valuation_model():
     if warning:
         st.warning("⚠️ " + warning)
     tiles = st.columns(4)
-    tiles[0].metric("Model price per share", f"{price:,.2f}" if np.isfinite(price) else "n/a",
+    tiles[0].metric("Modeled fair value per share", f"{price:,.2f}" if np.isfinite(price) else "n/a",
                     f"{values['residual_pct']:+.1f}% vs close" if np.isfinite(values.get("residual_pct", np.nan)) else None)
     tiles[1].metric("Close", f"{values['close']:,.2f}" if np.isfinite(values.get("close", np.nan)) else "n/a")
     tiles[2].metric("Risk-adjusted EPS", signal_text(values, "risk_adjusted_eps"))
@@ -5659,7 +5659,7 @@ def render_valuation_model():
     st.selectbox("Open a block", blocks, key="model_block", format_func=lambda key: MODEL_BLOCKS[key]["title"])
     render_model_inspector(result, block)
 
-    st.markdown(f"**{ticker} model price against the close, last {years} years**")
+    st.markdown(f"**{ticker} modeled fair value against the close, last {years} years**")
     show_chart(model_price_figure(result, ticker, mobile=MOBILE), width="stretch")
     st.caption(
         "Every day uses only the results released by then, and the P/E anchor of a day ends the day before. The "
@@ -5676,7 +5676,7 @@ def render_valuation_model():
         + "An estimate from stated assumptions, not investment advice.")
     st.markdown(f"**{ticker} price against growth, gross margin and earnings**")
     show_chart(price_and_fundamentals_figure(result, ticker, mobile=MOBILE), width="stretch")
-    st.caption("Close and model price on the left axis; on the right, the revenue growth a year over the growth "
+    st.caption("Close and modeled fair value on the left axis; on the right, the revenue growth a year over the growth "
                "history and the gross margin that feed the fundamental P/E, and the clean trailing earnings as an "
                "index (highest = 100) on the far right, each held from the release it came from. "
                "Without revenue or gross profit (e.g. an ADR reporting in another currency) those lines are missing.")

@@ -1,5 +1,5 @@
 """Pictures of the valuation model (analysis.valuation_model): its block diagram, the signals of one block and the
-model price against the close.
+modeled fair value against the close.
 
 The diagram follows the two sample rates: the quarterly blocks sit in the upper region, the daily blocks in the
 lower one, with a hold block on every signal that crosses. Each block shows its latest output, each wire the value
@@ -93,7 +93,7 @@ def block_summary(block, values):
                                      if np.isfinite(values.get("fundamental_pe", np.nan))
                                      else f"P/E {signal_text(values, 'acceptable_pe')}"),
         "product": lambda: f"{signal_text(values, 'held_eps')} x {signal_text(values, 'acceptable_pe')}",
-        "market_check": lambda: f"Model vs close {signal_text(values, 'residual_pct')}",
+        "market_check": lambda: f"Modeled fair value vs close {signal_text(values, 'residual_pct')}",
         "price": lambda: signal_text(values, "model_price"),
         "market_data": lambda: f"Close {signal_text(values, 'close')}" + (
             f" · rate {signal_text(values, 'policy_rate')}" if np.isfinite(values.get("policy_rate", np.nan)) else ""),
@@ -253,7 +253,7 @@ def model_diagram(result, selected=None, on=None, mobile=False):
           f"{text('forward_gap') if peers_used else text('model_yield')}")
     _wire(fig, [edge("market_data", "bottom"), edge("market_check", "top")], f"close {text('close')}")
     _wire(fig, [edge("product", "bottom"), edge("price", "top")], f"price {text('model_price')}")
-    # The model price branches to the market check.
+    # The modeled fair value branches to the market check.
     branch_y = POSITIONS["market_data"][1] + 0.55
     middle_x = (LEFT + RIGHT) / 2 + 0.15
     fig.add_trace(go.Scatter(x=[LEFT], y=[branch_y], mode="markers", marker=dict(size=7, color=WIRE),
@@ -368,7 +368,7 @@ def block_signals_figure(result, block, mobile=False):
 
 
 def model_price_figure(result, ticker="", mobile=False):
-    """The model's output over time: the model price and its bear-to-bull range against the close, the P/E the
+    """The model's output over time: the modeled fair value and its bear-to-bull range against the close, the P/E the
     market pays for the risk-adjusted EPS against the acceptable P/E, and the gap between model and close."""
 
     daily, quarterly = result["daily"], result["quarterly"]
@@ -376,9 +376,9 @@ def model_price_figure(result, ticker="", mobile=False):
     height = 900
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=(110 if mobile else 80) / height,
                         row_heights=[0.5, 0.25, 0.25],
-                        subplot_titles=[f"{ticker} model price per share and close".strip(),
+                        subplot_titles=[f"{ticker} modeled fair value per share and close".strip(),
                                         "P/E: what the market pays and what the model accepts",
-                                        "Model price vs close, %"])
+                                        "Modeled fair value vs close, %"])
     held = _held(quarterly[[f"eps_{name.lower()}" for name in SCENARIOS]] if not quarterly.empty else pd.DataFrame(
         columns=[f"eps_{name.lower()}" for name in SCENARIOS]), daily.index)
     roll = daily["eps_roll"] if "eps_roll" in daily else 1.0
@@ -390,13 +390,13 @@ def model_price_figure(result, ticker="", mobile=False):
     fig.add_trace(go.Scatter(x=daily.index, y=bear, name="Bear case", mode="lines", fill="tonexty",
                              fillcolor="rgba(65, 105, 225, 0.10)", line=dict(width=0.6, color=SCENARIO_COLORS["Bear"]),
                              hovertemplate="Bear case: %{y:,.2f}<extra></extra>"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=daily.index, y=daily["model_price"], name="Model price", mode="lines",
+    fig.add_trace(go.Scatter(x=daily.index, y=daily["model_price"], name="Modeled fair value", mode="lines",
                              line=dict(width=2, color="royalblue"),
-                             hovertemplate="Model price: %{y:,.2f}<extra></extra>"), row=1, col=1)
+                             hovertemplate="Modeled fair value: %{y:,.2f}<extra></extra>"), row=1, col=1)
     if "now_price" in daily:
-        fig.add_trace(go.Scatter(x=daily.index, y=daily["now_price"], name="Model price, last quarter (no forward assumptions)",
+        fig.add_trace(go.Scatter(x=daily.index, y=daily["now_price"], name="Modeled fair value, last quarter (no forward assumptions)",
                                  mode="lines", line=dict(width=1.2, color="royalblue", dash="dot"),
-                                 hovertemplate="Model price, last quarter: %{y:,.2f}<extra></extra>"), row=1, col=1)
+                                 hovertemplate="Modeled fair value, last quarter: %{y:,.2f}<extra></extra>"), row=1, col=1)
     fig.add_trace(go.Scatter(x=daily.index, y=daily["close"], name="Close", mode="lines",
                              line=dict(width=1.6, color="dimgray"),
                              hovertemplate="Close: %{y:,.2f}<extra></extra>"), row=1, col=1)
@@ -406,9 +406,9 @@ def model_price_figure(result, ticker="", mobile=False):
     fig.add_trace(go.Scatter(x=daily.index, y=daily["acceptable_pe"], name="Acceptable P/E", mode="lines",
                              line=dict(width=1.6, color="goldenrod"),
                              hovertemplate="Acceptable P/E: %{y:.1f}x<extra></extra>"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=daily.index, y=daily["residual_pct"], name="Model vs close", mode="lines",
+    fig.add_trace(go.Scatter(x=daily.index, y=daily["residual_pct"], name="Modeled fair value vs close", mode="lines",
                              line=dict(width=1.4, color="teal"),
-                             hovertemplate="Model vs close: %{y:+.1f}%<extra></extra>"), row=3, col=1)
+                             hovertemplate="Modeled fair value vs close: %{y:+.1f}%<extra></extra>"), row=3, col=1)
     fig.add_hline(y=0, line=dict(color="gray", width=1, dash="dot"), row=3, col=1)
     # A dotted line at every update of the quarterly part that falls in the window.
     if len(daily):
@@ -423,13 +423,13 @@ def model_price_figure(result, ticker="", mobile=False):
 
 
 def price_and_fundamentals_figure(result, ticker="", mobile=False):
-    """Close and model price on the left axis; revenue growth and gross margin (%) on the right; earnings as an
+    """Close and modeled fair value on the left axis; revenue growth and gross margin (%) on the right; earnings as an
     index (highest = 100) on a second right-hand axis. Growth, margin and earnings are held from each release."""
 
     daily = result["daily"]
     fig = go.Figure()
     for name, label, style in [("close", "Close", dict(width=1.6, color="dimgray")),
-                               ("model_price", "Model price", dict(width=2, color="royalblue"))]:
+                               ("model_price", "Modeled fair value", dict(width=2, color="royalblue"))]:
         if name in daily:
             fig.add_trace(go.Scatter(x=daily.index, y=daily[name], name=label, mode="lines", line=style, yaxis="y",
                                      hovertemplate=f"{label}: %{{y:,.2f}}<extra></extra>"))

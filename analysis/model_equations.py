@@ -70,8 +70,8 @@ EQUATIONS = {
         r"\begin{aligned} \text{anchor} = {} & k \times \text{P/E}_{\text{outside}} \\ & + (1 - k) \times \text{P/E}^{r}_{\text{own}} \end{aligned}",
         r"\begin{aligned} \text{P/E}_{\text{acc}} = {} & \operatorname{clip}(\text{anchor} + a - d_q) \\ & \times (1 + p / 100) \end{aligned}",
     ],
-    "product": [r"\text{Model price} = \text{EPS}_{\text{risk}} \times \text{P/E}_{\text{acc}}"],
-    "market_check": [r"\text{Gap} = \left(\frac{\text{Model price}}{\text{Close}} - 1\right) \times 100"],
+    "product": [r"\text{Modeled fair value} = \text{EPS}_{\text{risk}} \times \text{P/E}_{\text{acc}}"],
+    "market_check": [r"\text{Gap} = \left(\frac{\text{Modeled fair value}}{\text{Close}} - 1\right) \times 100"],
 }
 
 # What each symbol stands for, shown under the equations.
