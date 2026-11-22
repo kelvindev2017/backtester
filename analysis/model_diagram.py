@@ -327,6 +327,10 @@ def _signal_trace(result, name, color=None):
         hovertemplate=f"{label}: %{{y:,.2f}}{suffix}<extra></extra>")
 
 
+CHART_HIDDEN = ("cycle_on", "cycle_past_sum", "cycle_years_used")
+CYCLE_SIGNALS = ("next_year_eps", "cycle_eps", "cycle_trend")
+
+
 def block_signals_figure(result, block, mobile=False):
     """Every input and output signal of one block over time: inputs in the upper panels, outputs in the lower ones.
 
@@ -336,9 +340,13 @@ def block_signals_figure(result, block, mobile=False):
 
     spec = BLOCKS[block]
     panels = []
+    quarterly = result["quarterly"]
+    cycle_used = "cycle_on" in quarterly and bool((quarterly["cycle_on"] == 1).any())
+    # Bookkeeping signals stay in the table; the through-cycle lines only show for a stock valued on them.
+    hidden = set(CHART_HIDDEN) | (set() if cycle_used else set(CYCLE_SIGNALS))
     for side, names in [("Input", spec["inputs"]), ("Output", spec["outputs"])]:
         groups = {}
-        for name in names:
+        for name in [name for name in names if name not in hidden]:
             groups.setdefault(SIGNALS[name][3], []).append(name)
         panels += [(side, axis, group) for axis, group in groups.items()]
     if not panels:
@@ -373,8 +381,9 @@ def model_price_figure(result, ticker="", mobile=False):
                                         "Model price vs close, %"])
     held = _held(quarterly[[f"eps_{name.lower()}" for name in SCENARIOS]] if not quarterly.empty else pd.DataFrame(
         columns=[f"eps_{name.lower()}" for name in SCENARIOS]), daily.index)
-    bear = held["eps_bear"].where(held["eps_bear"] > 0) * daily["acceptable_pe"]
-    bull = held["eps_bull"].where(held["eps_bull"] > 0) * daily["acceptable_pe"]
+    roll = daily["eps_roll"] if "eps_roll" in daily else 1.0
+    bear = held["eps_bear"].where(held["eps_bear"] > 0) * roll * daily["acceptable_pe"]
+    bull = held["eps_bull"].where(held["eps_bull"] > 0) * roll * daily["acceptable_pe"]
     fig.add_trace(go.Scatter(x=daily.index, y=bull, name="Bull case", mode="lines",
                              line=dict(width=0.6, color=SCENARIO_COLORS["Bull"]),
                              hovertemplate="Bull case: %{y:,.2f}<extra></extra>"), row=1, col=1)

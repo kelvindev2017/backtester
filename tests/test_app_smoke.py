@@ -1111,7 +1111,7 @@ def test_valuation_model_switches_between_forward_and_trailing_pe(offline, monke
     app.text_input(key="model_ticker").input("NVDA")
     open_tab(app, "Valuation Model")
     assert app.session_state["model_NVDA_pe_basis"] == "Forward"
-    assert app.session_state["model_NVDA_pe_cap"] == 100
+    assert app.session_state["model_NVDA_pe_cap"] == 300
     assert any("forward P/Es" in element.value for element in app.caption)
     app.radio(key="model_NVDA_pe_basis").set_value("Trailing")
     open_tab(app, "Valuation Model")
