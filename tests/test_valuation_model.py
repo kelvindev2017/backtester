@@ -394,16 +394,16 @@ def test_rate_dial_sensitivity_and_cases():
     values = latest_values(result)
     dials = implied_dials(result).set_index("Dial")
     assert "Policy rate" in dials.index and dials.loc["Policy rate", "Block"] == "Rate model"
-    # The model price is above the close here, so the rate that explains the close is higher than today's.
+    # The modeled fair value is above the close here, so the rate that explains the close is higher than today's.
     if values["model_price"] > values["close"]:
         assert dials.loc["Policy rate", "Needed"] > 4.0
     steps = sensitivities(result)
     assert steps["0.5 point higher policy rate"] < 0
     table, expected = rate_cases(result, default_rate_cases(4.0))
     assert table["Policy rate %"].tolist() == [4.0, 4.25, 4.5]
-    assert table["Model price"].iloc[0] == pytest.approx(values["model_price"])
-    assert table["Model price"].is_monotonic_decreasing
-    assert expected == pytest.approx((table["Model price"] * table["Probability %"]).sum() / 100)
+    assert table["Modeled fair value"].iloc[0] == pytest.approx(values["model_price"])
+    assert table["Modeled fair value"].is_monotonic_decreasing
+    assert expected == pytest.approx((table["Modeled fair value"] * table["Probability %"]).sum() / 100)
     # Without a policy rate there is no rate dial and no cases.
     off = run_model(make_quarters(), make_close(make_quarters()), None, model_params(),
                     pd.DataFrame({"AAA": 20.0}, index=make_close(make_quarters()).index))
@@ -427,7 +427,7 @@ def test_now_is_the_chain_without_forward_assumptions():
     assert moved["now_price"] == pytest.approx(values["now_price"]) and moved["model_price"] < values["model_price"]
     table = now_and_forward(hiked).set_index("Step")
     assert table.loc["Policy rate %", "Last quarter"] == 4.0 and table.loc["Policy rate %", "Forward"] == 4.5
-    assert table.loc["Model price", "Change"] == pytest.approx(moved["model_price"] - moved["now_price"])
+    assert table.loc["Modeled fair value", "Change"] == pytest.approx(moved["model_price"] - moved["now_price"])
     # Growth is forward too: the default cases lift the forward EPS above the clean trailing EPS.
     grown = latest_values(rate_run(4.0))
     assert grown["held_eps"] > grown["held_clean_eps"] and grown["now_price"] == pytest.approx(values["now_price"])

@@ -68,9 +68,9 @@ def test_block_charts_split_inputs_and_outputs(result):
 def test_price_chart_has_the_model_the_close_and_the_range(result):
     fig = model_price_figure(result, "TEST")
     names = [trace.name for trace in fig.data]
-    assert names[:5] == ["Bull case", "Bear case", "Model price", "Model price, last quarter (no forward assumptions)", "Close"]
+    assert names[:5] == ["Bull case", "Bear case", "Modeled fair value", "Modeled fair value, last quarter (no forward assumptions)", "Close"]
     assert "Acceptable P/E" in names
-    model = next(trace for trace in fig.data if trace.name == "Model price")
+    model = next(trace for trace in fig.data if trace.name == "Modeled fair value")
     assert np.nanmax(np.asarray(model.y, dtype=float)) == pytest.approx(result["daily"]["model_price"].max())
 
 
@@ -112,7 +112,7 @@ def test_price_against_growth_margin_and_earnings():
     result = run_model(quarters, close, None, model_params({"anchor_source": "Fundamentals", "peer_weight": 1.0}))
     fig = price_and_fundamentals_figure(result, "TEST")
     axes = {trace.name: trace.yaxis for trace in fig.data}
-    assert axes["Close"] == axes["Model price"] == "y"
+    assert axes["Close"] == axes["Modeled fair value"] == "y"
     assert axes["Revenue growth"] == axes["Gross margin"] == "y2"
     assert axes["Earnings (highest = 100)"] == "y3"
     earnings = next(trace for trace in fig.data if trace.name == "Earnings (highest = 100)")

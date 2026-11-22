@@ -1004,13 +1004,13 @@ def test_valuation_model_tab(offline, monkeypatch):
     app.radio(key="model_ASMVY_anchor_source").set_value("Fundamentals")
     open_tab(app, "Valuation Model")
     charts = [chart.proto.spec for chart in app.get("plotly_chart")]
-    # The block diagram, the open block's signals and the model price against the close.
+    # The block diagram, the open block's signals and the modeled fair value against the close.
     assert any("Quarterly rate" in spec and "Risk weighting" in spec and "Price per share" in spec for spec in charts)
     assert any("Output: Risk-adjusted EPS" in spec for spec in charts)
     # A "/" is escaped in the chart's JSON, so "Acceptable P/E" is matched up to the slash.
-    assert any("Model price" in spec and "Acceptable P" in spec and "Bear case" in spec for spec in charts)
+    assert any("Modeled fair value" in spec and "Acceptable P" in spec and "Bear case" in spec for spec in charts)
     labels = [metric.label for metric in app.metric]
-    assert labels[:4] == ["Model price per share", "Close", "Risk-adjusted EPS", "Acceptable P/E"]
+    assert labels[:4] == ["Modeled fair value per share", "Close", "Risk-adjusted EPS", "Acceptable P/E"]
     assert all(metric.value != "n/a" for metric in app.metric[:4])
     assert any(list(frame.value.columns) == ["Dial", "Block", "Current", "Needed", "Change", "Unit", "Read"]
                and "Bear weight" in frame.value["Dial"].tolist() for frame in app.dataframe)
@@ -1024,7 +1024,7 @@ def test_valuation_model_tab(offline, monkeypatch):
                for frame in app.dataframe)
     assert any("Output: Bear EPS" in chart.proto.spec for chart in app.get("plotly_chart"))
 
-    # A parameter changes the model price.
+    # A parameter changes the modeled fair value.
     before = app.metric[0].value
     app.number_input(key="model_ASMVY_weight_bear").set_value(60.0)
     open_tab(app, "Valuation Model")
@@ -1170,9 +1170,9 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     assert any("Policy rate" in frame.value.get("Dial", pd.Series(dtype=str)).tolist() for frame in app.dataframe)
     cases = next(frame.value for frame in app.dataframe if "N-year yield %" in frame.value.columns)
     assert cases["Policy rate %"].tolist() == [4.0, 4.25, 4.5]
-    assert "Expected model price" in [metric.label for metric in app.metric]
+    assert "Expected modeled fair value" in [metric.label for metric in app.metric]
 
-    # Ticking the forward rate starts it at today's rate; a higher forward rate lowers the model price.
+    # Ticking the forward rate starts it at today's rate; a higher forward rate lowers the modeled fair value.
     before = app.metric[0].value
     app.checkbox(key="model_ASMVY_use_forward_rate").check()
     open_tab(app, "Valuation Model")
@@ -1193,7 +1193,7 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     steps = next(frame.value for frame in app.dataframe if list(frame.value.columns) == ["Step", "Last quarter", "Forward", "Change"])
     steps = steps.set_index("Step")
     assert steps.loc["Policy rate %", "Last quarter"] == pytest.approx(4.0) and steps.loc["Policy rate %", "Forward"] == pytest.approx(5.0)
-    assert steps.loc["Model price", "Change"] < 0
+    assert steps.loc["Modeled fair value", "Change"] < 0
     assert any("fwd " in spec and "last Q " in spec for spec in (chart.proto.spec for chart in app.get("plotly_chart")))
     app.selectbox(key="model_block").select("rate_model")
     open_tab(app, "Valuation Model")
