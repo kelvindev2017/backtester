@@ -33,7 +33,7 @@ def test_diagram_shows_every_block_with_its_value_and_both_rates(result):
     for block in BLOCKS.values():
         assert f"<b>{block['title']}</b>" in text, block["title"]
     assert "Quarterly rate" in text and "Daily rate" in text and "<b>Hold</b>" in text
-    assert "<b>Price per share</b><br>261.65" in text and "P/E 18.0x" in text and "1 modelled · 1 parked" in text
+    assert "<b>Price per share</b><br>262.32" in text and "P/E 18.0x" in text and "1 modelled · 1 parked" in text
     # One clickable marker per block, carrying the block's key; the hover lists inputs, outputs and parameters.
     markers = fig.data[-1]
     assert [row[0] for row in markers.customdata] == list(BLOCKS)

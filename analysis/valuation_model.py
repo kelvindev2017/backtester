@@ -84,6 +84,8 @@ DEFAULT_PARAMS = {
     "erp_lookback_years": 2,         # ... the usual premium is the median over this many years of month-ends
     "implied_erp_floor": -2.0,       # ... the implied premium is solved within this floor
     "implied_erp_cap": 20.0,         # ... and this cap, in %
+    "roll_forward_eps": True,
+    "past_base": "EPS trend",        # base growth before the latest release: EPS trend (history rule) or Revenue rule        # next year's EPS rolls forward between releases (the next 12 months, each day)
     "usual_erp_floor": 2.5,          # ... and the usual premium is at least this, % (a bubble's premium is no guide)
     # Through-cycle EPS: a deep-cycle company is valued on its average EPS over a whole cycle, not one year's.
     "cycle_eps": "Auto",             # Auto (when the EPS fell deeply and has no strong trend), On or Off
@@ -154,6 +156,7 @@ SIGNALS = {
     "cycle_on": ("quarterly", "Through-cycle EPS on (1 = yes)", "", "count"),
     "cycle_past_sum": ("quarterly", "Past years' EPS, summed", "", "eps"),
     "cycle_years_used": ("quarterly", "Years in the through-cycle mean", "", "count"),
+    "past_growth": ("quarterly", "Base EPS growth before the latest release (EPS trend)", "%", "percent"),
     "pe_adjust": ("quarterly", "P/E points from general items", "pts", "points"),
     "quality_pe": ("quarterly", "P/E points from earnings quality", "pts", "points"),
     "items_modelled": ("quarterly", "Items in the model", "", "count"),
@@ -166,7 +169,9 @@ SIGNALS = {
     "yield_ref": ("daily", "Model yield, median over the P/E look-back", "%", "rate"),
     "yield_gap": ("daily", "Yield vs the own P/E's look-back", "%", "rate_change"),
     "forward_gap": ("daily", "Yield change from the forward rate", "%", "rate_change"),
-    "held_eps": ("daily", "Risk-adjusted EPS (held)", "", "eps"),
+    "held_eps": ("daily", "Risk-adjusted EPS (rolled forward daily)", "", "eps"),
+    "eps_roll": ("daily", "Roll-forward factor on next year's EPS", "", "count"),
+    "roll_years": ("daily", "Years since the release (roll-forward)", "", "count"),
     "held_pe_adjust": ("daily", "P/E points (held)", "pts", "points"),
     "held_quality_pe": ("daily", "Earnings quality P/E points (held)", "pts", "points"),
     "own_anchor": ("daily", "Own median P/E", "x", "multiple"),
@@ -918,12 +923,31 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     held = inputs.reindex(inputs.index.union(updates)).ffill().reindex(updates) if len(updates) else inputs
     rows = []
     last_release = inputs.index.max() if len(inputs) else None
+    eps_trend = None
+    if params["past_base"] == "EPS trend" and params["manual_eps"] <= 0 and "ttm_eps" in held:
+        ttm = held["ttm_eps"].astype(float)
+        known = inputs["ttm_eps"].astype(float) if "ttm_eps" in inputs else ttm
+        year_ago = known.shift(4).reindex(known.index.union(held.index)).ffill().reindex(held.index)
+        change = (ttm / year_ago.where(year_ago > 0) - 1) * 100
+        eps_trend = (float(params["history_growth_follow"]) * change).clip(
+            lower=float(params["history_growth_floor"]), upper=float(params["history_growth_cap"])).where(ttm > 0)
     for when, row in held.iterrows():
         ttm_eps = params["manual_eps"] if params["manual_eps"] > 0 else row.get("ttm_eps", np.nan)
         events, points = case_effects(routed, when, params)
         forward = last_release is None or when >= last_release
-        point = scenario_point(ttm_eps, row.get("revenue_yoy", np.nan), row.get("net_margin", np.nan), params, events,
-                               forward, row.get("eps_spread", np.nan) if params["manual_eps"] <= 0 else np.nan)
+        row_params, row_forward = params, forward
+        past_growth = eps_trend.get(when, np.nan) if eps_trend is not None else np.nan
+        if not forward and np.isfinite(past_growth):
+            # Before the latest release: the EPS trend known then (the forward P/E history rule), margin held, so a
+            # company whose margins are widening is not cut to its revenue growth.
+            margin = row.get("net_margin", np.nan)
+            row_params = {**params, "forward_growth": past_growth,
+                          "forward_margin": margin if np.isfinite(margin) and margin > 0 else params["fallback_margin"]}
+            row_forward = True
+        point = scenario_point(ttm_eps, row.get("revenue_yoy", np.nan), row.get("net_margin", np.nan), row_params,
+                               events, row_forward,
+                               row.get("eps_spread", np.nan) if params["manual_eps"] <= 0 else np.nan)
+        point["past_growth"] = past_growth if not forward else np.nan
         point["cycle_eps"], point["cycle_trend"], point["cycle_on"] = np.nan, np.nan, 0.0
         point["next_year_eps"], point["cycle_past_sum"] = point.get("risk_adjusted_eps", np.nan), np.nan
         point["cycle_years_used"] = np.nan
@@ -965,6 +989,20 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         daily["held_gross_margin"] = both["gross_margin"] if "gross_margin" in both else np.nan
         daily["held_cycle_on"] = both["cycle_on"].fillna(0.0) if "cycle_on" in both else 0.0
         daily["held_cycle_trend"] = both["cycle_trend"] if "cycle_trend" in both else np.nan
+    # Rolling forward: next year's EPS is the next 12 months from the release. Each day after it the window covers
+    # later months, so the EPS grows at the rate the release set (risk-adjusted EPS over the clean trailing EPS),
+    # instead of jumping once a quarter. Only what was known at the release is used. Through-cycle EPS stays put.
+    daily["eps_roll"], daily["roll_years"] = 1.0, 0.0
+    if params["roll_forward_eps"] and not quarterly.empty and params["manual_eps"] <= 0:
+        since = pd.Series(quarterly.index, index=quarterly.index).reindex(
+            quarterly.index.union(close.index)).ffill().reindex(close.index)
+        years = ((close.index.to_series() - since).dt.days / 365.25).clip(lower=0, upper=1)
+        ratio = (daily["held_eps"] / daily["held_clean_eps"]).where(
+            (daily["held_eps"] > 0) & (daily["held_clean_eps"] > 0))
+        roll = (ratio.clip(0.5, 3.0) ** years).where(daily["held_cycle_on"].astype(float) <= 0)
+        daily["eps_roll"] = roll.fillna(1.0)
+        daily["roll_years"] = years.where(roll.notna(), 0.0)
+        daily["held_eps"] = daily["held_eps"] * daily["eps_roll"]
 
     # Multiple builder. The own anchor is the median trailing P/E of the look-back, up to the day before, so the
     # day's own price does not set its own fair multiple.
@@ -1154,6 +1192,9 @@ def _point_price(state, params, routed):
     point = scenario_point(state["ttm_eps"], state["revenue_yoy"], state["net_margin"], params, events,
                            state.get("forward", True), state.get("eps_spread", np.nan))
     eps = point["risk_adjusted_eps"]
+    years = state.get("roll_years", 0.0)
+    if years > 0 and eps > 0 and point["clean_eps"] > 0:
+        eps = eps * float(np.clip(eps / point["clean_eps"], 0.5, 3.0)) ** years
     if state.get("cycle_on") and np.isfinite(state.get("cycle_past_sum", np.nan)):
         eps = (state["cycle_past_sum"] + eps) / state.get("cycle_years_used", params["cycle_years"])
     if not np.isfinite(eps) or not np.isfinite(state["anchor"]):
@@ -1183,6 +1224,7 @@ def _day_state(result, values, on):
             "cycle_on": bool(values.get("cycle_on", 0) or 0) and result["params"]["manual_eps"] <= 0,
             "cycle_past_sum": values.get("cycle_past_sum", np.nan),
             "cycle_years_used": values.get("cycle_years_used", np.nan),
+            "roll_years": float(day.get("roll_years", 0.0)) if np.isfinite(day.get("roll_years", np.nan)) else 0.0,
             "forward": _is_forward(result, on)}
 
 

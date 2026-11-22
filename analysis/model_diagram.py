@@ -381,8 +381,9 @@ def model_price_figure(result, ticker="", mobile=False):
                                         "Model price vs close, %"])
     held = _held(quarterly[[f"eps_{name.lower()}" for name in SCENARIOS]] if not quarterly.empty else pd.DataFrame(
         columns=[f"eps_{name.lower()}" for name in SCENARIOS]), daily.index)
-    bear = held["eps_bear"].where(held["eps_bear"] > 0) * daily["acceptable_pe"]
-    bull = held["eps_bull"].where(held["eps_bull"] > 0) * daily["acceptable_pe"]
+    roll = daily["eps_roll"] if "eps_roll" in daily else 1.0
+    bear = held["eps_bear"].where(held["eps_bear"] > 0) * roll * daily["acceptable_pe"]
+    bull = held["eps_bull"].where(held["eps_bull"] > 0) * roll * daily["acceptable_pe"]
     fig.add_trace(go.Scatter(x=daily.index, y=bull, name="Bull case", mode="lines",
                              line=dict(width=0.6, color=SCENARIO_COLORS["Bull"]),
                              hovertemplate="Bull case: %{y:,.2f}<extra></extra>"), row=1, col=1)

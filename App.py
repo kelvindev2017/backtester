@@ -4874,6 +4874,16 @@ def model_settings():
             st.caption("Defaults from a forward test on 60 US stocks: set on 2010-2018 results, they scored better than "
                        "the fixed gaps in every year 2019-2025 (outcomes 4 quarters later). The bull/bear adjustments "
                        "in the Forward table are not used in this mode.")
+        params["past_base"] = st.radio(
+            "Base growth before the latest release", ["EPS trend", "Revenue rule"], key=model_param_key("past_base"),
+            horizontal=True,
+            help="EPS trend: the share of the past year's EPS growth below (the forward P/E history rule), net margin "
+                 "held, so a company with widening margins is not cut to its revenue growth. Revenue rule: the auto "
+                 "rule below on revenue growth and margin.")
+        params["roll_forward_eps"] = st.checkbox(
+            "Roll next year's EPS forward each day", key=model_param_key("roll_forward_eps"),
+            help="Next year's EPS is the next 12 months from the release. Each day after it, the window covers later "
+                 "months, so the EPS grows at the rate the release set instead of jumping once a quarter.")
         params["cycle_eps"] = st.radio(
             "Value on through-cycle EPS", ["Auto", "On", "Off"], key=model_param_key("cycle_eps"), horizontal=True,
             help="For a deep-cycle company one year's EPS says little: at the bottom the P/E looks huge, at the top "

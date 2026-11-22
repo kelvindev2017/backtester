@@ -103,13 +103,16 @@ def test_model_price_is_held_eps_times_acceptable_pe():
     daily, quarterly = result["daily"], result["quarterly"]
     last = daily.iloc[-1]
     assert last["peer_anchor"] == pytest.approx(20.0) and last["acceptable_pe"] == pytest.approx(17.0)
-    assert last["held_eps"] == pytest.approx(quarterly["risk_adjusted_eps"].iloc[-1])
+    # Next year's EPS rolls forward from the release at the rate it set.
+    assert last["held_eps"] == pytest.approx(quarterly["risk_adjusted_eps"].iloc[-1] * last["eps_roll"])
+    ratio = quarterly["risk_adjusted_eps"].iloc[-1] / quarterly["clean_eps"].iloc[-1]
+    assert last["eps_roll"] == pytest.approx(ratio ** last["roll_years"]) and last["roll_years"] > 0
     assert last["model_price"] == pytest.approx(last["held_eps"] * 17.0)
     assert last["residual_pct"] == pytest.approx((last["model_price"] / last["close"] - 1) * 100)
     # Between releases the quarterly outputs are held.
     release = quarterly.index[-2]
-    held = daily.loc[release:quarterly.index[-1] - pd.Timedelta(days=1), "held_eps"]
-    assert held.nunique() == 1 and held.iloc[0] == pytest.approx(quarterly.at[release, "risk_adjusted_eps"])
+    held = (daily["held_eps"] / daily["eps_roll"]).loc[release:quarterly.index[-1] - pd.Timedelta(days=1)]
+    assert held.round(9).nunique() == 1 and held.iloc[0] == pytest.approx(quarterly.at[release, "risk_adjusted_eps"])
     # Every signal a block reads or writes exists in the result.
     for block in BLOCKS.values():
         for name in block["inputs"] + block["outputs"]:
@@ -141,7 +144,8 @@ def test_an_item_starts_on_its_date_between_releases():
     assert since in result["quarterly"].index
     before, after = since - pd.Timedelta(days=1), close.index[-1]
     assert result["daily"].loc[:before, "held_eps"].iloc[-1] == pytest.approx(plain["daily"].loc[:before, "held_eps"].iloc[-1])
-    assert result["daily"].at[after, "held_eps"] == pytest.approx(plain["daily"].at[after, "held_eps"] * 0.9)
+    unrolled = lambda run: run["daily"].at[after, "held_eps"] / run["daily"].at[after, "eps_roll"]
+    assert unrolled(result) == pytest.approx(unrolled(plain) * 0.9)
     assert result["quarterly"].at[since, "items_modelled"] == 1
 
 
@@ -781,3 +785,13 @@ def test_usual_premium_has_a_floor():
     assert implied.dropna().iloc[-1] < 2.5 and usual.dropna().min() == pytest.approx(2.5)
     _, free = usual_implied_erp(pe, growth, half, yields, model_params({"usual_erp_floor": np.nan}), 2)
     assert free.dropna().iloc[-1] < 2.5
+
+
+def test_past_quarters_follow_the_eps_trend_and_eps_rolls_forward():
+    quarters = make_quarters()
+    close = make_close(quarters)
+    trend = run_model(quarters, close, None, model_params())
+    revenue = run_model(quarters, close, None, model_params({"past_base": "Revenue rule", "roll_forward_eps": False}))
+    q = trend["quarterly"]
+    assert q["past_growth"].iloc[:-1].notna().any() and np.isnan(q["past_growth"].iloc[-1])
+    assert (revenue["daily"]["eps_roll"] == 1.0).all() and trend["daily"]["eps_roll"].max() > 1.0
