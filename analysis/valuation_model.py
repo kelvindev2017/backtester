@@ -526,7 +526,7 @@ def case_spread(eps_spread, params):
     return share * float(eps_spread) + (1 - share) * typical
 
 
-def through_cycle_eps(past_ttm, forward_eps, clean_share, params):
+def through_cycle_eps(past_ttm, forward_eps, clean_share, params, was_on=False):
     """(through-cycle EPS, its trend growth %, on) for one date.
 
     The yearly figures are the trailing-4-quarter EPS at the latest release and every 4th release before it (the
@@ -554,7 +554,10 @@ def through_cycle_eps(past_ttm, forward_eps, clean_share, params):
         return mean, trend, True
     high = np.maximum.accumulate(values)
     fell = bool((values / high).min() <= 1 - float(params["cycle_fall"]) / 100) if (high > 0).all() else True
-    on = fell and trend < float(params["cycle_trend_cap"])
+    # Hysteresis: once on, it stays on until the trend clears the cap by half again, so a stock near the line does
+    # not flip between bases (and P/Es) from one release to the next.
+    cap = float(params["cycle_trend_cap"]) * (1.5 if was_on else 1.0)
+    on = fell and trend < cap
     return (mean, trend, True) if on else (mean, trend, False)
 
 
@@ -931,6 +934,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         change = (ttm / year_ago.where(year_ago > 0) - 1) * 100
         eps_trend = (float(params["history_growth_follow"]) * change).clip(
             lower=float(params["history_growth_floor"]), upper=float(params["history_growth_cap"])).where(ttm > 0)
+    was_on = False
     for when, row in held.iterrows():
         ttm_eps = params["manual_eps"] if params["manual_eps"] > 0 else row.get("ttm_eps", np.nan)
         events, points = case_effects(routed, when, params)
@@ -953,7 +957,8 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         point["cycle_years_used"] = np.nan
         if params["manual_eps"] <= 0 and "ttm_eps" in inputs:
             cycle, trend, on = through_cycle_eps(inputs["ttm_eps"].loc[:when], point.get("risk_adjusted_eps", np.nan),
-                                                 1 - params["eps_haircut_pct"] / 100, params)
+                                                 1 - params["eps_haircut_pct"] / 100, params, was_on)
+            was_on = on
             point["cycle_eps"], point["cycle_trend"] = cycle, trend
             if on:
                 # Deep cycle: value the average EPS over the cycle; next year's EPS is one of its years.
@@ -1095,7 +1100,8 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
                                          params, params["erp_lookback_years"])[1]
             off_cycle = usual_implied_erp(market_pe.where(~cycle_days), growth, daily["growth_half_life"], now_yield,
                                           params, params["erp_lookback_years"])[1]
-            usual = on_cycle.where(cycle_days, off_cycle)
+            # A basis with no months of its own yet borrows the other's usual premium rather than the beta rule.
+            usual = on_cycle.where(cycle_days, off_cycle).combine_first(usual)
         daily["implied_erp"], daily["usual_erp"] = implied, usual
         base_erp = usual.combine_first(base_erp)
     daily["rule_erp"] = base_erp

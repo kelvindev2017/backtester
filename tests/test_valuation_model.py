@@ -795,3 +795,12 @@ def test_past_quarters_follow_the_eps_trend_and_eps_rolls_forward():
     q = trend["quarterly"]
     assert q["past_growth"].iloc[:-1].notna().any() and np.isnan(q["past_growth"].iloc[-1])
     assert (revenue["daily"]["eps_roll"] == 1.0).all() and trend["daily"]["eps_roll"].max() > 1.0
+
+
+def test_through_cycle_auto_has_hysteresis():
+    # Trend about 12% a year after a deep fall: above the 10% cap when off, but kept on once on (cap x 1.5).
+    past = pd.Series(np.repeat([2.0, 4.0, 8.0, 3.0, 3.5, 4.5], 4))
+    params = model_params({"cycle_eps": "Auto", "cycle_years": 7})
+    _, trend, on = through_cycle_eps(past, 6.0, 1.0, params)
+    assert 10 < trend < 15 and not on
+    assert through_cycle_eps(past, 6.0, 1.0, params, was_on=True)[2]
