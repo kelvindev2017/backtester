@@ -207,6 +207,7 @@ from analysis.what_happened_next import (
 )
 from analysis.valuation_model import (
     BLOCKS as MODEL_BLOCKS,
+    premium_warning,
     PRESETS as MODEL_PRESETS,
     RATE_CASE_COLUMNS,
     DEFAULT_PARAMS as MODEL_DEFAULTS,
@@ -4966,10 +4967,13 @@ def model_settings():
             if params["market_implied_erp"]:
                 params["erp_lookback_years"] = st.select_slider("Usual premium look-back (years)", [1, 2, 3, 5, 10],
                                                                 key=model_param_key("erp_lookback_years"))
+                params["usual_erp_floor_on"] = st.checkbox(
+                    "Floor the usual premium", key=model_param_key("usual_erp_floor_on"),
+                    help="Off (default): the model uses the market's usual premium even when it is tiny or negative, "
+                         "and shows a warning above the results. On: it never goes below the level below.")
                 params["usual_erp_floor"] = number(
-                    "usual_erp_floor", "Usual premium at least (%)", 0, 8, 0.25,
-                    "When the market has priced the stock at a tiny premium (a run-up such as PLTR's in 2025), the "
-                    "model uses this floor instead of copying it. 2.5% matches the floor of the beta rule.")
+                    "usual_erp_floor", "Floor, or warning level when off (%)", 0, 8, 0.25,
+                    "2.5% matches the floor of the beta rule. Below it, the price rests on a story-driven valuation.")
             params["erp_from_beta"] = st.checkbox(
                 "Risk premium from beta", key=model_param_key("erp_from_beta"),
                 help="The risk premium times the stock's adjusted beta to the S&P 500 (0.67 x raw + 0.33; SPY, "
@@ -5595,12 +5599,18 @@ def render_valuation_model():
                 entry["Model price after"] = float(price)
     st.session_state["model_last_price"] = float(price) if np.isfinite(price) else None
     if not np.isfinite(price):
+        held = values.get("held_eps", np.nan)
         st.warning(
             f"The model has no price for {ticker}: " + (
                 "there is no P/E anchor yet (add peers, or wait for more price history)."
-                if np.isfinite(values.get("held_eps", np.nan)) and values.get("held_eps", 0) > 0 else
+                if np.isfinite(held) and held > 0 else
+                "its risk-adjusted EPS is a loss, and a P/E cannot value a loss."
+                if np.isfinite(held) else
                 "it needs four quarters of reported EPS, and Yahoo has fewer. Type a trailing EPS under Earnings "
                 "quality in the settings to run it."))
+    warning = premium_warning(values, result["params"])
+    if warning:
+        st.warning("⚠️ " + warning)
     tiles = st.columns(4)
     tiles[0].metric("Model price per share", f"{price:,.2f}" if np.isfinite(price) else "n/a",
                     f"{values['residual_pct']:+.1f}% vs close" if np.isfinite(values.get("residual_pct", np.nan)) else None)

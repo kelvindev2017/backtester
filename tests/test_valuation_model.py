@@ -781,9 +781,10 @@ def test_usual_premium_has_a_floor():
     yields = pd.Series(4.5, index=days)
     # A market P/E of 300 implies a tiny premium; the usual one is held at the floor.
     pe = pd.Series(300.0, index=days)
-    implied, usual = usual_implied_erp(pe, growth, half, yields, model_params(), 2)
+    implied, usual = usual_implied_erp(pe, growth, half, yields, model_params({"usual_erp_floor_on": True}), 2)
     assert implied.dropna().iloc[-1] < 2.5 and usual.dropna().min() == pytest.approx(2.5)
-    _, free = usual_implied_erp(pe, growth, half, yields, model_params({"usual_erp_floor": np.nan}), 2)
+    # Off by default: the market's own premium is used (and flagged in the tab).
+    _, free = usual_implied_erp(pe, growth, half, yields, model_params(), 2)
     assert free.dropna().iloc[-1] < 2.5
 
 
@@ -804,3 +805,13 @@ def test_through_cycle_auto_has_hysteresis():
     _, trend, on = through_cycle_eps(past, 6.0, 1.0, params)
     assert 10 < trend < 15 and not on
     assert through_cycle_eps(past, 6.0, 1.0, params, was_on=True)[2]
+
+
+def test_premium_warning_flags_a_low_or_negative_usual_premium():
+    from analysis.valuation_model import premium_warning
+    params = model_params({"anchor_source": "Fundamentals"})
+    assert premium_warning({"pe_erp": 4.0, "implied_erp": 3.0, "now_yield": 4.5}, params) is None
+    assert "only 1.00%" in premium_warning({"pe_erp": 1.0, "implied_erp": 3.0, "now_yield": 4.5}, params)
+    text = premium_warning({"pe_erp": -0.5, "implied_erp": -0.5, "now_yield": 4.5}, params)
+    assert "negative (-0.50%)" in text and "lower premium than the model can solve" in text
+    assert premium_warning({"pe_erp": -0.5}, model_params({"anchor_source": "Peers"})) is None

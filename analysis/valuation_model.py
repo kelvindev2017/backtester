@@ -86,7 +86,8 @@ DEFAULT_PARAMS = {
     "implied_erp_cap": 20.0,         # ... and this cap, in %
     "roll_forward_eps": True,
     "past_base": "EPS trend",        # base growth before the latest release: EPS trend (history rule) or Revenue rule        # next year's EPS rolls forward between releases (the next 12 months, each day)
-    "usual_erp_floor": 2.5,          # ... and the usual premium is at least this, % (a bubble's premium is no guide)
+    "usual_erp_floor_on": False,     # ... floor the usual premium (off: the market's premium is used, even negative,
+    "usual_erp_floor": 2.5,          # ... and flagged when below this level), %
     # Through-cycle EPS: a deep-cycle company is valued on its average EPS over a whole cycle, not one year's.
     "cycle_eps": "Auto",             # Auto (when the EPS fell deeply and has no strong trend), On or Off
     "cycle_years": 7,                # ... the average of this many yearly EPS figures (the past years + next year)
@@ -276,7 +277,8 @@ BLOCKS = {
                 "equity_premium": "Fundamental P/E: equity risk premium %",
                 "market_implied_erp": "Fundamental P/E: use the market's usual implied risk premium (1 = yes)",
                 "erp_lookback_years": "Fundamental P/E: look-back for the usual implied premium, years",
-                "usual_erp_floor": "Fundamental P/E: floor on the usual implied premium, %",
+                "usual_erp_floor_on": "Fundamental P/E: floor the usual implied premium (1 = yes)",
+                "usual_erp_floor": "Fundamental P/E: floor (or flag level) for the usual implied premium, %",
                 "base_yield": "Fundamental P/E: yield without rate data %",
                 "terminal_growth": "Fundamental P/E: growth after the growth years %",
                 "growth_half_life_min": "Fundamental P/E: growth half-life at a low gross margin, years",
@@ -852,7 +854,7 @@ def usual_implied_erp(market_pe, growth, half_life, yields, params, lookback_yea
                         for day in ends], index=pd.DatetimeIndex(ends.values), dtype=float)
     months = max(1, int(round(12 * float(lookback_years))))
     usual = values.shift(1).rolling(months, min_periods=min(months, 12)).median()
-    if np.isfinite(params.get("usual_erp_floor", np.nan)):
+    if params.get("usual_erp_floor_on", True) and np.isfinite(params.get("usual_erp_floor", np.nan)):
         usual = usual.clip(lower=float(params["usual_erp_floor"]))
     on_day = lambda series: series.reindex(series.index.union(days)).ffill().reindex(days)
     return on_day(values), on_day(usual)
@@ -1732,3 +1734,31 @@ def now_and_forward(result, on=None):
     frame = frame[frame[["Last quarter", "Forward"]].notna().any(axis=1)].reset_index(drop=True)
     frame["Change"] = frame["Forward"] - frame["Last quarter"]
     return frame
+
+
+def premium_warning(values, params):
+    """A plain warning when the risk premium the model uses is below the flag level or negative, or when today's
+    close lies beyond the lowest premium the model can solve; None otherwise."""
+
+    params = model_params(params)
+    if not (params["market_implied_erp"] and params["anchor_source"] == "Fundamentals"):
+        return None
+    used, today = values.get("pe_erp", np.nan), values.get("implied_erp", np.nan)
+    level, yield_pct = float(params["usual_erp_floor"]), values.get("now_yield", np.nan)
+    notes = []
+    if np.isfinite(used) and used < level:
+        if used < 0:
+            notes.append(f"The risk premium the market has usually asked of this stock is negative ({used:.2f}%): "
+                         "investors have accepted a return below the Treasury yield"
+                         + (f" ({yield_pct:.2f}%)" if np.isfinite(yield_pct) else "") + ".")
+            notes.append("The model follows it, so its price rests on the market's story, not on the earnings "
+                         "alone.")
+        else:
+            notes.append(f"The risk premium the market has usually asked of this stock is only {used:.2f}%, below "
+                         f"{level:g}%: the market prices it richly, and the model follows.")
+    low = max(float(params["implied_erp_floor"]), params["terminal_growth"] + 1.0 - (
+        yield_pct if np.isfinite(yield_pct) else params["base_yield"]))
+    if np.isfinite(today) and today <= low + 1e-6:
+        notes.append("Today's close needs an even lower premium than the model can solve (the required return "
+                     "would fall to the long-run growth rate): what is left shows as market premium.")
+    return " ".join(notes) or None
