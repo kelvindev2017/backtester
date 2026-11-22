@@ -774,17 +774,14 @@ def test_market_implied_premium_respects_the_usual_market_pe_and_passes_rate_cha
     assert risen["acceptable_pe"] < steady["acceptable_pe"]
 
 
-def test_usual_premium_has_a_floor():
+def test_usual_premium_follows_the_market_even_below_zero():
     from analysis.valuation_model import usual_implied_erp
     days = pd.bdate_range("2023-01-02", "2026-11-20")
     growth, half = pd.Series(40.0, index=days), pd.Series(2.0, index=days)
     yields = pd.Series(4.5, index=days)
-    # A market P/E of 300 implies a tiny premium; the usual one is held at the floor.
-    pe = pd.Series(300.0, index=days)
-    implied, usual = usual_implied_erp(pe, growth, half, yields, model_params(), 2)
-    assert implied.dropna().iloc[-1] < 2.5 and usual.dropna().min() == pytest.approx(2.5)
-    _, free = usual_implied_erp(pe, growth, half, yields, model_params({"usual_erp_floor": np.nan}), 2)
-    assert free.dropna().iloc[-1] < 2.5
+    # A market P/E of 300 implies a tiny premium, and the usual one follows it: no floor.
+    _, usual = usual_implied_erp(pd.Series(300.0, index=days), growth, half, yields, model_params(), 2)
+    assert usual.dropna().iloc[-1] < 2.5
 
 
 def test_past_quarters_follow_the_eps_trend_and_eps_rolls_forward():
@@ -795,3 +792,22 @@ def test_past_quarters_follow_the_eps_trend_and_eps_rolls_forward():
     q = trend["quarterly"]
     assert q["past_growth"].iloc[:-1].notna().any() and np.isnan(q["past_growth"].iloc[-1])
     assert (revenue["daily"]["eps_roll"] == 1.0).all() and trend["daily"]["eps_roll"].max() > 1.0
+
+
+def test_through_cycle_auto_has_hysteresis():
+    # Trend about 12% a year after a deep fall: above the 10% cap when off, but kept on once on (cap x 1.5).
+    past = pd.Series(np.repeat([2.0, 4.0, 8.0, 3.0, 3.5, 4.5], 4))
+    params = model_params({"cycle_eps": "Auto", "cycle_years": 7})
+    _, trend, on = through_cycle_eps(past, 6.0, 1.0, params)
+    assert 10 < trend < 15 and not on
+    assert through_cycle_eps(past, 6.0, 1.0, params, was_on=True)[2]
+
+
+def test_premium_warning_flags_a_low_or_negative_usual_premium():
+    from analysis.valuation_model import premium_warning
+    params = model_params({"anchor_source": "Fundamentals"})
+    assert premium_warning({"pe_erp": 4.0, "implied_erp": 3.0, "now_yield": 4.5}, params) is None
+    assert "only 1.00%" in premium_warning({"pe_erp": 1.0, "implied_erp": 3.0, "now_yield": 4.5}, params)
+    text = premium_warning({"pe_erp": -0.5, "implied_erp": -0.5, "now_yield": 4.5}, params)
+    assert "negative (-0.50%)" in text and "lower premium than the model can solve" in text
+    assert premium_warning({"pe_erp": -0.5}, model_params({"anchor_source": "Peers"})) is None

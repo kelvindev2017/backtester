@@ -62,7 +62,7 @@ EQUATIONS = {
         r"h = \max(h_{GM},\ h_{\text{steady}})",
         r"\text{Beta rule: ERP} = \operatorname{clip}\big(\text{ERP}_0 \times \operatorname{clip}(0.67 \beta + 0.33,\ 0.5,\ 1.8),\ 2.5,\ 8\big)",
         r"\text{Market-implied (default): } \text{P/E}_{\text{fund}}(\text{ERP}^{*}_m) = \frac{\text{Close}_m}{\text{EPS}_{\text{risk}, m}} \text{ at each month-end } m",
-        r"\text{ERP} = \max\!\big(\text{ERP}_{\min},\ \operatorname{median}_{\text{look-back}}(\text{ERP}^{*}_m)\big)",
+        r"\text{ERP} = \operatorname{median}_{\text{look-back}}\big(\text{ERP}^{*}_m\big)",
         r"\ln(1 + g_t) = \ln(1 + g_T) + \big(\ln(1 + g) - \ln(1 + g_T)\big)\, 0.5^{t/h}",
         r"E_1 = 1, \quad E_{t+1} = E_t (1 + g_t)",
         r"\text{P/E}_{\text{fund}} = \sum_{t=1}^{40} \frac{E_t}{(1+r)^t} + \frac{E_{41}}{(r - g_T)(1+r)^{40}}, \qquad r = y_N + \text{ERP}",
@@ -104,7 +104,7 @@ SYMBOLS = {
                         "growth history (within floor and cap), GM: gross margin %, h: half-life in years of the growth above g_T (longer with "
                         "a higher gross margin, or with steady growth: h_steady runs from the low half-life for choppy growth to the steady "
                         "half-life), g_T: terminal growth, y_N: the Rate model's yield (or the base yield), ERP: equity risk premium, ERP_0 the "
-                        "plain one, β: the stock's 3-year weekly beta to the S&P 500 (when beta scaling is on); ERP*_m: the premium at which the fundamental P/E equals the market's P/E on that month-end (solved within the floor and cap); with the market-implied premium on, the ERP is its median over the look-back months before the day, at least ERP_min (2.5% by default, so a run-up's tiny premium is not copied), so a change in the yield moves the P/E as the market usually prices it, and the gap to the close says how far today's premium strays from the usual one; from the latest release g, h and "
+                        "plain one, β: the stock's 3-year weekly beta to the S&P 500 (when beta scaling is on); ERP*_m: the premium at which the fundamental P/E equals the market's P/E on that month-end (solved within the floor and cap); with the market-implied premium on, the ERP is its median over the look-back months before the day, even when negative (the tab warns when it is below 2.5%), so a change in the yield moves the P/E as the market usually prices it, and the gap to the close says how far today's premium strays from the usual one; from the latest release g, h and "
                         "ERP are your forward values where set. "
                         "p: your market premium % (kept apart from the fundamentals). x: own or peers, Δy_x: yield change from the Rate model, t: share of it passed to the P/E "
                         "(the earnings yield 1/P/E moves point for point with the required return). k: share of the anchor from peers, P/E peers and own: their medians over the look-back, "

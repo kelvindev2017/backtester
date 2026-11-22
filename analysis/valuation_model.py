@@ -86,7 +86,7 @@ DEFAULT_PARAMS = {
     "implied_erp_cap": 20.0,         # ... and this cap, in %
     "roll_forward_eps": True,
     "past_base": "EPS trend",        # base growth before the latest release: EPS trend (history rule) or Revenue rule        # next year's EPS rolls forward between releases (the next 12 months, each day)
-    "usual_erp_floor": 2.5,          # ... and the usual premium is at least this, % (a bubble's premium is no guide)
+    "erp_flag_level": 2.5,           # ... the market's premium is used even when negative; below this % it is flagged
     # Through-cycle EPS: a deep-cycle company is valued on its average EPS over a whole cycle, not one year's.
     "cycle_eps": "Auto",             # Auto (when the EPS fell deeply and has no strong trend), On or Off
     "cycle_years": 7,                # ... the average of this many yearly EPS figures (the past years + next year)
@@ -276,7 +276,6 @@ BLOCKS = {
                 "equity_premium": "Fundamental P/E: equity risk premium %",
                 "market_implied_erp": "Fundamental P/E: use the market's usual implied risk premium (1 = yes)",
                 "erp_lookback_years": "Fundamental P/E: look-back for the usual implied premium, years",
-                "usual_erp_floor": "Fundamental P/E: floor on the usual implied premium, %",
                 "base_yield": "Fundamental P/E: yield without rate data %",
                 "terminal_growth": "Fundamental P/E: growth after the growth years %",
                 "growth_half_life_min": "Fundamental P/E: growth half-life at a low gross margin, years",
@@ -526,7 +525,7 @@ def case_spread(eps_spread, params):
     return share * float(eps_spread) + (1 - share) * typical
 
 
-def through_cycle_eps(past_ttm, forward_eps, clean_share, params):
+def through_cycle_eps(past_ttm, forward_eps, clean_share, params, was_on=False):
     """(through-cycle EPS, its trend growth %, on) for one date.
 
     The yearly figures are the trailing-4-quarter EPS at the latest release and every 4th release before it (the
@@ -554,7 +553,10 @@ def through_cycle_eps(past_ttm, forward_eps, clean_share, params):
         return mean, trend, True
     high = np.maximum.accumulate(values)
     fell = bool((values / high).min() <= 1 - float(params["cycle_fall"]) / 100) if (high > 0).all() else True
-    on = fell and trend < float(params["cycle_trend_cap"])
+    # Hysteresis: once on, it stays on until the trend clears the cap by half again, so a stock near the line does
+    # not flip between bases (and P/Es) from one release to the next.
+    cap = float(params["cycle_trend_cap"]) * (1.5 if was_on else 1.0)
+    on = fell and trend < cap
     return (mean, trend, True) if on else (mean, trend, False)
 
 
@@ -849,8 +851,6 @@ def usual_implied_erp(market_pe, growth, half_life, yields, params, lookback_yea
                         for day in ends], index=pd.DatetimeIndex(ends.values), dtype=float)
     months = max(1, int(round(12 * float(lookback_years))))
     usual = values.shift(1).rolling(months, min_periods=min(months, 12)).median()
-    if np.isfinite(params.get("usual_erp_floor", np.nan)):
-        usual = usual.clip(lower=float(params["usual_erp_floor"]))
     on_day = lambda series: series.reindex(series.index.union(days)).ffill().reindex(days)
     return on_day(values), on_day(usual)
 
@@ -931,6 +931,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         change = (ttm / year_ago.where(year_ago > 0) - 1) * 100
         eps_trend = (float(params["history_growth_follow"]) * change).clip(
             lower=float(params["history_growth_floor"]), upper=float(params["history_growth_cap"])).where(ttm > 0)
+    was_on = False
     for when, row in held.iterrows():
         ttm_eps = params["manual_eps"] if params["manual_eps"] > 0 else row.get("ttm_eps", np.nan)
         events, points = case_effects(routed, when, params)
@@ -953,7 +954,8 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         point["cycle_years_used"] = np.nan
         if params["manual_eps"] <= 0 and "ttm_eps" in inputs:
             cycle, trend, on = through_cycle_eps(inputs["ttm_eps"].loc[:when], point.get("risk_adjusted_eps", np.nan),
-                                                 1 - params["eps_haircut_pct"] / 100, params)
+                                                 1 - params["eps_haircut_pct"] / 100, params, was_on)
+            was_on = on
             point["cycle_eps"], point["cycle_trend"] = cycle, trend
             if on:
                 # Deep cycle: value the average EPS over the cycle; next year's EPS is one of its years.
@@ -1095,7 +1097,8 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
                                          params, params["erp_lookback_years"])[1]
             off_cycle = usual_implied_erp(market_pe.where(~cycle_days), growth, daily["growth_half_life"], now_yield,
                                           params, params["erp_lookback_years"])[1]
-            usual = on_cycle.where(cycle_days, off_cycle)
+            # A basis with no months of its own yet borrows the other's usual premium rather than the beta rule.
+            usual = on_cycle.where(cycle_days, off_cycle).combine_first(usual)
         daily["implied_erp"], daily["usual_erp"] = implied, usual
         base_erp = usual.combine_first(base_erp)
     daily["rule_erp"] = base_erp
@@ -1726,3 +1729,31 @@ def now_and_forward(result, on=None):
     frame = frame[frame[["Last quarter", "Forward"]].notna().any(axis=1)].reset_index(drop=True)
     frame["Change"] = frame["Forward"] - frame["Last quarter"]
     return frame
+
+
+def premium_warning(values, params):
+    """A plain warning when the risk premium the model uses is below the flag level or negative, or when today's
+    close lies beyond the lowest premium the model can solve; None otherwise."""
+
+    params = model_params(params)
+    if not (params["market_implied_erp"] and params["anchor_source"] == "Fundamentals"):
+        return None
+    used, today = values.get("pe_erp", np.nan), values.get("implied_erp", np.nan)
+    level, yield_pct = float(params["erp_flag_level"]), values.get("now_yield", np.nan)
+    notes = []
+    if np.isfinite(used) and used < level:
+        if used < 0:
+            notes.append(f"The risk premium the market has usually asked of this stock is negative ({used:.2f}%): "
+                         "investors have accepted a return below the Treasury yield"
+                         + (f" ({yield_pct:.2f}%)" if np.isfinite(yield_pct) else "") + ".")
+            notes.append("The model follows it, so its price rests on the market's story, not on the earnings "
+                         "alone.")
+        else:
+            notes.append(f"The risk premium the market has usually asked of this stock is only {used:.2f}%, below "
+                         f"{level:g}%: the market prices it richly, and the model follows.")
+    low = max(float(params["implied_erp_floor"]), params["terminal_growth"] + 1.0 - (
+        yield_pct if np.isfinite(yield_pct) else params["base_yield"]))
+    if np.isfinite(today) and today <= low + 1e-6:
+        notes.append("Today's close needs an even lower premium than the model can solve (the required return "
+                     "would fall to the long-run growth rate): what is left shows as market premium.")
+    return " ".join(notes) or None
