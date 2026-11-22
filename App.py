@@ -208,6 +208,7 @@ from analysis.what_happened_next import (
 from analysis.valuation_model import (
     BLOCKS as MODEL_BLOCKS,
     premium_warning,
+    split_adjusted_shares,
     PRESETS as MODEL_PRESETS,
     RATE_CASE_COLUMNS,
     DEFAULT_PARAMS as MODEL_DEFAULTS,
@@ -1162,6 +1163,7 @@ def load_yahoo_quarterly_fundamentals(symbol):
         )
         gross_profit = extract_statement_row(income_statement, ["Gross Profit"])
         cost_of_revenue = extract_statement_row(income_statement, ["Cost Of Revenue", "Reconciled Cost Of Revenue"])
+        shares = extract_statement_row(income_statement, ["Diluted Average Shares", "Basic Average Shares"])
         capex = extract_statement_row(
             cash_flow_statement,
             [
@@ -1186,6 +1188,7 @@ def load_yahoo_quarterly_fundamentals(symbol):
         result["Net_Income"] = net_income.reindex(all_dates)
         result["Gross_Profit"] = gross_profit.reindex(all_dates).combine_first(
             revenue.reindex(all_dates) - cost_of_revenue.reindex(all_dates))
+        result["Shares"] = shares.reindex(all_dates)
 
         # If Yahoo omits total expenses, derive it as revenue minus operating income.
         derived_total_expense = revenue.reindex(all_dates) - operating_income.reindex(all_dates)
@@ -1289,6 +1292,23 @@ def get_sec_fact_entries(company_facts, tag):
 
     us_gaap_facts = company_facts.get("facts", {}).get("us-gaap", {})
     return us_gaap_facts.get(tag, {}).get("units", {}).get("USD", [])
+
+
+def extract_sec_quarterly_shares(company_facts):
+    """Diluted weighted average shares of each fiscal quarter (3-month periods only; an annual average says nothing
+    about the fourth quarter), by quarter end."""
+
+    us_gaap_facts = company_facts.get("facts", {}).get("us-gaap", {})
+    values = {}
+    for tag in ["WeightedAverageNumberOfDilutedSharesOutstanding", "WeightedAverageNumberOfSharesOutstandingBasic"]:
+        for entry in us_gaap_facts.get(tag, {}).get("units", {}).get("shares", []):
+            start, end = pd.to_datetime(entry.get("start"), errors="coerce"), pd.to_datetime(entry.get("end"), errors="coerce")
+            value = pd.to_numeric(entry.get("val"), errors="coerce")
+            if pd.isna(start) or pd.isna(end) or pd.isna(value) or value <= 0 or not 60 <= (end - start).days <= 100:
+                continue
+            if not any(abs((end - known).days) <= 14 for known in values):
+                values[end] = float(value)
+    return pd.Series(values, dtype=float).sort_index()
 
 
 def combine_sec_tags(company_facts, candidate_tags, extract):
@@ -1591,6 +1611,7 @@ def load_sec_quarterly_fundamentals(symbol):
             company_facts,
             [
                 "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "RevenueFromContractWithCustomerIncludingAssessedTax",
                 "SalesRevenueNet",
                 # Banks report net revenue (after interest expense) here.
                 "RevenuesNetOfInterestExpense",
@@ -1623,6 +1644,7 @@ def load_sec_quarterly_fundamentals(symbol):
         gross_profit = extract_sec_fiscal_quarters(company_facts, ["GrossProfit"])
         cost_of_revenue = extract_sec_fiscal_quarters(
             company_facts, ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"])
+        shares = extract_sec_quarterly_shares(company_facts)
 
         all_dates = revenue.index.union(operating_expense.index)
         all_dates = all_dates.union(total_expense.index).union(capex.index)
@@ -1639,6 +1661,9 @@ def load_sec_quarterly_fundamentals(symbol):
         result["Net_Income"] = net_income.reindex(all_dates)
         result["Gross_Profit"] = gross_profit.reindex(all_dates).combine_first(
             revenue.reindex(all_dates) - cost_of_revenue.reindex(all_dates))
+        # Share counts reported a few days off the quarter end land on the nearest quarter.
+        result["Shares"] = (shares.reindex(all_dates, method="nearest", tolerance=pd.Timedelta(days=14))
+                            if len(shares) else np.nan)
 
         derived_total_expense = (
             revenue.reindex(all_dates) - operating_income.reindex(all_dates)
@@ -1658,7 +1683,7 @@ def load_quarterly_fundamentals(
     symbol,
     start_date_str,
     end_date_str,
-    cache_version="2026-11-20-v7",
+    cache_version="2026-11-22-v8",
 ):
     """Combine long SEC history with recent Yahoo Finance statements."""
 
@@ -5102,10 +5127,18 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing",
     release_dates = pd.DatetimeIndex(released.index) if len(released) else pd.DatetimeIndex([])
     eps_dates = pd.DatetimeIndex(eps.index) if len(eps) else pd.DatetimeIndex([])
     quarters = pd.DataFrame(index=release_dates.union(eps_dates))
-    for column in ["Revenue", "Net_Income", "Gross_Profit"]:
+    for column in ["Revenue", "Net_Income", "Gross_Profit", "Shares"]:
         if column in released:
             quarters[column] = released[column]
     quarters["EPS"] = eps
+    if "Shares" in quarters and quarters["Shares"].notna().any():
+        # EPS from Yahoo is on today's split basis; put the share counts on it too.
+        try:
+            splits = yf.Ticker(ADR_HOME_LISTINGS[ticker][0] if home is not None else ticker).splits
+        except Exception:
+            splits = None
+        adjusted = split_adjusted_shares(quarters["Shares"], splits)
+        quarters["Shares"] = adjusted.reindex(quarters.index)
     forward = pe_basis == "Forward"
     # Analysts' EPS growth (next four quarters over the last four) is needed for the base case on either basis.
     if home is not None:
