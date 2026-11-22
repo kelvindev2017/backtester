@@ -4967,13 +4967,6 @@ def model_settings():
             if params["market_implied_erp"]:
                 params["erp_lookback_years"] = st.select_slider("Usual premium look-back (years)", [1, 2, 3, 5, 10],
                                                                 key=model_param_key("erp_lookback_years"))
-                params["usual_erp_floor_on"] = st.checkbox(
-                    "Floor the usual premium", key=model_param_key("usual_erp_floor_on"),
-                    help="Off (default): the model uses the market's usual premium even when it is tiny or negative, "
-                         "and shows a warning above the results. On: it never goes below the level below.")
-                params["usual_erp_floor"] = number(
-                    "usual_erp_floor", "Floor, or warning level when off (%)", 0, 8, 0.25,
-                    "2.5% matches the floor of the beta rule. Below it, the price rests on a story-driven valuation.")
             params["erp_from_beta"] = st.checkbox(
                 "Risk premium from beta", key=model_param_key("erp_from_beta"),
                 help="The risk premium times the stock's adjusted beta to the S&P 500 (0.67 x raw + 0.33; SPY, "

@@ -86,8 +86,7 @@ DEFAULT_PARAMS = {
     "implied_erp_cap": 20.0,         # ... and this cap, in %
     "roll_forward_eps": True,
     "past_base": "EPS trend",        # base growth before the latest release: EPS trend (history rule) or Revenue rule        # next year's EPS rolls forward between releases (the next 12 months, each day)
-    "usual_erp_floor_on": False,     # ... floor the usual premium (off: the market's premium is used, even negative,
-    "usual_erp_floor": 2.5,          # ... and flagged when below this level), %
+    "erp_flag_level": 2.5,           # ... the market's premium is used even when negative; below this % it is flagged
     # Through-cycle EPS: a deep-cycle company is valued on its average EPS over a whole cycle, not one year's.
     "cycle_eps": "Auto",             # Auto (when the EPS fell deeply and has no strong trend), On or Off
     "cycle_years": 7,                # ... the average of this many yearly EPS figures (the past years + next year)
@@ -277,8 +276,6 @@ BLOCKS = {
                 "equity_premium": "Fundamental P/E: equity risk premium %",
                 "market_implied_erp": "Fundamental P/E: use the market's usual implied risk premium (1 = yes)",
                 "erp_lookback_years": "Fundamental P/E: look-back for the usual implied premium, years",
-                "usual_erp_floor_on": "Fundamental P/E: floor the usual implied premium (1 = yes)",
-                "usual_erp_floor": "Fundamental P/E: floor (or flag level) for the usual implied premium, %",
                 "base_yield": "Fundamental P/E: yield without rate data %",
                 "terminal_growth": "Fundamental P/E: growth after the growth years %",
                 "growth_half_life_min": "Fundamental P/E: growth half-life at a low gross margin, years",
@@ -854,8 +851,6 @@ def usual_implied_erp(market_pe, growth, half_life, yields, params, lookback_yea
                         for day in ends], index=pd.DatetimeIndex(ends.values), dtype=float)
     months = max(1, int(round(12 * float(lookback_years))))
     usual = values.shift(1).rolling(months, min_periods=min(months, 12)).median()
-    if params.get("usual_erp_floor_on", True) and np.isfinite(params.get("usual_erp_floor", np.nan)):
-        usual = usual.clip(lower=float(params["usual_erp_floor"]))
     on_day = lambda series: series.reindex(series.index.union(days)).ffill().reindex(days)
     return on_day(values), on_day(usual)
 
@@ -1744,7 +1739,7 @@ def premium_warning(values, params):
     if not (params["market_implied_erp"] and params["anchor_source"] == "Fundamentals"):
         return None
     used, today = values.get("pe_erp", np.nan), values.get("implied_erp", np.nan)
-    level, yield_pct = float(params["usual_erp_floor"]), values.get("now_yield", np.nan)
+    level, yield_pct = float(params["erp_flag_level"]), values.get("now_yield", np.nan)
     notes = []
     if np.isfinite(used) and used < level:
         if used < 0:
