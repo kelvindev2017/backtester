@@ -131,7 +131,7 @@ SIGNALS = {
     "net_income": ("quarterly", "Quarterly net income", "", "amount"),
     "eps": ("quarterly", "Quarterly reported EPS", "", "eps"),
     "ttm_revenue": ("quarterly", "Revenue, last 4 quarters", "", "amount"),
-    "revenue_yoy": ("quarterly", "Revenue growth, year on year", "%", "percent"),
+    "revenue_yoy": ("quarterly", "Revenue per share growth, year on year", "%", "percent"),
     "net_margin": ("quarterly", "Net margin, last 4 quarters", "%", "share"),
     "gross_margin": ("quarterly", "Gross margin, last 4 quarters", "%", "share"),
     "revenue_cagr": ("quarterly", "Revenue growth a year over the growth history", "%", "percent"),
@@ -176,10 +176,10 @@ SIGNALS = {
     "held_quality_pe": ("daily", "Earnings quality P/E points (held)", "pts", "points"),
     "own_anchor": ("daily", "Own median P/E", "x", "multiple"),
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
-    "held_cagr": ("daily", "Revenue growth a year over the growth history (held)", "%", "percent"),
+    "held_cagr": ("daily", "Revenue per share growth a year over the growth history (held)", "%", "percent"),
     "held_gross_margin": ("daily", "Gross margin, last 4 quarters (held)", "%", "share"),
     "growth_half_life": ("daily", "Half-life of the extra growth, years (gross margin and steadiness)", "", "count"),
-    "held_yoy": ("daily", "Revenue growth, latest year (held)", "%", "percent"),
+    "held_yoy": ("daily", "Revenue per share growth, latest year (held)", "%", "percent"),
     "held_growth_spread": ("daily", "How much the yearly growth varies, points (held)", "", "count"),
     "beta": ("daily", "Beta to the market, 3 years weekly (raw)", "", "count"),
     "implied_erp": ("daily", "Risk premium the close implies (month-end)", "%", "percent"),
@@ -604,8 +604,48 @@ def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, f
 
 
 def _trailing(series, periods=4):
+    """Sum of the last ``periods`` quarters, only where they are consecutive (spanning under about a year): a gap in
+    the data must not make four quarters out of several years."""
+
     series = pd.to_numeric(series, errors="coerce").dropna()
-    return series.rolling(periods, min_periods=periods).sum()
+    total = series.rolling(periods, min_periods=periods).sum()
+    if len(series) < periods or not isinstance(series.index, pd.DatetimeIndex):
+        return total
+    dates = pd.Series(series.index, index=series.index)
+    span = (dates - dates.shift(periods - 1)).dt.days
+    return total.where(span <= int(periods * 92 + 30))
+
+
+def split_adjusted_shares(shares, splits):
+    """Share counts on today's split basis. ``splits`` maps a split date to its ratio (2 for 2-for-1). Filings often
+    keep the old count for quarters before a split; each split multiplies those earlier counts by its ratio, but only
+    when the count really jumps across it (about the ratio), so counts a filing already restated are left alone."""
+
+    shares = pd.to_numeric(pd.Series(shares, dtype=float), errors="coerce").dropna().sort_index()
+    if shares.empty or splits is None or len(splits) == 0:
+        return shares
+    for day, ratio in pd.Series(splits, dtype=float).sort_index().items():
+        if not np.isfinite(ratio) or ratio <= 0 or abs(ratio - 1) < 0.05:
+            continue
+        day = pd.Timestamp(day).tz_localize(None) if pd.Timestamp(day).tzinfo else pd.Timestamp(day)
+        before, after = shares[shares.index < day], shares[shares.index >= day]
+        if before.empty or after.empty:
+            continue
+        jump = after.iloc[0] / before.iloc[-1]
+        if abs(np.log(jump / ratio)) < np.log(1.25):
+            shares.loc[before.index] = before * ratio
+    return shares
+
+
+def _year_ago(series, periods=4):
+    """The value ``periods`` entries back, only where it is about a year earlier (300 to 430 days)."""
+
+    earlier = series.shift(periods)
+    if not isinstance(series.index, pd.DatetimeIndex):
+        return earlier
+    dates = pd.Series(series.index, index=series.index)
+    gap = (dates - dates.shift(periods)).dt.days
+    return earlier.where((gap >= 300) & (gap <= 430))
 
 
 def quarterly_inputs(quarters, growth_years=3):
@@ -628,8 +668,22 @@ def quarterly_inputs(quarters, growth_years=3):
 
     revenue, net_income, eps = column("Revenue"), column("Net_Income"), column("EPS")
     ttm_revenue, ttm_income = _trailing(revenue), _trailing(net_income)
-    yoy = (ttm_revenue / ttm_revenue.shift(4).where(ttm_revenue.shift(4) > 0) - 1) * 100
-    quarter_yoy = (revenue / revenue.shift(4).where(revenue.shift(4) > 0) - 1) * 100
+    # Growth is per share: a company that doubles its revenue by buying another one with new shares has not
+    # doubled what each share earns. The share count is the quarter's diluted average, held when a quarter lacks it.
+    shares = column("Shares")
+    if len(shares) >= 4:
+        # Quarters before the first reported count take the earliest one, so the series never mixes bases.
+        held_shares = shares.reindex(shares.index.union(revenue.index)).ffill().bfill()
+        # Each quarter's revenue over that quarter's shares, then summed, so a share issue mid-year counts only
+        # from the quarter it happened.
+        growth_quarter = revenue / held_shares.reindex(revenue.index)
+        growth_revenue = _trailing(growth_quarter)
+    else:
+        growth_revenue, growth_quarter = ttm_revenue, revenue
+    growth_revenue, growth_quarter = growth_revenue.dropna(), growth_quarter.dropna()
+    before, quarter_before = _year_ago(growth_revenue), _year_ago(growth_quarter)
+    yoy = (growth_revenue / before.where(before > 0) - 1) * 100
+    quarter_yoy = (growth_quarter / quarter_before.where(quarter_before > 0) - 1) * 100
     yoy = yoy.combine_first(quarter_yoy)
     margin = (ttm_income.reindex(ttm_revenue.index) / ttm_revenue.where(ttm_revenue > 0)) * 100
     ttm_gross = _trailing(column("Gross_Profit"))
@@ -637,8 +691,8 @@ def quarterly_inputs(quarters, growth_years=3):
     # Yearly growth over the growth history; fewer years when the history is shorter (at least one).
     cagr = pd.Series(np.nan, index=ttm_revenue.index, dtype=float)
     for years in range(max(1, int(growth_years)), 0, -1):
-        earlier = ttm_revenue.shift(4 * years)
-        ratio = ttm_revenue / earlier.where(earlier > 0)
+        earlier = growth_revenue.shift(4 * years)
+        ratio = growth_revenue / earlier.where(earlier > 0)
         cagr = cagr.combine_first((ratio.where(ratio > 0) ** (1 / years) - 1) * 100)
     frame["revenue"], frame["net_income"], frame["eps"] = revenue, net_income, eps
     ttm_eps = _trailing(eps)

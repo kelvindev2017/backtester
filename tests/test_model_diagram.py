@@ -56,7 +56,7 @@ def test_block_charts_split_inputs_and_outputs(result):
     titles = [annotation.text for annotation in fig.layout.annotations]
     assert titles[0].startswith("Input: Clean base EPS") and any(title.startswith("Output: Bear EPS") for title in titles)
     names = [trace.name for trace in fig.data]
-    assert {"Bear EPS", "Base EPS", "Bull EPS", "Revenue growth, year on year"} <= set(names)
+    assert {"Bear EPS", "Base EPS", "Bull EPS", "Revenue per share growth, year on year"} <= set(names)
     # Quarterly signals are held between updates, so they are drawn as steps.
     assert all(trace.line.shape == "hv" for trace in fig.data)
     daily = block_signals_figure(result, "multiple_builder")

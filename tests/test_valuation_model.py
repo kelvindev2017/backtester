@@ -811,3 +811,21 @@ def test_premium_warning_flags_a_low_or_negative_usual_premium():
     text = premium_warning({"pe_erp": -0.5, "implied_erp": -0.5, "now_yield": 4.5}, params)
     assert "negative (-0.50%)" in text and "lower premium than the model can solve" in text
     assert premium_warning({"pe_erp": -0.5}, model_params({"anchor_source": "Peers"})) is None
+
+
+def test_growth_is_per_share_over_consecutive_quarters_and_split_adjusted():
+    from analysis.valuation_model import quarterly_inputs, split_adjusted_shares
+    ends = pd.date_range("2023-03-31", periods=12, freq="QE")
+    # Revenue doubles in 2025 by an all-share deal that doubles the shares: no growth per share.
+    revenue = pd.Series([100.0] * 8 + [200.0] * 4, index=ends)
+    shares = pd.Series([10.0] * 8 + [20.0] * 4, index=ends)
+    frame = quarterly_inputs(pd.DataFrame({"Revenue": revenue, "Shares": shares, "EPS": 1.0}))
+    assert frame["revenue_yoy"].iloc[-1] == pytest.approx(0.0)
+    assert quarterly_inputs(pd.DataFrame({"Revenue": revenue, "EPS": 1.0}))["revenue_yoy"].iloc[-1] == pytest.approx(100.0)
+    # A gap in the data: four reported quarters spread over years give no trailing sum.
+    gappy = revenue.drop(ends[3:7])
+    assert np.isnan(quarterly_inputs(pd.DataFrame({"Revenue": gappy, "EPS": 1.0}))["ttm_revenue"].loc[ends[7]])
+    # A 10-for-1 split: earlier counts are put on today's basis; a deal's share issue is left alone.
+    counts = pd.Series([2.5, 2.5, 25.0, 25.0], index=ends[:4])
+    assert split_adjusted_shares(counts, {ends[1] + pd.Timedelta(days=10): 10.0}).tolist() == [25.0] * 4
+    assert split_adjusted_shares(shares, {ends[7] + pd.Timedelta(days=10): 10.0}).tolist() == shares.tolist()
