@@ -1616,6 +1616,8 @@ def load_sec_quarterly_fundamentals(symbol):
                 # Banks report net revenue (after interest expense) here.
                 "RevenuesNetOfInterestExpense",
                 "Revenues",
+                # Last resort: goods-only revenue (Coca-Cola before 2018 used no other tag).
+                "SalesRevenueGoodsNet",
             ],
         )
         operating_expense = extract_sec_fiscal_quarters(

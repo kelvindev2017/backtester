@@ -617,11 +617,17 @@ def _trailing(series, periods=4):
 
 
 def split_adjusted_shares(shares, splits):
-    """Share counts on today's split basis. ``splits`` maps a split date to its ratio (2 for 2-for-1). Filings often
+    """Share counts on today's split basis and one unit scale. ``splits`` maps a split date to its ratio (2 for 2-for-1). Filings often
     keep the old count for quarters before a split; each split multiplies those earlier counts by its ratio, but only
     when the count really jumps across it (about the ratio), so counts a filing already restated are left alone."""
 
     shares = pd.to_numeric(pd.Series(shares, dtype=float), errors="coerce").dropna().sort_index()
+    shares = shares[shares > 0]
+    if len(shares):
+        # Some filings state the count in thousands or millions (4,306 for 4.306 billion): put every count on the
+        # scale of the typical one, in steps of 1,000.
+        steps = np.round(np.log10(shares.median() / shares) / 3)
+        shares = shares * 1000.0 ** steps
     if shares.empty or splits is None or len(splits) == 0:
         return shares
     for day, ratio in pd.Series(splits, dtype=float).sort_index().items():
