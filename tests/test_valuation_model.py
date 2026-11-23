@@ -829,3 +829,13 @@ def test_growth_is_per_share_over_consecutive_quarters_and_split_adjusted():
     counts = pd.Series([2.5, 2.5, 25.0, 25.0], index=ends[:4])
     assert split_adjusted_shares(counts, {ends[1] + pd.Timedelta(days=10): 10.0}).tolist() == [25.0] * 4
     assert split_adjusted_shares(shares, {ends[7] + pd.Timedelta(days=10): 10.0}).tolist() == shares.tolist()
+
+
+def test_share_counts_filed_in_millions_are_put_on_one_scale():
+    from analysis.valuation_model import split_adjusted_shares
+    ends = pd.date_range("2018-03-31", periods=6, freq="QE")
+    # KO's older filings state 4,306 (millions) next to 4.305e9 in later ones.
+    counts = pd.Series([4306.0, 4290.0, 4295.0, 4.305e9, 4.321e9, 4.325e9], index=ends)
+    fixed = split_adjusted_shares(counts, None)
+    assert fixed.iloc[:3].tolist() == pytest.approx([4.306e9, 4.29e9, 4.295e9])
+    assert fixed.iloc[3:].tolist() == counts.iloc[3:].tolist()
