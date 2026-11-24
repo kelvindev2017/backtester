@@ -987,10 +987,24 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     if params["past_base"] == "EPS trend" and params["manual_eps"] <= 0 and "ttm_eps" in held:
         ttm = held["ttm_eps"].astype(float)
         known = inputs["ttm_eps"].astype(float) if "ttm_eps" in inputs else ttm
-        year_ago = known.shift(4).reindex(known.index.union(held.index)).ffill().reindex(held.index)
+        recovery = float(params["history_recovery"])
+        # Normal EPS: the average of the last 3 years (12 releases) as known on each release.
+        normal_known = known.rolling(12, min_periods=8).mean()
+        reference = known.shift(4)
+        if recovery > 0:
+            # A rebound is measured from the normal level a year ago, not from the slump, so the climb back out of
+            # a one-off dip is not projected forward as growth.
+            reference = pd.concat([reference, normal_known.shift(4)], axis=1).max(axis=1, skipna=False).fillna(reference)
+        year_ago = reference.reindex(known.index.union(held.index)).ffill().reindex(held.index)
         change = (ttm / year_ago.where(year_ago > 0) - 1) * 100
         eps_trend = (float(params["history_growth_follow"]) * change).clip(
             lower=float(params["history_growth_floor"]), upper=float(params["history_growth_cap"])).where(ttm > 0)
+        if recovery > 0:
+            # Below its normal level, a share of the gap is expected back (the forward P/E history rule's recovery
+            # view), so a one-off slump (a pandemic quarter) is not projected forward as a trend.
+            normal = normal_known.reindex(normal_known.index.union(held.index)).ffill().reindex(held.index)
+            back = (recovery * (normal / ttm - 1) * 100).where((normal > ttm) & (ttm > 0))
+            eps_trend = pd.concat([eps_trend, back], axis=1).max(axis=1, skipna=True).where(ttm > 0)
     was_on = False
     for when, row in held.iterrows():
         ttm_eps = params["manual_eps"] if params["manual_eps"] > 0 else row.get("ttm_eps", np.nan)
