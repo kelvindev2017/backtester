@@ -1,0 +1,68 @@
+name: Log guidance and analyst estimates
+
+# Every weekday evening (after the US close): Yahoo's analyst estimates as they stand that day and the outlook
+# sentences of new 8-K earnings releases, appended to CSV files on the data-log branch. Kept off main so the logs
+# survive app updates and reboots and do not redeploy the app. Pull requests touching the logger do a dry run.
+on:
+  schedule:
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/log_guidance.py
+      - .github/workflows/log_guidance.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: log-guidance
+  cancel-in-progress: false
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Dry run (pull request)
+        if: github.event_name == 'pull_request'
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: python scripts/log_guidance.py dry-run --tickers BSX,NVDA,KO,LLY,TSM --days 120
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request'
+        with:
+          name: guidance-dry-run
+          path: dry-run/
+      - name: Check out the log branch
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "guidance-log"
+          git config user.email "guidance-log@users.noreply.github.com"
+          if git fetch origin data-log; then
+            git worktree add log origin/data-log
+            git -C log switch -c data-log
+          else
+            git worktree add --detach log
+            git -C log switch --orphan data-log
+            printf "# Logs\n\nWritten daily by .github/workflows/log_guidance.yml (scripts/log_guidance.py).\n" > log/README.md
+          fi
+      - name: Log
+        if: github.event_name != 'pull_request'
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: python scripts/log_guidance.py log
+      - name: Commit and push
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          cd log
+          git add -A
+          if git diff --cached --quiet; then echo "nothing new"; exit 0; fi
+          git commit -q -m "Log $(date -u +%F)"
+          for attempt in 1 2 3 4; do git push origin data-log && break; sleep $((attempt * 10)); done
