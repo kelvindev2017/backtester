@@ -64,8 +64,12 @@ def yahoo_rows(ticker, today):
         for period, values in frame.iterrows():
             for field, value in values.items():
                 if pd.notna(value):
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        value = str(value)  # e.g. the currency of the estimates
                     rows.append({"date": today, "ticker": ticker, "table": table, "period": str(period),
-                                 "field": str(field), "value": float(value)})
+                                 "field": str(field), "value": value})
     return rows
 
 
