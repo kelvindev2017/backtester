@@ -839,3 +839,19 @@ def test_share_counts_filed_in_millions_are_put_on_one_scale():
     fixed = split_adjusted_shares(counts, None)
     assert fixed.iloc[:3].tolist() == pytest.approx([4.306e9, 4.29e9, 4.295e9])
     assert fixed.iloc[3:].tolist() == counts.iloc[3:].tolist()
+
+
+def test_a_one_off_slump_is_not_projected_forward():
+    # Flat EPS of 1 a quarter, one quarter at 0.2 (a pandemic quarter), then back to 1.
+    quarters = make_quarters(count=24, growth=0.0)
+    eps = np.ones(24)
+    eps[12] = 0.2
+    quarters["EPS"] = eps
+    close = make_close(quarters)
+    with_recovery = run_model(quarters, close, None, model_params())["quarterly"]["past_growth"]
+    without = run_model(quarters, close, None, model_params({"history_recovery": 0.0}))["quarterly"]["past_growth"]
+    slump, rebound = quarters.index[13], quarters.index[17]
+    # In the slump: the old rule projects the fall forward; the recovery view expects part of the gap back.
+    assert without.loc[slump] < 0 < with_recovery.loc[slump]
+    # Climbing back out: growth is measured from the normal level, not from the dip.
+    assert without.loc[rebound] > 10 and abs(with_recovery.loc[rebound]) < 5
