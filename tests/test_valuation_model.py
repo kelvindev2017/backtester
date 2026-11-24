@@ -896,3 +896,13 @@ def test_pe_growth_can_use_the_latest_quarter():
     year = run_model(quarters, close, None, model_params({**base, "pe_growth_latest": "4 quarters"}))
     assert quarter["daily"]["rule_growth"].iloc[-1] == pytest.approx(20.0, abs=0.5)
     assert year["daily"]["rule_growth"].iloc[-1] == pytest.approx(5.0, abs=0.5)
+
+
+def test_growth_history_is_set_in_quarters():
+    from analysis.valuation_model import quarterly_inputs
+    quarters = make_quarters(count=24, growth=0.0)
+    quarters["Revenue"] = 100 * 1.1 ** (np.arange(len(quarters)) / 4)  # 10% a year, steadily
+    for count in (4, 6, 12):
+        assert quarterly_inputs(quarters, count)["revenue_cagr"].iloc[-1] == pytest.approx(10.0, abs=0.01)
+    # Settings saved as years still work.
+    assert model_params({"growth_history_years": 2})["growth_history_quarters"] == 8

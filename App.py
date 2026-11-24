@@ -4573,7 +4573,7 @@ def model_box_value(name, value):
 
     if isinstance(value, (str, bool)):
         return value
-    return int(value) if name in ("pe_lookback_years", "yield_years", "growth_history_years", "erp_lookback_years", "cycle_years") else float(value)
+    return int(value) if name in ("pe_lookback_years", "yield_years", "growth_history_quarters", "erp_lookback_years", "cycle_years") else float(value)
 
 
 def fill_missing_model_boxes(ticker):
@@ -4975,8 +4975,11 @@ def model_settings():
         params["peer_weight"] = number("peer_weight", "Share of the anchor from the outside view", 0, 1, 0.05,
                                        "The rest comes from the stock's own P/E history.")
         if params["anchor_source"] == "Fundamentals":
-            params["growth_history_years"] = st.select_slider("Growth history (years)", [1, 2, 3, 5],
-                                                              key=model_param_key("growth_history_years"))
+            params["growth_history_quarters"] = st.select_slider(
+                "Growth history (quarters)", list(range(4, 21)) + [24, 28, 32, 40],
+                key=model_param_key("growth_history_quarters"),
+                help="The yearly revenue growth per share between the last 4 quarters and the 4 quarters ending this "
+                     "many quarters earlier. 4: the last 4 quarters vs the 4 before; 12: over 3 years.")
             params["pe_growth_latest"] = st.radio(
                 "Latest growth", ["Latest quarter", "4 quarters"], key=model_param_key("pe_growth_latest"),
                 horizontal=True,
