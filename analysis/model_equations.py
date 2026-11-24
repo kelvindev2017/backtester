@@ -57,7 +57,7 @@ EQUATIONS = {
         r"\Delta y_{\text{peers}} = y_N(r_f) - y_N(r_{\text{today}})",
     ],
     "multiple_builder": [
-        r"g = s_g \times g_{\text{latest year}} + (1 - s_g) \times g_{\text{history}}",
+        r"g = s_g \times g_{\text{latest}} + (1 - s_g) \times g_{\text{history}}",
         r"h_{GM} = h_{\min} + (h_{\max} - h_{\min}) \times \operatorname{clip}\!\left(\frac{GM - GM_{\text{low}}}{GM_{\text{high}} - GM_{\text{low}}}, 0, 1\right)",
         r"h = \max(h_{GM},\ h_{\text{steady}})",
         r"\text{Beta rule: ERP} = \operatorname{clip}\big(\text{ERP}_0 \times \operatorname{clip}(0.67 \beta + 0.33,\ 0.5,\ 1.8),\ 2.5,\ 8\big)",
@@ -101,7 +101,8 @@ SYMBOLS = {
                   "surprise, because the peers' P/E is today's and already prices today's rate.",
     "multiple_builder": "Outside view: P/E_fund (default) or the peers' median P/E (moved by the forward rate's yield change "
                         "like the own one). g: growth for the P/E %, s_g: share from the latest revenue growth (latest quarter vs a year ago, or the last 4 quarters vs the 4 before, per the Latest growth setting), g_history: revenue growth a year over the "
-                        "growth history (within floor and cap), GM: gross margin %, h: half-life in years of the growth above g_T (longer with "
+                        "growth history, (TTM revenue per share now / TTM N quarters earlier)^(4/N) - 1 with N the Growth history "
+                        "(quarters) setting (within floor and cap), GM: gross margin %, h: half-life in years of the growth above g_T (longer with "
                         "a higher gross margin, or with steady growth: h_steady runs from the low half-life for choppy growth to the steady "
                         "half-life), g_T: terminal growth, y_N: the Rate model's yield (or the base yield), ERP: equity risk premium, ERP_0 the "
                         "plain one, β: the stock's 3-year weekly beta to the S&P 500 (when beta scaling is on); ERP*_m: the premium at which the fundamental P/E equals the market's P/E on that month-end (solved within the floor and cap); with the market-implied premium on, the ERP is its median over the look-back months before the day, even when negative (the tab warns when it is below 2.5%), so a change in the yield moves the P/E as the market usually prices it, and the gap to the close says how far today's premium strays from the usual one; from the latest release g, h and "

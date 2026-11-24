@@ -63,7 +63,7 @@ DEFAULT_PARAMS = {
     "pe_lookback_years": 5,
     "peer_weight": 1.0,          # share of the P/E anchor from the outside view (fundamentals or peers); rest: own median
     "anchor_source": "Fundamentals",  # the outside view: Fundamentals (growth, gross margin, yield) or Peers' median P/E
-    "growth_history_years": 3,   # fundamental P/E: revenue growth = the yearly growth (CAGR) over this many years
+    "growth_history_quarters": 12,  # fundamental P/E: revenue growth = the yearly growth (CAGR) over this many quarters
     "fund_growth_cap": 300.0,    # ... kept within this cap (high: some companies grow over 100% a year)
     "fund_growth_floor": -50.0,  # ... and floor, in %
     "equity_premium": 4.5,       # ... required return = N-year yield + this, in %
@@ -275,7 +275,7 @@ BLOCKS = {
         params={"pe_lookback_years": "Own P/E look-back, years",
                 "peer_weight": "Share of the anchor from the outside view (rest: own P/E history)",
                 "anchor_source": "Outside view: Fundamentals or Peers",
-                "growth_history_years": "Fundamental P/E: growth history, years",
+                "growth_history_quarters": "Fundamental P/E: growth history, quarters",
                 "fund_growth_cap": "Fundamental P/E: growth cap %", "fund_growth_floor": "Fundamental P/E: growth floor %",
                 "equity_premium": "Fundamental P/E: equity risk premium %",
                 "market_implied_erp": "Fundamental P/E: use the market's usual implied risk premium (1 = yes)",
@@ -346,7 +346,10 @@ def model_params(overrides=None):
     """The default parameters with ``overrides`` on top; unknown keys are ignored."""
 
     params = dict(DEFAULT_PARAMS)
-    for key, value in (overrides or {}).items():
+    overrides = dict(overrides or {})
+    if "growth_history_years" in overrides and "growth_history_quarters" not in overrides:
+        overrides["growth_history_quarters"] = 4 * int(overrides.pop("growth_history_years"))  # settings saved before
+    for key, value in overrides.items():
         if key in params and value is not None:
             params[key] = value
     return params
@@ -666,7 +669,7 @@ def _year_ago(series, periods=4):
     return earlier.where((gap >= 300) & (gap <= 430))
 
 
-def quarterly_inputs(quarters, growth_years=3):
+def quarterly_inputs(quarters, growth_quarters=12):
     """Income and cost map: trailing revenue, its growth and the net margin at each release date.
 
     ``quarters`` is indexed by the date each quarter became public, with any of the columns Revenue, Net_Income and
@@ -706,12 +709,13 @@ def quarterly_inputs(quarters, growth_years=3):
     margin = (ttm_income.reindex(ttm_revenue.index) / ttm_revenue.where(ttm_revenue > 0)) * 100
     ttm_gross = _trailing(column("Gross_Profit"))
     gross_margin = (ttm_gross.reindex(ttm_revenue.index) / ttm_revenue.where(ttm_revenue > 0)) * 100
-    # Yearly growth over the growth history; fewer years when the history is shorter (at least one).
+    # Yearly growth over the growth history: the last 4 quarters against the 4 quarters ending N quarters earlier,
+    # made a yearly rate. Fewer quarters when the history is shorter (at least 4).
     cagr = pd.Series(np.nan, index=ttm_revenue.index, dtype=float)
-    for years in range(max(1, int(growth_years)), 0, -1):
-        earlier = growth_revenue.shift(4 * years)
+    for count in range(max(4, int(growth_quarters)), 3, -1):
+        earlier = growth_revenue.shift(count)
         ratio = growth_revenue / earlier.where(earlier > 0)
-        cagr = cagr.combine_first((ratio.where(ratio > 0) ** (1 / years) - 1) * 100)
+        cagr = cagr.combine_first((ratio.where(ratio > 0) ** (4 / count) - 1) * 100)
     frame["revenue"], frame["net_income"], frame["eps"] = revenue, net_income, eps
     ttm_eps = _trailing(eps)
     log_eps = np.log(ttm_eps.where(ttm_eps > 0))
@@ -975,7 +979,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     close = pd.to_numeric(close, errors="coerce").dropna().sort_index()
     close = close.loc[~close.index.duplicated(keep="last")]
     routed = route_items(register, params)
-    inputs = quarterly_inputs(quarters, params["growth_history_years"])
+    inputs = quarterly_inputs(quarters, params["growth_history_quarters"])
     params["analyst_base"] = False
     if (params["base_eps_source"] == "Analysts" and analyst_growth is not None and np.isfinite(analyst_growth)
             and len(inputs)):
