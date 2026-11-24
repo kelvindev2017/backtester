@@ -5269,8 +5269,10 @@ def render_market_check(result):
         f"The modeled fair value is {abs(values['residual_pct']):.0f}% {'above' if above else 'below'} the close. Each row "
         "holds everything else as it is and finds the value of that one dial that would make the modeled fair value equal "
         "the close. 'Plausible' means the needed value is inside the range such a dial normally takes; 'Cannot match "
-        "alone' means no value of it closes the gap. A parked item is tried too: a risk can only explain a model "
-        "price that is too high, a product one that is too low.")
+        "alone' means no value of it closes the gap. The P/E is plausible within a third below to half above the stock's "
+        "own usual P/E, and is searched past your P/E cap ('Beyond your cap'). With through-cycle EPS, bear weight, "
+        "growth and margin only move next year's share of the cycle average ('Little effect'). A parked item is "
+        "tried too: a risk can only explain a modeled fair value that is too high, a product one that is too low.")
     st.dataframe(dials, hide_index=True, width="stretch", column_config={
         column: st.column_config.NumberColumn(format="%.1f") for column in ["Current", "Needed", "Change"]})
     implied, applied = values.get("implied_premium_pct", np.nan), values.get("premium_pct", 0.0)

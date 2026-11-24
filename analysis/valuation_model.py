@@ -92,6 +92,7 @@ DEFAULT_PARAMS = {
     "cycle_years": 7,                # ... the average of this many yearly EPS figures (the past years + next year)
     "cycle_fall": 50.0,              # ... Auto: the EPS fell at least this % below an earlier high in those years
     "cycle_trend_cap": 10.0,         # ... Auto: and its trend growth is below this % a year
+    "cycle_revenue_fall": 15.0,      # ... Auto: and revenue fell at least this % from a high (a cycle, not a margin squeeze)
     # Forward view of the P/E (latest quarter on; NaN = the historical value) and a premium kept apart from it.
     "forward_pe_growth": np.nan,      # growth the fundamental P/E rests on, %
     "forward_half_life": np.nan,      # years for half of the extra growth to fade
@@ -525,14 +526,16 @@ def case_spread(eps_spread, params):
     return share * float(eps_spread) + (1 - share) * typical
 
 
-def through_cycle_eps(past_ttm, forward_eps, clean_share, params, was_on=False):
+def through_cycle_eps(past_ttm, forward_eps, clean_share, params, was_on=False, past_revenue=None):
     """(through-cycle EPS, its trend growth %, on) for one date.
 
     The yearly figures are the trailing-4-quarter EPS at the latest release and every 4th release before it (the
     past ``cycle_years`` - 1 years, at least 3, after the haircut) and next year's risk-adjusted EPS. The through-cycle EPS is
     their mean; the trend is the log-linear growth through them (0 when any is not positive). Auto turns it on when
     a figure fell at least ``cycle_fall`` % below an earlier high and the trend is below ``cycle_trend_cap``: a
-    deep cycle, where one year's EPS says little about the next five. Off, or too little history: (NaN, NaN, False).
+    deep cycle, where one year's EPS says little about the next five. Auto also needs trailing revenue
+    (``past_revenue``) to have fallen ``cycle_revenue_fall`` % below a high over those years: EPS falling on flat revenue
+    is a margin squeeze, not a cycle. Without revenue that test is skipped. Off, or too little history: (NaN, NaN, False).
     """
 
     mode = str(params.get("cycle_eps", "Off"))
@@ -556,7 +559,13 @@ def through_cycle_eps(past_ttm, forward_eps, clean_share, params, was_on=False):
     # Hysteresis: once on, it stays on until the trend clears the cap by half again, so a stock near the line does
     # not flip between bases (and P/Es) from one release to the next.
     cap = float(params["cycle_trend_cap"]) * (1.5 if was_on else 1.0)
-    on = fell and trend < cap
+    revenue_fell = True
+    if past_revenue is not None and not was_on:
+        revenue = pd.to_numeric(pd.Series(past_revenue), errors="coerce").dropna()
+        revenue = revenue[revenue > 0].iloc[-(4 * (years - 1) + 1):]
+        if len(revenue) >= 8:
+            revenue_fell = bool((revenue / revenue.cummax()).min() <= 1 - float(params.get("cycle_revenue_fall", 15)) / 100)
+    on = fell and revenue_fell and trend < cap
     return (mean, trend, True) if on else (mean, trend, False)
 
 
@@ -1028,7 +1037,9 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         point["cycle_years_used"] = np.nan
         if params["manual_eps"] <= 0 and "ttm_eps" in inputs:
             cycle, trend, on = through_cycle_eps(inputs["ttm_eps"].loc[:when], point.get("risk_adjusted_eps", np.nan),
-                                                 1 - params["eps_haircut_pct"] / 100, params, was_on)
+                                                 1 - params["eps_haircut_pct"] / 100, params, was_on,
+                                                 inputs["ttm_revenue"].loc[:when]
+                                                 if "ttm_revenue" in inputs else None)
             was_on = on
             point["cycle_eps"], point["cycle_trend"] = cycle, trend
             if on:
@@ -1410,9 +1421,22 @@ def implied_dials(result, on=None):
         lambda haircut: _point_price(state, {**params, "eps_haircut_pct": haircut}, routed))
     events, points = case_effects(routed, on, params)
     points -= abs(float(params["quality_pe_pts"]))
-    add("Acceptable P/E", "Multiple builder", float(np.clip(anchor + points, params["pe_floor"], params["pe_cap"])),
-        1, float(params["pe_cap"]), (params["pe_floor"], params["pe_cap"]), "x",
+    # The P/E is searched past your cap, so the row can say how far the market is beyond it; plausible is within
+    # a third below to half above the stock's own usual P/E (or the current one when that is unknown).
+    pe_now = float(np.clip(anchor + points, params["pe_floor"], params["pe_cap"]))
+    usual_pe = values.get("own_anchor", np.nan)
+    reference = usual_pe if np.isfinite(usual_pe) and usual_pe > 0 else pe_now
+    cap = float(params["pe_cap"])
+    add("Acceptable P/E", "Multiple builder", pe_now, 1, max(cap, 1000.0), (reference / 1.5, reference * 1.5), "x",
         lambda multiple: _point_price(state, {**params, "pe_floor": multiple, "pe_cap": multiple}, routed))
+    if np.isfinite(rows[-1]["Needed"]) and rows[-1]["Needed"] > cap:
+        rows[-1]["Read"] = f"Beyond your {cap:.0f}x cap"
+    if values.get("cycle_on", 0) > 0:
+        # Through-cycle EPS is the average over the cycle: these dials only move next year's share of it.
+        for row in rows:
+            if row["Dial"] in ("Bear weight", "Growth in every case", "Net margin in every case") \
+                    and row["Read"] == "Cannot match alone":
+                row["Read"] = "Little effect (through-cycle EPS)"
 
     if has_rates(result):
         used = result["daily"].loc[:on, "forward_rate"].iloc[-1]
