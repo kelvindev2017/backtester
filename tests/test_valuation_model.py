@@ -855,3 +855,23 @@ def test_a_one_off_slump_is_not_projected_forward():
     assert without.loc[slump] < 0 < with_recovery.loc[slump]
     # Climbing back out: growth is measured from the normal level, not from the dip.
     assert without.loc[rebound] > 10 and abs(with_recovery.loc[rebound]) < 5
+
+
+def test_through_cycle_auto_needs_revenue_to_fall_too():
+    from analysis.valuation_model import through_cycle_eps
+    params = model_params({"cycle_eps": "Auto", "cycle_years": 7})
+    past = pd.Series(np.repeat([2.0, 4.0, 3.0, 1.5, 1.4, 1.5], 4))
+    flat = pd.Series(np.linspace(100, 104, 24))
+    cyclical = pd.Series(np.concatenate([np.linspace(100, 140, 12), np.linspace(140, 100, 12)]))
+    # EPS more than halved: with flat revenue it is a margin squeeze, with falling revenue a cycle.
+    assert not through_cycle_eps(past, 1.5, 1.0, params, past_revenue=flat)[2]
+    assert through_cycle_eps(past, 1.5, 1.0, params, past_revenue=cyclical)[2]
+    assert through_cycle_eps(past, 1.5, 1.0, params)[2]
+
+
+def test_market_check_pe_is_searched_past_the_cap():
+    quarters = make_quarters()
+    close = make_close(quarters, pe=400.0)
+    dials = implied_dials(run_model(quarters, close, None, model_params({"market_implied_erp": False})))
+    row = dials[dials["Dial"] == "Acceptable P/E"].iloc[0]
+    assert row["Needed"] > 300 and row["Read"] == "Beyond your 300x cap"
