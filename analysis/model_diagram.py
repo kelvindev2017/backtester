@@ -423,7 +423,8 @@ def model_price_figure(result, ticker="", mobile=False):
 
 
 def price_and_fundamentals_figure(result, ticker="", mobile=False):
-    """Close and modeled fair value on the left axis; revenue growth and gross margin (%) on the right; earnings as an
+    """Close and modeled fair value on the left axis; revenue growth (the latest quarter against the same quarter a year
+    earlier, and a year over the growth history) and gross margin (%) on the right; earnings as an
     index (highest = 100) on a second right-hand axis. Growth, margin and earnings are held from each release."""
 
     daily = result["daily"]
@@ -433,10 +434,13 @@ def price_and_fundamentals_figure(result, ticker="", mobile=False):
         if name in daily:
             fig.add_trace(go.Scatter(x=daily.index, y=daily[name], name=label, mode="lines", line=style, yaxis="y",
                                      hovertemplate=f"{label}: %{{y:,.2f}}<extra></extra>"))
-    for name, label, color in [("held_cagr", "Revenue growth", "seagreen"), ("held_gross_margin", "Gross margin", "darkorange")]:
+    for name, label, color, dash in [
+            ("held_quarter_yoy", "Revenue growth, latest quarter vs a year ago", "crimson", "solid"),
+            ("held_cagr", "Revenue growth, a year over the growth history", "seagreen", "dash"),
+            ("held_gross_margin", "Gross margin", "darkorange", "dash")]:
         if name in daily and daily[name].notna().any():
             fig.add_trace(go.Scatter(x=daily.index, y=daily[name], name=label, mode="lines", line_shape="hv",
-                                     line=dict(width=1.4, color=color, dash="dash"), yaxis="y2",
+                                     line=dict(width=1.4, color=color, dash=dash), yaxis="y2",
                                      hovertemplate=f"{label}: %{{y:.1f}}%<extra></extra>"))
     earnings = daily["held_clean_eps"] if "held_clean_eps" in daily else pd.Series(dtype=float)
     top = earnings.max() if len(earnings.dropna()) else np.nan

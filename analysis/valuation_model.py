@@ -178,6 +178,8 @@ SIGNALS = {
     "own_anchor": ("daily", "Own median P/E", "x", "multiple"),
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
     "held_cagr": ("daily", "Revenue per share growth a year over the growth history (held)", "%", "percent"),
+    "held_quarter_yoy": ("daily", "Revenue per share growth, latest quarter vs the same quarter a year ago (held)", "%",
+                         "percent"),
     "held_gross_margin": ("daily", "Gross margin, last 4 quarters (held)", "%", "share"),
     "growth_half_life": ("daily", "Half-life of the extra growth, years (gross margin and steadiness)", "", "count"),
     "held_yoy": ("daily", "Revenue per share growth, latest year (held)", "%", "percent"),
@@ -673,7 +675,7 @@ def quarterly_inputs(quarters, growth_years=3):
 
     frame = pd.DataFrame(index=pd.DatetimeIndex(quarters.index).sort_values().unique()) if quarters is not None else pd.DataFrame()
     if quarters is None or quarters.empty:
-        return pd.DataFrame(columns=["revenue", "net_income", "eps", "ttm_revenue", "revenue_yoy", "net_margin", "ttm_eps",
+        return pd.DataFrame(columns=["revenue", "net_income", "eps", "ttm_revenue", "revenue_yoy", "quarter_yoy", "net_margin", "ttm_eps",
                                      "gross_margin", "revenue_cagr", "growth_spread", "eps_spread"])
     quarters = quarters.sort_index()
     quarters = quarters.loc[~quarters.index.duplicated(keep="last")]
@@ -714,7 +716,8 @@ def quarterly_inputs(quarters, growth_years=3):
     log_eps = np.log(ttm_eps.where(ttm_eps > 0))
     # How much trailing EPS moved in a year (log change), its spread over the last 12 releases (at least 8).
     eps_spread = (log_eps - log_eps.shift(4)).rolling(12, min_periods=8).std()
-    for name, series in [("ttm_revenue", ttm_revenue), ("revenue_yoy", yoy), ("net_margin", margin),
+    for name, series in [("ttm_revenue", ttm_revenue), ("revenue_yoy", yoy), ("quarter_yoy", quarter_yoy.dropna()),
+                         ("net_margin", margin),
                          ("ttm_eps", _trailing(eps)), ("gross_margin", gross_margin.dropna()),
                          ("revenue_cagr", cagr.dropna()),
                          # How much the yearly growth varied over the last 12 releases (at least 8), as known then.
@@ -1063,6 +1066,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         daily["held_clean_eps"] = np.nan
         daily["held_cagr"], daily["held_gross_margin"] = np.nan, np.nan
         daily["held_yoy"], daily["held_growth_spread"] = np.nan, np.nan
+        daily["held_quarter_yoy"] = np.nan
         daily["held_cycle_on"], daily["held_cycle_trend"] = 0.0, np.nan
     else:
         # Hold blocks: each quarterly output keeps its last value until the next update.
@@ -1072,6 +1076,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         daily["held_clean_eps"] = both["clean_eps"]
         daily["held_cagr"] = both["revenue_cagr"] if "revenue_cagr" in both else np.nan
         daily["held_yoy"] = both["revenue_yoy"] if "revenue_yoy" in both else np.nan
+        daily["held_quarter_yoy"] = both["quarter_yoy"] if "quarter_yoy" in both else np.nan
         daily["held_growth_spread"] = both["growth_spread"] if "growth_spread" in both else np.nan
         daily["held_gross_margin"] = both["gross_margin"] if "gross_margin" in both else np.nan
         daily["held_cycle_on"] = both["cycle_on"].fillna(0.0) if "cycle_on" in both else 0.0

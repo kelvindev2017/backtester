@@ -5681,7 +5681,9 @@ def render_valuation_model():
     st.markdown(f"**{ticker} price against growth, gross margin and earnings**")
     show_chart(price_and_fundamentals_figure(result, ticker, mobile=MOBILE), width="stretch")
     st.caption("Close and modeled fair value on the left axis; on the right, the revenue growth a year over the growth "
-               "history and the gross margin that feed the fundamental P/E, and the clean trailing earnings as an "
+               "history and the gross margin that feed the fundamental P/E, the latest quarter's revenue growth against "
+               "the same quarter a year earlier (red: the figure the market reacts to, so it turns 2-3 quarters before "
+               "the averages; per share), and the clean trailing earnings as an "
                "index (highest = 100) on the far right, each held from the release it came from. "
                "Without revenue or gross profit (e.g. an ADR reporting in another currency) those lines are missing.")
     render_market_check(result)
