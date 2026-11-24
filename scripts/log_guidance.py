@@ -1,9 +1,10 @@
-"""Daily log of company guidance and analysts' estimates, so they build a history that can be tested later.
+"""Daily log of company guidance and analysts' estimates (S&P 500 members, the study and supply chain stocks and a
+watch list), so they build a history that can be tested later.
 
 Two files, appended to on each run (run by .github/workflows/log_guidance.yml, which keeps them on the
 ``data-log`` branch so they survive app updates and reboots):
 
-- ``estimates.csv``: Yahoo's analyst estimates as they stand today, one row per ticker, table, period and field
+- ``estimates/YYYY-MM-DD.csv.gz``: Yahoo's analyst estimates as they stand that day, one row per ticker, table, period and field
   (EPS and revenue estimates, EPS trend 7/30/60/90 days ago, revisions up/down). Yahoo keeps no history of these,
   so this file is the history.
 - ``guidance.csv``: company guidance from SEC 8-K filings (Item 2.02 results and 7.01 updates): the sentences of the
@@ -29,7 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 STUDY = ["COST", "WMT", "KO", "PEP", "PG", "JNJ", "MCD", "HD", "NKE", "SBUX", "AAPL", "MSFT", "GOOGL", "AMZN", "META",
          "NVDA", "AVGO", "ADBE", "CRM", "ORCL", "INTC", "TXN", "AMAT", "KLAC", "LRCX", "TSLA", "UNH", "LLY", "MRK",
          "ABBV", "CAT", "DE", "HON", "NFLX", "ISRG", "TGT", "LOW", "QCOM", "CVX", "XOM"]
-WATCHED = ["BSX", "PLTR", "AVAV", "ASMVY", "BESIY", "TSM", "SKHY"]
+WATCHED = ["BSX", "PLTR", "AVAV", "ASMVY", "BESIY", "TSM", "SKHY", "ANT", "SPCX"]
 SEC_AGENT = os.getenv("SEC_USER_AGENT") or "StreamlitBacktester/1.0 kelvin@example.com"  # same default as App.py
 GUIDANCE_WORDS = re.compile(r"\b(outlook|guidance|expects?|expected|anticipates?|forecasts?|now estimates?|"
                             r"estimates? (?:net |total )?(?:sales|revenue|earnings|eps)|reaffirm\w*|"
@@ -40,6 +41,13 @@ NUMBER = re.compile(r"(\$\s?\d[\d,.]*|\d[\d,.]*\s?(?:%|percent|billion|million))
 
 def universe():
     tickers = list(STUDY) + list(WATCHED)
+    try:
+        from analysis.universe import load_us_index_members, normalize_ticker
+        members = load_us_index_members("S&P 500")["Ticker"].map(normalize_ticker).tolist()
+        print(f"S&P 500: {len(members)} members")
+        tickers += members
+    except Exception as error:
+        print(f"S&P 500 list not loaded: {type(error).__name__}: {error}")
     try:
         from analysis.supply_chain import COMPANIES
         tickers += [t for t in COMPANIES if isinstance(t, str)]
@@ -197,21 +205,21 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()] or universe()
     today = datetime.now(timezone.utc).date().isoformat()
-    estimates_path = os.path.join(args.out_dir, "estimates.csv")
+    # One compressed file a day (about 60,000 values for 520 stocks), so the log stays small in git.
+    estimates_path = os.path.join(args.out_dir, "estimates", f"{today}.csv.gz")
     guidance_path = os.path.join(args.out_dir, "guidance.csv")
 
     yahoo = []
-    if not args.skip_yahoo:
-        done = set()
-        if os.path.exists(estimates_path):
-            previous = pd.read_csv(estimates_path, usecols=["date", "ticker"])
-            done = set(previous.loc[previous["date"] == today, "ticker"])
+    if not args.skip_yahoo and not os.path.exists(estimates_path):
         for ticker in tickers:
-            if ticker in done:
-                continue
             yahoo += yahoo_rows(ticker, today)
-            time.sleep(0.5)
-    added_estimates = append(estimates_path, yahoo, ["date", "ticker", "table", "period", "field", "value"])
+            time.sleep(0.3)
+    added_estimates = 0
+    if yahoo:
+        os.makedirs(os.path.dirname(estimates_path), exist_ok=True)
+        frame = pd.DataFrame(yahoo, columns=["date", "ticker", "table", "period", "field", "value"])
+        frame.to_csv(estimates_path, index=False, compression="gzip")
+        added_estimates = len(frame)
 
     logged = set()
     if os.path.exists(guidance_path):
@@ -224,7 +232,7 @@ def main():
     print(f"{len(tickers)} tickers; {added_estimates} estimate rows "
           f"({len({row['ticker'] for row in yahoo})} tickers with Yahoo estimates); {added_guidance} guidance rows "
           f"({with_numbers} outlook sentences from {len({row['accession'] for row in guidance})} new 8-K filings)")
-    if not args.skip_yahoo and not yahoo:
+    if not args.skip_yahoo and not yahoo and not os.path.exists(estimates_path):
         sys.exit("Yahoo returned no estimates at all")
 
 
