@@ -100,7 +100,7 @@ SYMBOLS = {
                   "Δy_own compares with the years the own P/E median covers; Δy_peers is only the forward rate's "
                   "surprise, because the peers' P/E is today's and already prices today's rate.",
     "multiple_builder": "Outside view: P/E_fund (default) or the peers' median P/E (moved by the forward rate's yield change "
-                        "like the own one). g: growth for the P/E %, s_g: share from the latest year's revenue growth, g_history: revenue growth a year over the "
+                        "like the own one). g: growth for the P/E %, s_g: share from the latest revenue growth (latest quarter vs a year ago, or the last 4 quarters vs the 4 before, per the Latest growth setting), g_history: revenue growth a year over the "
                         "growth history (within floor and cap), GM: gross margin %, h: half-life in years of the growth above g_T (longer with "
                         "a higher gross margin, or with steady growth: h_steady runs from the low half-life for choppy growth to the steady "
                         "half-life), g_T: terminal growth, y_N: the Rate model's yield (or the base yield), ERP: equity risk premium, ERP_0 the "

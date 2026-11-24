@@ -74,6 +74,7 @@ DEFAULT_PARAMS = {
     "gm_low": 20.0,
     "gm_high": 60.0,
     # Rules worked out from the data known on each day, so they hold for the whole history, not only the latest quarter.
+    "pe_growth_latest": "Latest quarter",  # latest growth: Latest quarter vs the same quarter a year ago, or 4 quarters
     "pe_growth_latest_share": 0.5,   # growth for the P/E = this share of the latest year's growth + the rest of the history's
     "half_life_from_steadiness": True,  # steady growth earns a longer half-life than a low gross margin gives
     "steady_spread": 2.0,            # ... yearly growth varying by this many points or less earns steady_half_life
@@ -1155,6 +1156,9 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     margin_half = pd.Series([growth_half_life(margin, params) for margin in daily["held_gross_margin"].astype(float)],
                             index=daily.index, dtype=float)
     cagr, latest = daily["held_cagr"].astype(float), daily["held_yoy"].astype(float)
+    if params.get("pe_growth_latest", "Latest quarter") == "Latest quarter" and "held_quarter_yoy" in daily:
+        # The latest quarter against the same quarter a year earlier: the figure the market reacts to.
+        latest = daily["held_quarter_yoy"].astype(float).clip(-50, 150).combine_first(latest)
     share = float(np.clip(params["pe_growth_latest_share"], 0, 1))
     growth = (share * latest + (1 - share) * cagr).combine_first(cagr).combine_first(latest)
     if growth.isna().all():

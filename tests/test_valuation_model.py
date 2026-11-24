@@ -885,3 +885,14 @@ def test_latest_quarter_growth_is_held_daily():
     # The 4-quarter growth moves only a quarter as much.
     assert result["quarterly"]["revenue_yoy"].iloc[-1] == pytest.approx(5.0)
     assert result["daily"]["held_quarter_yoy"].iloc[-1] == pytest.approx(20.0)
+
+
+def test_pe_growth_can_use_the_latest_quarter():
+    quarters = make_quarters(count=16, growth=0.0)
+    quarters.loc[quarters.index[-1], ["Revenue", "Net_Income"]] *= 1.2
+    close = make_close(quarters)
+    base = {"anchor_source": "Fundamentals", "peer_weight": 1.0, "pe_growth_latest_share": 1.0}
+    quarter = run_model(quarters, close, None, model_params({**base, "pe_growth_latest": "Latest quarter"}))
+    year = run_model(quarters, close, None, model_params({**base, "pe_growth_latest": "4 quarters"}))
+    assert quarter["daily"]["rule_growth"].iloc[-1] == pytest.approx(20.0, abs=0.5)
+    assert year["daily"]["rule_growth"].iloc[-1] == pytest.approx(5.0, abs=0.5)
