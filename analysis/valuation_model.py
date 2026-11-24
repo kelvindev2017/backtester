@@ -75,6 +75,7 @@ DEFAULT_PARAMS = {
     "gm_high": 60.0,
     # Rules worked out from the data known on each day, so they hold for the whole history, not only the latest quarter.
     "pe_growth_latest": "Latest quarter",  # latest growth: Latest quarter vs the same quarter a year ago, or 4 quarters
+    "quarter_base_effect": True,     # latest-quarter growth vs two years ago when the year-ago quarter had dipped
     "pe_growth_latest_share": 0.5,   # growth for the P/E = this share of the latest year's growth + the rest of the history's
     "half_life_from_steadiness": True,  # steady growth earns a longer half-life than a low gross margin gives
     "steady_spread": 2.0,            # ... yearly growth varying by this many points or less earns steady_half_life
@@ -276,6 +277,7 @@ BLOCKS = {
                 "peer_weight": "Share of the anchor from the outside view (rest: own P/E history)",
                 "anchor_source": "Outside view: Fundamentals or Peers",
                 "growth_history_quarters": "Fundamental P/E: growth history, quarters",
+                "quarter_base_effect": "Latest quarter: skip a dipped year-ago quarter",
                 "fund_growth_cap": "Fundamental P/E: growth cap %", "fund_growth_floor": "Fundamental P/E: growth floor %",
                 "equity_premium": "Fundamental P/E: equity risk premium %",
                 "market_implied_erp": "Fundamental P/E: use the market's usual implied risk premium (1 = yes)",
@@ -658,18 +660,26 @@ def split_adjusted_shares(shares, splits):
     return shares
 
 
-def _year_ago(series, periods=4):
-    """The value ``periods`` entries back, only where it is about a year earlier (300 to 430 days)."""
-
-    earlier = series.shift(periods)
-    if not isinstance(series.index, pd.DatetimeIndex):
-        return earlier
-    dates = pd.Series(series.index, index=series.index)
-    gap = (dates - dates.shift(periods)).dt.days
-    return earlier.where((gap >= 300) & (gap <= 430))
+BASE_EFFECT_POINTS = 15.0  # a one-off dip: growth this many points below both neighbouring quarters'
 
 
-def quarterly_inputs(quarters, growth_quarters=12):
+def _year_ago(series, periods=4, years=1):
+    """The value about ``years`` years earlier: the entry dated nearest to that day, within 65 days a year, so a
+    quarter missing from the data spoils only the comparisons that need it (not the next four by position).
+    Without dates, the value ``periods`` entries back."""
+
+    if not isinstance(series.index, pd.DatetimeIndex) or series.empty:
+        return series.shift(periods)
+    series = series[~series.index.duplicated(keep="last")]
+    target = series.index - pd.Timedelta(days=round(365.25 * years))
+    position = series.index.get_indexer(target, method="nearest")
+    found = series.index[position]
+    near = np.abs((found - target).days) <= 65 * years
+    values = series.to_numpy()[position]
+    return pd.Series(np.where(near, values, np.nan), index=series.index, dtype=float)
+
+
+def quarterly_inputs(quarters, growth_quarters=12, base_effect=True):
     """Income and cost map: trailing revenue, its growth and the net margin at each release date.
 
     ``quarters`` is indexed by the date each quarter became public, with any of the columns Revenue, Net_Income and
@@ -706,6 +716,17 @@ def quarterly_inputs(quarters, growth_quarters=12):
     yoy = (growth_revenue / before.where(before > 0) - 1) * 100
     quarter_yoy = (growth_quarter / quarter_before.where(quarter_before > 0) - 1) * 100
     yoy = yoy.combine_first(quarter_yoy)
+    if base_effect:
+        # Base effect: when the year-ago quarter was a one-off dip (BSX's 2020 lockdown quarter: -24% while the
+        # quarters either side were about flat), growth against it overstates the pace (+51% in mid-2021). Then
+        # compare with two years ago instead, as a yearly rate. A dip of several quarters (a cycle) is left alone.
+        known = quarter_yoy.dropna()
+        neighbours = pd.concat([known.shift(1), known.shift(-1)], axis=1).min(axis=1, skipna=False)
+        one_off = (known <= neighbours - BASE_EFFECT_POINTS).astype(float)
+        two_before = _year_ago(growth_quarter, 8, years=2)
+        two_year = ((growth_quarter / two_before.where(two_before > 0)) ** 0.5 - 1) * 100
+        dipped = (_year_ago(one_off).reindex(quarter_yoy.index) == 1) & two_year.reindex(quarter_yoy.index).notna()
+        quarter_yoy = quarter_yoy.where(~dipped, two_year)
     margin = (ttm_income.reindex(ttm_revenue.index) / ttm_revenue.where(ttm_revenue > 0)) * 100
     ttm_gross = _trailing(column("Gross_Profit"))
     gross_margin = (ttm_gross.reindex(ttm_revenue.index) / ttm_revenue.where(ttm_revenue > 0)) * 100
@@ -979,7 +1000,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     close = pd.to_numeric(close, errors="coerce").dropna().sort_index()
     close = close.loc[~close.index.duplicated(keep="last")]
     routed = route_items(register, params)
-    inputs = quarterly_inputs(quarters, params["growth_history_quarters"])
+    inputs = quarterly_inputs(quarters, params["growth_history_quarters"], bool(params["quarter_base_effect"]))
     params["analyst_base"] = False
     if (params["base_eps_source"] == "Analysts" and analyst_growth is not None and np.isfinite(analyst_growth)
             and len(inputs)):
