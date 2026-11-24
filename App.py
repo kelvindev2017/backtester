@@ -4977,8 +4977,14 @@ def model_settings():
         if params["anchor_source"] == "Fundamentals":
             params["growth_history_years"] = st.select_slider("Growth history (years)", [1, 2, 3, 5],
                                                               key=model_param_key("growth_history_years"))
+            params["pe_growth_latest"] = st.radio(
+                "Latest growth", ["Latest quarter", "4 quarters"], key=model_param_key("pe_growth_latest"),
+                horizontal=True,
+                help="Latest quarter: the last quarter's revenue per share against the same quarter a year ago, the "
+                     "figure the market reacts to (moves with the price). 4 quarters: the last four quarters against "
+                     "the four before, smoother but 2-3 quarters later.")
             params["pe_growth_latest_share"] = number(
-                "pe_growth_latest_share", "Growth for the P/E: share of the latest year", 0, 1, 0.1,
+                "pe_growth_latest_share", "Growth for the P/E: share of the latest growth", 0, 1, 0.1,
                 "0: the history's growth a year only; 1: the latest year only; 0.5: halfway (less swayed by one "
                 "odd year, quicker to see a change of pace).")
             params["half_life_from_steadiness"] = st.checkbox(
