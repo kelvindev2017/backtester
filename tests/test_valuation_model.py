@@ -875,3 +875,13 @@ def test_market_check_pe_is_searched_past_the_cap():
     dials = implied_dials(run_model(quarters, close, None, model_params({"market_implied_erp": False})))
     row = dials[dials["Dial"] == "Acceptable P/E"].iloc[0]
     assert row["Needed"] > 300 and row["Read"] == "Beyond your 300x cap"
+
+
+def test_latest_quarter_growth_is_held_daily():
+    quarters = make_quarters(count=12, growth=0.0)
+    quarters.loc[quarters.index[-1], ["Revenue", "Net_Income"]] *= 1.2
+    result = run_model(quarters, make_close(quarters), None, model_params())
+    assert result["quarterly"]["quarter_yoy"].iloc[-1] == pytest.approx(20.0)
+    # The 4-quarter growth moves only a quarter as much.
+    assert result["quarterly"]["revenue_yoy"].iloc[-1] == pytest.approx(5.0)
+    assert result["daily"]["held_quarter_yoy"].iloc[-1] == pytest.approx(20.0)

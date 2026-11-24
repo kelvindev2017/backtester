@@ -113,7 +113,8 @@ def test_price_against_growth_margin_and_earnings():
     fig = price_and_fundamentals_figure(result, "TEST")
     axes = {trace.name: trace.yaxis for trace in fig.data}
     assert axes["Close"] == axes["Modeled fair value"] == "y"
-    assert axes["Revenue growth"] == axes["Gross margin"] == "y2"
+    assert axes["Revenue growth, a year over the growth history"] == axes["Gross margin"] == "y2"
+    assert axes["Revenue growth, latest quarter vs a year ago"] == "y2"
     assert axes["Earnings (highest = 100)"] == "y3"
     earnings = next(trace for trace in fig.data if trace.name == "Earnings (highest = 100)")
     assert np.nanmax(np.asarray(earnings.y, dtype=float)) == pytest.approx(100.0)
