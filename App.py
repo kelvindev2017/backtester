@@ -205,7 +205,9 @@ from analysis.what_happened_next import (
     today_text,
     walkthrough_figure,
 )
+from analysis.guidance import company_guidance
 from analysis.valuation_model import (
+    GUIDANCE_COLUMNS,
     BLOCKS as MODEL_BLOCKS,
     premium_warning,
     split_adjusted_shares,
@@ -4992,6 +4994,12 @@ def model_settings():
                      "either side, e.g. a lockdown quarter), the latest quarter is compared with two years ago "
                      "instead, as a yearly rate: "
                      "(Q / Q two years ago)^(1/2) - 1. Stops the bounce-back from reading as a growth spurt.")
+            params["use_guidance"] = st.checkbox(
+                "Use company guidance", key=model_param_key("use_guidance"),
+                help="Revenue guidance read from the company's 8-K press releases (next quarter, else the fiscal "
+                     "year), as growth against the same period a year earlier, per share. It replaces the latest "
+                     "growth from the day it is given until the next quarterly release; with no guidance in force, "
+                     "the last reported quarter is held.")
             params["pe_growth_latest_share"] = number(
                 "pe_growth_latest_share", "Growth for the P/E: share of the latest growth", 0, 1, 0.1,
                 "0: the history's growth a year only; 1: the latest year only; 0.5: halfway (less swayed by one "
@@ -5114,6 +5122,48 @@ def home_listing_results(ticker, adr_close, load_start, end):
     note = (f"results from the home listing {home} ({currency}), {ratio:g} share{'s' if ratio != 1 else ''} per ADR, "
             f"converted at each day's {currency}/USD rate")
     return earnings, home_prices, home_earnings, fundamentals, source, note
+
+
+GUIDANCE_LOG = "https://raw.githubusercontent.com/kelvindev2017/backtester/data-log/"  # written by log_guidance.py
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_guidance_log():
+    """Guidance read from 8-K filings by the daily log: ``(rows, tickers read)``; empty when not reachable."""
+
+    try:
+        rows = pd.read_csv(GUIDANCE_LOG + "guidance_numbers.csv")
+        read = set(pd.read_csv(GUIDANCE_LOG + "guidance_read.csv")["ticker"].astype(str))
+        return rows, read
+    except Exception:
+        return pd.DataFrame(columns=GUIDANCE_COLUMNS), set()
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def read_company_guidance(ticker):
+    """Guidance read straight from a company's 8-K filings since 2012 (for a ticker the log has not read yet)."""
+
+    import requests
+
+    cik = get_sec_cik(ticker)
+    if not cik:
+        return pd.DataFrame(columns=GUIDANCE_COLUMNS)
+    rows, _ = company_guidance(ticker, cik, requests.Session(), get_sec_user_agent(), since="2012-01-01")
+    return pd.DataFrame(rows, columns=GUIDANCE_COLUMNS)
+
+
+def load_company_guidance(ticker):
+    """Company guidance for the model's guidance interface: the daily log's rows, or a direct read of the filings
+    when the log has not covered the ticker. Empty when there is none (the model then holds reported values)."""
+
+    rows, read = load_guidance_log()
+    ticker = str(ticker).upper()
+    if ticker in read:
+        return rows[rows["ticker"].astype(str) == ticker].reset_index(drop=True)
+    try:
+        return read_company_guidance(ticker)
+    except Exception:
+        return pd.DataFrame(columns=GUIDANCE_COLUMNS)
 
 
 def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing", history_rule=(0.5, -20.0, 100.0, 0.5)):
@@ -5591,6 +5641,32 @@ def render_model_register(result, tracked, candidates, ticker):
                 for column in ["Modeled fair value before", "Modeled fair value after"]})
 
 
+def render_guidance_table(result):
+    """The company guidance the model used, so each figure can be checked against its sentence."""
+
+    guided = result.get("guidance")
+    if not result["params"].get("use_guidance", True):
+        return
+    with st.expander("Company guidance read from filings", expanded=False):
+        if guided is None or guided.empty:
+            st.caption("No revenue guidance found in this company's 8-K press releases (companies that guide only on "
+                       "the call, or file on 6-K, give none). The model holds the last reported quarter.")
+            return
+        table = guided.reset_index().rename(columns={"date": "Date", "period": "Period", "metric": "Figure",
+                                                     "growth": "Growth used %", "text": "Sentence"})
+        scale = lambda v: v / 1e9 if abs(v) >= 1e6 else v
+        table["Guided"] = [f"{scale(lo):,.2f} to {scale(hi):,.2f}" + ("B" if abs(lo) >= 1e6 else "%")
+                           if lo != hi else f"{scale(lo):,.2f}" + ("B" if abs(lo) >= 1e6 else "%")
+                           for lo, hi in zip(table["low"].astype(float), table["high"].astype(float))]
+        table["Date"] = pd.to_datetime(table["Date"]).dt.date
+        st.dataframe(table.sort_values("Date", ascending=False)[["Date", "Period", "Figure", "Guided", "Growth used %",
+                                                                 "Sentence"]],
+                     hide_index=True, width="stretch",
+                     column_config={"Growth used %": st.column_config.NumberColumn(format="%.1f")})
+        st.caption("Read by rules from the press release text, so a figure can be misread: check the sentence. "
+                   "Amounts are compared with the reported revenue a year earlier; growth is per share.")
+
+
 def render_valuation_model():
     """The block model of a share's fair price: diagram, signals between the blocks, parameters and market check."""
 
@@ -5624,11 +5700,16 @@ def render_valuation_model():
     # A story already parked as an item is no longer unexplained.
     candidates = candidates[~candidates["title"].str[:80].isin(set(model_register()["Item"]))].reset_index(drop=True)
     policy, market_yield, rate_note = load_model_rates(params["yield_years"])
+    guidance = None
+    if params.get("use_guidance", False):
+        with st.spinner("Reading company guidance from SEC filings (the first time for a ticker takes about a minute)..."):
+            guidance = load_company_guidance(ticker)
+
     def rerun_with(other_params):
         return run_model(inputs.quarters, inputs.close, model_register(), other_params, inputs.peer_pe,
                          start=inputs.start, own_pe=inputs.own_pe, policy_rate=policy, market_yield=market_yield,
                          market_close=getattr(inputs, "market_close", None),
-                         analyst_growth=inputs.found.get("growth_check", (np.nan, np.nan))[0])
+                         analyst_growth=inputs.found.get("growth_check", (np.nan, np.nan))[0], guidance=guidance)
 
     result = rerun_with(params)
     values = latest_values(result)
@@ -5699,9 +5780,11 @@ def render_valuation_model():
                "history and the gross margin that feed the fundamental P/E, the latest quarter's revenue growth against "
                "the same quarter a year earlier (red: the figure the market reacts to, so it turns 2-3 quarters before "
                "the averages; per share; against two years ago, as a yearly rate, when the year-ago quarter was a "
-               "one-off dip), and the clean trailing earnings as an "
+               "one-off dip), the company's guided revenue growth (red dots, while in force), and the clean "
+               "trailing earnings as an "
                "index (highest = 100) on the far right, each held from the release it came from. "
                "Without revenue or gross profit (e.g. an ADR reporting in another currency) those lines are missing.")
+    render_guidance_table(result)
     render_market_check(result)
     render_rate_cases(result)
     render_model_register(result, tracked, candidates, ticker)
