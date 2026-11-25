@@ -339,12 +339,40 @@ def release_filings(submissions, session=None, agent=DEFAULT_AGENT, since="2000-
     return filings[keep].drop_duplicates("accession").sort_values("filed").reset_index(drop=True)
 
 
-def filing_guidance(cik, accession, filed, fiscal_year_end, session, ticker="", agent=DEFAULT_AGENT):
-    """Guidance rows of one 8-K, read from its EX-99 exhibits (results first, so the headline figure wins)."""
+def day_filings(day, session, agent=DEFAULT_AGENT):
+    """8-K filings made on one day, from the SEC's daily index (one request for the whole market): a frame of
+    cik, accession, filed. None while the day's index is not published yet (or the day had no filings)."""
+
+    day = pd.Timestamp(day)
+    quarter = (day.month - 1) // 3 + 1
+    url = f"https://www.sec.gov/Archives/edgar/daily-index/{day.year}/QTR{quarter}/form.{day:%Y%m%d}.idx"
+    response = sec_get(url, session, agent)
+    if response is None:
+        return None
+    rows = []
+    for line in response.text.splitlines():
+        if not line.startswith("8-K "):
+            continue
+        found = re.search(r"\s(\d{3,10})\s+(\d{8})\s+edgar/data/\d+/([\d-]+)\.txt", line)
+        if found:
+            rows.append({"cik": int(found.group(1)), "accession": found.group(3),
+                         "filed": f"{found.group(2)[:4]}-{found.group(2)[4:6]}-{found.group(2)[6:]}"})
+    return pd.DataFrame(rows, columns=["cik", "accession", "filed"])
+
+
+def results_or_update(index_page):
+    """Whether a filing's index page lists Item 2.02 (results) or 7.01 (an update such as new guidance)."""
+
+    return bool(re.search(r"Item\s+(2\.02|7\.01)", index_page))
+
+
+def filing_guidance(cik, accession, filed, fiscal_year_end, session, ticker="", agent=DEFAULT_AGENT, items_check=False):
+    """Guidance rows of one 8-K, read from its EX-99 exhibits (results first, so the headline figure wins). With
+    ``items_check``, a filing that is neither results nor an update (Item 2.02 / 7.01) is skipped."""
 
     folder = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}"
     index = sec_get(f"{folder}/{accession}-index.html", session, agent)
-    if index is None:
+    if index is None or (items_check and not results_or_update(index.text)):
         return []
     rows = []
     for name in exhibit_names(index.text):
