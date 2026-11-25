@@ -4530,8 +4530,8 @@ MODEL_BLOCK_NOTES = {
                         "and the stock's own past median, each moved by the Rate model's yield change (a higher yield lifts the earnings yield 1/P/E point for point), "
                         "then adds the P/E points of the general items and takes off the earnings quality "
                         "deduction. Recomputed every day, because peer prices move every day.",
-    "product": "Risk-adjusted EPS, held since the last release, times the day's acceptable P/E.",
-    "market_check": "Compares the modeled fair value with the close, and works backwards from the close to the value each "
+    "product": "Risk-adjusted EPS, held since the last release, times the day's risk-adjusted P/E.",
+    "market_check": "Compares the risk-adjusted fair value with the close, and works backwards from the close to the value each "
                     "dial would need to explain the gap.",
 }
 
@@ -4787,7 +4787,7 @@ def render_forward_items(result):
             "Status": st.column_config.SelectboxColumn("Status", options=["Modelled", "Parked"], required=True),
             "Current %": st.column_config.NumberColumn(
                 "Current %", disabled=True, format="%.0f",
-                help="Market-implied: the probability that on its own makes the modeled fair value equal today's close "
+                help="Market-implied: the probability that on its own makes the risk-adjusted fair value equal today's close "
                      "(today's P/E), everything else as set. Blank: no probability does it alone, or the item has "
                      "no probability (a general item)."),
             "Forward %": st.column_config.NumberColumn("Forward %", min_value=0, max_value=100, format="%.0f",
@@ -4852,8 +4852,8 @@ def model_settings():
                           help="Back to the ticker's preset, or to the defaults when it has none.")
     with settings_panel("Forward assumptions"):
         st.caption("Everything the model assumes about the future, in one place. Beside each block of the diagram, "
-                   "'last Q' is the last quarter's results at today's rate without these, and 'fwd' is with them; the "
-                   "Last quarter vs forward table sums it up.")
+                   "'model' is the last quarter's results at today's rate without these, and 'risk-adj' is with them; the "
+                   "Model vs risk-adjusted table sums it up.")
         st.markdown("**Policy rate** · Rate model")
         params["use_forward_rate"] = st.checkbox(
             "Use a forward policy rate on the last day", key=model_param_key("use_forward_rate"),
@@ -5321,23 +5321,23 @@ def render_model_inspector(result, block):
 
 
 def render_market_check(result):
-    """What the close implies for each dial, and how far one step of the main dials moves the modeled fair value."""
+    """What the close implies for each dial, and how far one step of the main dials moves the risk-adjusted fair value."""
 
     st.markdown("**Market check: what the price implies**")
     dials = implied_dials(result)
     if dials.empty:
-        st.caption("No modeled fair value yet, so there is nothing to compare with the close.")
+        st.caption("No risk-adjusted fair value yet, so there is nothing to compare with the close.")
         return
     values = latest_values(result)
     above = values["model_price"] > values["close"]
     st.caption(
-        f"The modeled fair value is {abs(values['residual_pct']):.0f}% {'above' if above else 'below'} the close. Each row "
-        "holds everything else as it is and finds the value of that one dial that would make the modeled fair value equal "
+        f"The risk-adjusted fair value is {abs(values['residual_pct']):.0f}% {'above' if above else 'below'} the close. Each row "
+        "holds everything else as it is and finds the value of that one dial that would make the risk-adjusted fair value equal "
         "the close. 'Plausible' means the needed value is inside the range such a dial normally takes; 'Cannot match "
         "alone' means no value of it closes the gap. The P/E is plausible within a third below to half above the stock's "
         "own usual P/E, and is searched past your P/E cap ('Beyond your cap'). With through-cycle EPS, bear weight, "
         "growth and margin only move next year's share of the cycle average ('Little effect'). A parked item is "
-        "tried too: a risk can only explain a modeled fair value that is too high, a product one that is too low.")
+        "tried too: a risk can only explain a risk-adjusted fair value that is too high, a product one that is too low.")
     st.dataframe(dials, hide_index=True, width="stretch", column_config={
         column: st.column_config.NumberColumn(format="%.1f") for column in ["Current", "Needed", "Change"]})
     implied, applied = values.get("implied_premium_pct", np.nan), values.get("premium_pct", 0.0)
@@ -5349,7 +5349,7 @@ def render_market_check(result):
                      "do not explain; keep it apart rather than stretching growth to fit it.")
     steps = sensitivities(result)
     if steps:
-        st.caption("One step of each main dial moves the modeled fair value by: "
+        st.caption("One step of each main dial moves the risk-adjusted fair value by: "
                    + "; ".join(f"{name} {value:+,.2f}" for name, value in steps.items() if np.isfinite(value))
                    + ". Use the table to decide which assumption to look at again, not to fit the model to the "
                      "price: a model tuned until the gap is zero can only ever say the stock is fairly priced.")
@@ -5451,7 +5451,7 @@ def render_model_check(result, inputs, rerun_with):
         changes = pd.DataFrame([{"Setting": row["Label"], "From": shown(row, row["Current"]), "To": shown(row, row["Suggested"]),
                                  "Applies to": row["Applies to"]} for row in proposed.to_dict("records")])
         before, after = latest_values(result), latest_values(rerun_with(suggested_params(result["params"], proposed)))
-        for name, label_text, digits in [("acceptable_pe", "Acceptable P/E", 1), ("model_price", "Modeled fair value", 2)]:
+        for name, label_text, digits in [("acceptable_pe", "Risk-adjusted P/E", 1), ("model_price", "Risk-adjusted fair value", 2)]:
             changes = pd.concat([changes, pd.DataFrame([{
                 "Setting": f"= {label_text}", "From": f"{before.get(name, np.nan):,.{digits}f}",
                 "To": f"{after.get(name, np.nan):,.{digits}f}", "Applies to": "result today"}])], ignore_index=True)
@@ -5479,16 +5479,16 @@ def render_now_and_forward(result):
     table = now_and_forward(result)
     if table.empty:
         return
-    st.markdown("**Last quarter vs forward**")
+    st.markdown("**Model vs risk-adjusted**")
     st.dataframe(table, hide_index=True, width="stretch",
-                 column_config={column: st.column_config.NumberColumn(format="%.2f") for column in ["Last quarter", "Forward", "Change"]})
-    st.caption("Last quarter: the last four quarters' clean EPS with no growth or margin change, no register items, "
-               "at today's policy rate. Forward: the same with the Forward assumptions (forward rate, growth and margin cases and "
+                 column_config={column: st.column_config.NumberColumn(format="%.2f") for column in ["Model", "Risk-adjusted", "Change"]})
+    st.caption("Model: the last four quarters' clean EPS with no growth or margin change, no register items, "
+               "at today's policy rate. Risk-adjusted: the same with the Forward assumptions (forward rate, growth and margin cases and "
                "their weights, register items).")
 
 
 def render_rate_cases(result):
-    """The modeled fair value in a few policy rate cases and their probability-weighted expected value."""
+    """The risk-adjusted fair value in a few policy rate cases and their probability-weighted expected value."""
 
     st.markdown("**Rate cases: expected value**")
     if not has_rates(result):
@@ -5516,14 +5516,14 @@ def render_rate_cases(result):
     edited = pd.DataFrame(edited, columns=RATE_CASE_COLUMNS)
     table, expected = rate_cases(result, edited)
     if table.empty:
-        st.caption("No modeled fair value yet, so there is nothing to weigh.")
+        st.caption("No risk-adjusted fair value yet, so there is nothing to weigh.")
         return
     st.dataframe(table, hide_index=True, width="stretch", column_config={
         column: st.column_config.NumberColumn(format="%.2f")
-        for column in ["Policy rate %", "N-year yield %", "P/E anchor", "Modeled fair value", "vs close %"]})
+        for column in ["Policy rate %", "N-year yield %", "P/E anchor", "Risk-adjusted fair value", "vs close %"]})
     close = latest_values(result).get("close", np.nan)
     if np.isfinite(expected):
-        st.metric("Expected modeled fair value", f"{expected:,.2f}",
+        st.metric("Expected risk-adjusted fair value", f"{expected:,.2f}",
                   f"{(expected / close - 1) * 100:+.1f}% vs close" if np.isfinite(close) else None)
 
 
@@ -5537,7 +5537,7 @@ def add_model_candidate(title, url):
 def log_model_change(changes, price_before):
     log = list(st.session_state.get("model_log", []))
     when = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
-    log += [{"When": when, "Change": change, "Modeled fair value before": price_before, "Modeled fair value after": None}
+    log += [{"When": when, "Change": change, "Risk-adjusted fair value before": price_before, "Risk-adjusted fair value after": None}
             for change in changes]
     st.session_state["model_log"] = log
 
@@ -5634,11 +5634,11 @@ def render_model_register(result, tracked, candidates, ticker):
     log = pd.DataFrame(st.session_state.get("model_log", []))
     with st.expander(f"Change log ({len(log)})"):
         if log.empty:
-            st.caption("Changes to the register are listed here with the modeled fair value before and after.")
+            st.caption("Changes to the register are listed here with the risk-adjusted fair value before and after.")
         else:
             st.dataframe(log.iloc[::-1], hide_index=True, width="stretch", column_config={
                 column: st.column_config.NumberColumn(format="%.2f")
-                for column in ["Modeled fair value before", "Modeled fair value after"]})
+                for column in ["Risk-adjusted fair value before", "Risk-adjusted fair value after"]})
 
 
 def render_guidance_table(result):
@@ -5717,12 +5717,12 @@ def render_valuation_model():
     st.caption(model_data_note(inputs.found, params) + (" " + rate_note if rate_note else ""))
 
     price = values.get("model_price", np.nan)
-    # The change log's "after" price is the first modeled fair value computed after the change.
+    # The change log's "after" price is the first risk-adjusted fair value computed after the change.
     log = st.session_state.get("model_log", [])
     if log and np.isfinite(price):
         for entry in log:
-            if entry["Modeled fair value after"] is None:
-                entry["Modeled fair value after"] = float(price)
+            if entry["Risk-adjusted fair value after"] is None:
+                entry["Risk-adjusted fair value after"] = float(price)
     st.session_state["model_last_price"] = float(price) if np.isfinite(price) else None
     if not np.isfinite(price):
         held = values.get("held_eps", np.nan)
@@ -5737,12 +5737,16 @@ def render_valuation_model():
     warning = premium_warning(values, result["params"])
     if warning:
         st.warning("⚠️ " + warning)
-    tiles = st.columns(4)
-    tiles[0].metric("Modeled fair value per share", f"{price:,.2f}" if np.isfinite(price) else "n/a",
+    tiles = st.columns(5)
+    model_value = float(values.get("now_price", np.nan))
+    tiles[0].metric("Model fair value per share", f"{model_value:,.2f}" if np.isfinite(model_value) else "n/a",
+                    f"{values['now_residual_pct']:+.1f}% vs close" if np.isfinite(values.get("now_residual_pct", np.nan)) else None)
+    tiles = tiles[1:]
+    tiles[0].metric("Risk-adjusted fair value per share", f"{price:,.2f}" if np.isfinite(price) else "n/a",
                     f"{values['residual_pct']:+.1f}% vs close" if np.isfinite(values.get("residual_pct", np.nan)) else None)
     tiles[1].metric("Close", f"{values['close']:,.2f}" if np.isfinite(values.get("close", np.nan)) else "n/a")
     tiles[2].metric("Risk-adjusted EPS", signal_text(values, "risk_adjusted_eps"))
-    tiles[3].metric("Acceptable P/E", signal_text(values, "acceptable_pe"))
+    tiles[3].metric("Risk-adjusted P/E", signal_text(values, "acceptable_pe"))
     render_premium_model(result, ticker)
     render_now_and_forward(result)
     render_model_check(result, inputs, rerun_with)
@@ -5759,13 +5763,13 @@ def render_valuation_model():
     st.selectbox("Open a block", blocks, key="model_block", format_func=lambda key: MODEL_BLOCKS[key]["title"])
     render_model_inspector(result, block)
 
-    st.markdown(f"**{ticker} modeled fair value against the close, last {years} years**")
+    st.markdown(f"**{ticker} model fair value against the close, last {years} years**")
     show_chart(model_price_figure(result, ticker, mobile=MOBILE), width="stretch")
     st.caption(
         "Every day uses only the results released by then, and the P/E anchor of a day ends the day before. The "
         "parameters and the register are today's, applied to the whole history, so the past line shows what this "
         "model would have said, not what you would have assumed at the time; an item with a Since date starts on "
-        "that date. The shaded band runs from the bear to the bull case at the same P/E. Dotted lines are the "
+        "that date. Solid lines are the model fair value and model P/E (last four quarters' clean EPS at today's rate, no forward assumptions or risk items); dashed lines are the risk-adjusted ones (next year's risk-adjusted EPS at the risk-adjusted P/E). The shaded band runs from the bear to the bull case, with the same spread around the model fair value as the cases have around the risk-adjusted one. Dotted lines are the "
         "updates of the quarterly part. " + (
             "The P/E anchors are forward P/Es (price / next four quarters' EPS), the same footing as the model's next-"
             "year EPS. Past forward P/Es use only what was known on the day (trailing EPS grown by the history "
@@ -5776,7 +5780,7 @@ def render_valuation_model():
         + "An estimate from stated assumptions, not investment advice.")
     st.markdown(f"**{ticker} price against growth, gross margin and earnings**")
     show_chart(price_and_fundamentals_figure(result, ticker, mobile=MOBILE), width="stretch")
-    st.caption("Close and modeled fair value on the left axis; on the right, the revenue growth a year over the growth "
+    st.caption("Close, model fair value and risk-adjusted fair value (dashed) on the left axis; on the right, the revenue growth a year over the growth "
                "history and the gross margin that feed the fundamental P/E, the latest quarter's revenue growth against "
                "the same quarter a year earlier (red: the figure the market reacts to, so it turns 2-3 quarters before "
                "the averages; per share; against two years ago, as a yearly rate, when the year-ago quarter was a "

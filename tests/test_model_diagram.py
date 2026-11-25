@@ -60,7 +60,7 @@ def test_block_charts_split_inputs_and_outputs(result):
     # Quarterly signals are held between updates, so they are drawn as steps.
     assert all(trace.line.shape == "hv" for trace in fig.data)
     daily = block_signals_figure(result, "multiple_builder")
-    assert any(trace.name == "Acceptable P/E" and trace.line.shape == "linear" for trace in daily.data)
+    assert any(trace.name == "Risk-adjusted P/E" and trace.line.shape == "linear" for trace in daily.data)
     for block in BLOCKS:
         assert block_signals_figure(result, block) is not None or block == "item_tracker" or BLOCKS[block]["outputs"]
 
@@ -68,10 +68,19 @@ def test_block_charts_split_inputs_and_outputs(result):
 def test_price_chart_has_the_model_the_close_and_the_range(result):
     fig = model_price_figure(result, "TEST")
     names = [trace.name for trace in fig.data]
-    assert names[:5] == ["Bull case", "Bear case", "Modeled fair value", "Modeled fair value, last quarter (no forward assumptions)", "Close"]
-    assert "Acceptable P/E" in names
-    model = next(trace for trace in fig.data if trace.name == "Modeled fair value")
-    assert np.nanmax(np.asarray(model.y, dtype=float)) == pytest.approx(result["daily"]["model_price"].max())
+    assert names[:5] == ["Bull case", "Bear case", "Model fair value", "Risk-adjusted fair value", "Close"]
+    assert {"Model P/E", "Risk-adjusted P/E", "Model fair value vs close"} <= set(names)
+    daily = result["daily"]
+    model = next(trace for trace in fig.data if trace.name == "Model fair value")
+    assert np.nanmax(np.asarray(model.y, dtype=float)) == pytest.approx(daily["now_price"].max())
+    risk = next(trace for trace in fig.data if trace.name == "Risk-adjusted fair value")
+    assert risk.line.dash == "dash" and model.line.dash is None
+    assert np.nanmax(np.asarray(risk.y, dtype=float)) == pytest.approx(daily["model_price"].max())
+    # The band keeps the cases' spread, moved onto the model fair value: bear <= model <= bull.
+    bull, bear = (np.asarray(next(t for t in fig.data if t.name == name).y, dtype=float) for name in ["Bull case", "Bear case"])
+    line = np.asarray(model.y, dtype=float)
+    ok = np.isfinite(bull) & np.isfinite(bear) & np.isfinite(line)
+    assert ok.any() and (bear[ok] <= line[ok] + 1e-9).all() and (line[ok] <= bull[ok] + 1e-9).all()
 
 
 def test_parameter_and_item_tables(result):
@@ -95,8 +104,8 @@ def test_values_are_formatted_by_unit():
 
 def test_blocks_with_forward_assumptions_show_now_and_forward(result):
     text = texts(model_diagram(result))
-    assert text.count("last Q ") >= 6 and "fwd " in text
-    assert "fwd base" in text and "last Q none" in text
+    assert text.count("model ") >= 6 and "risk-adj " in text
+    assert "risk-adj base" in text and "model none" in text
     # No policy rate in this run: the rate model has no now/fwd pair.
     from analysis.model_diagram import now_and_forward_text
     from analysis.valuation_model import latest_values
@@ -112,7 +121,7 @@ def test_price_against_growth_margin_and_earnings():
     result = run_model(quarters, close, None, model_params({"anchor_source": "Fundamentals", "peer_weight": 1.0}))
     fig = price_and_fundamentals_figure(result, "TEST")
     axes = {trace.name: trace.yaxis for trace in fig.data}
-    assert axes["Close"] == axes["Modeled fair value"] == "y"
+    assert axes["Close"] == axes["Risk-adjusted fair value"] == "y"
     assert axes["Revenue growth, a year over the growth history"] == axes["Gross margin"] == "y2"
     assert axes["Revenue growth, latest quarter vs a year ago"] == "y2"
     assert axes["Earnings (highest = 100)"] == "y3"
