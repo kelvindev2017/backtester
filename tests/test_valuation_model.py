@@ -906,3 +906,29 @@ def test_growth_history_is_set_in_quarters():
         assert quarterly_inputs(quarters, count)["revenue_cagr"].iloc[-1] == pytest.approx(10.0, abs=0.01)
     # Settings saved as years still work.
     assert model_params({"growth_history_years": 2})["growth_history_quarters"] == 8
+
+
+def test_latest_quarter_growth_skips_a_dipped_year_ago_quarter():
+    from analysis.valuation_model import quarterly_inputs
+    quarters = make_quarters(count=16, growth=0.0)
+    revenue = 100 * 1.1 ** (np.arange(16) / 4)
+    revenue[-5] *= 0.7  # a one-off lockdown quarter a year ago
+    quarters["Revenue"] = revenue
+    on = quarterly_inputs(quarters)["quarter_yoy"].iloc[-1]
+    off = quarterly_inputs(quarters, base_effect=False)["quarter_yoy"].iloc[-1]
+    assert off > 50 and on == pytest.approx(10.0, abs=0.1)
+    # A downturn lasting several quarters (a cycle) is not a one-off dip: growth out of it stays a year-on-year read.
+    cycle = 100 * 1.1 ** (np.arange(16) / 4)
+    cycle[-7:-3] *= 0.7
+    quarters["Revenue"] = cycle
+    assert quarterly_inputs(quarters)["quarter_yoy"].iloc[-1] > 50
+
+
+def test_year_ago_quarter_is_found_by_date_past_a_missing_quarter():
+    from analysis.valuation_model import quarterly_inputs
+    quarters = make_quarters(count=16, growth=0.0)
+    quarters["Revenue"] = 100 * 1.1 ** (np.arange(16) / 4)
+    quarters.loc[quarters.index[8], "Revenue"] = np.nan
+    yoy = quarterly_inputs(quarters)["quarter_yoy"]
+    # The quarters after the gap still compare with their own year-ago quarter.
+    assert yoy.iloc[9:12].round(1).tolist() == [10.0, 10.0, 10.0]

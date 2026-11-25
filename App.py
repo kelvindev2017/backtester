@@ -4986,6 +4986,12 @@ def model_settings():
                 help="Latest quarter: the last quarter's revenue per share against the same quarter a year ago, the "
                      "figure the market reacts to (moves with the price). 4 quarters: the last four quarters against "
                      "the four before, smoother but 2-3 quarters later.")
+            params["quarter_base_effect"] = st.checkbox(
+                "Latest quarter: skip a dipped year-ago quarter", key=model_param_key("quarter_base_effect"),
+                help="When the year-ago quarter was a one-off dip (its growth 15 points or more below both quarters "
+                     "either side, e.g. a lockdown quarter), the latest quarter is compared with two years ago "
+                     "instead, as a yearly rate: "
+                     "(Q / Q two years ago)^(1/2) - 1. Stops the bounce-back from reading as a growth spurt.")
             params["pe_growth_latest_share"] = number(
                 "pe_growth_latest_share", "Growth for the P/E: share of the latest growth", 0, 1, 0.1,
                 "0: the history's growth a year only; 1: the latest year only; 0.5: halfway (less swayed by one "
@@ -5692,7 +5698,8 @@ def render_valuation_model():
     st.caption("Close and modeled fair value on the left axis; on the right, the revenue growth a year over the growth "
                "history and the gross margin that feed the fundamental P/E, the latest quarter's revenue growth against "
                "the same quarter a year earlier (red: the figure the market reacts to, so it turns 2-3 quarters before "
-               "the averages; per share), and the clean trailing earnings as an "
+               "the averages; per share; against two years ago, as a yearly rate, when the year-ago quarter was a "
+               "one-off dip), and the clean trailing earnings as an "
                "index (highest = 100) on the far right, each held from the release it came from. "
                "Without revenue or gross profit (e.g. an ADR reporting in another currency) those lines are missing.")
     render_market_check(result)
