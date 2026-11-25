@@ -68,10 +68,10 @@ EQUATIONS = {
         r"\text{P/E}_{\text{fund}} = \sum_{t=1}^{40} \frac{E_t}{(1+r)^t} + \frac{E_{41}}{(r - g_T)(1+r)^{40}}, \qquad r = y_N + \text{ERP}",
         r"\text{P/E}^{r}_{\text{own}} = \frac{1}{1 / \text{P/E}_{\text{own}} + t \times \Delta y_{\text{own}} / 100}",
         r"\begin{aligned} \text{anchor} = {} & k \times \text{P/E}_{\text{outside}} \\ & + (1 - k) \times \text{P/E}^{r}_{\text{own}} \end{aligned}",
-        r"\begin{aligned} \text{P/E}_{\text{acc}} = {} & \operatorname{clip}(\text{anchor} + a - d_q) \\ & \times (1 + p / 100) \end{aligned}",
+        r"\begin{aligned} \text{P/E}_{\text{risk}} = {} & \operatorname{clip}(\text{anchor} + a - d_q) \\ & \times (1 + p / 100) \end{aligned}",
     ],
-    "product": [r"\text{Modeled fair value} = \text{EPS}_{\text{risk}} \times \text{P/E}_{\text{acc}}"],
-    "market_check": [r"\text{Gap} = \left(\frac{\text{Modeled fair value}}{\text{Close}} - 1\right) \times 100"],
+    "product": [r"\text{Risk-adjusted fair value} = \text{EPS}_{\text{risk}} \times \text{P/E}_{\text{risk}}"],
+    "market_check": [r"\text{Gap} = \left(\frac{\text{Risk-adjusted fair value}}{\text{Close}} - 1\right) \times 100"],
 }
 
 # What each symbol stands for, shown under the equations.

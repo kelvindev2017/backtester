@@ -171,8 +171,8 @@ def test_implied_dials_match_the_market_price():
     again = run_model(quarters, close, items, {**params, "weight_bear": needed, "weight_base": 50 * rest,
                                                "weight_bull": 25 * rest}, peers)
     assert latest_values(again)["model_price"] == pytest.approx(values["close"], rel=1e-6)
-    assert dials.at["Acceptable P/E", "Needed"] == pytest.approx(values["close"] / values["held_eps"], rel=1e-6)
-    assert dials.at["Acceptable P/E", "Current"] == pytest.approx(18.0)
+    assert dials.at["Risk-adjusted P/E", "Needed"] == pytest.approx(values["close"] / values["held_eps"], rel=1e-6)
+    assert dials.at["Risk-adjusted P/E", "Current"] == pytest.approx(18.0)
     # The modelled general risk needs more points; the parked risk could explain the gap, the parked product cannot.
     assert dials.at["Cyclicality: P/E points", "Needed"] == pytest.approx(2 + 18.0 - values["close"] / values["held_eps"], rel=1e-6)
     assert 0 < dials.at["Export rules (parked): probability", "Needed"] < 100
@@ -285,7 +285,7 @@ def test_earnings_quality_takes_points_off_the_acceptable_pe():
     assert after["acceptable_pe"] == pytest.approx(before["acceptable_pe"] - 3.0)
     assert after["model_price"] == pytest.approx(after["held_eps"] * after["acceptable_pe"])
     dials = implied_dials(weak).set_index("Dial")
-    assert dials.at["Acceptable P/E", "Current"] == pytest.approx(after["acceptable_pe"])
+    assert dials.at["Risk-adjusted P/E", "Current"] == pytest.approx(after["acceptable_pe"])
 
 
 def test_stock_pay_haircut_uses_the_last_quarters_of_both():
@@ -394,16 +394,16 @@ def test_rate_dial_sensitivity_and_cases():
     values = latest_values(result)
     dials = implied_dials(result).set_index("Dial")
     assert "Policy rate" in dials.index and dials.loc["Policy rate", "Block"] == "Rate model"
-    # The modeled fair value is above the close here, so the rate that explains the close is higher than today's.
+    # The risk-adjusted fair value is above the close here, so the rate that explains the close is higher than today's.
     if values["model_price"] > values["close"]:
         assert dials.loc["Policy rate", "Needed"] > 4.0
     steps = sensitivities(result)
     assert steps["0.5 point higher policy rate"] < 0
     table, expected = rate_cases(result, default_rate_cases(4.0))
     assert table["Policy rate %"].tolist() == [4.0, 4.25, 4.5]
-    assert table["Modeled fair value"].iloc[0] == pytest.approx(values["model_price"])
-    assert table["Modeled fair value"].is_monotonic_decreasing
-    assert expected == pytest.approx((table["Modeled fair value"] * table["Probability %"]).sum() / 100)
+    assert table["Risk-adjusted fair value"].iloc[0] == pytest.approx(values["model_price"])
+    assert table["Risk-adjusted fair value"].is_monotonic_decreasing
+    assert expected == pytest.approx((table["Risk-adjusted fair value"] * table["Probability %"]).sum() / 100)
     # Without a policy rate there is no rate dial and no cases.
     off = run_model(make_quarters(), make_close(make_quarters()), None, model_params(),
                     pd.DataFrame({"AAA": 20.0}, index=make_close(make_quarters()).index))
@@ -426,8 +426,8 @@ def test_now_is_the_chain_without_forward_assumptions():
     moved = latest_values(hiked)
     assert moved["now_price"] == pytest.approx(values["now_price"]) and moved["model_price"] < values["model_price"]
     table = now_and_forward(hiked).set_index("Step")
-    assert table.loc["Policy rate %", "Last quarter"] == 4.0 and table.loc["Policy rate %", "Forward"] == 4.5
-    assert table.loc["Modeled fair value", "Change"] == pytest.approx(moved["model_price"] - moved["now_price"])
+    assert table.loc["Policy rate %", "Model"] == 4.0 and table.loc["Policy rate %", "Risk-adjusted"] == 4.5
+    assert table.loc["Fair value", "Change"] == pytest.approx(moved["model_price"] - moved["now_price"])
     # Growth is forward too: the default cases lift the forward EPS above the clean trailing EPS.
     grown = latest_values(rate_run(4.0))
     assert grown["held_eps"] > grown["held_clean_eps"] and grown["now_price"] == pytest.approx(values["now_price"])
@@ -873,7 +873,7 @@ def test_market_check_pe_is_searched_past_the_cap():
     quarters = make_quarters()
     close = make_close(quarters, pe=400.0)
     dials = implied_dials(run_model(quarters, close, None, model_params({"market_implied_erp": False})))
-    row = dials[dials["Dial"] == "Acceptable P/E"].iloc[0]
+    row = dials[dials["Dial"] == "Risk-adjusted P/E"].iloc[0]
     assert row["Needed"] > 300 and row["Read"] == "Beyond your 300x cap"
 
 
