@@ -436,11 +436,12 @@ def price_and_fundamentals_figure(result, ticker="", mobile=False):
                                      hovertemplate=f"{label}: %{{y:,.2f}}<extra></extra>"))
     for name, label, color, dash in [
             ("held_quarter_yoy", "Revenue growth, latest quarter vs a year ago", "crimson", "solid"),
+            ("held_guided_growth", "Revenue growth the company guided", "crimson", "dot"),
             ("held_cagr", "Revenue growth, a year over the growth history", "seagreen", "dash"),
             ("held_gross_margin", "Gross margin", "darkorange", "dash")]:
         if name in daily and daily[name].notna().any():
             fig.add_trace(go.Scatter(x=daily.index, y=daily[name], name=label, mode="lines", line_shape="hv",
-                                     line=dict(width=1.4, color=color, dash=dash), yaxis="y2",
+                                     line=dict(width=2.2 if dash == "dot" else 1.4, color=color, dash=dash), yaxis="y2",
                                      hovertemplate=f"{label}: %{{y:.1f}}%<extra></extra>"))
     earnings = daily["held_clean_eps"] if "held_clean_eps" in daily else pd.Series(dtype=float)
     top = earnings.max() if len(earnings.dropna()) else np.nan

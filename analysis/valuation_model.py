@@ -75,6 +75,7 @@ DEFAULT_PARAMS = {
     "gm_high": 60.0,
     # Rules worked out from the data known on each day, so they hold for the whole history, not only the latest quarter.
     "pe_growth_latest": "Latest quarter",  # latest growth: Latest quarter vs the same quarter a year ago, or 4 quarters
+    "use_guidance": False,           # company guidance, when a source gives some, replaces the reported growth
     "quarter_base_effect": True,     # latest-quarter growth vs two years ago when the year-ago quarter had dipped
     "pe_growth_latest_share": 0.5,   # growth for the P/E = this share of the latest year's growth + the rest of the history's
     "half_life_from_steadiness": True,  # steady growth earns a longer half-life than a low gross margin gives
@@ -180,6 +181,8 @@ SIGNALS = {
     "own_anchor": ("daily", "Own median P/E", "x", "multiple"),
     "peer_anchor": ("daily", "Peers' median P/E", "x", "multiple"),
     "held_cagr": ("daily", "Revenue per share growth a year over the growth history (held)", "%", "percent"),
+    "held_guided_growth": ("daily", "Revenue per share growth the company guided (in force until the next release)", "%",
+                           "percent"),
     "held_quarter_yoy": ("daily", "Revenue per share growth, latest quarter vs the same quarter a year ago (held)", "%",
                          "percent"),
     "held_gross_margin": ("daily", "Gross margin, last 4 quarters (held)", "%", "share"),
@@ -278,6 +281,7 @@ BLOCKS = {
                 "anchor_source": "Outside view: Fundamentals or Peers",
                 "growth_history_quarters": "Fundamental P/E: growth history, quarters",
                 "quarter_base_effect": "Latest quarter: skip a dipped year-ago quarter",
+                "use_guidance": "Use company guidance",
                 "fund_growth_cap": "Fundamental P/E: growth cap %", "fund_growth_floor": "Fundamental P/E: growth floor %",
                 "equity_premium": "Fundamental P/E: equity risk premium %",
                 "market_implied_erp": "Fundamental P/E: use the market's usual implied risk premium (1 = yes)",
@@ -976,8 +980,111 @@ def blend_anchor(own, peer, share):
     return anchor if np.ndim(own) or np.ndim(peer) else float(anchor.iloc[0])
 
 
+# --- Company guidance interface --------------------------------------------------------------------------------
+# The model does not read filings itself. A guidance source (analysis/guidance.py, or anything else) hands it a
+# table with these columns, one row per guided figure:
+#   date        the day the guidance became public (the model uses it from that day on)
+#   period      "quarter" (the next quarter) or "year" (the fiscal year)
+#   period_end  the last day of the guided quarter or fiscal year
+#   metric      "revenue" (an amount), "revenue_growth" (% against the same period a year earlier) or "eps"
+#   low, high   the guided range (a single figure has low = high)
+# Other columns (ticker, basis, text, ...) are carried along for display.
+GUIDANCE_COLUMNS = ["date", "ticker", "accession", "period", "period_end", "metric", "low", "high", "basis", "text"]
+GUIDANCE_GROWTH_RANGE = (-60.0, 200.0)  # a guided growth outside this is taken as a misread and left out
+
+
+def guided_growth(guidance, quarters, base_effect=True):
+    """Revenue growth per share (%) the company guided, one row per guidance day: the next quarter against the
+    same quarter a year earlier where the company guided the quarter, else its fiscal year against the year
+    before. Amounts are turned into growth with the reported revenue the model has; growth stated by the company
+    is used as it is. Columns: growth, period, metric, low, high, base (the year-earlier revenue an amount was
+    compared with), text."""
+
+    columns = ["growth", "period", "metric", "low", "high", "base", "text"]
+    if guidance is None or len(guidance) == 0 or quarters is None or quarters.empty or "Revenue" not in quarters:
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame(guidance).copy()
+    frame = frame[frame["metric"].isin(["revenue", "revenue_growth"])].copy()
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
+    frame["period_end"] = pd.to_datetime(frame["period_end"])
+    frame["mid"] = (pd.to_numeric(frame["low"], errors="coerce") + pd.to_numeric(frame["high"], errors="coerce")) / 2
+    quarters = quarters.sort_index()
+    revenue = pd.to_numeric(quarters["Revenue"], errors="coerce").dropna()
+    ttm = _trailing(revenue)
+    shares = pd.to_numeric(quarters["Shares"], errors="coerce").dropna() if "Shares" in quarters else pd.Series(dtype=float)
+    released = pd.DatetimeIndex(revenue.index).normalize()
+
+    def first_release_after(series, day):
+        """The value released 5 to 100 days after a period that ended on ``day``, and its release date."""
+        dates = pd.DatetimeIndex(series.index).normalize()
+        window = (dates > day + pd.Timedelta(days=5)) & (dates <= day + pd.Timedelta(days=100))
+        values = series[window].dropna()
+        return (float(values.iloc[0]), values.index[0]) if len(values) else (np.nan, None)
+
+    # One-off dips (as in quarterly_inputs): a quarter whose growth is 15 points or more below both neighbours'.
+    quarter_growth = (revenue / _year_ago(revenue).where(lambda v: v > 0) - 1) * 100
+    known = quarter_growth.dropna()
+    neighbours = pd.concat([known.shift(1), known.shift(-1)], axis=1).min(axis=1, skipna=False)
+    one_off = known <= neighbours - BASE_EFFECT_POINTS
+
+    rows = []
+    for row in frame.itertuples():
+        if not np.isfinite(row.mid) or pd.isna(row.period_end):
+            continue
+        year_before = row.period_end - pd.Timedelta(days=365)
+        base = np.nan
+        base, base_day = first_release_after(revenue if row.period == "quarter" else ttm, year_before)
+        if row.metric == "revenue_growth":
+            growth = row.mid
+        else:
+            growth = (row.mid / base - 1) * 100 if np.isfinite(base) and base > 0 else np.nan
+        if not np.isfinite(growth):
+            continue
+        if base_effect and row.period == "quarter" and base_day is not None and bool(one_off.get(base_day, False)):
+            # Guided against a one-off dip a year ago: as a yearly rate against two years ago instead.
+            two, _ = first_release_after(revenue, year_before - pd.Timedelta(days=365))
+            if np.isfinite(two) and two > 0 and np.isfinite(base) and base > 0:
+                growth = (np.sqrt((1 + growth / 100) * base / two) - 1) * 100
+        # Per share, like the model's own growth: take off the change in the share count over the last year.
+        known = shares[pd.DatetimeIndex(shares.index).normalize() <= row.date]
+        if len(known) >= 5 and known.iloc[-5] > 0 and (known.index[-1] - known.index[-5]).days <= 430:
+            growth = ((1 + growth / 100) / (known.iloc[-1] / known.iloc[-5]) - 1) * 100
+        if not GUIDANCE_GROWTH_RANGE[0] <= growth <= GUIDANCE_GROWTH_RANGE[1]:
+            continue
+        rank = {("quarter", "revenue"): 0, ("quarter", "revenue_growth"): 1, ("year", "revenue"): 2,
+                ("year", "revenue_growth"): 3}.get((row.period, row.metric), 4)
+        rows.append({"date": row.date, "rank": rank, "growth": growth, "period": row.period, "metric": row.metric,
+                     "low": row.low, "high": row.high, "base": base, "text": getattr(row, "text", "")})
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    found = pd.DataFrame(rows).sort_values(["date", "rank"]).drop_duplicates("date")
+    return found.set_index("date")[columns]
+
+
+def held_guidance(guided, releases, days):
+    """Guided growth on each day: from the guidance day until the next quarterly release after it (a release
+    the same day as the guidance does not end it). Days with no guidance in force are NaN, so the model holds the
+    last reported quarter."""
+
+    out = pd.Series(np.nan, index=days, dtype=float)
+    if guided is None or guided.empty:
+        return out
+    releases = pd.DatetimeIndex(releases).normalize().unique().sort_values()
+    events = pd.concat([pd.Series(guided["growth"].astype(float).values, index=guided.index),
+                        pd.Series(np.nan, index=releases[~releases.isin(guided.index)])]).sort_index()
+    events = events[~events.index.duplicated(keep="first")]
+    # A release ends the guidance in force; NaN events are kept (not forward-filled) by marking them first.
+    marker = events.isna()
+    filled = events.reindex(events.index.union(days)).ffill()
+    ended = marker.astype(float).reindex(events.index.union(days)).ffill().fillna(1.0) > 0
+    out = filled.where(~ended).reindex(days)
+    return out
+
+
 def run_model(quarters, close, register=None, params=None, peer_pe=None, start=None, own_pe=None, policy_rate=None,
-              market_yield=None, market_close=None, analyst_growth=None):
+              market_yield=None, market_close=None, analyst_growth=None, guidance=None):
     """Run the whole model over history.
 
     quarters: results by the date they became public (columns Revenue, Net_Income, EPS; any may be missing).
@@ -1180,10 +1287,16 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     # The rules below use only what was known on each day, so they hold for the whole history.
     margin_half = pd.Series([growth_half_life(margin, params) for margin in daily["held_gross_margin"].astype(float)],
                             index=daily.index, dtype=float)
+    # Company guidance (when a source gave some): in force from its day until the next quarterly release.
+    guided = (guided_growth(guidance, quarters, bool(params["quarter_base_effect"])) if params.get("use_guidance", False)
+              else guided_growth(None, None))
+    daily["held_guided_growth"] = held_guidance(guided, quarterly.index if not quarterly.empty else [], daily.index)
     cagr, latest = daily["held_cagr"].astype(float), daily["held_yoy"].astype(float)
     if params.get("pe_growth_latest", "Latest quarter") == "Latest quarter" and "held_quarter_yoy" in daily:
         # The latest quarter against the same quarter a year earlier: the figure the market reacts to.
         latest = daily["held_quarter_yoy"].astype(float).clip(-50, 150).combine_first(latest)
+    # Guidance in force replaces the reported growth; with none, the last reported quarter is held.
+    latest = daily["held_guided_growth"].astype(float).clip(-50, 150).combine_first(latest)
     share = float(np.clip(params["pe_growth_latest_share"], 0, 1))
     growth = (share * latest + (1 - share) * cagr).combine_first(cagr).combine_first(latest)
     if growth.isna().all():
@@ -1273,6 +1386,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
         before = quarterly.loc[:pd.Timestamp(start)]
         quarterly = quarterly.loc[before.index[-1]:] if len(before) else quarterly
     return {"quarterly": quarterly, "daily": daily, "items": routed, "params": params, "forward_from": last_release,
+            "guidance": guided,
             "peer_pe": peers.reindex(daily.index)}
 
 

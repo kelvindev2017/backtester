@@ -10,12 +10,14 @@ Two files, appended to on each run (run by .github/workflows/log_guidance.yml, w
 - ``guidance.csv``: company guidance from SEC 8-K filings (Item 2.02 results and 7.01 updates): the sentences of the
   press release exhibit that state an outlook with a number, one row per sentence, by filing. Each filing is logged
   once.
+- ``guidance_numbers.csv``: the guided figures read from those sentences by analysis/guidance.py (revenue, revenue
+  growth and EPS for the next quarter or the fiscal year), in the Valuation Model's guidance interface. Each run also
+  backfills a batch of tickers from 2012 on; ``guidance_read.csv`` lists the tickers whose history is complete.
 
-Usage: python scripts/log_guidance.py OUT_DIR [--tickers A,B] [--days 120]
+Usage: python scripts/log_guidance.py OUT_DIR [--tickers A,B] [--days 120] [--backfill 60]
 """
 
 import argparse
-import html
 import os
 import re
 import sys
@@ -31,12 +33,10 @@ STUDY = ["COST", "WMT", "KO", "PEP", "PG", "JNJ", "MCD", "HD", "NKE", "SBUX", "A
          "NVDA", "AVGO", "ADBE", "CRM", "ORCL", "INTC", "TXN", "AMAT", "KLAC", "LRCX", "TSLA", "UNH", "LLY", "MRK",
          "ABBV", "CAT", "DE", "HON", "NFLX", "ISRG", "TGT", "LOW", "QCOM", "CVX", "XOM"]
 WATCHED = ["BSX", "PLTR", "AVAV", "ASMVY", "BESIY", "TSM", "SKHY", "ANT", "SPCX"]
+from analysis.guidance import (GUIDANCE_COLUMNS, company_guidance, exhibit_names, extract_filing,  # noqa: E402
+                               guidance_sentences, sec_get as guidance_get, text_of)
+
 SEC_AGENT = os.getenv("SEC_USER_AGENT") or "StreamlitBacktester/1.0 kelvin@example.com"  # same default as App.py
-GUIDANCE_WORDS = re.compile(r"\b(outlook|guidance|expects?|expected|anticipates?|forecasts?|now estimates?|"
-                            r"estimates? (?:net |total )?(?:sales|revenue|earnings|eps)|reaffirm\w*|"
-                            r"(?:raises?|raised|lowers?|lowered|narrows?|narrowed|updates?|updated) (?:its |the )?"
-                            r"(?:full[- ]year |fiscal )?(?:outlook|guidance|forecast))\b", re.I)
-NUMBER = re.compile(r"(\$\s?\d[\d,.]*|\d[\d,.]*\s?(?:%|percent|billion|million))", re.I)
 
 
 def universe():
@@ -82,72 +82,20 @@ def yahoo_rows(ticker, today):
 
 
 def sec_get(url, session):
-    for attempt in range(4):
-        response = session.get(url, headers={"User-Agent": SEC_AGENT, "Accept-Encoding": "gzip, deflate"}, timeout=30)
-        time.sleep(0.15)  # SEC asks for at most 10 requests a second
-        if response.status_code == 200:
-            return response
-        if response.status_code in (403, 429, 503):
-            time.sleep(2 * (attempt + 1))
-            continue
-        return None
-    return None
+    return guidance_get(url, session, SEC_AGENT)
 
 
-def exhibit_names(index_page):
-    """Press release exhibits (EX-99.x) listed in a filing's index page; companies name the files freely."""
-
-    names = []
-    for row in re.findall(r"(?is)<tr.*?</tr>", index_page):
-        cells = re.findall(r"(?is)<td[^>]*>(.*?)</td>", row)
-        if len(cells) >= 4 and re.fullmatch(r"\s*EX-99(\.\d+)?\s*", re.sub(r"<[^>]+>", "", cells[3])):
-            link = re.search(r'href="([^"]+)"', cells[2])
-            if link and link.group(1).lower().endswith((".htm", ".html", ".txt")):
-                names.append(link.group(1).rsplit("/", 1)[-1])
-    return names
-
-
-def text_of(document):
-    document = re.sub(r"(?is)<(script|style).*?</\1>", " ", document)
-    document = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", document)
-    document = html.unescape(re.sub(r"<[^>]+>", " ", document))
-    return re.sub(r"[ \t\xa0]+", " ", document)
-
-
-def guidance_sentences(text):
-    """Sentences stating an outlook with a number, plus the numeric lines of an "Outlook" or "Guidance" section
-    (many releases give guidance as a table), prefixed with that section's heading."""
-
-    sentences = re.split(r"(?<=[.;])\s+(?=[A-Z(•])|\n+", text)
-    kept, heading, left = [], "", 0
-    for sentence in sentences:
-        sentence = re.sub(r"\s+", " ", sentence).strip(" •-")
-        if not sentence:
-            continue
-        if len(sentence) <= 80 and re.search(r"\b(outlook|guidance)\b", sentence, re.I) \
-                and not re.search(r"\b(reports?|results|raises|lowers)\b", sentence, re.I):
-            heading, left = sentence, 25
-            continue
-        if left and re.match(r"(about |conference call|forward-looking|notes?\b|non-gaap financial measures)", sentence, re.I):
-            left = 0
-        if re.search(r"forward-looking statements|safe harbor|undue reliance|not able to reconcile", sentence, re.I):
-            continue
-        if left:
-            left -= 1
-            if 8 <= len(sentence) <= 700 and NUMBER.search(sentence):
-                kept.append(f"[{heading}] {sentence}")
-                continue
-        if 40 <= len(sentence) <= 700 and GUIDANCE_WORDS.search(sentence) and NUMBER.search(sentence):
-            kept.append(sentence)
-    return kept
-
-
-def sec_rows(tickers, since, logged, session):
+def sec_ciks(session):
     lookup = sec_get("https://www.sec.gov/files/company_tickers.json", session)
     if lookup is None:
         print("SEC ticker list not reachable")
-        return []
-    ciks = {entry["ticker"].upper(): int(entry["cik_str"]) for entry in lookup.json().values()}
+        return {}
+    return {entry["ticker"].upper(): int(entry["cik_str"]) for entry in lookup.json().values()}
+
+
+def sec_rows(tickers, since, logged, session, ciks, numbers=None):
+    """Outlook sentences of new 8-K releases; the guided figures read from them are added to ``numbers``."""
+
     rows = []
     for ticker in tickers:
         cik = ciks.get(ticker)
@@ -156,6 +104,7 @@ def sec_rows(tickers, since, logged, session):
         submissions = sec_get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json", session)
         if submissions is None:
             continue
+        fiscal_year_end = submissions.json().get("fiscalYearEnd") or "1231"
         recent = submissions.json().get("filings", {}).get("recent", {})
         for form, filed, accession, items in zip(recent.get("form", []), recent.get("filingDate", []),
                                                  recent.get("accessionNumber", []), recent.get("items", [])):
@@ -173,7 +122,10 @@ def sec_rows(tickers, since, logged, session):
                 document = sec_get(f"{folder}/{name}", session)
                 if document is None:
                     continue
-                for sentence in guidance_sentences(text_of(document.text)):
+                text = text_of(document.text)
+                if numbers is not None:
+                    numbers += extract_filing(text, filed, fiscal_year_end, ticker, accession)
+                for sentence in guidance_sentences(text):
                     if sentence in seen:
                         continue
                     seen.add(sentence)
@@ -201,6 +153,8 @@ def main():
     parser.add_argument("--tickers", default="")
     parser.add_argument("--days", type=int, default=120, help="8-K look-back on the first run")
     parser.add_argument("--skip-yahoo", action="store_true")
+    parser.add_argument("--backfill", type=int, default=60,
+                        help="tickers whose guidance figures are read back to 2012 on this run")
     args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()] or universe()
@@ -208,6 +162,8 @@ def main():
     # One compressed file a day (about 60,000 values for 520 stocks), so the log stays small in git.
     estimates_path = os.path.join(args.out_dir, "estimates", f"{today}.csv.gz")
     guidance_path = os.path.join(args.out_dir, "guidance.csv")
+    numbers_path = os.path.join(args.out_dir, "guidance_numbers.csv")
+    read_path = os.path.join(args.out_dir, "guidance_read.csv")
 
     yahoo = []
     if not args.skip_yahoo and not os.path.exists(estimates_path):
@@ -226,12 +182,29 @@ def main():
         logged = set(pd.read_csv(guidance_path, usecols=["accession"])["accession"])
     since = (date.today() - timedelta(days=args.days)).isoformat()
     session = requests.Session()
-    guidance = sec_rows(tickers, since, logged, session)
+    ciks = sec_ciks(session)
+    numbers = []
+    guidance = sec_rows(tickers, since, logged, session, ciks, numbers)
     added_guidance = append(guidance_path, guidance, ["filed", "ticker", "accession", "items", "url", "sentence"])
+
+    # Backfill: a batch of tickers read back to 2012, so the figures build a full history over a few runs.
+    done = set(pd.read_csv(read_path)["ticker"]) if os.path.exists(read_path) else set()
+    have = set(pd.read_csv(numbers_path, usecols=["accession"])["accession"]) if os.path.exists(numbers_path) else set()
+    have |= {row["accession"] for row in numbers}
+    finished = []
+    for ticker in [t for t in tickers if t not in done and t in ciks][: max(0, args.backfill)]:
+        started = time.time()
+        rows, _ = company_guidance(ticker, ciks[ticker], session, SEC_AGENT, since="2012-01-01", skip=have)
+        numbers += rows
+        finished.append({"ticker": ticker, "read": today})
+        print(f"{ticker}: backfilled {len(rows)} figures in {time.time() - started:.0f}s")
+    added_numbers = append(numbers_path, numbers, GUIDANCE_COLUMNS)
+    append(read_path, finished, ["ticker", "read"])
     with_numbers = sum(1 for row in guidance if row["sentence"])
     print(f"{len(tickers)} tickers; {added_estimates} estimate rows "
           f"({len({row['ticker'] for row in yahoo})} tickers with Yahoo estimates); {added_guidance} guidance rows "
-          f"({with_numbers} outlook sentences from {len({row['accession'] for row in guidance})} new 8-K filings)")
+          f"({with_numbers} outlook sentences from {len({row['accession'] for row in guidance})} new 8-K filings); "
+          f"{added_numbers} guided figures, {len(finished)} tickers backfilled")
     if not args.skip_yahoo and not yahoo and not os.path.exists(estimates_path):
         sys.exit("Yahoo returned no estimates at all")
 
