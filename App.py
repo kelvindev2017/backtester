@@ -4981,6 +4981,12 @@ def model_settings():
                  "margin held; bear and bull keep their gaps around it. Own rule: base growth from the auto rule or "
                  "your forward growth. Earlier quarters always use the auto rule, since today's estimates were not "
                  "known then. Falls back to the own rule when Yahoo has no estimates.")
+        if params["base_eps_source"] == "Analysts":
+            params["analyst_share"] = st.slider(
+                "Analysts' share of the base growth", 0.0, 1.0, step=0.05, key=model_param_key("analyst_share"),
+                help="Base growth on the latest release = this share x analysts' growth + the rest x the EPS trend "
+                     "rule that every earlier release uses. 1 = analysts only (a big jump at the latest release when "
+                     "they expect much more than the past trend); 0 = the rule only.")
         st.caption("Your forward growth and margin and the bull/bear adjustments are under Forward assumptions. "
                    "The auto rule below sets the forward values on every earlier quarter, and on the latest one "
                    "when you leave Forward blank.")

@@ -37,7 +37,8 @@ DEFAULT_PARAMS = {
     "quality_pe_pts": 0.0,       # P/E points taken off the risk-adjusted P/E for weak earnings quality
     # Scenario engine
     "analyst_base": False,       # set by run_model: True when the latest base case is the analysts' EPS
-    "base_eps_source": "Analysts",  # latest quarter's base EPS: Analysts (next 4 quarters' estimates) or Own rule
+    "base_eps_source": "Own rule",  # latest quarter's base EPS: Analysts (next 4 quarters' estimates) or Own rule
+    "analyst_share": 1.0,        # with Analysts: their share of the latest base growth; the rest is the EPS trend rule
     "forward_growth": np.nan,    # base (forward) revenue growth % for the latest quarter; NaN = the auto rule below
     "forward_margin": np.nan,    # base (forward) net margin % for the latest quarter; NaN = current + base_margin_pts
     "growth_follow": 0.5,        # auto rule: base growth = this share of the trailing revenue growth
@@ -250,6 +251,7 @@ BLOCKS = {
                 "spread_k": "EPS volatility: k (cases at exp(-/+ k x s))",
                 "spread_own_share": "EPS volatility: share of the own volatility in s",
                 "spread_typical": "EPS volatility: typical volatility",
+                "analyst_share": "Analysts' share of the latest base growth (rest: EPS trend rule)",
                 "forward_growth": "Forward revenue growth % (blank = auto rule)",
                 "forward_margin": "Forward net margin % (blank = auto rule)",
                 "bear_growth_gap": "Bear: growth points below forward", "bull_growth_gap": "Bull: growth points above forward",
@@ -1113,7 +1115,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
             and len(inputs)):
         # The base case is the analysts' EPS: their growth, with the net margin held (margin ratio 1).
         latest_margin = inputs["net_margin"].dropna() if "net_margin" in inputs else pd.Series(dtype=float)
-        params["forward_growth"] = float(analyst_growth)
+        params["forward_growth"] = float(analyst_growth)  # blended with the EPS trend rule below (analyst_share)
         params["forward_margin"] = (float(latest_margin.iloc[-1]) if len(latest_margin) and latest_margin.iloc[-1] > 0
                                     else float(params["fallback_margin"]))
         params["analyst_base"] = True
@@ -1150,6 +1152,17 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
             normal = normal_known.reindex(normal_known.index.union(held.index)).ffill().reindex(held.index)
             back = (recovery * (normal / ttm - 1) * 100).where((normal > ttm) & (ttm > 0))
             eps_trend = pd.concat([eps_trend, back], axis=1).max(axis=1, skipna=True).where(ttm > 0)
+    if params["analyst_base"]:
+        # Analysts' growth on the latest release only, blended with the rule every earlier release uses (the EPS
+        # trend, else the auto rule), so one bold estimate does not make a step the past line could never show.
+        share = float(np.clip(params["analyst_share"], 0, 1))
+        rule = eps_trend.get(last_release, np.nan) if eps_trend is not None and last_release is not None else np.nan
+        if not np.isfinite(rule):
+            latest = held.loc[last_release] if last_release in held.index else held.iloc[-1]
+            rule = base_growth_and_margin(latest.get("revenue_yoy", np.nan), latest.get("net_margin", np.nan),
+                                          {**params, "forward_growth": np.nan})[1]
+        params["analyst_growth"], params["rule_growth_latest"] = float(analyst_growth), float(rule)
+        params["forward_growth"] = share * float(analyst_growth) + (1 - share) * float(rule)
     was_on = False
     for when, row in held.iterrows():
         ttm_eps = params["manual_eps"] if params["manual_eps"] > 0 else row.get("ttm_eps", np.nan)

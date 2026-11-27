@@ -689,14 +689,24 @@ def test_market_yield_is_the_discount_rate_and_a_forward_rate_moves_it_by_the_mo
     assert latest_values(alone)["now_yield"] == pytest.approx(5.0)
 
 
+def test_own_rule_is_the_default_base_case():
+    result = run_model(make_quarters(), make_close(make_quarters()), None, model_params({}), analyst_growth=30.0)
+    assert not result["params"]["analyst_base"]
+
+
 def test_analysts_base_case_makes_base_eps_the_analysts_eps_less_the_haircut():
     from analysis.valuation_model import case_table
     quarters = make_quarters()
     close = make_close(quarters)
-    params = model_params({"eps_haircut_pct": 10.0, "base_margin_pts": 2.0})
+    params = model_params({"eps_haircut_pct": 10.0, "base_margin_pts": 2.0, "base_eps_source": "Analysts"})
     result = run_model(quarters, close, None, params, analyst_growth=30.0)
     values = latest_values(result)
     assert values["eps_base"] == pytest.approx(values["ttm_eps"] * 1.3 * 0.9)
+    # A share below 1 blends in the EPS trend rule the earlier releases use.
+    blended = run_model(quarters, close, None, model_params({**params, "analyst_share": 0.5}), analyst_growth=30.0)
+    rule = blended["params"]["rule_growth_latest"]
+    assert latest_values(blended)["growth_base"] == pytest.approx(0.5 * 30.0 + 0.5 * rule)
+    assert blended["params"]["analyst_growth"] == 30.0
     assert values["eps_bear"] < values["eps_base"] < values["eps_bull"]
     assert case_table(result).set_index("Metric").loc["Revenue growth %", "Forward from"] == "analysts"
     own = run_model(quarters, close, None, model_params({**params, "base_eps_source": "Own rule"}), analyst_growth=30.0)

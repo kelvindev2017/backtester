@@ -201,7 +201,9 @@ def worked_equations(result, block, on=None):
         base, base_margin = get("growth_base"), get("margin_base")
         forward = result.get("forward_from") is None or (on is None or pd.Timestamp(on) >= result["forward_from"])
         if forward and params.get("analyst_base"):
-            lines = [rf"g_{{\text{{base}}}} = {_n(base, 1)}\% \ \text{{(analysts' EPS, next 4q vs last 4q)}}"]
+            a = float(np.clip(params.get("analyst_share", 1.0), 0, 1))
+            lines = [rf"\begin{{aligned}} g_{{\text{{base}}}} = {{}} & {_n(a)} \times {_n(params.get('analyst_growth', np.nan), 1)}\ \text{{(analysts, next 4q vs last 4q)}} \\ "
+                     rf"& + {_n(1 - a)} \times {_n(params.get('rule_growth_latest', np.nan), 1)}\ \text{{(EPS trend rule)}} = {_n(base, 1)}\% \end{{aligned}}"]
         elif forward and np.isfinite(params.get("forward_growth", np.nan)):
             lines = [rf"g_{{\text{{base}}}} = {_n(base, 1)}\% \ \text{{(yours)}}"]
         else:
