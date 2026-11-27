@@ -157,7 +157,7 @@ SIGNALS = {
     "gross_margin": ("quarterly", "Gross margin, last 4 quarters", "%", "share"),
     "revenue_cagr": ("quarterly", "Revenue growth a year over the growth history", "%", "percent"),
     "ttm_eps": ("quarterly", "Reported EPS, last 4 quarters", "", "eps"),
-    "eps_spread": ("quarterly", "Own EPS volatility (std of the yearly log change, last 12 releases)", "", "count"),
+    "eps_spread": ("quarterly", "Own EPS volatility (std of the yearly log change, at most 4x, last 12 releases)", "", "count"),
     "case_spread": ("quarterly", "Case spread s used (EPS volatility)", "", "count"),
     "clean_eps": ("quarterly", "Clean base EPS", "", "eps"),
     "growth_bear": ("quarterly", "Bear growth", "%", "percent"),
@@ -565,6 +565,9 @@ def base_growth_and_margin(revenue_yoy, net_margin, params, forward=False):
     return yoy, growth, margin, base_margin
 
 
+EPS_CHANGE_CAP = 4.0  # own EPS volatility: a yearly change counts as at most this many times up or down
+
+
 def case_spread(eps_spread, params):
     """The case spread s: a share of the company's own EPS volatility plus the rest of the typical one (the typical
     one alone without enough history)."""
@@ -605,7 +608,10 @@ def through_cycle_eps(past_ttm, forward_eps, clean_share, params, was_on=False, 
     if mode == "On":
         return mean, trend, True
     high = np.maximum.accumulate(values)
-    fell = bool((values / high).min() <= 1 - float(params["cycle_fall"]) / 100) if (high > 0).all() else True
+    # A fall from a profitable high (into a loss counts too). Losses at the start of the years, before any profit in
+    # them, are a turnaround, not a cycle: AMD from 2020, whose years start in its 2015-2017 losses.
+    profitable = high > 0
+    fell = bool((values[profitable] / high[profitable] <= 1 - float(params["cycle_fall"]) / 100).any())
     # Hysteresis: once on, it stays on until the trend clears the cap by half again, so a stock near the line does
     # not flip between bases (and P/Es) from one release to the next.
     cap = float(params["cycle_trend_cap"]) * (1.5 if was_on else 1.0)
@@ -772,8 +778,10 @@ def split_adjusted_shares(shares, splits):
     shares = shares[shares > 0]
     if len(shares):
         # Some filings state the count in thousands or millions (4,306 for 4.306 billion): put every count on the
-        # scale of the typical one, in steps of 1,000.
-        steps = np.round(np.log10(shares.median() / shares) / 3)
+        # scale of the typical one, in steps of 1,000. Only a gap of 300x or more is a unit: two splits can move the
+        # count 40x (NVDA 4-for-1 in 2021, 10-for-1 in 2024), and a nearest-step rounding read that as thousands.
+        gap = np.log10(shares.median() / shares)
+        steps = np.trunc((gap + np.sign(gap) * 0.5) / 3)
         shares = shares * 1000.0 ** steps
     if shares.empty or splits is None or len(splits) == 0:
         return shares
@@ -871,8 +879,11 @@ def quarterly_inputs(quarters, growth_quarters=12, base_effect=True):
     build_up = _build_up_series(quarters, column, revenue, ttm_revenue, shares)
     ttm_eps = _trailing(eps)
     log_eps = np.log(ttm_eps.where(ttm_eps > 0))
-    # How much trailing EPS moved in a year (log change), its spread over the last 12 releases (at least 8).
-    eps_spread = (log_eps - log_eps.shift(4)).rolling(12, min_periods=8).std()
+    # How much trailing EPS moved in a year (log change), its spread over the last 12 releases (at least 8). A change
+    # counts as at most 4x up or down: EPS climbing out of a loss starts near 0 (AMD 2017: $0.003), and its log change
+    # (x100 in a year) would make the cases thousands of times apart.
+    yearly_change = (log_eps - log_eps.shift(4)).clip(-np.log(EPS_CHANGE_CAP), np.log(EPS_CHANGE_CAP))
+    eps_spread = yearly_change.rolling(12, min_periods=8).std()
     for name, series in [("ttm_revenue", ttm_revenue), ("revenue_yoy", yoy), ("quarter_yoy", quarter_yoy.dropna()),
                          ("net_margin", margin),
                          ("ttm_eps", _trailing(eps)), ("gross_margin", gross_margin.dropna()),
