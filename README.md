@@ -6,3 +6,4 @@ Written daily by .github/workflows/log_guidance.yml (scripts/log_guidance.py).
 - guidance_read.csv: tickers whose history is loaded (the app reads these from the log).
 - guidance_days.csv: days whose SEC filing list the daily run has read.
 - estimates/: analysts' estimates, one file a day.
+- foreign_quarters.csv: quarterly results of foreign filers (20-F) from their 6-K results releases; foreign_read.csv: tickers read.
