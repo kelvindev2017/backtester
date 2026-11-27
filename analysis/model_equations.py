@@ -100,7 +100,8 @@ SYMBOLS = {
                        "(latest quarter only; blank = the auto rule with s: share of trailing growth), c: bear, base or "
                        "bull, adj_c and Δm_c: the case's growth and margin adjustment in points (Fixed gaps only), e_c: event "
                        "items' EPS change % at that case's probability. σ_own: the company's own EPS volatility (standard "
-                       "deviation of the yearly log change in trailing EPS over the last 12 releases, at least 8), "
+                       "deviation of the yearly log change in trailing EPS over the last 12 releases, at least 8; a change "
+                       "counts as at most 4x up or down, so EPS climbing out of a loss does not blow it up), "
                        "σ_typical: the typical one, w: share of the own one, k: how many s the bear and bull cases sit "
                        "from base. Defaults (k 2.4, w 0.25, σ_typical 0.073) come from a forward test on 60 stocks: "
                        "trained on 2010-2018, they beat the fixed gaps in each year 2019-2025.",

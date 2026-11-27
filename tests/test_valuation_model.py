@@ -849,6 +849,11 @@ def test_share_counts_filed_in_millions_are_put_on_one_scale():
     fixed = split_adjusted_shares(counts, None)
     assert fixed.iloc[:3].tolist() == pytest.approx([4.306e9, 4.29e9, 4.295e9])
     assert fixed.iloc[3:].tolist() == counts.iloc[3:].tolist()
+    # Two splits (4x then 10x, NVDA) are not a unit change: the counts stay as filed until the splits put them on one basis.
+    nvda = pd.Series([0.62e9] * 5 + [2.49e9] * 3 + [24.8e9, 24.7e9], index=pd.date_range("2020-03-31", periods=10, freq="QE"))
+    assert split_adjusted_shares(nvda, None).tolist() == nvda.tolist()
+    splits = {pd.Timestamp("2021-05-01"): 4.0, pd.Timestamp("2022-01-15"): 10.0}
+    assert split_adjusted_shares(nvda, splits).iloc[0] == pytest.approx(24.8e9)
 
 
 def test_a_one_off_slump_is_not_projected_forward():
@@ -877,6 +882,29 @@ def test_through_cycle_auto_needs_revenue_to_fall_too():
     assert not through_cycle_eps(past, 1.5, 1.0, params, past_revenue=flat)[2]
     assert through_cycle_eps(past, 1.5, 1.0, params, past_revenue=cyclical)[2]
     assert through_cycle_eps(past, 1.5, 1.0, params)[2]
+
+
+def test_through_cycle_auto_needs_a_fall_from_a_profitable_high():
+    from analysis.valuation_model import through_cycle_eps
+    params = model_params({"cycle_eps": "Auto", "cycle_years": 7})
+    # Losses, then a recovery (AMD 2015-2020): no profitable high fell, so no cycle.
+    turnaround = pd.Series(np.repeat([-0.4, -0.2, -0.1, 0.1, 0.4, 0.8], 4))
+    assert not through_cycle_eps(turnaround, 1.2, 1.0, params)[2]
+    # A profit that fell into a loss is a cycle.
+    assert through_cycle_eps(pd.Series(np.repeat([2.0, 3.0, -1.0, 0.5, 1.5, 2.0], 4)), 2.5, 1.0, params)[2]
+
+
+def test_eps_climbing_out_of_a_loss_does_not_blow_up_the_cases():
+    from analysis.valuation_model import EPS_CHANGE_CAP, quarterly_inputs
+    quarters = make_quarters(count=24)
+    # Trailing EPS about $0.003 a year before a normal $1: a log change of ~6 on its own.
+    eps = np.full(24, 0.25)
+    eps[8:12] = [-0.1, 0.05, 0.05, 0.001]
+    quarters["EPS"] = eps
+    spread = quarterly_inputs(quarters)["eps_spread"].dropna()
+    assert spread.max() <= 2 * np.log(EPS_CHANGE_CAP)
+    point = scenario_point(1.0, 10.0, 20.0, model_params(), eps_spread=float(spread.max()))
+    assert point["eps_bull"] / point["eps_bear"] < 20
 
 
 def test_market_check_pe_is_searched_past_the_cap():

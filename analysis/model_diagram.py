@@ -382,6 +382,13 @@ def model_price_figure(result, ticker="", mobile=False):
     held = _held(quarterly[[f"eps_{name.lower()}" for name in SCENARIOS]] if not quarterly.empty else pd.DataFrame(
         columns=[f"eps_{name.lower()}" for name in SCENARIOS]), daily.index)
     roll = daily["eps_roll"] if "eps_roll" in daily else 1.0
+    if {"cycle_on", "cycle_past_sum", "cycle_years_used"} <= set(quarterly.columns):
+        # On through-cycle EPS the cases are next year's share of the cycle mean, like the risk-adjusted EPS, so
+        # the band sits around the line (one year's bull EPS on its own was 15x the cycle mean for AMD in 2018).
+        cycle = _held(quarterly[["cycle_on", "cycle_past_sum", "cycle_years_used"]], daily.index)
+        on = (cycle["cycle_on"] == 1) & np.isfinite(cycle["cycle_past_sum"]) & (cycle["cycle_years_used"] > 0)
+        for column in held.columns:
+            held[column] = held[column].where(~on, (cycle["cycle_past_sum"] + held[column]) / cycle["cycle_years_used"])
     bear = held["eps_bear"].where(held["eps_bear"] > 0) * roll * daily["acceptable_pe"]
     bull = held["eps_bull"].where(held["eps_bull"] > 0) * roll * daily["acceptable_pe"]
     # The model fair value (no risk adjustment) is the main line. Its bear and bull band is the risk-adjusted
