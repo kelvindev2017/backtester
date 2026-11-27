@@ -73,3 +73,53 @@ def test_yahoo_adr_share_counts_put_on_ordinary_shares():
     assert aligned["Revenue"].tolist() == yahoo["Revenue"].tolist()
     assert align_units(pd.DataFrame(), reference).empty
     assert np.isnan(align_units(yahoo.assign(Shares=np.nan), reference)["Shares"]).all()
+
+
+def test_log_round_trip_and_restated_quarter_replaces_old_row():
+    from analysis.foreign_results import from_log, merge_log, to_log
+
+    first = pd.DataFrame({"Revenue": [1.0, 2.0], "Shares": [10.0, 10.0]},
+                         index=pd.DatetimeIndex(["2026-03-31", "2026-06-30"]))
+    log = merge_log(pd.DataFrame(), to_log("ASML", first))
+    restated = pd.DataFrame({"Revenue": [2.5], "Shares": [10.0]}, index=pd.DatetimeIndex(["2026-06-30"]))
+    log = merge_log(log, to_log("ASML", restated))
+    back = from_log(log, "ASML")
+    assert back["Revenue"].tolist() == [1.0, 2.5]
+    assert from_log(log, "TSM").empty and from_log(pd.DataFrame(), "ASML").empty
+
+
+def test_a_read_past_its_deadline_raises_instead_of_returning_part(monkeypatch):
+    import analysis.foreign_results as F
+
+    class Reply:
+        def json(self):
+            return {"filings": {"recent": {"form": ["6-K"], "filingDate": ["2026-10-14"], "accessionNumber": ["a"]}}}
+
+    monkeypatch.setattr(F, "sec_get", lambda *args, **kwargs: Reply())
+    with pytest.raises(TimeoutError):
+        F.foreign_quarters(1, None, None, since="2026-01-01", deadline=0)
+
+
+def test_daily_run_adds_foreign_quarters(tmp_path, monkeypatch):
+    import sys
+    from datetime import date
+
+    sys.path.insert(0, "scripts")
+    import log_guidance as L
+
+    monkeypatch.setattr(L, "sec_ciks", lambda session: {"ASML": 937966})
+    calls = []
+
+    def fake(cik, releases, session, agent, since):
+        calls.append(since)
+        return pd.DataFrame({"Revenue": [11.66e9], "Shares": [383e6]}, index=pd.DatetimeIndex(["2026-09-30"]))
+
+    monkeypatch.setattr(L, "foreign_quarters", fake)
+    dates = lambda ticker: pd.DatetimeIndex(["2026-10-14"])
+    L.update_foreign(str(tmp_path), ["ASML", "NOPE"], None, date(2026, 11, 27), dates)
+    L.update_foreign(str(tmp_path), ["ASML"], None, date(2026, 11, 27), dates)
+    log = pd.read_csv(tmp_path / "foreign_quarters.csv")
+    assert log["ticker"].tolist() == ["ASML"] and log["Revenue"].iloc[0] == pytest.approx(11.66e9)
+    # The history once, then only the last 20 days.
+    assert calls == [L.FOREIGN_SINCE, "2026-11-07"]
+    assert pd.read_csv(tmp_path / "foreign_read.csv")["ticker"].tolist() == ["ASML"]
