@@ -1609,78 +1609,108 @@ def load_sec_quarterly_fundamentals(symbol):
         company_facts = sec_request_json(
             f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
         )
-
-        revenue = extract_sec_fiscal_quarters(
-            company_facts,
-            [
-                "RevenueFromContractWithCustomerExcludingAssessedTax",
-                "RevenueFromContractWithCustomerIncludingAssessedTax",
-                "SalesRevenueNet",
-                # Banks report net revenue (after interest expense) here.
-                "RevenuesNetOfInterestExpense",
-                "Revenues",
-                # Last resort: goods-only revenue (Coca-Cola before 2018 used no other tag).
-                "SalesRevenueGoodsNet",
-            ],
-        )
-        operating_expense = extract_sec_fiscal_quarters(
-            company_facts,
-            ["OperatingExpenses"],
-        )
-        total_expense = extract_sec_fiscal_quarters(
-            company_facts,
-            ["CostsAndExpenses"],
-        )
-        operating_income = extract_sec_fiscal_quarters(
-            company_facts,
-            ["OperatingIncomeLoss"],
-        )
-        capex = extract_sec_cumulative_quarters(
-            company_facts,
-            [
-                "PaymentsToAcquirePropertyPlantAndEquipment",
-                "PaymentsForAdditionsToPropertyPlantAndEquipment",
-            ],
-        )
-        net_income = extract_sec_fiscal_quarters(
-            company_facts,
-            ["NetIncomeLoss", "ProfitLoss"],
-        )
-        gross_profit = extract_sec_fiscal_quarters(company_facts, ["GrossProfit"])
-        cost_of_revenue = extract_sec_fiscal_quarters(
-            company_facts, ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"])
-        shares = extract_sec_quarterly_shares(company_facts)
-
-        all_dates = revenue.index.union(operating_expense.index)
-        all_dates = all_dates.union(total_expense.index).union(capex.index)
-        all_dates = all_dates.union(net_income.index).sort_values()
-
-        if len(all_dates) == 0:
+        result = sec_quarterly_frame(company_facts)
+        # A company that moved to a new holding company files under a new CIK; its history stays on the old one.
+        for old_cik in PREDECESSOR_CIKS.get(str(symbol).upper(), []):
+            try:
+                older = sec_quarterly_frame(sec_request_json(
+                    f"https://data.sec.gov/api/xbrl/companyfacts/CIK{old_cik:010d}.json"))
+            except Exception:
+                continue
+            result = result.combine_first(older) if len(result) else older
+        if result.empty:
             return pd.DataFrame(), "SEC returned no usable quarterly duration facts."
-
-        result = pd.DataFrame(index=all_dates)
-        result["Revenue"] = revenue.reindex(all_dates)
-        result["Operating_Expense"] = operating_expense.reindex(all_dates)
-        result["Total_Expense"] = total_expense.reindex(all_dates)
-        result["CapEx"] = capex.reindex(all_dates)
-        result["Net_Income"] = net_income.reindex(all_dates)
-        result["Gross_Profit"] = gross_profit.reindex(all_dates).combine_first(
-            revenue.reindex(all_dates) - cost_of_revenue.reindex(all_dates))
-        # Share counts reported a few days off the quarter end land on the nearest quarter.
-        result["Shares"] = (shares.reindex(all_dates, method="nearest", tolerance=pd.Timedelta(days=14))
-                            if len(shares) else np.nan)
-
-        derived_total_expense = (
-            revenue.reindex(all_dates) - operating_income.reindex(all_dates)
-        )
-        result["Total_Expense"] = result["Total_Expense"].combine_first(
-            derived_total_expense
-        )
-
-        return result.dropna(how="all"), ""
+        return result.sort_index(), ""
 
     except Exception as error:
         return pd.DataFrame(), f"{type(error).__name__}: {error}"
+
+
+# New CIK -> the CIKs its history was filed under (Exxon Mobil moved to a new holding company in 2025).
+PREDECESSOR_CIKS = {"XOM": [34088]}
+
+
+def sec_quarterly_frame(company_facts):
+    """Quarterly Revenue, expenses, CapEx, Net_Income, Gross_Profit and Shares from one CIK's Company Facts."""
+
+    revenue = extract_sec_fiscal_quarters(
+        company_facts,
+        [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
+            "SalesRevenueNet",
+            # Banks report net revenue (after interest expense) here.
+            "RevenuesNetOfInterestExpense",
+            "Revenues",
+            # Last resort: goods-only revenue (Coca-Cola before 2018 used no other tag).
+            "SalesRevenueGoodsNet",
+            # Utilities (DTE, XEL) after they stopped tagging Revenues.
+            "RegulatedAndUnregulatedOperatingRevenue",
+        ],
+    )
+    # Banks that tag no revenue (RF, SYF, TFC, BNY, FITB): net interest income plus noninterest income.
+    bank_revenue = (extract_sec_fiscal_quarters(company_facts, ["InterestIncomeExpenseNet", "InterestRevenueExpenseNet"])
+                    + extract_sec_fiscal_quarters(company_facts, ["NoninterestIncome"])).dropna()
+    # Residential REITs (VMRK) after they stopped tagging Revenues: rental income. Checked after the banks, whose
+    # small lease income must not stand in for their revenue.
+    lease_revenue = extract_sec_fiscal_quarters(company_facts, ["OperatingLeaseLeaseIncome"])
+    for fallback in [bank_revenue, lease_revenue]:
+        revenue = revenue.combine_first(fallback) if len(revenue) else fallback
+    operating_expense = extract_sec_fiscal_quarters(
+        company_facts,
+        ["OperatingExpenses"],
+    )
+    total_expense = extract_sec_fiscal_quarters(
+        company_facts,
+        ["CostsAndExpenses"],
+    )
+    operating_income = extract_sec_fiscal_quarters(
+        company_facts,
+        ["OperatingIncomeLoss"],
+    )
+    capex = extract_sec_cumulative_quarters(
+        company_facts,
+        [
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PaymentsForAdditionsToPropertyPlantAndEquipment",
+        ],
+    )
+    net_income = extract_sec_fiscal_quarters(
+        company_facts,
+        ["NetIncomeLoss", "ProfitLoss"],
+    )
+    gross_profit = extract_sec_fiscal_quarters(company_facts, ["GrossProfit"])
+    cost_of_revenue = extract_sec_fiscal_quarters(
+        company_facts, ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"])
+    shares = extract_sec_quarterly_shares(company_facts)
+
+    all_dates = revenue.index.union(operating_expense.index)
+    all_dates = all_dates.union(total_expense.index).union(capex.index)
+    all_dates = all_dates.union(net_income.index).sort_values()
+
+    if len(all_dates) == 0:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(index=all_dates)
+    result["Revenue"] = revenue.reindex(all_dates)
+    result["Operating_Expense"] = operating_expense.reindex(all_dates)
+    result["Total_Expense"] = total_expense.reindex(all_dates)
+    result["CapEx"] = capex.reindex(all_dates)
+    result["Net_Income"] = net_income.reindex(all_dates)
+    result["Gross_Profit"] = gross_profit.reindex(all_dates).combine_first(
+        revenue.reindex(all_dates) - cost_of_revenue.reindex(all_dates))
+    # Share counts reported a few days off the quarter end land on the nearest quarter.
+    result["Shares"] = (shares.reindex(all_dates, method="nearest", tolerance=pd.Timedelta(days=14))
+                        if len(shares) else np.nan)
+
+    derived_total_expense = (
+        revenue.reindex(all_dates) - operating_income.reindex(all_dates)
+    )
+    result["Total_Expense"] = result["Total_Expense"].combine_first(
+        derived_total_expense
+    )
+
+    return result.dropna(how="all")
 
 
 FOREIGN_LOG = "https://raw.githubusercontent.com/kelvindev2017/backtester/data-log/foreign_quarters.csv"
