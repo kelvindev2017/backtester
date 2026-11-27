@@ -41,6 +41,11 @@ DEFAULT_PARAMS = {
                                  # stock-pay dilution and buybacks) or Scaled EPS (reported EPS x growth x margin ratio)
     "fallback_tax_rate": 21.0,   # Build-up: tax rate % when the pre-tax income is not positive or no tax is reported
     "share_creep_cap": 5.0,
+    # Off by default: on 60 stocks' past releases (2016-2025) a flat margin forecast the EPS a year later best (median
+    # error 17.9%; carrying 0.25 / 0.5 / 1 of the trend: 18.1% / 19.1% / 21.5%; margins tend to revert).
+    "margin_trend": False,       # Build-up: next year's EBIT margin carries on the gross margin and OpEx % trend
+    "margin_trend_follow": 0.25,  # ... this share of the last year's change in each (last 4 quarters vs the 4 before)
+    "margin_trend_cap": 5.0,     # ... the EBIT margin moves by at most this many points a year
     "exclude_one_offs": True,    # Build-up: leave one-time costs (acquired intangibles' amortization, impairments,
                                  # acquired R&D, deal costs) out of operating income
     "one_off_floor": 0.8,        # Build-up: the EBIT margin used is at least this share of the margin the reported EPS
@@ -138,7 +143,7 @@ YIELD_MATURITIES = [1, 2, 3, 5, 7, 10, 20, 30]
 BUILD_UP_COLUMNS = ["Operating_Income", "Pretax_Income", "Income_Tax", "Interest_Expense", "Interest_Income",
                     "Net_Interest_Nonoperating", "Preferred_Dividends", "Stock_Comp", "Buybacks", "One_Off_Costs"]
 # The build-up's held inputs at each release (quarterly signals), in model units (revenue and money in dollars).
-BUILD_UP_INPUTS = ["bu_revenue", "bu_net_interest", "bu_tax_rate", "bu_preferred", "bu_shares", "bu_stock_comp",
+BUILD_UP_INPUTS = ["bu_gross_change", "bu_opex_change", "bu_revenue", "bu_net_interest", "bu_tax_rate", "bu_preferred", "bu_shares", "bu_stock_comp",
                    "bu_buybacks", "bu_price", "bu_creep_pct"]
 
 # Assumptions about the future, set together in the Forward section; the other parameters describe today's data.
@@ -191,6 +196,10 @@ SIGNALS = {
     "bu_one_offs": ("quarterly", "Build-up: one-time costs left out of EBIT, last 4 quarters", "", "amount"),
     "bu_margin_floor": ("quarterly", "Build-up: EBIT margin floor from the reported EPS", "%", "share"),
     "bu_creep_pct": ("quarterly", "Build-up: yearly share creep from stock-based pay", "%", "percent"),
+    "bu_gross_margin": ("quarterly", "Build-up: gross margin, last 4 quarters", "%", "share"),
+    "bu_gross_change": ("quarterly", "Build-up: gross margin change over the last year", "pts", "points"),
+    "bu_opex_change": ("quarterly", "Build-up: OpEx share of revenue, change over the last year", "pts", "points"),
+    "bu_margin_trend": ("quarterly", "Build-up: EBIT margin change carried into next year", "pts", "points"),
     "bu_on": ("quarterly", "EPS from the build-up (1) or scaled reported EPS (0)", "", "count"),
     "past_growth": ("quarterly", "Base EPS growth before the latest release (EPS trend)", "%", "percent"),
     "pe_adjust": ("quarterly", "P/E points from general items", "pts", "points"),
@@ -294,7 +303,10 @@ BLOCKS = {
                 "bear_margin_pts": "Bear: margin points vs forward", "bull_margin_pts": "Bull: margin points vs forward",
                 "growth_follow": "Auto rule: base growth as a share of trailing growth",
                 "growth_floor": "Auto rule: base growth floor %", "growth_cap": "Auto rule: base growth cap %",
-                "base_margin_pts": "Auto rule: base margin change, points"}),
+                "base_margin_pts": "Auto rule: base margin change, points",
+                "margin_trend": "Build-up: carry the margin trend into next year (1 = yes)",
+                "margin_trend_follow": "Margin trend: share of the last year's change carried",
+                "margin_trend_cap": "Margin trend: most points a year"}),
     "risk_weighting": dict(
         title="Risk weighting", rate="quarterly", role="Param: scenario weights",
         inputs=["eps_bear", "eps_base", "eps_bull", "ttm_eps"],
@@ -648,7 +660,8 @@ def build_up_inputs(values):
     inputs["ebit_margin"] = float(values.get("ebit_margin", np.nan))
     if not (inputs["bu_revenue"] > 0 and inputs["bu_shares"] > 0 and np.isfinite(inputs["ebit_margin"])):
         return None
-    for name in ["bu_net_interest", "bu_preferred", "bu_stock_comp", "bu_buybacks", "bu_creep_pct"]:
+    for name in ["bu_net_interest", "bu_preferred", "bu_stock_comp", "bu_buybacks", "bu_creep_pct", "bu_gross_change",
+                 "bu_opex_change"]:
         if not np.isfinite(inputs[name]):
             inputs[name] = 0.0
     if not np.isfinite(inputs["bu_tax_rate"]):
@@ -656,6 +669,19 @@ def build_up_inputs(values):
     if not np.isfinite(inputs["bu_price"]):
         inputs["bu_price"] = 0.0
     return inputs
+
+
+def margin_trend(inputs, params):
+    """Points the EBIT margin moves next year: ``margin_trend_follow`` x (the gross margin's change over the last year
+    - the OpEx share's change), within +/- ``margin_trend_cap``. 0 when switched off."""
+
+    if not params.get("margin_trend", False):
+        return 0.0
+    change = float(inputs.get("bu_gross_change", 0.0)) - float(inputs.get("bu_opex_change", 0.0))
+    if not np.isfinite(change):
+        return 0.0
+    cap = abs(float(params["margin_trend_cap"]))
+    return float(np.clip(float(params["margin_trend_follow"]) * change, -cap, cap))
 
 
 def _build_up_case(inputs, growth, margin, params):
@@ -716,15 +742,16 @@ def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, f
     if build_up is not None:
         # The EBIT margin is used as it is, a loss included (the net-margin fallback is for a missing figure).
         margin = build_up["ebit_margin"]
+        trend = margin_trend(build_up, params)
         base_margin = (float(params["forward_margin"]) if forward and np.isfinite(params.get("forward_margin", np.nan))
-                       else margin + params["base_margin_pts"])
+                       else margin + params["base_margin_pts"] + trend)
     growth = {"Bear": base_growth - params["bear_growth_gap"], "Base": base_growth,
               "Bull": base_growth + params["bull_growth_gap"]}
     case_margin = {"Bear": base_margin + params["bear_margin_pts"], "Base": base_margin,
                    "Bull": base_margin + params["bull_margin_pts"]}
     events = event_effect if isinstance(event_effect, dict) else {name: event_effect for name in SCENARIOS}
     weights = scenario_weights(params)
-    point = {"clean_eps": clean, "event_effect": float(sum(w * events[n] for w, n in zip(weights, SCENARIOS))) * 100,
+    point = {"bu_margin_trend": trend if build_up is not None else np.nan, "clean_eps": clean, "event_effect": float(sum(w * events[n] for w, n in zip(weights, SCENARIOS))) * 100,
              "quality_pe": -abs(float(params["quality_pe_pts"])), "margin_base": base_margin}
     by_volatility = params.get("case_spread", "Fixed gaps") == "EPS volatility"
     spread = case_spread(eps_spread, params)
@@ -1253,10 +1280,25 @@ def _build_up_series(quarters, column, revenue, ttm_revenue, shares):
     adjusted_pretax = ttm_pretax + one_offs.reindex(dates).fillna(0.0)
     tax_rate = ((ttm_tax + 0.21 * one_offs.reindex(dates).fillna(0.0)) / adjusted_pretax.where(adjusted_pretax > 0)
                 * 100).clip(0, 50)
+    # Margin trend: the gross margin's and the OpEx share's change from the 4 quarters a year earlier, in points. OpEx is
+    # everything between gross profit and EBIT (one-offs left out); without gross profit (banks) it is all of it.
+    ebit_margin = ebit / ttm_revenue.where(ttm_revenue > 0) * 100
+    gross = column("Gross_Profit")
+    gross_margin = (_trailing(gross.reindex(dates)) / ttm_revenue.where(ttm_revenue > 0) * 100) if len(gross) else (
+        pd.Series(np.nan, index=dates))
+    opex_share = gross_margin - ebit_margin
+    ebit_change = ebit_margin - _year_ago(ebit_margin.dropna()).reindex(dates)
+    gross_change = (gross_margin - _year_ago(gross_margin.dropna()).reindex(dates)) if gross_margin.notna().any() else (
+        pd.Series(np.nan, index=dates))
+    opex_change = (opex_share - _year_ago(opex_share.dropna()).reindex(dates)).where(gross_change.notna(), -ebit_change)
+    gross_change = gross_change.where(gross_change.notna(), 0.0).where(ebit_change.notna())
     total_before = _year_ago(ttm_revenue.dropna())
     total_yoy = (ttm_revenue / total_before.where(total_before > 0) - 1) * 100
     series = {
-        "ebit_margin": (ebit / ttm_revenue.where(ttm_revenue > 0) * 100).dropna(),
+        "ebit_margin": ebit_margin.dropna(),
+        "bu_gross_margin": gross_margin.dropna(),
+        "bu_gross_change": gross_change.dropna(),
+        "bu_opex_change": opex_change.dropna(),
         "revenue_total_yoy": total_yoy.dropna(),
         "bu_revenue": ttm_revenue.dropna(),
         "bu_net_interest": net_interest.dropna(),

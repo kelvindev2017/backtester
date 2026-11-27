@@ -33,6 +33,7 @@ EQUATIONS = {
     "scenario_engine": [
         r"\text{Build-up (default): }",
         r"\begin{aligned} \text{EPS}_{c} = {} & \frac{\big[R_0 (1 + g_c)\, M_c - I\big](1 - t) - P}{S_0 + D - B / p} \end{aligned}",
+        r"M_{\text{base}} = M + \text{clip}\big(\phi\,(\Delta \text{GM} - \Delta \text{OpEx}),\ \pm \text{cap}\big)",
         r"\text{Scaled EPS: }",
         r"g_{\text{base}} = g_{\text{fwd}} \ \text{(yours) or } \min\!\big(\text{cap},\ \max(\text{floor},\ s \times g)\big)",
         r"m_{\text{base}} = m_{\text{fwd}} \ \text{(yours) or } m + \Delta m_{\text{base}}",
@@ -92,7 +93,9 @@ SYMBOLS = {
                        "(the last year's share creep: change in shares plus shares bought back, as % of shares, capped), "
                        "B: buybacks over the last 4 quarters, p: the share price on the release. EBIT leaves out "
                        "one-time costs the filings tag (acquired intangibles' amortization, impairments, acquired R&D, "
-                       "deal costs). M is at least f "
+                       "deal costs). M_base carries on the margin trend: ΔGM and ΔOpEx are the changes in the gross margin and in "
+                       "OpEx as % of revenue from the 4 quarters a year earlier to the last 4 (OpEx: all costs between gross "
+                       "profit and EBIT; no gross profit reported: all costs), φ the share carried. M is at least f "
                        "(one-off floor) times M_reported, the margin at which the build-up gives the reported EPS after "
                        "the haircut, so a one-off accounting hit in GAAP operating income cannot sink it. The base and the bear "
                        "and bull spread work as below; the haircut does not apply (the EBIT is after stock-based pay). "
@@ -211,6 +214,9 @@ def _build_up_worked(values, params, get):
              rf"g_{{\text{{base}}}} = {_n(base, 1)}\%" + (r"\ \text{(yours)}" if np.isfinite(params.get("forward_growth", np.nan))
                                                          else rf" = \min\!\big({_n(params['growth_cap'], 0)},\ \max({_n(params['growth_floor'], 0)},\ {_n(params['growth_follow'])} \times g)\big)"),
              rf"M_{{\text{{base}}}} = {_n(get('margin_base'), 1)}\% \ \text{{(EBIT margin {_n(inputs['ebit_margin'], 1)}\%)}}",
+             *([rf"\text{{trend}} = \text{{clip}}\big({_n(params['margin_trend_follow'])} \times ({_n(inputs['bu_gross_change'], 1)} - "
+                rf"({_n(inputs['bu_opex_change'], 1)})),\ \pm {_n(params['margin_trend_cap'], 1)}\big) = {_n(get('bu_margin_trend'), 1)}"
+                r"\ \text{pts}"] if params.get("margin_trend") else []),
              rf"M = \max\Big(\frac{{\text{{EBIT}} + {_n(get('bu_one_offs') / 1e9 if np.isfinite(get('bu_one_offs')) else 0.0, 2)}\ \text{{(one-offs)}}}}{{R_0}},\ f \times M_{{\text{{reported}}}}\Big) = \max\big({_n(get('ebit_margin_gaap'), 1)},\ "
              rf"{_n(get('bu_margin_floor'), 1)}\big)\%",
              rf"\begin{{aligned}} \text{{EPS}}_{{\text{{base}}}} = {{}} & \frac{{\big[{_n(inputs['bu_revenue'] / 1e9, 1)} \times {_n(1 + base / 100, 3)} "

@@ -907,6 +907,27 @@ def test_eps_climbing_out_of_a_loss_does_not_blow_up_the_cases():
     assert point["eps_bull"] / point["eps_bear"] < 20
 
 
+def test_build_up_margin_trend_moves_next_years_margin():
+    from analysis.valuation_model import margin_trend, quarterly_inputs
+    quarters = make_quarters(count=12, growth=0.0)
+    revenue = quarters["Revenue"]
+    # Gross margin 50% -> 54% and OpEx 30% -> 31% of revenue over the last year: EBIT margin +3 points.
+    gross = np.r_[np.full(8, 0.50), np.full(4, 0.54)]
+    opex = np.r_[np.full(8, 0.30), np.full(4, 0.31)]
+    quarters["Gross_Profit"] = revenue * gross
+    quarters["Operating_Income"] = revenue * (gross - opex)
+    last = quarterly_inputs(quarters).iloc[-1]
+    assert last["bu_gross_change"] == pytest.approx(4.0)
+    assert last["bu_opex_change"] == pytest.approx(1.0)
+    on = model_params({"margin_trend": True, "margin_trend_follow": 0.5, "margin_trend_cap": 5.0})
+    assert margin_trend(last, on) == pytest.approx(1.5)
+    assert margin_trend(last, model_params({**on, "margin_trend_cap": 1.0})) == pytest.approx(1.0)
+    assert margin_trend(last, model_params()) == 0.0
+    # No gross profit reported: the whole EBIT margin change counts as OpEx.
+    plain = quarterly_inputs(quarters.drop(columns=["Gross_Profit"])).iloc[-1]
+    assert plain["bu_gross_change"] == 0.0 and plain["bu_opex_change"] == pytest.approx(-3.0)
+
+
 def test_market_check_pe_is_searched_past_the_cap():
     quarters = make_quarters()
     close = make_close(quarters, pe=400.0)
@@ -1096,3 +1117,21 @@ def test_one_off_costs_are_left_out_of_ebit():
     assert left_out["ebit_margin"] == pytest.approx(25.0) and kept["ebit_margin"] == pytest.approx(5.0)
     assert left_out["bu_one_offs"] == pytest.approx(hit["One_Off_Costs"].iloc[-4:].sum())
     assert left_out["eps_base"] > 3 * kept["eps_base"]
+
+
+def test_margin_trend_lifts_the_base_case_when_on():
+    quarters = build_up_quarters()
+    revenue = quarters["Revenue"]
+    margin = np.r_[np.full(len(quarters) - 4, 0.20), np.full(4, 0.24)]
+    quarters["Operating_Income"] = revenue * margin
+    quarters["Pretax_Income"] = quarters["Operating_Income"] - 6.0
+    quarters["Income_Tax"] = quarters["Pretax_Income"] * 0.2
+    close = make_close(quarters)
+    off = run_model(quarters, close, None, model_params())["quarterly"].iloc[-1]
+    on = run_model(quarters, close, None, model_params({"margin_trend": True, "margin_trend_follow": 0.5}))["quarterly"].iloc[-1]
+    assert off["bu_margin_trend"] == 0.0 and on["bu_margin_trend"] > 1.0
+    assert on["margin_base"] == pytest.approx(off["margin_base"] + on["bu_margin_trend"])
+    assert on["eps_base"] > off["eps_base"]
+    from analysis.model_equations import worked_equations
+    result = run_model(quarters, close, None, model_params({"margin_trend": True}))
+    assert any(r"\text{trend}" in line for line in worked_equations(result, "scenario_engine"))

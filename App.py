@@ -5087,6 +5087,18 @@ def model_settings():
                 "one_off_floor", "Lowest EBIT margin, as a share of the reported EPS's margin", 0, 1, 0.05,
                 "A backstop for one-time costs a company's filings do not tag (Salesforce, Ford): the margin used is "
                 "at least this share of the margin that gives the reported EPS after the haircut. 0 = off.")
+            params["margin_trend"] = st.checkbox(
+                "Carry the margin trend into next year", key=model_param_key("margin_trend"),
+                help="Next year's EBIT margin = the last 4 quarters' + a share of how the gross margin and the OpEx "
+                     "share of revenue moved over the last year (the last 4 quarters vs the 4 before). Off: the margin "
+                     "is held flat. Off by default: on 60 stocks' past releases a flat margin forecast the EPS a year "
+                     "later best (median error 17.9%; carrying a quarter of the trend 18.1%, half 19.1%, all of it 21.5%), "
+                     "because margins tend to revert.")
+            if params["margin_trend"]:
+                params["margin_trend_follow"] = number(
+                    "margin_trend_follow", "Margin trend: share of the last year's change carried", 0, 1, 0.05)
+                params["margin_trend_cap"] = number(
+                    "margin_trend_cap", "Margin trend: most points a year", 0, 30, 0.5)
             st.caption("The build-up grows revenue, so its base growth is the auto rule on total revenue growth (or "
                        "your forward growth); analysts' EPS growth does not apply to it.")
         params["base_eps_source"] = st.radio(
