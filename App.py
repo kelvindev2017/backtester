@@ -206,7 +206,7 @@ from analysis.what_happened_next import (
     walkthrough_figure,
 )
 from analysis.guidance import company_guidance
-from analysis.foreign_results import align_units, foreign_quarters
+from analysis.foreign_results import align_units, foreign_quarters, from_log
 from analysis.valuation_model import (
     GUIDANCE_COLUMNS,
     BLOCKS as MODEL_BLOCKS,
@@ -1683,22 +1683,54 @@ def load_sec_quarterly_fundamentals(symbol):
         return pd.DataFrame(), f"{type(error).__name__}: {error}"
 
 
-@st.cache_data(ttl=7 * 86400, show_spinner="Reading quarterly results from the company's 6-K releases (first time only)...")
-def load_foreign_quarters(symbol, start_date_str):
-    """Quarterly results of a foreign filer from its 6-K results releases (analysis/foreign_results.py), filed around
-    its earnings dates since ``start_date_str``. Empty when the ticker has no SEC CIK or no readable releases."""
+FOREIGN_LOG = "https://raw.githubusercontent.com/kelvindev2017/backtester/data-log/foreign_quarters.csv"
+FOREIGN_LIVE_SECONDS = 25  # longest a live read of 6-K releases may take before the app falls back to Yahoo
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_foreign_log():
+    """Foreign filers' quarters saved by the daily log (scripts/log_guidance.py) and the tickers it has read:
+    ``(rows, tickers read)``; empty when not reachable."""
 
     try:
-        cik = get_sec_cik(symbol)
-        if cik is None:
-            return pd.DataFrame()
-        earnings = load_earnings_data(symbol, start_date_str, date.today().strftime("%Y-%m-%d"))
-        if earnings.empty:
-            return pd.DataFrame()
-        import requests
+        rows = pd.read_csv(FOREIGN_LOG)
+    except Exception:
+        return pd.DataFrame(), set()
+    try:
+        read = set(pd.read_csv(FOREIGN_LOG.replace("foreign_quarters.csv", "foreign_read.csv"))["ticker"].astype(str))
+    except Exception:
+        read = set()
+    return rows, read
 
-        session = requests.Session()
-        return foreign_quarters(cik, earnings.index, session, get_sec_user_agent(), since=start_date_str)
+
+@st.cache_data(ttl=7 * 86400, show_spinner="Reading quarterly results from the company's 6-K releases...")
+def read_foreign_quarters_live(symbol, start_date_str):
+    """A live read of the 6-K releases, stopped after FOREIGN_LIVE_SECONDS (TimeoutError, which is not cached)."""
+
+    import time
+    import requests
+
+    cik = get_sec_cik(symbol)
+    if cik is None:
+        return pd.DataFrame()
+    earnings = load_earnings_data(symbol, start_date_str, date.today().strftime("%Y-%m-%d"))
+    if earnings.empty:
+        return pd.DataFrame()
+    return foreign_quarters(cik, earnings.index, requests.Session(), get_sec_user_agent(), since=start_date_str,
+                            deadline=time.time() + FOREIGN_LIVE_SECONDS)
+
+
+def load_foreign_quarters(symbol, start_date_str):
+    """Quarterly results of a foreign filer from its 6-K results releases (analysis/foreign_results.py): from the
+    daily log when it has the ticker, else read live within a time limit. Empty when neither works, and the
+    fundamentals then fall back to Yahoo's few quarters."""
+
+    log, read = load_foreign_log()
+    saved = from_log(log, symbol)
+    if len(saved) or symbol in read:
+        return saved  # the log has read this ticker: a live read would find no more
+    try:
+        return read_foreign_quarters_live(symbol, start_date_str)
     except Exception:
         return pd.DataFrame()
 

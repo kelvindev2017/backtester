@@ -9,6 +9,9 @@ so they survive app updates and reboots:
   ``guidance_days.csv`` records the days done. The history back to 2012 was read once by
   scripts/backfill_guidance.py.
 - ``estimates/YYYY-MM-DD.csv.gz``: Yahoo's analyst estimates as they stand that day (Yahoo keeps no history).
+- ``foreign_quarters.csv``: quarterly results of foreign filers (FOREIGN, 20-F companies) read by
+  analysis/foreign_results.py from their 6-K results releases, so the app need not read them live. Each run reads
+  the 6-Ks filed around their earnings dates in the last 20 days; a ticker not yet in the file gets its history.
 
 Usage: python scripts/log_guidance.py OUT_DIR [--tickers A,B] [--skip-yahoo]
 """
@@ -24,11 +27,15 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from analysis.foreign_results import foreign_quarters, merge_log, to_log  # noqa: E402
 from analysis.guidance import GUIDANCE_COLUMNS, day_filings, filing_guidance, sec_get  # noqa: E402
 
 WATCHED = ["ANT", "SPCX"]
 SEC_AGENT = os.getenv("SEC_USER_AGENT") or "StreamlitBacktester/1.0 kelvin@example.com"  # same default as App.py
 MAX_DAYS = 10  # days caught up in one run after missed runs
+# Foreign filers (20-F) the app shows: SEC Company Facts has only their yearly figures.
+FOREIGN = ["ARM", "ASML", "ASX", "BABA", "GFS", "NVO", "SAP", "SKHY", "SONY", "STM", "TM", "TSM", "UMC"]
+FOREIGN_SINCE = "2014-01-01"
 
 
 def universe():
@@ -89,6 +96,46 @@ def yahoo_rows(ticker, today):
     return rows
 
 
+def earnings_dates(ticker):
+    import yfinance as yf
+
+    try:
+        return pd.DatetimeIndex(yf.Ticker(ticker).get_earnings_dates(limit=60).index).tz_localize(None)
+    except Exception:
+        return pd.DatetimeIndex([])
+
+
+def update_foreign(out_dir, tickers, session, today, dates=earnings_dates):
+    """Add the foreign filers' newly released quarters to foreign_quarters.csv; a ticker not in it gets its history."""
+
+    path = os.path.join(out_dir, "foreign_quarters.csv")
+    log = pd.read_csv(path) if os.path.exists(path) else pd.DataFrame(columns=["ticker", "quarter_end"])
+    ciks = sec_ciks(session)
+    added = 0
+    for ticker in [t for t in tickers if t in ciks]:
+        known = ticker in set(log["ticker"])
+        since = (today - timedelta(days=20)).isoformat() if known else FOREIGN_SINCE
+        releases = dates(ticker)
+        if not len(releases):
+            continue
+        try:
+            frame = foreign_quarters(ciks[ticker], releases, session, SEC_AGENT, since=since)
+        except Exception as error:
+            print(f"foreign {ticker}: {error}")
+            continue
+        if len(frame):
+            log = merge_log(log, to_log(ticker, frame))
+            added += len(frame)
+    if added:
+        log.to_csv(path, index=False)
+    # Tickers whose history was read, found or not: the app does not try a live read of these.
+    read_path = os.path.join(out_dir, "foreign_read.csv")
+    read = set(pd.read_csv(read_path)["ticker"]) if os.path.exists(read_path) else set()
+    done = sorted(read | {t for t in tickers if t in ciks})
+    pd.DataFrame({"ticker": done}).to_csv(read_path, index=False)
+    print(f"foreign quarters: {added} read")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("out_dir")
@@ -113,6 +160,9 @@ def main():
     if done:
         pd.DataFrame({"day": done}).to_csv(days_path, mode="a", header=not os.path.exists(days_path), index=False)
     print(f"guidance: {len(done)} days read, {len(rows)} figures")
+
+    if not args.skip_yahoo:
+        update_foreign(args.out_dir, [t for t in FOREIGN if not args.tickers or t in tickers], requests.Session(), today)
 
     # Analysts' estimates as they stand today, one compressed file a day.
     estimates_path = os.path.join(args.out_dir, "estimates", f"{today.isoformat()}.csv.gz")

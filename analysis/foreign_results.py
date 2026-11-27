@@ -7,6 +7,7 @@ company's reporting currency; the model only uses ratios of them (growth, margin
 """
 
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -182,19 +183,32 @@ def filing_quarters(cik, accession, session, agent=DEFAULT_AGENT):
     return found
 
 
-def foreign_quarters(cik, release_dates, session, agent=DEFAULT_AGENT, since="2010-01-01"):
+def foreign_quarters(cik, release_dates, session, agent=DEFAULT_AGENT, since="2010-01-01", deadline=None):
     """Quarterly Revenue, Gross_Profit, Net_Income and Shares by quarter end, from the 6-K results releases filed
-    around ``release_dates``. The latest release wins where two report the same quarter (restated comparatives)."""
+    around ``release_dates`` (None: every 6-K filed since ``since``, for the daily run's few new filings). The
+    latest release wins where two report the same quarter (restated comparatives).
+
+    ``deadline`` (a time.time() value): past it, the read stops and raises TimeoutError rather than return part of
+    the history, so a caller can fall back and try again later.
+    """
 
     response = sec_get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json", session, agent)
     if response is None:
         return pd.DataFrame(columns=FIELDS)
     filings = sixk_filings(response.json(), session, agent)
-    filings = near_releases(filings[filings["filed"] >= since], release_dates)
+    filings = filings[filings["filed"] >= since]
+    if release_dates is not None:
+        filings = near_releases(filings, release_dates)
     filings = filings.sort_values("filed")
+
+    def read(accession):
+        if deadline is not None and time.time() > deadline:
+            raise TimeoutError("6-K read took too long")
+        return filing_quarters(cik, accession, session, agent)
+
     # A few filings at a time: each is an index page and a few documents, and SEC allows 10 requests a second.
     with ThreadPoolExecutor(max_workers=3) as pool:
-        found_list = list(pool.map(lambda accession: filing_quarters(cik, accession, session, agent), filings["accession"]))
+        found_list = list(pool.map(read, filings["accession"]))
     rows = {}
     for found in found_list:
         for end, figures in found.items():
@@ -207,6 +221,32 @@ def foreign_quarters(cik, release_dates, session, agent=DEFAULT_AGENT, since="20
     frame = frame[frame["Shares"].notna()]
     frame.index = pd.DatetimeIndex(frame.index)
     return frame.astype(float).replace(0, np.nan)
+
+
+def to_log(ticker, frame):
+    """Quarters as rows for the log's foreign_quarters.csv: ticker, quarter_end and the fields."""
+
+    out = frame.reindex(columns=FIELDS).copy()
+    out.insert(0, "quarter_end", pd.DatetimeIndex(out.index).strftime("%Y-%m-%d"))
+    out.insert(0, "ticker", ticker)
+    return out.reset_index(drop=True)
+
+
+def from_log(log, ticker):
+    """One ticker's quarters from the log, indexed by quarter end (empty when the ticker is not in it)."""
+
+    if log is None or log.empty or "ticker" not in log:
+        return pd.DataFrame(columns=FIELDS)
+    rows = log[log["ticker"] == ticker]
+    frame = rows.set_index(pd.DatetimeIndex(pd.to_datetime(rows["quarter_end"]))).reindex(columns=FIELDS)
+    return frame.astype(float).sort_index()
+
+
+def merge_log(log, new):
+    """The log with ``new`` rows added; a quarter read again (a later, restated release) replaces the old row."""
+
+    combined = pd.concat([log, new], ignore_index=True) if log is not None and len(log) else new
+    return combined.drop_duplicates(["ticker", "quarter_end"], keep="last").sort_values(["ticker", "quarter_end"])
 
 
 def align_units(other, reference, tolerance_days=14):
