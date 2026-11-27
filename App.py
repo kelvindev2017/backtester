@@ -3036,11 +3036,14 @@ def render_robustness(s):
         stored = st.session_state.get("robustness_result")
         if not stored or stored["key"] != run_key:
             return
-        render_robustness_results(stored, [name for name, _ in candidates])
+        keys = result["searched"] if result is not None else [param.key for param in space.params]
+        render_robustness_results(stored, candidates, space, keys)
 
 
-def render_robustness_results(stored, names):
+def render_robustness_results(stored, candidates, space, keys):
     rows, yearly = stored["rows"], stored["yearly"]
+    names = [name for name, _ in candidates]
+    values = dict(candidates)
     if stored["failed"]:
         st.warning("No prices for: " + ", ".join(stored["failed"]))
     if rows.empty:
@@ -3064,6 +3067,7 @@ def render_robustness_results(stored, names):
                                                 if name != "Your current settings" else np.nan),
             "Median forward return %": group["Forward return %"].median(),
             "Median forward max DD %": group["Forward max DD %"].median(),
+            **param_columns(values[name], space, keys),
         })
     bh = rows.loc[rows["Settings"].eq("Buy & hold")]
     summary.append({"Settings": "Buy & hold", "Median total gain %": bh["Total gain %"].median(),
@@ -3071,13 +3075,18 @@ def render_robustness_results(stored, names):
                     "Median forward score": bh["Forward score"].median(),
                     "Median forward score, other stocks": bh.loc[~bh["Stock"].isin(stored["tuned_ticker"].split(", ")), "Forward score"].median(),
                     "Median forward return %": bh["Forward return %"].median(),
-                    "Median forward max DD %": bh["Forward max DD %"].median()})
+                    "Median forward max DD %": bh["Forward max DD %"].median(),
+                    **param_columns(None, space, keys)})
     summary = pd.DataFrame(summary)
+    setting_columns = list(param_columns(None, space, keys))
     st.markdown(f"**Across {rows['Stock'].nunique()} stocks**")
     st.dataframe(summary, hide_index=True, width="stretch", key="robustness_summary_table", column_config={
-        **{column: st.column_config.NumberColumn(format="%.2f") for column in summary.columns if "score" in column or "%" in column},
+        **{column: st.column_config.NumberColumn(format="%.2f") for column in summary.columns
+           if column not in setting_columns and ("score" in column or "%" in column)},
         "Forward: beats buy & hold": st.column_config.NumberColumn(format="%.0f%% of stocks"),
-        "Forward: beats current settings": st.column_config.NumberColumn(format="%.0f%% of stocks")})
+        "Forward: beats current settings": st.column_config.NumberColumn(format="%.0f%% of stocks"),
+        **param_column_config(space, keys),
+        "Settings": st.column_config.TextColumn(pinned=True)})
     st.caption(
         "Scores are medians across the stocks (the middle stock, so one outlier can't carry it). \"Other stocks\" "
         f"leaves out {stored['tuned_ticker']}, the stock(s) the picks were tuned on. Settings that only work on the stock "
@@ -7082,10 +7091,24 @@ def rule_backtest(price_df, s, params=None):
     return result[["Close", "Equity", "Buy_Signal"]]
 
 
-def describe_params(params, space):
+def param_columns(params, space, keys):
+    """One column per setting (header = the setting's name), so each value reads on its own instead of in one long
+    text that a phone cuts off. ``params`` None (buy & hold) leaves the cells blank."""
+
     labels = {param.key: param.label for param in space.params}
-    return ", ".join(f"{labels.get(key, key)} {value:g}" if isinstance(value, (int, float)) else f"{labels.get(key, key)} {value}"
-                     for key, value in params.items())
+    return {labels.get(key, key): (params or {}).get(key) for key in keys}
+
+
+def param_column_config(space, keys):
+    """Number formats for the setting columns: whole numbers for whole-number settings, the step's decimals else."""
+
+    config = {}
+    for param in space.params:
+        if param.key not in keys or param.kind == "choice":
+            continue
+        decimals = 0 if param.kind == "int" else len(f"{param.step:g}".partition(".")[2])
+        config[param.label] = st.column_config.NumberColumn(format=f"%.{decimals}f")
+    return config
 
 
 def apply_params(params):
@@ -7288,8 +7311,9 @@ def render_optimizer(price_df, s):
         ("Best single trial", params_of(best, space)),
         ("Your current settings", result["current"]),
     ]
-    runs = [(label, describe_params({key: params[key] for key in result["searched"]}, space), params)
-            for label, params in candidates] + [("Buy & hold", "", None)]
+    searched = result["searched"]
+    runs = [(label, param_columns(params, space, searched), params)
+            for label, params in candidates] + [("Buy & hold", param_columns(None, space, searched), None)]
     per_stock = []
     for ticker, frame in frames.items():
         for label, text, params in runs:
@@ -7305,18 +7329,24 @@ def render_optimizer(price_df, s):
                 "Tuning score": objective_score(tune, weights), "Forward score": objective_score(ahead, weights),
                 "Tuning return %": tune["return"] * 100, "Forward return %": ahead["return"] * 100,
                 "Tuning max DD %": tune["max_dd"] * 100, "Forward max DD %": ahead["max_dd"] * 100,
-                "Tuning trades": tune["trades"], "Forward trades": ahead["trades"], "Settings": text,
+                "Tuning trades": tune["trades"], "Forward trades": ahead["trades"], **text,
             })
     per_stock = pd.DataFrame(per_stock)
     for column in ("Tuning trades", "Forward trades"):
         per_stock[column] = per_stock[column].astype(float)
         per_stock.loc[per_stock[""].eq("Buy & hold"), column] = np.nan
-    numbers = [column for column in per_stock.columns if column not in ("Stock", "", "Settings")]
+    setting_columns = list(runs[0][1])
+    numbers = [column for column in per_stock.columns if column not in ("Stock", "", *setting_columns)]
     table = per_stock.groupby("", sort=False)[numbers].median().reset_index()
-    table["Settings"] = [text for _, text, _ in runs]
-    st.dataframe(table, hide_index=True, width="stretch", key="optimizer_results_table", column_config={
-        column: st.column_config.NumberColumn(format="%.2f") for column in table.columns
-        if column.endswith("score") or column.endswith("%")})
+    # Each searched setting in its own column, after the results.
+    table = table.join(pd.DataFrame([text for _, text, _ in runs]))
+    table_formats = {
+        **{column: st.column_config.NumberColumn(format="%.2f") for column in table.columns
+           if column not in setting_columns and (column.endswith("score") or column.endswith("%"))},
+        **param_column_config(space, searched),
+        # Pinned, so the row's name stays in view while a phone scrolls across to the settings.
+        "": st.column_config.TextColumn(pinned=True)}
+    st.dataframe(table, hide_index=True, width="stretch", key="optimizer_results_table", column_config=table_formats)
     st.caption(
         "**Most stable** is the trial whose own score and its 5 nearest neighbours' scores average highest: a "
         "setting on a plateau, where nearby values also work. **Best single trial** is the top score, often a lucky "
@@ -7324,9 +7354,8 @@ def render_optimizer(price_df, s):
         f"With {len(trials)} trials, the best tuning score is flattered by luck, so expect the forward score to be lower.")
     if len(frames) > 1:
         with st.expander("Every stock"):
-            st.dataframe(per_stock, hide_index=True, width="stretch", key="optimizer_per_stock_table", column_config={
-                column: st.column_config.NumberColumn(format="%.2f") for column in per_stock.columns
-                if column.endswith("score") or column.endswith("%")})
+            st.dataframe(per_stock, hide_index=True, width="stretch", key="optimizer_per_stock_table",
+                         column_config=table_formats)
     buttons = st.columns(2)
     buttons[0].button("Use the most stable settings", on_click=apply_params, args=(params_of(stable, space),),
                       key="optimizer_apply_stable_btn")
@@ -7334,7 +7363,6 @@ def render_optimizer(price_df, s):
                       key="optimizer_apply_best_btn")
     # Best first and larger, so the star stays visible on top when both picks are the same trial.
     picks = [("Best single trial", best, "crimson", "diamond"), ("Most stable", stable, "gold", "star")]
-    searched = result["searched"]
     if len(searched) >= 2:
         labels = {param.key: param.label for param in space.params}
         # Default axes: the two settings that mattered most, when that can be told.
