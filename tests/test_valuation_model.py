@@ -942,3 +942,81 @@ def test_year_ago_quarter_is_found_by_date_past_a_missing_quarter():
     yoy = quarterly_inputs(quarters)["quarter_yoy"]
     # The quarters after the gap still compare with their own year-ago quarter.
     assert yoy.iloc[9:12].round(1).tolist() == [10.0, 10.0, 10.0]
+
+
+def build_up_quarters(count=14, operating_margin=0.25, shares=100.0, end="2026-10-28"):
+    """Quarters with the build-up's inputs: revenue +20% a year, a steady operating margin, interest, tax at 20%,
+    preferred dividends, stock-based pay and buybacks."""
+
+    quarters = make_quarters(count, shares=shares, end=end)
+    revenue = quarters["Revenue"]
+    quarters["Operating_Income"] = revenue * operating_margin
+    quarters["Interest_Expense"] = 10.0
+    quarters["Interest_Income"] = 4.0
+    quarters["Pretax_Income"] = quarters["Operating_Income"] - 6.0
+    quarters["Income_Tax"] = quarters["Pretax_Income"] * 0.2
+    quarters["Preferred_Dividends"] = 1.0
+    quarters["Stock_Comp"] = 5.0
+    quarters["Buybacks"] = 20.0
+    quarters["Shares"] = shares
+    return quarters
+
+
+def test_build_up_eps_follows_the_formula():
+    from analysis.valuation_model import build_up_eps
+
+    # ([1000 x 1.1 x 25% - 24] x (1 - 20%) - 4) / (100 + 2 - 80 / 40)
+    eps = build_up_eps(1000.0, 10.0, 25.0, 24.0, 20.0, 4.0, 100.0, 2.0, 80.0, 40.0)
+    assert eps == pytest.approx(((1000 * 1.1 * 0.25 - 24) * 0.8 - 4) / 100)
+    assert np.isnan(build_up_eps(1000.0, 0.0, 25.0, 0.0, 20.0, 0.0, 1.0, 0.0, 100.0, 1.0))
+
+
+def test_share_creep_is_historical_and_capped():
+    from analysis.valuation_model import share_creep_pct
+
+    # Shares 100 -> 101 while 2 were bought back: 3% of the year-ago count was issued.
+    assert share_creep_pct(101.0, 100.0, 100.0, 50.0, 0.0, 50.0, 5.0) == pytest.approx(3.0)
+    # An acquisition paid in shares is capped; without a year-ago count, stock-based pay over the price.
+    assert share_creep_pct(150.0, 100.0, 0.0, 50.0, 0.0, 50.0, 5.0) == pytest.approx(5.0)
+    assert share_creep_pct(100.0, np.nan, 0.0, np.nan, 100.0, 50.0, 5.0) == pytest.approx(2.0)
+
+
+def test_quarterly_inputs_build_up_columns():
+    inputs = quarterly_inputs(build_up_quarters())
+    last = inputs.iloc[-1]
+    assert last["ebit_margin"] == pytest.approx(25.0)
+    assert last["bu_net_interest"] == pytest.approx(24.0)
+    assert last["bu_tax_rate"] == pytest.approx(20.0)
+    assert last["bu_preferred"] == pytest.approx(4.0) and last["bu_buybacks"] == pytest.approx(80.0)
+    assert last["revenue_total_yoy"] == pytest.approx(20.0, rel=0.01)
+    # Without operating income (a bank), EBIT is the pre-tax income and interest is not taken off again.
+    bank = build_up_quarters().drop(columns=["Operating_Income"])
+    bank_last = quarterly_inputs(bank).iloc[-1]
+    assert bank_last["bu_net_interest"] == 0.0
+    assert bank_last["ebit_margin"] == pytest.approx(bank["Pretax_Income"].iloc[-4:].sum() / bank["Revenue"].iloc[-4:].sum() * 100)
+
+
+def test_run_model_uses_the_build_up_and_falls_back_without_inputs():
+    quarters = build_up_quarters()
+    close = make_close(quarters)
+    params = {"case_spread": "Fixed gaps"}
+    result = run_model(quarters, close, params=params)
+    values = latest_values(result)
+    assert values["bu_on"] == 1
+    inputs = quarterly_inputs(quarters).iloc[-1]
+    price = close.asof(quarters.index[-1])
+    retired = 80.0 / price
+    # Shares held at 100 while 80 a year was spent on buybacks: the shares bought back were issued again (creep).
+    assert values["bu_creep_pct"] > 0
+    expected = ((inputs["bu_revenue"] * (1 + values["growth_base"] / 100) * 0.25 - 24.0) * 0.8 - 4.0) / (
+        100.0 + values["bu_creep_pct"] - retired)
+    assert values["eps_base"] == pytest.approx(expected)
+    # The haircut does not touch the build-up (its EBIT is after stock-based pay).
+    cut = latest_values(run_model(quarters, close, params={**params, "eps_haircut_pct": 30.0}))
+    assert cut["eps_base"] == pytest.approx(values["eps_base"])
+    scaled = latest_values(run_model(quarters, close, params={**params, "eps_model": "Scaled EPS"}))
+    assert scaled["bu_on"] == 0 and scaled["eps_base"] != pytest.approx(values["eps_base"])
+    plain = latest_values(run_model(make_quarters(), close, params=params))
+    assert plain["bu_on"] == 0 and np.isfinite(plain["eps_base"])
+    # The what-if helpers see the same case as the model.
+    assert sensitivities(result)["1 point more growth"] > 0
