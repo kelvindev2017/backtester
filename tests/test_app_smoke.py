@@ -1193,7 +1193,7 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     steps = next(frame.value for frame in app.dataframe if list(frame.value.columns) == ["Step", "Model", "Risk-adjusted", "Change"])
     steps = steps.set_index("Step")
     assert steps.loc["Policy rate %", "Model"] == pytest.approx(4.0) and steps.loc["Policy rate %", "Risk-adjusted"] == pytest.approx(5.0)
-    assert steps.loc["Fair value", "Change"] < 0
+    assert steps.loc["P/E", "Change"] < 0  # the higher forward rate lowers the P/E
     assert any("risk-adj " in spec and "model " in spec for spec in (chart.proto.spec for chart in app.get("plotly_chart")))
     app.selectbox(key="model_block").select("rate_model")
     open_tab(app, "Valuation Model")

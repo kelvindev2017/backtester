@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.valuation_model import (
-    SCENARIOS, case_effects, latest_values, rate_adjusted_pe, rate_weight, scenario_weights,
+    SCENARIOS, build_up_inputs, case_effects, latest_values, rate_adjusted_pe, rate_weight, scenario_weights,
 )
 
 # Each string is one display line, kept short enough for a phone; aligned blocks break longer ones.
@@ -31,6 +31,9 @@ EQUATIONS = {
         r"e = \sum \pm\, p \times \text{impact} \qquad a = \sum \pm\, \text{points}",
     ],
     "scenario_engine": [
+        r"\text{Build-up (default): }",
+        r"\begin{aligned} \text{EPS}_{c} = {} & \frac{\big[R_0 (1 + g_c)\, M_c - I\big](1 - t) - P}{S_0 + D - B / p} \end{aligned}",
+        r"\text{Scaled EPS: }",
         r"g_{\text{base}} = g_{\text{fwd}} \ \text{(yours) or } \min\!\big(\text{cap},\ \max(\text{floor},\ s \times g)\big)",
         r"m_{\text{base}} = m_{\text{fwd}} \ \text{(yours) or } m + \Delta m_{\text{base}}",
         r"\begin{aligned} \text{EPS}_{\text{base}} = {} & \text{EPS}_{\text{clean}} \times \left(1 + \frac{g_{\text{base}}}{100}\right) \\ "
@@ -81,7 +84,15 @@ SYMBOLS = {
     "triage_gate": "p: probability, impact: EPS impact %, points: P/E points.",
     "item_router": "e: expected EPS change % from event items (per case: the forward probability plus the item's bull "
                    "or bear adjustment; shown weighted), a: P/E points (+ product, - risk), weighted over the cases.",
-    "scenario_engine": "g, m: current (trailing) revenue growth and net margin %, g_fwd, m_fwd: your forward values "
+    "scenario_engine": "Build-up: R_0: revenue over the last 4 quarters, g_c: the case's revenue growth (total, "
+                       "not per share), M_c: its EBIT (operating) margin (pre-tax margin for banks and insurers, which "
+                       "report no operating income), I: net interest expense (interest expense less interest income), "
+                       "t: tax rate over the last 4 quarters (the fallback when pre-tax income is not positive), P: "
+                       "preferred dividends, S_0: the latest diluted share count, D: new shares from stock-based pay "
+                       "(the last year's share creep: change in shares plus shares bought back, as % of shares, capped), "
+                       "B: buybacks over the last 4 quarters, p: the share price on the release. The base and the bear "
+                       "and bull spread work as below; the haircut does not apply (the EBIT is after stock-based pay). "
+                       "Scaled EPS: g, m: current (trailing) revenue growth and net margin %, g_fwd, m_fwd: your forward values "
                        "(latest quarter only; blank = the auto rule with s: share of trailing growth), c: bear, base or "
                        "bull, adj_c and Δm_c: the case's growth and margin adjustment in points (Fixed gaps only), e_c: event "
                        "items' EPS change % at that case's probability. σ_own: the company's own EPS volatility (standard "
@@ -179,6 +190,38 @@ def _n(value, digits=2):
     return f"{value:,.{digits}f}" if value is not None and np.isfinite(value) else r"\text{n/a}"
 
 
+def _build_up_worked(values, params, get):
+    """The build-up's base case with the latest release's inputs, in billions and millions of shares."""
+
+    inputs = build_up_inputs(values)
+    if inputs is None:
+        return []
+    tax = inputs["bu_tax_rate"] if np.isfinite(inputs["bu_tax_rate"]) else params["fallback_tax_rate"]
+    price = inputs["bu_price"]
+    dilution = inputs["bu_shares"] * inputs["bu_creep_pct"] / 100
+    retired = inputs["bu_buybacks"] / price if price > 0 else 0.0
+    growth = get("revenue_total_yoy")
+    base = get("growth_base")
+    lines = [rf"g = {_n(growth, 1)}\% \ \text{{(total revenue, last 4q vs 4q before)}}",
+             rf"g_{{\text{{base}}}} = {_n(base, 1)}\%" + (r"\ \text{(yours)}" if np.isfinite(params.get("forward_growth", np.nan))
+                                                         else rf" = \min\!\big({_n(params['growth_cap'], 0)},\ \max({_n(params['growth_floor'], 0)},\ {_n(params['growth_follow'])} \times g)\big)"),
+             rf"M_{{\text{{base}}}} = {_n(get('margin_base'), 1)}\% \ \text{{(EBIT margin {_n(inputs['ebit_margin'], 1)}\%)}}",
+             rf"\begin{{aligned}} \text{{EPS}}_{{\text{{base}}}} = {{}} & \frac{{\big[{_n(inputs['bu_revenue'] / 1e9, 1)} \times {_n(1 + base / 100, 3)} "
+             rf"\times {_n(get('margin_base') / 100, 3)} - {_n(inputs['bu_net_interest'] / 1e9, 2)}\big] \times {_n(1 - tax / 100, 3)} "
+             rf"- {_n(inputs['bu_preferred'] / 1e9, 2)}}}{{{_n(inputs['bu_shares'] / 1e9, 3)} + {_n(dilution / 1e9, 3)} - {_n(retired / 1e9, 3)}}} \\ "
+             rf"= {{}} & {_n(get('eps_base'))} \end{{aligned}}",
+             rf"\text{{Money in billions, shares in billions; }} D = {_n(inputs['bu_creep_pct'], 1)}\% \times S_0,\ B / p = "
+             rf"{_n(inputs['bu_buybacks'] / 1e9, 2)} / {_n(price, 2)}"]
+    if params.get("case_spread") == "EPS volatility" and np.isfinite(get("case_spread")):
+        spread, k = get("case_spread"), params["spread_k"]
+        lines.append(rf"\text{{EPS}}_{{\text{{bear}}}} = {_n(get('eps_bear'))},\ \text{{EPS}}_{{\text{{bull}}}} = {_n(get('eps_bull'))} "
+                     rf"\ (e^{{\mp {_n(k, 1)} \times {_n(spread, 3)}}})")
+    else:
+        lines.append(rf"\text{{EPS}}_{{\text{{bear}}}} = {_n(get('eps_bear'))},\ \text{{EPS}}_{{\text{{bull}}}} = {_n(get('eps_bull'))} "
+                     r"\ \text{(their own } g_c, M_c)")
+    return lines
+
+
 def worked_equations(result, block, on=None):
     """The block's equations with the run's values on ``on`` (default: the last close) filled in."""
 
@@ -197,11 +240,15 @@ def worked_equations(result, block, on=None):
     if block == "earnings_quality":
         return [rf"\text{{EPS}}_{{\text{{clean}}}} = {_n(get('ttm_eps'))} \times \left(1 - \frac{{{_n(params['eps_haircut_pct'], 1)}}}{{100}}\right)"
                 rf" = {_n(get('clean_eps'))}", rf"d_q = {_n(params['quality_pe_pts'], 1)} \text{{ P/E points}}"]
+    if block == "scenario_engine" and get("bu_on") == 1:
+        return _build_up_worked(values, params, get)
     if block == "scenario_engine":
         base, base_margin = get("growth_base"), get("margin_base")
         forward = result.get("forward_from") is None or (on is None or pd.Timestamp(on) >= result["forward_from"])
         if forward and params.get("analyst_base"):
-            lines = [rf"g_{{\text{{base}}}} = {_n(base, 1)}\% \ \text{{(analysts' EPS, next 4q vs last 4q)}}"]
+            a = float(np.clip(params.get("analyst_share", 1.0), 0, 1))
+            lines = [rf"\begin{{aligned}} g_{{\text{{base}}}} = {{}} & {_n(a)} \times {_n(params.get('analyst_growth', np.nan), 1)}\ \text{{(analysts, next 4q vs last 4q)}} \\ "
+                     rf"& + {_n(1 - a)} \times {_n(params.get('rule_growth_latest', np.nan), 1)}\ \text{{(EPS trend rule)}} = {_n(base, 1)}\% \end{{aligned}}"]
         elif forward and np.isfinite(params.get("forward_growth", np.nan)):
             lines = [rf"g_{{\text{{base}}}} = {_n(base, 1)}\% \ \text{{(yours)}}"]
         else:

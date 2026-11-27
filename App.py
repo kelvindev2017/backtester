@@ -208,6 +208,7 @@ from analysis.what_happened_next import (
 from analysis.guidance import company_guidance
 from analysis.foreign_results import align_units, foreign_quarters, from_log
 from analysis.valuation_model import (
+    BUILD_UP_COLUMNS,
     GUIDANCE_COLUMNS,
     BLOCKS as MODEL_BLOCKS,
     premium_warning,
@@ -1626,6 +1627,42 @@ def load_sec_quarterly_fundamentals(symbol):
         return pd.DataFrame(), f"{type(error).__name__}: {error}"
 
 
+def sec_build_up_inputs(company_facts):
+    """Quarterly inputs of the EPS build-up (analysis/valuation_model.py ``build_up_eps``) from Company Facts.
+
+    Income statement items keep their sign (a tax benefit is negative); cash-flow items (stock-based pay, buybacks)
+    are year-to-date in filings and become single quarters.
+    """
+
+    quarterly = lambda tags: extract_sec_fiscal_quarters(company_facts, tags)
+    return {
+        "Pretax_Income": quarterly([
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
+        ]),
+        "Income_Tax": quarterly(["IncomeTaxExpenseBenefit", "IncomeTaxExpenseBenefitContinuingOperations"]),
+        "Interest_Expense": quarterly([
+            "InterestExpense", "InterestExpenseNonoperating", "InterestExpenseDebt", "InterestAndDebtExpense",
+            "InterestExpenseOperating",
+        ]),
+        "Interest_Income": quarterly([
+            "InvestmentIncomeInterest", "InterestIncomeOther", "InvestmentIncomeInterestAndDividend",
+            "InterestIncomeNonoperating",
+        ]),
+        # Net interest income (positive) or expense (negative) outside operations, when tagged as one figure.
+        "Net_Interest_Nonoperating": quarterly(["InterestIncomeExpenseNonoperatingNet"]),
+        "Preferred_Dividends": quarterly([
+            "PreferredStockDividendsIncomeStatementImpact", "DividendsPreferredStock",
+            "PreferredStockDividendsAndOtherAdjustments",
+        ]),
+        "Stock_Comp": extract_sec_cumulative_quarters(company_facts, [
+            "ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"]),
+        "Buybacks": extract_sec_cumulative_quarters(company_facts, [
+            "PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"]),
+    }
+
+
 # New CIK -> the CIKs its history was filed under (Exxon Mobil moved to a new holding company in 2025).
 PREDECESSOR_CIKS = {"XOM": [34088]}
 
@@ -1683,6 +1720,7 @@ def sec_quarterly_frame(company_facts):
     cost_of_revenue = extract_sec_fiscal_quarters(
         company_facts, ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"])
     shares = extract_sec_quarterly_shares(company_facts)
+    build_up = sec_build_up_inputs(company_facts)
 
     all_dates = revenue.index.union(operating_expense.index)
     all_dates = all_dates.union(total_expense.index).union(capex.index)
@@ -1702,6 +1740,12 @@ def sec_quarterly_frame(company_facts):
     # Share counts reported a few days off the quarter end land on the nearest quarter.
     result["Shares"] = (shares.reindex(all_dates, method="nearest", tolerance=pd.Timedelta(days=14))
                         if len(shares) else np.nan)
+
+    # The EPS build-up's inputs (operating income, interest, tax, preferred dividends, stock pay, buybacks), on the
+    # nearest quarter end like the share counts.
+    for column, series in [("Operating_Income", operating_income), *build_up.items()]:
+        result[column] = (series.reindex(all_dates, method="nearest", tolerance=pd.Timedelta(days=14))
+                          if len(series) else np.nan)
 
     derived_total_expense = (
         revenue.reindex(all_dates) - operating_income.reindex(all_dates)
@@ -1770,7 +1814,7 @@ def load_quarterly_fundamentals(
     symbol,
     start_date_str,
     end_date_str,
-    cache_version="2026-11-26-v9",
+    cache_version="2026-11-27-v10",
 ):
     """Combine long SEC history with recent Yahoo Finance statements."""
 
@@ -4974,6 +5018,21 @@ def model_settings():
         params["quality_pe_pts"] = number("quality_pe_pts", "P/E deduction, points", 0, 50, 0.5)
     with settings_panel("Scenario engine", expanded=False):
         show_model_equations("scenario_engine")
+        params["eps_model"] = st.radio(
+            "Base EPS model", ["Build-up", "Scaled EPS"], key=model_param_key("eps_model"), horizontal=True,
+            help="Build-up: EPS = ([revenue x (1 + g) x EBIT margin - net interest] x (1 - tax rate) - preferred "
+                 "dividends) / (diluted shares + new shares from stock-based pay - buybacks / price), from the SEC "
+                 "filings of every past quarter. Scaled EPS: reported EPS x (1 + g) x margin change. Stocks without "
+                 "the build-up's inputs (foreign filers, ADRs) use Scaled EPS.")
+        if params["eps_model"] == "Build-up":
+            params["fallback_tax_rate"] = number("fallback_tax_rate", "Tax rate % when pre-tax income is not positive",
+                                                 0, 50, 1)
+            params["share_creep_cap"] = number(
+                "share_creep_cap", "Highest yearly share creep % from stock-based pay", 0, 20, 0.5,
+                "Share creep = the change in diluted shares over the last year plus the shares bought back, as % of "
+                "shares. A bigger jump is usually an acquisition paid in shares, not stock-based pay.")
+            st.caption("The build-up grows revenue, so its base growth is the auto rule on total revenue growth (or "
+                       "your forward growth); analysts' EPS growth does not apply to it.")
         params["base_eps_source"] = st.radio(
             "Base case EPS (latest quarter)", ["Analysts", "Own rule"], key=model_param_key("base_eps_source"),
             horizontal=True,
@@ -4981,6 +5040,12 @@ def model_settings():
                  "margin held; bear and bull keep their gaps around it. Own rule: base growth from the auto rule or "
                  "your forward growth. Earlier quarters always use the auto rule, since today's estimates were not "
                  "known then. Falls back to the own rule when Yahoo has no estimates.")
+        if params["base_eps_source"] == "Analysts":
+            params["analyst_share"] = st.slider(
+                "Analysts' share of the base growth", 0.0, 1.0, step=0.05, key=model_param_key("analyst_share"),
+                help="Base growth on the latest release = this share x analysts' growth + the rest x the EPS trend "
+                     "rule that every earlier release uses. 1 = analysts only (a big jump at the latest release when "
+                     "they expect much more than the past trend); 0 = the rule only.")
         st.caption("Your forward growth and margin and the bull/bear adjustments are under Forward assumptions. "
                    "The auto rule below sets the forward values on every earlier quarter, and on the latest one "
                    "when you leave Forward blank.")
@@ -5288,7 +5353,7 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing",
     release_dates = pd.DatetimeIndex(released.index) if len(released) else pd.DatetimeIndex([])
     eps_dates = pd.DatetimeIndex(eps.index) if len(eps) else pd.DatetimeIndex([])
     quarters = pd.DataFrame(index=release_dates.union(eps_dates))
-    for column in ["Revenue", "Net_Income", "Gross_Profit", "Shares"]:
+    for column in ["Revenue", "Net_Income", "Gross_Profit", "Shares", *BUILD_UP_COLUMNS]:
         if column in released:
             quarters[column] = released[column]
     quarters["EPS"] = eps
@@ -5330,6 +5395,23 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing",
     market_close = market["Close"] if not market.empty and "Close" in market else pd.Series(dtype=float)
     return SimpleNamespace(close=prices["Close"], quarters=quarters, peer_pe=pd.DataFrame(peer_pe), own_pe=own_pe,
                            start=start, found=found, market_close=market_close)
+
+
+def build_up_note(values, params):
+    """What the EPS build-up ran on at the latest release, or why it could not run."""
+
+    if params.get("eps_model") != "Build-up" or params.get("manual_eps", 0) > 0:
+        return ""
+    if values.get("bu_on", 0) != 1:
+        return (" The EPS build-up has no inputs for this stock (SEC filings without operating income or share "
+                "counts, e.g. a foreign filer), so the base EPS is the scaled reported EPS.")
+    money = lambda name: values.get(name, np.nan) / 1e9
+    tax = values.get("bu_tax_rate", np.nan)
+    tax_text = f"{tax:.1f}%" if np.isfinite(tax) else f"{params['fallback_tax_rate']:g}% (fallback)"
+    return (f" EPS build-up (SEC filings, last 4 quarters): revenue {money('bu_revenue'):,.1f}B, EBIT margin "
+            f"{values.get('ebit_margin', np.nan):.1f}%, net interest {money('bu_net_interest'):,.2f}B, tax {tax_text}, "
+            f"preferred dividends {money('bu_preferred'):,.2f}B, diluted shares {values.get('bu_shares', np.nan) / 1e6:,.0f}M, "
+            f"share creep {values.get('bu_creep_pct', np.nan):.1f}%, buybacks {money('bu_buybacks'):,.2f}B.")
 
 
 def model_data_note(found, params):
@@ -5808,7 +5890,7 @@ def render_valuation_model():
     result = rerun_with(params)
     values = latest_values(result)
     render_forward_tables(result)
-    st.caption(model_data_note(inputs.found, params) + (" " + rate_note if rate_note else ""))
+    st.caption(model_data_note(inputs.found, params) + (" " + rate_note if rate_note else "") + build_up_note(values, params))
 
     price = values.get("model_price", np.nan)
     # The change log's "after" price is the first risk-adjusted fair value computed after the change.

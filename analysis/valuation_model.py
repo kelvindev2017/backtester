@@ -37,7 +37,12 @@ DEFAULT_PARAMS = {
     "quality_pe_pts": 0.0,       # P/E points taken off the risk-adjusted P/E for weak earnings quality
     # Scenario engine
     "analyst_base": False,       # set by run_model: True when the latest base case is the analysts' EPS
-    "base_eps_source": "Analysts",  # latest quarter's base EPS: Analysts (next 4 quarters' estimates) or Own rule
+    "eps_model": "Build-up",     # base EPS: Build-up (revenue -> EBIT -> interest, tax, preferred -> per share after
+                                 # stock-pay dilution and buybacks) or Scaled EPS (reported EPS x growth x margin ratio)
+    "fallback_tax_rate": 21.0,   # Build-up: tax rate % when the pre-tax income is not positive or no tax is reported
+    "share_creep_cap": 5.0,      # Build-up: highest yearly share creep % from stock-based pay (more is an acquisition)
+    "base_eps_source": "Own rule",  # latest quarter's base EPS: Analysts (next 4 quarters' estimates) or Own rule
+    "analyst_share": 1.0,        # with Analysts: their share of the latest base growth; the rest is the EPS trend rule
     "forward_growth": np.nan,    # base (forward) revenue growth % for the latest quarter; NaN = the auto rule below
     "forward_margin": np.nan,    # base (forward) net margin % for the latest quarter; NaN = current + base_margin_pts
     "growth_follow": 0.5,        # auto rule: base growth = this share of the trailing revenue growth
@@ -124,6 +129,13 @@ DEFAULT_PARAMS = {
 
 YIELD_MATURITIES = [1, 2, 3, 5, 7, 10, 20, 30]
 
+# Quarterly columns the EPS build-up reads (besides Revenue and Shares), as the SEC loader names them.
+BUILD_UP_COLUMNS = ["Operating_Income", "Pretax_Income", "Income_Tax", "Interest_Expense", "Interest_Income",
+                    "Net_Interest_Nonoperating", "Preferred_Dividends", "Stock_Comp", "Buybacks"]
+# The build-up's held inputs at each release (quarterly signals), in model units (revenue and money in dollars).
+BUILD_UP_INPUTS = ["bu_revenue", "bu_net_interest", "bu_tax_rate", "bu_preferred", "bu_shares", "bu_stock_comp",
+                   "bu_buybacks", "bu_price", "bu_creep_pct"]
+
 # Assumptions about the future, set together in the Forward section; the other parameters describe today's data.
 FORWARD_PARAMS = ["use_forward_rate", "forward_rate", "forward_growth", "forward_margin", "bear_growth_gap",
                   "bull_growth_gap", "bear_margin_pts", "bull_margin_pts", "forward_pe_growth", "forward_half_life",
@@ -160,6 +172,18 @@ SIGNALS = {
     "cycle_on": ("quarterly", "Through-cycle EPS on (1 = yes)", "", "count"),
     "cycle_past_sum": ("quarterly", "Past years' EPS, summed", "", "eps"),
     "cycle_years_used": ("quarterly", "Years in the through-cycle mean", "", "count"),
+    "ebit_margin": ("quarterly", "EBIT (operating) margin, last 4 quarters", "%", "share"),
+    "revenue_total_yoy": ("quarterly", "Revenue growth, year on year (total, not per share)", "%", "percent"),
+    "bu_revenue": ("quarterly", "Build-up: revenue, last 4 quarters", "", "amount"),
+    "bu_net_interest": ("quarterly", "Build-up: net interest expense, last 4 quarters", "", "amount"),
+    "bu_tax_rate": ("quarterly", "Build-up: tax rate", "%", "share"),
+    "bu_preferred": ("quarterly", "Build-up: preferred dividends, last 4 quarters", "", "amount"),
+    "bu_shares": ("quarterly", "Build-up: diluted shares, latest quarter", "", "count"),
+    "bu_stock_comp": ("quarterly", "Build-up: stock-based pay, last 4 quarters", "", "amount"),
+    "bu_buybacks": ("quarterly", "Build-up: buybacks, last 4 quarters", "", "amount"),
+    "bu_price": ("quarterly", "Build-up: share price for dilution and buybacks (close on the release)", "", "price"),
+    "bu_creep_pct": ("quarterly", "Build-up: yearly share creep from stock-based pay", "%", "percent"),
+    "bu_on": ("quarterly", "EPS from the build-up (1) or scaled reported EPS (0)", "", "count"),
     "past_growth": ("quarterly", "Base EPS growth before the latest release (EPS trend)", "%", "percent"),
     "pe_adjust": ("quarterly", "P/E points from general items", "pts", "points"),
     "quality_pe": ("quarterly", "P/E points from earnings quality", "pts", "points"),
@@ -225,7 +249,9 @@ BLOCKS = {
         inputs=["revenue", "net_income"], outputs=["ttm_revenue", "revenue_yoy", "net_margin", "gross_margin",
                                                      "revenue_cagr"],
         params={"fallback_yoy": "Growth % when there is no revenue history",
-                "fallback_margin": "Net margin % when there is no net income"}),
+                "fallback_margin": "Net margin % when there is no net income",
+                "fallback_tax_rate": "Build-up: tax rate % when pre-tax income is not positive",
+                "share_creep_cap": "Build-up: highest yearly share creep %"}),
     "earnings_quality": dict(
         title="Earnings quality", rate="quarterly", role="Param: adjustment rules",
         inputs=["eps"], outputs=["ttm_eps", "clean_eps", "quality_pe"],
@@ -246,10 +272,12 @@ BLOCKS = {
         inputs=["clean_eps", "revenue_yoy", "net_margin", "event_effect", "eps_spread"],
         outputs=["growth_bear", "growth_base", "growth_bull", "margin_base", "case_spread", "eps_bear", "eps_base",
                  "eps_bull"],
-        params={"case_spread": "Bear and bull from: EPS volatility or Fixed gaps",
+        params={"eps_model": "Base EPS: Build-up (revenue to EPS) or Scaled EPS",
+                "case_spread": "Bear and bull from: EPS volatility or Fixed gaps",
                 "spread_k": "EPS volatility: k (cases at exp(-/+ k x s))",
                 "spread_own_share": "EPS volatility: share of the own volatility in s",
                 "spread_typical": "EPS volatility: typical volatility",
+                "analyst_share": "Analysts' share of the latest base growth (rest: EPS trend rule)",
                 "forward_growth": "Forward revenue growth % (blank = auto rule)",
                 "forward_margin": "Forward net margin % (blank = auto rule)",
                 "bear_growth_gap": "Bear: growth points below forward", "bull_growth_gap": "Bull: growth points above forward",
@@ -581,7 +609,62 @@ def through_cycle_eps(past_ttm, forward_eps, clean_share, params, was_on=False, 
     return (mean, trend, True) if on else (mean, trend, False)
 
 
-def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, forward=False, eps_spread=np.nan):
+def build_up_eps(revenue, growth, ebit_margin, net_interest, tax_rate, preferred, shares, dilution, buybacks, price):
+    """Estimated EPS = ([revenue x (1 + g) x EBIT margin - net interest] x (1 - t) - preferred dividends)
+    / (shares + SBC dilution - buyback $ / share price).
+
+    ``growth``, ``ebit_margin`` and ``tax_rate`` in %; money in one currency unit; ``dilution`` is next year's new
+    shares from stock-based pay and the buyback retires shares at ``price``. NaN when the shares left are not positive.
+    """
+
+    ebit = revenue * (1 + growth / 100) * ebit_margin / 100
+    earnings = (ebit - net_interest) * (1 - tax_rate / 100) - preferred
+    retired = buybacks / price if price > 0 else 0.0
+    count = shares + dilution - retired
+    return earnings / count if count > 0 else np.nan
+
+
+def build_up_inputs(values):
+    """The build-up's inputs from one release's held values, or None when the essentials (revenue, EBIT margin,
+    shares) are missing."""
+
+    inputs = {name: float(values.get(name, np.nan)) for name in BUILD_UP_INPUTS}
+    inputs["ebit_margin"] = float(values.get("ebit_margin", np.nan))
+    if not (inputs["bu_revenue"] > 0 and inputs["bu_shares"] > 0 and np.isfinite(inputs["ebit_margin"])):
+        return None
+    for name in ["bu_net_interest", "bu_preferred", "bu_stock_comp", "bu_buybacks", "bu_creep_pct"]:
+        if not np.isfinite(inputs[name]):
+            inputs[name] = 0.0
+    if not np.isfinite(inputs["bu_tax_rate"]):
+        inputs["bu_tax_rate"] = np.nan
+    if not np.isfinite(inputs["bu_price"]):
+        inputs["bu_price"] = 0.0
+    return inputs
+
+
+def _build_up_case(inputs, growth, margin, params):
+    tax = inputs["bu_tax_rate"] if np.isfinite(inputs["bu_tax_rate"]) else float(params["fallback_tax_rate"])
+    return build_up_eps(inputs["bu_revenue"], growth, margin, inputs["bu_net_interest"], tax, inputs["bu_preferred"],
+                        inputs["bu_shares"], inputs["bu_shares"] * inputs["bu_creep_pct"] / 100, inputs["bu_buybacks"],
+                        inputs["bu_price"])
+
+
+def share_creep_pct(shares, shares_year_ago, buybacks, average_price, stock_comp, price, cap):
+    """Yearly share creep from stock-based pay, % of today's shares: the historical one (the change in diluted shares
+    over the last year plus the shares bought back, at the year's average price) when a year-ago count exists, else
+    the stock-based pay over the price. Kept within 0 and ``cap`` (a jump beyond it is an acquisition paid in shares)."""
+
+    if shares > 0 and shares_year_ago > 0 and average_price > 0:
+        creep = (shares - shares_year_ago + buybacks / average_price) / shares_year_ago * 100
+    elif shares > 0 and price > 0:
+        creep = stock_comp / price / shares * 100
+    else:
+        return 0.0
+    return float(np.clip(creep, 0.0, cap)) if np.isfinite(creep) else 0.0
+
+
+def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, forward=False, eps_spread=np.nan,
+                   build_up=None):
     """The quarterly chain for one date: earnings quality, scenario engine and risk weighting.
 
     ``revenue_yoy`` and ``net_margin`` are in %; ``event_effect`` is the fraction of EPS the modelled event items are
@@ -590,10 +673,22 @@ def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, f
     do the same with their own growth and margin (the base plus or minus the gaps); with EPS volatility, they are the
     base EPS times exp(-k s) and exp(+k s), s from ``case_spread`` and ``eps_spread`` (the company's own EPS
     volatility; a forward test on 60 stocks, 2019-2025, set k, the share and the typical volatility). ``forward``: the latest quarter, where your forward growth and margin apply.
+
+    ``build_up`` (from ``build_up_inputs``): each case's EPS comes from the build-up instead (``build_up_eps``), with
+    ``revenue_yoy`` the total revenue growth and ``net_margin`` the EBIT margin. Its EPS is after stock-based pay
+    already, so the haircut does not apply; the clean EPS is the build-up today (no growth, today's shares).
     """
 
     clean = ttm_eps * (1 - params["eps_haircut_pct"] / 100)
+    if build_up is not None:
+        today = dict(build_up, bu_creep_pct=0.0, bu_buybacks=0.0)
+        clean = _build_up_case(today, 0.0, build_up["ebit_margin"], params)
     _, base_growth, margin, base_margin = base_growth_and_margin(revenue_yoy, net_margin, params, forward)
+    if build_up is not None:
+        # The EBIT margin is used as it is, a loss included (the net-margin fallback is for a missing figure).
+        margin = build_up["ebit_margin"]
+        base_margin = (float(params["forward_margin"]) if forward and np.isfinite(params.get("forward_margin", np.nan))
+                       else margin + params["base_margin_pts"])
     growth = {"Bear": base_growth - params["bear_growth_gap"], "Base": base_growth,
               "Bull": base_growth + params["bull_growth_gap"]}
     case_margin = {"Bear": base_margin + params["bear_margin_pts"], "Base": base_margin,
@@ -608,7 +703,15 @@ def scenario_point(ttm_eps, revenue_yoy, net_margin, params, event_effect=0.0, f
     factor = {"Bear": np.exp(-params["spread_k"] * spread), "Base": 1.0, "Bull": np.exp(params["spread_k"] * spread)}
     for name in SCENARIOS:
         key = name.lower()
-        if by_volatility:
+        if build_up is not None:
+            case_growth, case_margin_pct = ((base_growth, base_margin) if by_volatility
+                                            else (growth[name], case_margin[name]))
+            point[f"growth_{key}"] = case_growth
+            case_eps = _build_up_case(build_up, case_growth, case_margin_pct, params)
+            if by_volatility:
+                # The spread scales the base EPS; a loss stays a loss (the spread widens it in the bear case).
+                case_eps = case_eps * (factor[name] if case_eps >= 0 else 1 / factor[name])
+        elif by_volatility:
             # One spread on EPS, from how much the company's earnings have moved in a year.
             margin_ratio = max(0.0, base_margin) / margin if margin > 0 else 1.0
             point[f"growth_{key}"] = base_growth
@@ -742,6 +845,7 @@ def quarterly_inputs(quarters, growth_quarters=12, base_effect=True):
         ratio = growth_revenue / earlier.where(earlier > 0)
         cagr = cagr.combine_first((ratio.where(ratio > 0) ** (4 / count) - 1) * 100)
     frame["revenue"], frame["net_income"], frame["eps"] = revenue, net_income, eps
+    build_up = _build_up_series(quarters, column, revenue, ttm_revenue, shares)
     ttm_eps = _trailing(eps)
     log_eps = np.log(ttm_eps.where(ttm_eps > 0))
     # How much trailing EPS moved in a year (log change), its spread over the last 12 releases (at least 8).
@@ -752,7 +856,7 @@ def quarterly_inputs(quarters, growth_quarters=12, base_effect=True):
                          ("revenue_cagr", cagr.dropna()),
                          # How much the yearly growth varied over the last 12 releases (at least 8), as known then.
                          ("growth_spread", yoy.dropna().rolling(12, min_periods=8).std().dropna()),
-                         ("eps_spread", eps_spread.dropna())]:
+                         ("eps_spread", eps_spread.dropna()), *build_up.items()]:
         # A quarter known for one measure but not another keeps the last value of the other.
         frame[name] = series.reindex(frame.index.union(series.index)).ffill().reindex(frame.index)
     return frame
@@ -1083,6 +1187,49 @@ def held_guidance(guided, releases, days):
     return out
 
 
+def _build_up_series(quarters, column, revenue, ttm_revenue, shares):
+    """The EPS build-up's trailing inputs at each quarter: EBIT margin, total revenue growth, net interest, tax rate,
+    preferred dividends, stock-based pay, buybacks and the latest share count. Empty when there is no EBIT at all.
+
+    EBIT is the operating income; without one (banks, insurers: interest is their business), the pre-tax income with
+    no separate interest. Items a company does not report (no preferred shares, no buybacks) count as zero.
+    """
+
+    operating, pretax = column("Operating_Income"), column("Pretax_Income")
+    if (operating.empty and pretax.empty) or revenue.empty:
+        return {}
+    dates = revenue.index
+
+    def optional(name):
+        return _trailing(column(name).reindex(dates).fillna(0.0))
+
+    ttm_operating = _trailing(operating.reindex(dates)) if len(operating) else pd.Series(np.nan, index=dates)
+    ttm_pretax = _trailing(pretax.reindex(dates)) if len(pretax) else pd.Series(np.nan, index=dates)
+    has_operating = ttm_operating.notna()
+    ebit = ttm_operating.where(has_operating, ttm_pretax)
+    net_tagged = column("Net_Interest_Nonoperating").reindex(dates)
+    quarter_interest = (-net_tagged).where(net_tagged.notna(), column("Interest_Expense").reindex(dates).fillna(0.0)
+                                          - column("Interest_Income").reindex(dates).fillna(0.0))
+    net_interest = _trailing(quarter_interest).where(has_operating, 0.0)
+    ttm_tax = _trailing(column("Income_Tax").reindex(dates)) if "Income_Tax" in quarters else pd.Series(np.nan, index=dates)
+    tax_rate = (ttm_tax / ttm_pretax.where(ttm_pretax > 0) * 100).clip(0, 50)
+    total_before = _year_ago(ttm_revenue.dropna())
+    total_yoy = (ttm_revenue / total_before.where(total_before > 0) - 1) * 100
+    series = {
+        "ebit_margin": (ebit / ttm_revenue.where(ttm_revenue > 0) * 100).dropna(),
+        "revenue_total_yoy": total_yoy.dropna(),
+        "bu_revenue": ttm_revenue.dropna(),
+        "bu_net_interest": net_interest.dropna(),
+        "bu_tax_rate": tax_rate.dropna(),
+        "bu_preferred": optional("Preferred_Dividends").dropna(),
+        "bu_stock_comp": optional("Stock_Comp").dropna(),
+        "bu_buybacks": optional("Buybacks").dropna(),
+        "bu_shares": shares,
+        "bu_shares_year_ago": _year_ago(shares) if len(shares) else shares,
+    }
+    return {name: value for name, value in series.items() if len(value)}
+
+
 def run_model(quarters, close, register=None, params=None, peer_pe=None, start=None, own_pe=None, policy_rate=None,
               market_yield=None, market_close=None, analyst_growth=None, guidance=None):
     """Run the whole model over history.
@@ -1108,12 +1255,16 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     close = close.loc[~close.index.duplicated(keep="last")]
     routed = route_items(register, params)
     inputs = quarterly_inputs(quarters, params["growth_history_quarters"], bool(params["quarter_base_effect"]))
+    # The build-up grows revenue, not EPS: analysts' EPS growth does not fit it, only your own forward values do.
+    own_forward = {key: params[key] for key in ["forward_growth", "forward_margin"]}
+    use_build_up = params["eps_model"] == "Build-up" and params["manual_eps"] <= 0
+    price_on = close.reindex(close.index.union(pd.DatetimeIndex(inputs.index))).ffill() if len(close) else close
     params["analyst_base"] = False
     if (params["base_eps_source"] == "Analysts" and analyst_growth is not None and np.isfinite(analyst_growth)
             and len(inputs)):
         # The base case is the analysts' EPS: their growth, with the net margin held (margin ratio 1).
         latest_margin = inputs["net_margin"].dropna() if "net_margin" in inputs else pd.Series(dtype=float)
-        params["forward_growth"] = float(analyst_growth)
+        params["forward_growth"] = float(analyst_growth)  # blended with the EPS trend rule below (analyst_share)
         params["forward_margin"] = (float(latest_margin.iloc[-1]) if len(latest_margin) and latest_margin.iloc[-1] > 0
                                     else float(params["fallback_margin"]))
         params["analyst_base"] = True
@@ -1150,6 +1301,17 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
             normal = normal_known.reindex(normal_known.index.union(held.index)).ffill().reindex(held.index)
             back = (recovery * (normal / ttm - 1) * 100).where((normal > ttm) & (ttm > 0))
             eps_trend = pd.concat([eps_trend, back], axis=1).max(axis=1, skipna=True).where(ttm > 0)
+    if params["analyst_base"]:
+        # Analysts' growth on the latest release only, blended with the rule every earlier release uses (the EPS
+        # trend, else the auto rule), so one bold estimate does not make a step the past line could never show.
+        share = float(np.clip(params["analyst_share"], 0, 1))
+        rule = eps_trend.get(last_release, np.nan) if eps_trend is not None and last_release is not None else np.nan
+        if not np.isfinite(rule):
+            latest = held.loc[last_release] if last_release in held.index else held.iloc[-1]
+            rule = base_growth_and_margin(latest.get("revenue_yoy", np.nan), latest.get("net_margin", np.nan),
+                                          {**params, "forward_growth": np.nan})[1]
+        params["analyst_growth"], params["rule_growth_latest"] = float(analyst_growth), float(rule)
+        params["forward_growth"] = share * float(analyst_growth) + (1 - share) * float(rule)
     was_on = False
     for when, row in held.iterrows():
         ttm_eps = params["manual_eps"] if params["manual_eps"] > 0 else row.get("ttm_eps", np.nan)
@@ -1164,9 +1326,28 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
             row_params = {**params, "forward_growth": past_growth,
                           "forward_margin": margin if np.isfinite(margin) and margin > 0 else params["fallback_margin"]}
             row_forward = True
-        point = scenario_point(ttm_eps, row.get("revenue_yoy", np.nan), row.get("net_margin", np.nan), row_params,
-                               events, row_forward,
-                               row.get("eps_spread", np.nan) if params["manual_eps"] <= 0 else np.nan)
+        build_up = None
+        if use_build_up:
+            price = price_on.asof(when) if len(price_on) else np.nan
+            year = close.loc[when - pd.Timedelta(days=365):when] if len(close) else close
+            creep = share_creep_pct(row.get("bu_shares", np.nan), row.get("bu_shares_year_ago", np.nan),
+                                    row.get("bu_buybacks", 0.0), float(year.mean()) if len(year) else np.nan,
+                                    row.get("bu_stock_comp", 0.0), price, float(params["share_creep_cap"]))
+            build_up = build_up_inputs({**row.to_dict(), "bu_price": price, "bu_creep_pct": creep})
+        if build_up is not None:
+            # Build-up: revenue growth from the auto rule (or your forward growth on the latest release), on total
+            # revenue (the share count changes on its own), and the EBIT margin.
+            row_params, row_forward = {**params, **own_forward}, forward
+            past_growth = np.nan
+            point = scenario_point(ttm_eps, row.get("revenue_total_yoy", np.nan), build_up["ebit_margin"], row_params,
+                                   events, row_forward, row.get("eps_spread", np.nan), build_up=build_up)
+            point.update({name: build_up[name] for name in BUILD_UP_INPUTS})
+            point["bu_on"] = 1.0
+        else:
+            point = scenario_point(ttm_eps, row.get("revenue_yoy", np.nan), row.get("net_margin", np.nan), row_params,
+                                   events, row_forward,
+                                   row.get("eps_spread", np.nan) if params["manual_eps"] <= 0 else np.nan)
+            point["bu_on"] = 0.0
         point["past_growth"] = past_growth if not forward else np.nan
         point["cycle_eps"], point["cycle_trend"], point["cycle_on"] = np.nan, np.nan, 0.0
         point["next_year_eps"], point["cycle_past_sum"] = point.get("risk_adjusted_eps", np.nan), np.nan
@@ -1421,12 +1602,22 @@ def latest_values(result, on=None):
     return values
 
 
+def build_up_view(values):
+    """(revenue growth %, margin %, build-up inputs or None) the scenario engine used on the latest release: the
+    total revenue growth and EBIT margin when its EPS came from the build-up, else the per-share growth and net margin."""
+
+    build_up = build_up_inputs(values) if values.get("bu_on", 0) == 1 else None
+    if build_up is None:
+        return values.get("revenue_yoy", np.nan), values.get("net_margin", np.nan), None
+    return values.get("revenue_total_yoy", np.nan), build_up["ebit_margin"], build_up
+
+
 def _point_price(state, params, routed):
     """Risk-adjusted fair value from one day's held inputs: the whole chain as one function of the parameters and items."""
 
     events, points = case_effects(routed, state["on"], params)
     point = scenario_point(state["ttm_eps"], state["revenue_yoy"], state["net_margin"], params, events,
-                           state.get("forward", True), state.get("eps_spread", np.nan))
+                           state.get("forward", True), state.get("eps_spread", np.nan), build_up=state.get("build_up"))
     eps = point["risk_adjusted_eps"]
     years = state.get("roll_years", 0.0)
     if years > 0 and eps > 0 and point["clean_eps"] > 0:
@@ -1446,8 +1637,9 @@ def _day_state(result, values, on):
 
     day = result["daily"].loc[:on].iloc[-1]
     anchor = day["rate_anchor"] if "rate_anchor" in day else day["anchor"]
-    return {"on": on, "ttm_eps": values.get("ttm_eps", np.nan), "revenue_yoy": values.get("revenue_yoy", np.nan),
-            "net_margin": values.get("net_margin", np.nan), "anchor": anchor,
+    growth, margin, build_up = build_up_view(values)
+    return {"on": on, "ttm_eps": values.get("ttm_eps", np.nan), "revenue_yoy": growth,
+            "net_margin": margin, "anchor": anchor, "build_up": build_up,
             "eps_spread": values.get("eps_spread", np.nan) if result["params"]["manual_eps"] <= 0 else np.nan,
             "own_anchor": day.get("own_anchor", np.nan),
             "peer_anchor": day.get("outside_anchor", day.get("peer_anchor", np.nan)),
@@ -1694,9 +1886,13 @@ def case_table(result, params=None):
 
     params = model_params(params if params is not None else result["params"])
     values = latest_values(result)
-    yoy, growth, margin, base_margin = base_growth_and_margin(values.get("revenue_yoy", np.nan),
-                                                              values.get("net_margin", np.nan), params, forward=True)
-    reported = {"Revenue growth %": values.get("revenue_yoy", np.nan), "Net margin %": values.get("net_margin", np.nan)}
+    view_growth, view_margin, build_up = build_up_view(values)
+    yoy, growth, margin, base_margin = base_growth_and_margin(view_growth, view_margin, params, forward=True)
+    if build_up is not None:
+        margin = view_margin
+        base_margin = (float(params["forward_margin"]) if np.isfinite(params.get("forward_margin", np.nan))
+                       else margin + params["base_margin_pts"])
+    reported = {"Revenue growth %": view_growth, "Net margin %": view_margin}
     # Without a reported value the model runs on the fallback (Scenario engine settings): show that, and say so.
     current = {"Revenue growth %": yoy, "Net margin %": margin}
     forward = {"Revenue growth %": growth, "Net margin %": base_margin}
@@ -1707,9 +1903,17 @@ def case_table(result, params=None):
                      "Bull adj": params[bull], "Bear adj": bear_value,
                      "Current from": "reported" if np.isfinite(reported[metric]) and (
                          metric == "Revenue growth %" or reported[metric] > 0) else "fallback",
-                     "Forward from": ("analysts" if params.get("analyst_base") else
+                     "Forward from": ("analysts" if params.get("analyst_base") and build_up is None else
                                       "you" if np.isfinite(params.get(key, np.nan)) else "auto rule")})
-    return pd.DataFrame(rows, columns=CASE_COLUMNS)
+    table = pd.DataFrame(rows, columns=CASE_COLUMNS)
+    if build_up is not None:
+        # The build-up grows total revenue and applies the EBIT margin.
+        table["Metric"] = table["Metric"].replace(BUILD_UP_METRICS)
+        table.loc[table["Metric"] == BUILD_UP_METRICS["Net margin %"], "Current from"] = "reported"
+    return table
+
+
+BUILD_UP_METRICS = {"Revenue growth %": "Revenue growth % (total)", "Net margin %": "EBIT margin %"}
 
 
 def case_table_changes(before, after, params):
@@ -1720,7 +1924,10 @@ def case_table_changes(before, after, params):
     """
 
     updates = {}
-    before, after = before.set_index("Metric"), pd.DataFrame(after).set_index("Metric")
+    names = {shown: metric for metric, shown in BUILD_UP_METRICS.items()}
+    before = before.assign(Metric=before["Metric"].replace(names)).set_index("Metric")
+    after = pd.DataFrame(after)
+    after = after.assign(Metric=after["Metric"].replace(names)).set_index("Metric")
     for metric, (_, _, key, bull, bear) in CASE_ROWS.items():
         if metric not in after.index:
             continue
