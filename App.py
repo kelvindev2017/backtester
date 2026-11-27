@@ -206,6 +206,7 @@ from analysis.what_happened_next import (
     walkthrough_figure,
 )
 from analysis.guidance import company_guidance
+from analysis.foreign_results import align_units, foreign_quarters
 from analysis.valuation_model import (
     GUIDANCE_COLUMNS,
     BLOCKS as MODEL_BLOCKS,
@@ -1682,12 +1683,32 @@ def load_sec_quarterly_fundamentals(symbol):
         return pd.DataFrame(), f"{type(error).__name__}: {error}"
 
 
+@st.cache_data(ttl=7 * 86400, show_spinner="Reading quarterly results from the company's 6-K releases (first time only)...")
+def load_foreign_quarters(symbol, start_date_str):
+    """Quarterly results of a foreign filer from its 6-K results releases (analysis/foreign_results.py), filed around
+    its earnings dates since ``start_date_str``. Empty when the ticker has no SEC CIK or no readable releases."""
+
+    try:
+        cik = get_sec_cik(symbol)
+        if cik is None:
+            return pd.DataFrame()
+        earnings = load_earnings_data(symbol, start_date_str, date.today().strftime("%Y-%m-%d"))
+        if earnings.empty:
+            return pd.DataFrame()
+        import requests
+
+        session = requests.Session()
+        return foreign_quarters(cik, earnings.index, session, get_sec_user_agent(), since=start_date_str)
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_quarterly_fundamentals(
     symbol,
     start_date_str,
     end_date_str,
-    cache_version="2026-11-22-v8",
+    cache_version="2026-11-26-v9",
 ):
     """Combine long SEC history with recent Yahoo Finance statements."""
 
@@ -1695,6 +1716,14 @@ def load_quarterly_fundamentals(
 
     sec_data, sec_error = load_sec_quarterly_fundamentals(symbol)
     yahoo_data = load_yahoo_quarterly_fundamentals(symbol)
+    foreign = False
+    if sec_data.empty or "Revenue" not in sec_data or sec_data["Revenue"].notna().sum() < 8:
+        # A foreign filer (20-F) has only yearly figures in Company Facts: read its quarters from 6-K releases.
+        results = load_foreign_quarters(symbol, start_date_str)
+        if len(results) >= 8:
+            sec_data, foreign = results.drop(columns=["EPS"], errors="ignore"), True
+            # Yahoo may count shares in ADRs: put its figures on the releases' units, and let it only fill gaps.
+            yahoo_data = align_units(yahoo_data, sec_data)
 
     if sec_data.empty and yahoo_data.empty:
         return pd.DataFrame(), "No SEC or Yahoo quarterly fundamentals were returned.", "None"
@@ -1704,7 +1733,7 @@ def load_quarterly_fundamentals(
         source = "Yahoo Finance only"
     elif yahoo_data.empty:
         fundamentals = sec_data.copy()
-        source = "SEC Company Facts only"
+        source = "SEC 6-K results releases only" if foreign else "SEC Company Facts only"
     else:
         # Quarter-end dates can differ by a few days between data suppliers.
         # Keep SEC as the historical base, then use Yahoo only for dates not
@@ -1767,6 +1796,8 @@ def load_quarterly_fundamentals(
             if nearest_distance_days <= 14:
                 for column in yahoo_data.columns:
                     yahoo_value = yahoo_row.get(column)
+                    if foreign and column in fundamentals and pd.notna(fundamentals.loc[nearest_date, column]):
+                        continue  # the company's own release wins
             
                     if pd.notna(yahoo_value):
                         fundamentals.loc[
@@ -1780,7 +1811,8 @@ def load_quarterly_fundamentals(
                     yahoo_timestamp
                 ] = yahoo_row
 
-        source = "SEC Company Facts plus Yahoo Finance"
+        source = ("SEC 6-K results releases plus Yahoo Finance" if foreign
+                  else "SEC Company Facts plus Yahoo Finance")
 
     start_timestamp = pd.Timestamp(start_date_str).normalize()
     end_exclusive = pd.Timestamp(end_date_str).normalize() + pd.Timedelta(days=1)
