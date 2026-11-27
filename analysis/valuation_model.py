@@ -40,7 +40,10 @@ DEFAULT_PARAMS = {
     "eps_model": "Build-up",     # base EPS: Build-up (revenue -> EBIT -> interest, tax, preferred -> per share after
                                  # stock-pay dilution and buybacks) or Scaled EPS (reported EPS x growth x margin ratio)
     "fallback_tax_rate": 21.0,   # Build-up: tax rate % when the pre-tax income is not positive or no tax is reported
-    "share_creep_cap": 5.0,      # Build-up: highest yearly share creep % from stock-based pay (more is an acquisition)
+    "share_creep_cap": 5.0,
+    "one_off_floor": 0.8,        # Build-up: the EBIT margin used is at least this share of the margin the reported EPS
+                                 # (after the haircut) implies, so a one-off accounting hit (acquisition amortization,
+                                 # a write-down) cannot sink it; 0 = the GAAP margin as it is      # Build-up: highest yearly share creep % from stock-based pay (more is an acquisition)
     "base_eps_source": "Own rule",  # latest quarter's base EPS: Analysts (next 4 quarters' estimates) or Own rule
     "analyst_share": 1.0,        # with Analysts: their share of the latest base growth; the rest is the EPS trend rule
     "forward_growth": np.nan,    # base (forward) revenue growth % for the latest quarter; NaN = the auto rule below
@@ -182,6 +185,8 @@ SIGNALS = {
     "bu_stock_comp": ("quarterly", "Build-up: stock-based pay, last 4 quarters", "", "amount"),
     "bu_buybacks": ("quarterly", "Build-up: buybacks, last 4 quarters", "", "amount"),
     "bu_price": ("quarterly", "Build-up: share price for dilution and buybacks (close on the release)", "", "price"),
+    "ebit_margin_gaap": ("quarterly", "EBIT margin as reported (GAAP), last 4 quarters", "%", "share"),
+    "bu_margin_floor": ("quarterly", "Build-up: EBIT margin floor from the reported EPS", "%", "share"),
     "bu_creep_pct": ("quarterly", "Build-up: yearly share creep from stock-based pay", "%", "percent"),
     "bu_on": ("quarterly", "EPS from the build-up (1) or scaled reported EPS (0)", "", "count"),
     "past_growth": ("quarterly", "Base EPS growth before the latest release (EPS trend)", "%", "percent"),
@@ -251,7 +256,8 @@ BLOCKS = {
         params={"fallback_yoy": "Growth % when there is no revenue history",
                 "fallback_margin": "Net margin % when there is no net income",
                 "fallback_tax_rate": "Build-up: tax rate % when pre-tax income is not positive",
-                "share_creep_cap": "Build-up: highest yearly share creep %"}),
+                "share_creep_cap": "Build-up: highest yearly share creep %",
+                "one_off_floor": "Build-up: lowest EBIT margin, share of the reported EPS's (0 = off)"}),
     "earnings_quality": dict(
         title="Earnings quality", rate="quarterly", role="Param: adjustment rules",
         inputs=["eps"], outputs=["ttm_eps", "clean_eps", "quality_pe"],
@@ -647,6 +653,19 @@ def _build_up_case(inputs, growth, margin, params):
     return build_up_eps(inputs["bu_revenue"], growth, margin, inputs["bu_net_interest"], tax, inputs["bu_preferred"],
                         inputs["bu_shares"], inputs["bu_shares"] * inputs["bu_creep_pct"] / 100, inputs["bu_buybacks"],
                         inputs["bu_price"])
+
+
+def implied_ebit_margin(eps, inputs, params):
+    """The EBIT margin % at which the build-up, with no growth and today's shares, gives ``eps``: the margin behind
+    the reported EPS. NaN when ``eps`` is not positive."""
+
+    if not (np.isfinite(eps) and eps > 0):
+        return np.nan
+    tax = inputs["bu_tax_rate"] if np.isfinite(inputs["bu_tax_rate"]) else float(params["fallback_tax_rate"])
+    if tax >= 100:
+        return np.nan
+    earnings = (eps * inputs["bu_shares"] + inputs["bu_preferred"]) / (1 - tax / 100) + inputs["bu_net_interest"]
+    return earnings / inputs["bu_revenue"] * 100
 
 
 def share_creep_pct(shares, shares_year_ago, buybacks, average_price, stock_comp, price, cap):
@@ -1334,6 +1353,15 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
                                     row.get("bu_buybacks", 0.0), float(year.mean()) if len(year) else np.nan,
                                     row.get("bu_stock_comp", 0.0), price, float(params["share_creep_cap"]))
             build_up = build_up_inputs({**row.to_dict(), "bu_price": price, "bu_creep_pct": creep})
+            if build_up is not None:
+                # GAAP EBIT can carry non-cash one-offs the reported EPS leaves out (AMD: Xilinx amortization took
+                # its operating margin to about 0 in 2023). The margin used is at least a share of the one behind
+                # the reported EPS after the haircut (which keeps stock-based pay in).
+                clean_eps = ttm_eps * (1 - params["eps_haircut_pct"] / 100)
+                floor = float(params["one_off_floor"]) * implied_ebit_margin(clean_eps, build_up, params)
+                build_up["ebit_margin_gaap"], build_up["bu_margin_floor"] = build_up["ebit_margin"], floor
+                if np.isfinite(floor) and floor > build_up["ebit_margin"]:
+                    build_up["ebit_margin"] = floor
         if build_up is not None:
             # Build-up: revenue growth from the auto rule (or your forward growth on the latest release), on total
             # revenue (the share count changes on its own), and the EBIT margin.
@@ -1342,6 +1370,7 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
             point = scenario_point(ttm_eps, row.get("revenue_total_yoy", np.nan), build_up["ebit_margin"], row_params,
                                    events, row_forward, row.get("eps_spread", np.nan), build_up=build_up)
             point.update({name: build_up[name] for name in BUILD_UP_INPUTS})
+            point.update({name: build_up.get(name, np.nan) for name in ["ebit_margin", "ebit_margin_gaap", "bu_margin_floor"]})
             point["bu_on"] = 1.0
         else:
             point = scenario_point(ttm_eps, row.get("revenue_yoy", np.nan), row.get("net_margin", np.nan), row_params,

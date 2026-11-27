@@ -1020,3 +1020,25 @@ def test_run_model_uses_the_build_up_and_falls_back_without_inputs():
     assert plain["bu_on"] == 0 and np.isfinite(plain["eps_base"])
     # The what-if helpers see the same case as the model.
     assert sensitivities(result)["1 point more growth"] > 0
+
+
+def test_one_off_hit_in_gaap_ebit_is_floored_by_the_reported_eps():
+    from analysis.valuation_model import implied_ebit_margin
+
+    quarters = build_up_quarters()
+    close = make_close(quarters)
+    # An acquisition's amortization takes GAAP operating income to about zero; reported EPS leaves it out.
+    hit = quarters.assign(Operating_Income=quarters["Revenue"] * 0.01)
+    params = {"case_spread": "Fixed gaps"}
+    plain = latest_values(run_model(hit, close, params={**params, "one_off_floor": 0.0}))
+    floored = latest_values(run_model(hit, close, params=params))
+    assert plain["ebit_margin"] == pytest.approx(1.0)
+    assert floored["ebit_margin_gaap"] == pytest.approx(1.0)
+    assert floored["ebit_margin"] == pytest.approx(floored["bu_margin_floor"]) and floored["ebit_margin"] > 10
+    assert floored["eps_base"] > 5 * max(plain["eps_base"], 0.01)
+    # The floor is 0.8 x the margin behind the reported EPS; an ordinary company sits above it.
+    ordinary = latest_values(run_model(quarters, close, params=params))
+    assert ordinary["ebit_margin"] == pytest.approx(25.0)
+    inputs = {"bu_tax_rate": 20.0, "bu_shares": 100.0, "bu_preferred": 4.0, "bu_net_interest": 24.0, "bu_revenue": 1000.0}
+    assert implied_ebit_margin(2.0, inputs, model_params()) == pytest.approx(((2.0 * 100 + 4) / 0.8 + 24) / 1000 * 100)
+    assert np.isnan(implied_ebit_margin(-1.0, inputs, model_params()))

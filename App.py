@@ -5031,6 +5031,11 @@ def model_settings():
                 "share_creep_cap", "Highest yearly share creep % from stock-based pay", 0, 20, 0.5,
                 "Share creep = the change in diluted shares over the last year plus the shares bought back, as % of "
                 "shares. A bigger jump is usually an acquisition paid in shares, not stock-based pay.")
+            params["one_off_floor"] = number(
+                "one_off_floor", "Lowest EBIT margin, as a share of the reported EPS's margin", 0, 1, 0.05,
+                "GAAP operating income can carry one-off accounting hits the reported EPS leaves out (acquisition "
+                "amortization, write-downs: AMD's margin was about 0 in 2023 after buying Xilinx). The margin used is "
+                "at least this share of the margin that gives the reported EPS after the haircut. 0 = GAAP as it is.")
             st.caption("The build-up grows revenue, so its base growth is the auto rule on total revenue growth (or "
                        "your forward growth); analysts' EPS growth does not apply to it.")
         params["base_eps_source"] = st.radio(
@@ -5408,8 +5413,12 @@ def build_up_note(values, params):
     money = lambda name: values.get(name, np.nan) / 1e9
     tax = values.get("bu_tax_rate", np.nan)
     tax_text = f"{tax:.1f}%" if np.isfinite(tax) else f"{params['fallback_tax_rate']:g}% (fallback)"
+    gaap = values.get("ebit_margin_gaap", np.nan)
+    margin = f"{values.get('ebit_margin', np.nan):.1f}%"
+    if np.isfinite(gaap) and gaap < values.get("ebit_margin", np.nan) - 0.05:
+        margin += f" (GAAP {gaap:.1f}%, lifted to the floor from the reported EPS: a one-off accounting hit)"
     return (f" EPS build-up (SEC filings, last 4 quarters): revenue {money('bu_revenue'):,.1f}B, EBIT margin "
-            f"{values.get('ebit_margin', np.nan):.1f}%, net interest {money('bu_net_interest'):,.2f}B, tax {tax_text}, "
+            f"{margin}, net interest {money('bu_net_interest'):,.2f}B, tax {tax_text}, "
             f"preferred dividends {money('bu_preferred'):,.2f}B, diluted shares {values.get('bu_shares', np.nan) / 1e6:,.0f}M, "
             f"share creep {values.get('bu_creep_pct', np.nan):.1f}%, buybacks {money('bu_buybacks'):,.2f}B.")
 
