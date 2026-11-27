@@ -206,6 +206,7 @@ from analysis.what_happened_next import (
     walkthrough_figure,
 )
 from analysis.guidance import company_guidance
+from analysis.sec_periods import quarters_from_periods
 from analysis.foreign_results import align_units, foreign_quarters, from_log
 from analysis.valuation_model import (
     BUILD_UP_COLUMNS,
@@ -1627,6 +1628,51 @@ def load_sec_quarterly_fundamentals(symbol):
         return pd.DataFrame(), f"{type(error).__name__}: {error}"
 
 
+# One-time costs left out of the build-up's operating income (Kelvin: exclude acquisition costs). Each group is a
+# quarter's largest tag, so a total and its parts are not counted twice.
+ONE_OFF_TAG_GROUPS = {
+    "acquired intangibles amortization": ["AmortizationOfIntangibleAssets", "AmortizationOfAcquiredIntangibleAssets"],
+    "impairments": ["GoodwillAndIntangibleAssetImpairment", "GoodwillImpairmentLoss",
+                    "ImpairmentOfIntangibleAssetsExcludingGoodwill", "ImpairmentOfIntangibleAssetsFinitelived",
+                    "ImpairmentOfIntangibleAssetsIndefinitelivedExcludingGoodwill", "AssetImpairmentCharges",
+                    "ImpairmentOfLongLivedAssetsHeldForUse"],
+    "acquired in-process R&D": ["ResearchAndDevelopmentInProcess",
+                                "ResearchAndDevelopmentAssetAcquiredOtherThanThroughBusinessCombinationWrittenOff"],
+    "deal costs": ["BusinessCombinationAcquisitionRelatedCosts", "BusinessCombinationIntegrationRelatedCosts"],
+}
+
+
+def sec_one_off_costs(company_facts, quarter_ends=None):
+    """A quarter's one-time costs (sum over ONE_OFF_TAG_GROUPS of each group's largest tag), positive = a cost.
+
+    Amortization runs smoothly from quarter to quarter, so a quarter a company left untagged between two tagged ones
+    (``quarter_ends``: the company's quarter ends) is filled in between them; impairments and the like are not.
+    """
+
+    groups = []
+    for name, tags in ONE_OFF_TAG_GROUPS.items():
+        series = [quarters_from_periods(get_sec_fact_entries(company_facts, tag)).clip(lower=0) for tag in tags]
+        series = [one for one in series if len(one)]
+        if not series:
+            continue
+        group = pd.concat(series, axis=1).max(axis=1)
+        if name == "acquired intangibles amortization" and quarter_ends is not None and len(group) > 1:
+            grid = pd.DatetimeIndex(quarter_ends)
+            grid = grid[(grid > group.index.min() + pd.Timedelta(days=14)) & (grid < group.index.max() - pd.Timedelta(days=14))]
+            # Only short gaps (a quarter or two between tagged ones); a longer one may hide an acquisition's start.
+            missing = [day for day in grid if np.abs((group.index - day).days).min() > 14
+                       and (group.index[group.index < day].max() - day).days >= -200
+                       and (group.index[group.index > day].min() - day).days <= 200]
+            if missing:
+                filled = group.reindex(group.index.union(pd.DatetimeIndex(missing))).interpolate(method="time")
+                group = filled
+        groups.append(group)
+    if not groups:
+        return pd.Series(dtype=float)
+    # One company reports every tag on the same quarter end.
+    return pd.concat(groups, axis=1).sum(axis=1, min_count=1).sort_index()
+
+
 def sec_build_up_inputs(company_facts):
     """Quarterly inputs of the EPS build-up (analysis/valuation_model.py ``build_up_eps``) from Company Facts.
 
@@ -1660,6 +1706,7 @@ def sec_build_up_inputs(company_facts):
             "ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"]),
         "Buybacks": extract_sec_cumulative_quarters(company_facts, [
             "PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"]),
+        "One_Off_Costs": sec_one_off_costs(company_facts, extract_sec_fiscal_quarters(company_facts, ["OperatingIncomeLoss"]).index),
     }
 
 
@@ -1814,7 +1861,7 @@ def load_quarterly_fundamentals(
     symbol,
     start_date_str,
     end_date_str,
-    cache_version="2026-11-27-v10",
+    cache_version="2026-11-27-v11",
 ):
     """Combine long SEC history with recent Yahoo Finance statements."""
 
@@ -5031,6 +5078,15 @@ def model_settings():
                 "share_creep_cap", "Highest yearly share creep % from stock-based pay", 0, 20, 0.5,
                 "Share creep = the change in diluted shares over the last year plus the shares bought back, as % of "
                 "shares. A bigger jump is usually an acquisition paid in shares, not stock-based pay.")
+            params["exclude_one_offs"] = st.checkbox(
+                "Leave one-time costs out of operating income", key=model_param_key("exclude_one_offs"),
+                help="Adds back what the filings tag as amortization of acquired intangibles, impairments and "
+                     "write-downs, acquired in-process R&D and deal costs (AMD's Xilinx amortization took its 2023 "
+                     "operating margin to about 0). Restructuring stays in: some companies restructure every year.")
+            params["one_off_floor"] = number(
+                "one_off_floor", "Lowest EBIT margin, as a share of the reported EPS's margin", 0, 1, 0.05,
+                "A backstop for one-time costs a company's filings do not tag (Salesforce, Ford): the margin used is "
+                "at least this share of the margin that gives the reported EPS after the haircut. 0 = off.")
             st.caption("The build-up grows revenue, so its base growth is the auto rule on total revenue growth (or "
                        "your forward growth); analysts' EPS growth does not apply to it.")
         params["base_eps_source"] = st.radio(
@@ -5408,8 +5464,15 @@ def build_up_note(values, params):
     money = lambda name: values.get(name, np.nan) / 1e9
     tax = values.get("bu_tax_rate", np.nan)
     tax_text = f"{tax:.1f}%" if np.isfinite(tax) else f"{params['fallback_tax_rate']:g}% (fallback)"
+    gaap = values.get("ebit_margin_gaap", np.nan)
+    margin = f"{values.get('ebit_margin', np.nan):.1f}%"
+    one_offs = values.get("bu_one_offs", np.nan)
+    if params.get("exclude_one_offs", True) and np.isfinite(one_offs) and one_offs > 0:
+        margin += f" (one-time costs of {one_offs / 1e9:,.2f}B left out)"
+    if np.isfinite(gaap) and gaap < values.get("ebit_margin", np.nan) - 0.05:
+        margin += f" (lifted from {gaap:.1f}% to the floor from the reported EPS: an untagged one-time cost)"
     return (f" EPS build-up (SEC filings, last 4 quarters): revenue {money('bu_revenue'):,.1f}B, EBIT margin "
-            f"{values.get('ebit_margin', np.nan):.1f}%, net interest {money('bu_net_interest'):,.2f}B, tax {tax_text}, "
+            f"{margin}, net interest {money('bu_net_interest'):,.2f}B, tax {tax_text}, "
             f"preferred dividends {money('bu_preferred'):,.2f}B, diluted shares {values.get('bu_shares', np.nan) / 1e6:,.0f}M, "
             f"share creep {values.get('bu_creep_pct', np.nan):.1f}%, buybacks {money('bu_buybacks'):,.2f}B.")
 
