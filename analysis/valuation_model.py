@@ -41,6 +41,8 @@ DEFAULT_PARAMS = {
                                  # stock-pay dilution and buybacks) or Scaled EPS (reported EPS x growth x margin ratio)
     "fallback_tax_rate": 21.0,   # Build-up: tax rate % when the pre-tax income is not positive or no tax is reported
     "share_creep_cap": 5.0,
+    "exclude_one_offs": True,    # Build-up: leave one-time costs (acquired intangibles' amortization, impairments,
+                                 # acquired R&D, deal costs) out of operating income
     "one_off_floor": 0.8,        # Build-up: the EBIT margin used is at least this share of the margin the reported EPS
                                  # (after the haircut) implies, so a one-off accounting hit (acquisition amortization,
                                  # a write-down) cannot sink it; 0 = the GAAP margin as it is      # Build-up: highest yearly share creep % from stock-based pay (more is an acquisition)
@@ -134,7 +136,7 @@ YIELD_MATURITIES = [1, 2, 3, 5, 7, 10, 20, 30]
 
 # Quarterly columns the EPS build-up reads (besides Revenue and Shares), as the SEC loader names them.
 BUILD_UP_COLUMNS = ["Operating_Income", "Pretax_Income", "Income_Tax", "Interest_Expense", "Interest_Income",
-                    "Net_Interest_Nonoperating", "Preferred_Dividends", "Stock_Comp", "Buybacks"]
+                    "Net_Interest_Nonoperating", "Preferred_Dividends", "Stock_Comp", "Buybacks", "One_Off_Costs"]
 # The build-up's held inputs at each release (quarterly signals), in model units (revenue and money in dollars).
 BUILD_UP_INPUTS = ["bu_revenue", "bu_net_interest", "bu_tax_rate", "bu_preferred", "bu_shares", "bu_stock_comp",
                    "bu_buybacks", "bu_price", "bu_creep_pct"]
@@ -185,7 +187,8 @@ SIGNALS = {
     "bu_stock_comp": ("quarterly", "Build-up: stock-based pay, last 4 quarters", "", "amount"),
     "bu_buybacks": ("quarterly", "Build-up: buybacks, last 4 quarters", "", "amount"),
     "bu_price": ("quarterly", "Build-up: share price for dilution and buybacks (close on the release)", "", "price"),
-    "ebit_margin_gaap": ("quarterly", "EBIT margin as reported (GAAP), last 4 quarters", "%", "share"),
+    "ebit_margin_gaap": ("quarterly", "EBIT margin used before the floor, last 4 quarters", "%", "share"),
+    "bu_one_offs": ("quarterly", "Build-up: one-time costs left out of EBIT, last 4 quarters", "", "amount"),
     "bu_margin_floor": ("quarterly", "Build-up: EBIT margin floor from the reported EPS", "%", "share"),
     "bu_creep_pct": ("quarterly", "Build-up: yearly share creep from stock-based pay", "%", "percent"),
     "bu_on": ("quarterly", "EPS from the build-up (1) or scaled reported EPS (0)", "", "count"),
@@ -257,6 +260,7 @@ BLOCKS = {
                 "fallback_margin": "Net margin % when there is no net income",
                 "fallback_tax_rate": "Build-up: tax rate % when pre-tax income is not positive",
                 "share_creep_cap": "Build-up: highest yearly share creep %",
+                "exclude_one_offs": "Build-up: leave one-time costs out of EBIT",
                 "one_off_floor": "Build-up: lowest EBIT margin, share of the reported EPS's (0 = off)"}),
     "earnings_quality": dict(
         title="Earnings quality", rate="quarterly", role="Param: adjustment rules",
@@ -1225,13 +1229,19 @@ def _build_up_series(quarters, column, revenue, ttm_revenue, shares):
     ttm_operating = _trailing(operating.reindex(dates)) if len(operating) else pd.Series(np.nan, index=dates)
     ttm_pretax = _trailing(pretax.reindex(dates)) if len(pretax) else pd.Series(np.nan, index=dates)
     has_operating = ttm_operating.notna()
-    ebit = ttm_operating.where(has_operating, ttm_pretax)
+    # One-time costs (acquired intangibles' amortization, impairments, acquired R&D, deal costs) are left out:
+    # they are in GAAP operating and pre-tax income but say nothing about next year's earnings.
+    one_offs = optional("One_Off_Costs")
+    ebit = ttm_operating.where(has_operating, ttm_pretax) + one_offs.reindex(dates).fillna(0.0)
     net_tagged = column("Net_Interest_Nonoperating").reindex(dates)
     quarter_interest = (-net_tagged).where(net_tagged.notna(), column("Interest_Expense").reindex(dates).fillna(0.0)
                                           - column("Interest_Income").reindex(dates).fillna(0.0))
     net_interest = _trailing(quarter_interest).where(has_operating, 0.0)
     ttm_tax = _trailing(column("Income_Tax").reindex(dates)) if "Income_Tax" in quarters else pd.Series(np.nan, index=dates)
-    tax_rate = (ttm_tax / ttm_pretax.where(ttm_pretax > 0) * 100).clip(0, 50)
+    # Tax on the income without the one-offs: their tax saving (at 21%) is taken back out.
+    adjusted_pretax = ttm_pretax + one_offs.reindex(dates).fillna(0.0)
+    tax_rate = ((ttm_tax + 0.21 * one_offs.reindex(dates).fillna(0.0)) / adjusted_pretax.where(adjusted_pretax > 0)
+                * 100).clip(0, 50)
     total_before = _year_ago(ttm_revenue.dropna())
     total_yoy = (ttm_revenue / total_before.where(total_before > 0) - 1) * 100
     series = {
@@ -1243,6 +1253,7 @@ def _build_up_series(quarters, column, revenue, ttm_revenue, shares):
         "bu_preferred": optional("Preferred_Dividends").dropna(),
         "bu_stock_comp": optional("Stock_Comp").dropna(),
         "bu_buybacks": optional("Buybacks").dropna(),
+        "bu_one_offs": one_offs.dropna(),
         "bu_shares": shares,
         "bu_shares_year_ago": _year_ago(shares) if len(shares) else shares,
     }
@@ -1273,6 +1284,8 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
     close = pd.to_numeric(close, errors="coerce").dropna().sort_index()
     close = close.loc[~close.index.duplicated(keep="last")]
     routed = route_items(register, params)
+    if not params["exclude_one_offs"] and quarters is not None and "One_Off_Costs" in quarters:
+        quarters = quarters.drop(columns=["One_Off_Costs"])
     inputs = quarterly_inputs(quarters, params["growth_history_quarters"], bool(params["quarter_base_effect"]))
     # The build-up grows revenue, not EPS: analysts' EPS growth does not fit it, only your own forward values do.
     own_forward = {key: params[key] for key in ["forward_growth", "forward_margin"]}

@@ -90,7 +90,9 @@ SYMBOLS = {
                        "t: tax rate over the last 4 quarters (the fallback when pre-tax income is not positive), P: "
                        "preferred dividends, S_0: the latest diluted share count, D: new shares from stock-based pay "
                        "(the last year's share creep: change in shares plus shares bought back, as % of shares, capped), "
-                       "B: buybacks over the last 4 quarters, p: the share price on the release. M is at least f "
+                       "B: buybacks over the last 4 quarters, p: the share price on the release. EBIT leaves out "
+                       "one-time costs the filings tag (acquired intangibles' amortization, impairments, acquired R&D, "
+                       "deal costs). M is at least f "
                        "(one-off floor) times M_reported, the margin at which the build-up gives the reported EPS after "
                        "the haircut, so a one-off accounting hit in GAAP operating income cannot sink it. The base and the bear "
                        "and bull spread work as below; the haircut does not apply (the EBIT is after stock-based pay). "
@@ -208,7 +210,7 @@ def _build_up_worked(values, params, get):
              rf"g_{{\text{{base}}}} = {_n(base, 1)}\%" + (r"\ \text{(yours)}" if np.isfinite(params.get("forward_growth", np.nan))
                                                          else rf" = \min\!\big({_n(params['growth_cap'], 0)},\ \max({_n(params['growth_floor'], 0)},\ {_n(params['growth_follow'])} \times g)\big)"),
              rf"M_{{\text{{base}}}} = {_n(get('margin_base'), 1)}\% \ \text{{(EBIT margin {_n(inputs['ebit_margin'], 1)}\%)}}",
-             rf"M = \max\big(M_{{\text{{GAAP}}}},\ f \times M_{{\text{{reported}}}}\big) = \max\big({_n(get('ebit_margin_gaap'), 1)},\ "
+             rf"M = \max\Big(\frac{{\text{{EBIT}} + {_n(get('bu_one_offs') / 1e9 if np.isfinite(get('bu_one_offs')) else 0.0, 2)}\ \text{{(one-offs)}}}}{{R_0}},\ f \times M_{{\text{{reported}}}}\Big) = \max\big({_n(get('ebit_margin_gaap'), 1)},\ "
              rf"{_n(get('bu_margin_floor'), 1)}\big)\%",
              rf"\begin{{aligned}} \text{{EPS}}_{{\text{{base}}}} = {{}} & \frac{{\big[{_n(inputs['bu_revenue'] / 1e9, 1)} \times {_n(1 + base / 100, 3)} "
              rf"\times {_n(get('margin_base') / 100, 3)} - {_n(inputs['bu_net_interest'] / 1e9, 2)}\big] \times {_n(1 - tax / 100, 3)} "
