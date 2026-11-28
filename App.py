@@ -5381,6 +5381,16 @@ def load_company_guidance(ticker):
         return pd.DataFrame(columns=GUIDANCE_COLUMNS)
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_splits(symbol):
+    """The share's split history from Yahoo; None when it cannot be read. Cached: it was a live call on every rerun."""
+
+    try:
+        return yf.Ticker(symbol).splits
+    except Exception:
+        return None
+
+
 def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing", history_rule=(0.5, -20.0, 100.0, 0.5)):
     """Prices, results by release date and the share's and peers' P/E for the model, with a note on what was found.
 
@@ -5415,10 +5425,7 @@ def load_model_inputs(ticker, years, peers, lookback_years, pe_basis="Trailing",
     quarters["EPS"] = eps
     if "Shares" in quarters and quarters["Shares"].notna().any():
         # EPS from Yahoo is on today's split basis; put the share counts on it too.
-        try:
-            splits = yf.Ticker(ADR_HOME_LISTINGS[ticker][0] if home is not None else ticker).splits
-        except Exception:
-            splits = None
+        splits = load_splits(ADR_HOME_LISTINGS[ticker][0] if home is not None else ticker)
         adjusted = split_adjusted_shares(quarters["Shares"], splits)
         quarters["Shares"] = adjusted.reindex(quarters.index)
     forward = pe_basis == "Forward"
@@ -5906,6 +5913,18 @@ def render_guidance_table(result):
                    "Amounts are compared with the reported revenue a year earlier; growth is per share.")
 
 
+@st.cache_resource(max_entries=16, show_spinner=False)
+def cached_model_run(quarters, close, register, params, peer_pe, start, own_pe, policy_rate, market_yield, market_close,
+                     analyst_growth, guidance):
+    """``run_model`` kept between reruns: a tap or a setting elsewhere on the page no longer reruns the whole model,
+    and the market check's dials (seconds of root searches) are kept with the result. Shared, not copied: callers
+    only read the result."""
+
+    return run_model(quarters, close, register, params, peer_pe, start=start, own_pe=own_pe, policy_rate=policy_rate,
+                     market_yield=market_yield, market_close=market_close, analyst_growth=analyst_growth,
+                     guidance=guidance)
+
+
 def render_valuation_model():
     """The block model of a share's fair price: diagram, signals between the blocks, parameters and market check."""
 
@@ -5945,10 +5964,9 @@ def render_valuation_model():
             guidance = load_company_guidance(ticker)
 
     def rerun_with(other_params):
-        return run_model(inputs.quarters, inputs.close, model_register(), other_params, inputs.peer_pe,
-                         start=inputs.start, own_pe=inputs.own_pe, policy_rate=policy, market_yield=market_yield,
-                         market_close=getattr(inputs, "market_close", None),
-                         analyst_growth=inputs.found.get("growth_check", (np.nan, np.nan))[0], guidance=guidance)
+        return cached_model_run(inputs.quarters, inputs.close, model_register(), other_params, inputs.peer_pe,
+                                inputs.start, inputs.own_pe, policy, market_yield, getattr(inputs, "market_close", None),
+                                inputs.found.get("growth_check", (np.nan, np.nan))[0], guidance)
 
     result = rerun_with(params)
     values = latest_values(result)

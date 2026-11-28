@@ -638,17 +638,20 @@ def add_earnings_markers(fig, rows, releases=None, next_release=None):
         points.append((next_release[0], next_release[1], True))
     if not points:
         return
+    # Shapes are collected and set once: fig.add_shape copies every existing shape on each call, so adding
+    # one per release per panel took about 20 seconds on a chart with a decade of releases.
+    shapes = list(fig.layout.shapes)
+    number = max(int(key[5:] or 1) for key in fig.layout.to_plotly_json() if key.startswith("yaxis"))
     for row in range(1, rows + 1):
         subplot = fig.get_subplot(row, 1)
         x_axis, y_axis = subplot.xaxis.plotly_name.replace("axis", ""), subplot.yaxis.plotly_name.replace("axis", "")
-        taken = [int(key[5:] or 1) for key in fig.layout.to_plotly_json() if key.startswith("yaxis")]
-        number = max(taken) + 1
+        number += 1
         fig.layout[f"yaxis{number}"] = dict(overlaying=y_axis, anchor=x_axis, range=[0, 1], fixedrange=True,
                                             visible=False)
         for when, _, upcoming in points:
-            fig.add_shape(type="line", x0=when, x1=when, y0=0, y1=1, xref=x_axis, yref=f"{y_axis} domain",
-                          layer="below", line=dict(color=NEXT_EARNINGS_COLOR if upcoming else EARNINGS_LINE_COLOR,
-                                                   width=1, dash="dash" if upcoming else "dot"))
+            shapes.append(dict(type="line", x0=when, x1=when, y0=0, y1=1, xref=x_axis, yref=f"{y_axis} domain",
+                               layer="below", line=dict(color=NEXT_EARNINGS_COLOR if upcoming else EARNINGS_LINE_COLOR,
+                                                        width=1, dash="dash" if upcoming else "dot")))
         for upcoming in (False, True):
             part = [(when, text) for when, text, is_next in points if is_next == upcoming]
             if not part:
@@ -660,6 +663,7 @@ def add_earnings_markers(fig, rows, releases=None, next_release=None):
                 marker=dict(symbol="triangle-up", size=9 if upcoming else 7,
                             color=NEXT_EARNINGS_COLOR if upcoming else EARNINGS_MARKER_COLOR),
                 hovertemplate="%{text}<extra></extra>"))
+    fig.layout.shapes = shapes
 
 
 def revenue_pe_figure(revenue, trailing_pe, revenue_estimates=None, peg=None, eps=None, eps_estimates=None,
@@ -904,12 +908,15 @@ def earnings_signal_figure(close, releases, surprise=None, pe_change=None, forwa
     fig.update_yaxes(ticksuffix="%", row=2, col=1)
 
     # A dashed line at every release, across both panels, on the first session that could react.
+    # Set at once: one fig.add_shape per line copies all earlier shapes each time.
+    shapes = list(fig.layout.shapes)
     for day in marked["Reaction day"] if not marked.empty else []:
         for row in (1, 2):
             subplot = fig.get_subplot(row, 1)
-            fig.add_shape(type="line", x0=day, x1=day, y0=0, y1=1, xref=subplot.xaxis.plotly_name.replace("axis", ""),
-                          yref=f"{subplot.yaxis.plotly_name.replace('axis', '')} domain", layer="below",
-                          line=dict(color=RELEASE_LINE_COLOR, width=1.5, dash="dash"))
+            shapes.append(dict(type="line", x0=day, x1=day, y0=0, y1=1, xref=subplot.xaxis.plotly_name.replace("axis", ""),
+                               yref=f"{subplot.yaxis.plotly_name.replace('axis', '')} domain", layer="below",
+                               line=dict(color=RELEASE_LINE_COLOR, width=1.5, dash="dash")))
+    fig.layout.shapes = shapes
     fig.update_xaxes(rangeslider_visible=False)
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=40, b=60))
     legends_under_panels(fig, 2, height)

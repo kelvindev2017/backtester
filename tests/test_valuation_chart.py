@@ -399,3 +399,22 @@ def test_a_trough_near_zero_earnings_does_not_make_a_p_e_of_100():
     # Trough EPS alone: 80 / (0.2 x 0.8) = 500x. With half the gap to the ~3-year average back it is ~40x.
     assert no_hindsight_forward_pe(valuation, None, recovery=0.0)[day] == pytest.approx(500.0)
     assert 25 < trough < 60
+
+
+def test_earnings_markers_are_quick_on_many_releases():
+    import plotly.graph_objects as go
+    # One add_shape per line copied every earlier shape: a decade of releases on six panels took ~20 s.
+    import time
+    from plotly.subplots import make_subplots
+    from analysis.valuation_chart import add_earnings_markers
+
+    fig = make_subplots(rows=6, cols=1)
+    for row in range(1, 7):
+        fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1]), row=row, col=1)
+    when = pd.date_range("2012-01-01", periods=60, freq="QS")
+    releases = pd.DataFrame({"Release": when, "Text": [f"r{i}" for i in range(60)]})
+    started = time.time()
+    add_earnings_markers(fig, 6, releases, (when[-1] + pd.Timedelta(days=90), "next"))
+    assert time.time() - started < 2
+    assert len(fig.layout.shapes) == 6 * 61
+    assert {shape.yref for shape in fig.layout.shapes} == {f"y{'' if row == 1 else row} domain" for row in range(1, 7)}
