@@ -214,6 +214,7 @@ from analysis.valuation_model import (
     BLOCKS as MODEL_BLOCKS,
     premium_warning,
     growth_flip_warning,
+    surprise_table,
     split_adjusted_shares,
     PRESETS as MODEL_PRESETS,
     RATE_CASE_COLUMNS,
@@ -5888,6 +5889,22 @@ def render_model_register(result, tracked, candidates, ticker):
                 for column in ["Risk-adjusted fair value before", "Risk-adjusted fair value after"]})
 
 
+def render_surprise_log(result):
+    """Each release's surprise against what the model expected before it, newest first."""
+
+    table = surprise_table(result)
+    if table.empty:
+        return
+    with st.expander("Surprise log: reported vs what the model expected", expanded=False):
+        st.caption("Growth surprise: the revenue growth reported (latest quarter vs a year ago) minus the base growth "
+                   "the model expected at the release before. EPS a year on: the EPS reported now against the base "
+                   "EPS the model forecast four releases ago. Large or repeated surprises in one direction mean the "
+                   "business is moving faster or slower than the rule assumes: worth a forward growth of your own or a "
+                   "risk item.")
+        st.dataframe(table, hide_index=True, width="stretch", column_config={
+            column: st.column_config.NumberColumn(format="%+.1f") for column in table.columns if column != "Release"})
+
+
 def render_guidance_table(result):
     """The company guidance the model used, so each figure can be checked against its sentence."""
 
@@ -6038,6 +6055,7 @@ def render_valuation_model():
                "trailing earnings as an "
                "index (highest = 100) on the far right, each held from the release it came from. "
                "Without revenue or gross profit (e.g. an ADR reporting in another currency) those lines are missing.")
+    render_surprise_log(result)
     render_guidance_table(result)
     render_market_check(result)
     render_rate_cases(result)

@@ -184,6 +184,8 @@ SIGNALS = {
     "ebit_margin": ("quarterly", "EBIT (operating) margin, last 4 quarters", "%", "share"),
     "revenue_total_yoy": ("quarterly", "Revenue growth, year on year (total, not per share)", "%", "percent"),
     "revenue_quarter_total_yoy": ("quarterly", "Revenue growth, latest quarter vs a year ago (total)", "%", "percent"),
+    "growth_surprise": ("quarterly", "Surprise: reported revenue growth minus the growth the model expected", "pts", "points"),
+    "eps_surprise": ("quarterly", "Surprise: EPS a year on vs the model's base forecast", "%", "percent"),
     "bu_revenue": ("quarterly", "Build-up: revenue, last 4 quarters", "", "amount"),
     "bu_net_interest": ("quarterly", "Build-up: net interest expense, last 4 quarters", "", "amount"),
     "bu_tax_rate": ("quarterly", "Build-up: tax rate", "%", "share"),
@@ -286,7 +288,7 @@ BLOCKS = {
         title="Scenario engine", rate="quarterly", role="Param: growth, margins",
         inputs=["clean_eps", "revenue_yoy", "net_margin", "event_effect", "eps_spread"],
         outputs=["growth_bear", "growth_base", "growth_bull", "margin_base", "case_spread", "eps_bear", "eps_base",
-                 "eps_bull"],
+                 "eps_bull", "growth_surprise", "eps_surprise"],
         params={"eps_model": "Base EPS: Build-up (revenue to EPS) or Scaled EPS",
                 "case_spread": "Bear and bull from: EPS volatility or Fixed gaps",
                 "spread_k": "EPS volatility: k (cases at exp(-/+ k x s))",
@@ -672,6 +674,51 @@ def build_up_growth(values, params):
     latest, four = values.get("revenue_quarter_total_yoy", np.nan), values.get("revenue_total_yoy", np.nan)
     first, second = (latest, four) if params.get("growth_basis", "Latest quarter") == "Latest quarter" else (four, latest)
     return first if first is not None and np.isfinite(first) else second
+
+
+def add_surprises(quarterly, releases):
+    """The quarterly frame with two surprise signals on each release, as known that day:
+
+    ``growth_surprise``: the reported revenue growth (latest quarter vs a year ago, total) minus the base growth the
+    model expected at the release before, in points. ``eps_surprise``: the EPS a year on (the clean EPS now) against
+    the base EPS the model forecast at the release 4 back, in %. Both NaN where the model had no forecast then."""
+
+    frame = quarterly.copy()
+    frame["growth_surprise"], frame["eps_surprise"] = np.nan, np.nan
+    at = frame.loc[frame.index.isin(pd.DatetimeIndex(releases))]
+    at = at[~at.index.duplicated(keep="last")]
+    if at.empty:
+        return frame
+    reported = at["revenue_quarter_total_yoy"] if "revenue_quarter_total_yoy" in at else pd.Series(np.nan, index=at.index)
+    if "quarter_yoy" in at:
+        reported = reported.combine_first(at["quarter_yoy"])
+    expected = at["growth_base"].shift(1) if "growth_base" in at else pd.Series(np.nan, index=at.index)
+    forecast = at["eps_base"].shift(4) if "eps_base" in at else pd.Series(np.nan, index=at.index)
+    actual = at["clean_eps"] if "clean_eps" in at else pd.Series(np.nan, index=at.index)
+    growth = (pd.to_numeric(reported, errors="coerce") - pd.to_numeric(expected, errors="coerce"))
+    eps = (actual / forecast.where(forecast > 0) - 1) * 100
+    frame["growth_surprise"] = frame.index.map(growth).astype(float)
+    frame["eps_surprise"] = frame.index.map(eps.where(actual > 0)).astype(float)
+    return frame
+
+
+def surprise_table(result, releases=12):
+    """The last ``releases`` releases' surprises, newest first, for the surprise log."""
+
+    quarterly = result["quarterly"]
+    if quarterly.empty or "growth_surprise" not in quarterly:
+        return pd.DataFrame()
+    rows = quarterly[quarterly["growth_surprise"].notna() | quarterly["eps_surprise"].notna()]
+    rows = rows[~rows.index.duplicated(keep="last")].tail(releases)
+    reported = rows["revenue_quarter_total_yoy"] if "revenue_quarter_total_yoy" in rows else rows.get("quarter_yoy")
+    table = pd.DataFrame({
+        "Release": rows.index.strftime("%Y-%m-%d"),
+        "Revenue growth reported %": pd.to_numeric(reported, errors="coerce").to_numpy(),
+        "Growth the model expected %": (pd.to_numeric(reported, errors="coerce") - rows["growth_surprise"]).to_numpy(),
+        "Growth surprise, points": rows["growth_surprise"].to_numpy(),
+        "EPS a year on vs forecast %": rows["eps_surprise"].to_numpy(),
+    })
+    return table.iloc[::-1].reset_index(drop=True)
 
 
 def growth_flip_warning(quarterly):
@@ -1462,6 +1509,8 @@ def run_model(quarters, close, register=None, params=None, peer_pe=None, start=N
                      "items_modelled": int(in_force.sum()), "items_parked": int(len(routed) - in_force.sum())})
     quarterly = pd.DataFrame(rows, index=updates) if rows else pd.DataFrame(
         columns=[name for name, (frame, *_) in SIGNALS.items() if frame == "quarterly"])
+    if not quarterly.empty:
+        quarterly = add_surprises(quarterly, inputs.index)
 
     daily = pd.DataFrame(index=close.index)
     daily["close"] = close

@@ -1116,3 +1116,23 @@ def test_build_up_growth_starts_from_the_latest_quarter_without_limits():
     flip = pd.DataFrame({"revenue_quarter_total_yoy": [5.0, 3.0, -2.0]}, index=pd.date_range("2026-01-31", periods=3, freq="QE"))
     assert "turned negative" in growth_flip_warning(flip)
     assert growth_flip_warning(flip.iloc[:2]) is None
+
+
+def test_surprises_compare_each_release_with_what_the_model_expected_before():
+    from analysis.valuation_model import add_surprises, surprise_table
+    dates = pd.to_datetime(["2024-02-01", "2024-05-01", "2024-08-01", "2024-11-01", "2025-02-01", "2025-02-10"])
+    quarterly = pd.DataFrame({
+        "revenue_quarter_total_yoy": [10.0, 12.0, 30.0, 8.0, 20.0, 20.0],
+        "growth_base": [9.0, 11.0, 15.0, 9.0, 18.0, 18.0],
+        "eps_base": [2.0, 2.2, 2.4, 2.6, 3.0, 3.0],
+        "clean_eps": [1.8, 1.9, 2.0, 2.1, 2.5, 2.5],
+    }, index=dates)
+    out = add_surprises(quarterly, dates[:5])  # 2025-02-10 is a daily row, not a release
+    assert np.isnan(out["growth_surprise"].iloc[0])
+    assert out["growth_surprise"].iloc[2] == pytest.approx(30 - 11)  # reported vs the growth expected a release before
+    assert out["eps_surprise"].iloc[4] == pytest.approx((2.5 / 2.0 - 1) * 100)  # EPS now vs the forecast 4 releases ago
+    assert out["eps_surprise"].iloc[:4].isna().all()
+    assert np.isnan(out["growth_surprise"].iloc[5])
+    table = surprise_table({"quarterly": out})
+    assert list(table["Release"]) == ["2025-02-01", "2024-11-01", "2024-08-01", "2024-05-01"]
+    assert table["Growth the model expected %"].iloc[2] == pytest.approx(11.0)
