@@ -51,6 +51,7 @@ from analysis.optimizer import (
     unique_scored,
 )
 from analysis.chart_fit import fit_y_axes
+from analysis import portfolio
 from analysis.economy import (
     ASSETS,
     BENCHMARK as ECONOMY_BENCHMARK,
@@ -3516,7 +3517,7 @@ FUNDAMENTALS_YEARS = [3, 5, 8, 10]
 NEXT_BENCHMARK = "SPY"
 TAB_NAMES = [NEWS_TAB, "Stock Screener", ECONOMY_TAB, "Market Analysis", "Industry Analysis", FUNDAMENTALS_TAB, MODEL_TAB,
              SUPPLY_CHAIN_TAB,
-             "Backtest", "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
+             "Backtest", "Portfolio", "Signal Analysis & Trade Plan", "Validate", JOURNAL_TAB]
 SIGNAL_TAB = "Signal Analysis & Trade Plan"
 MOBILE_AGENT = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.IGNORECASE)
 # Session keys that are actions or display state rather than settings; they are not carried across tab switches.
@@ -8953,6 +8954,373 @@ def render_trade_journal():
 
 
 # ============================================================
+# Portfolio tab: check a mix of funds with optional trend and volatility rules against buy & hold
+# ============================================================
+
+PORTFOLIO_TAB = "Portfolio"
+PORTFOLIO_HOLDING_COLUMNS = ["Ticker", "Weight %", "Note", "Sleeve", "Trend days", "Stand-ins"]
+PORTFOLIO_SLEEVE_COLUMNS = ["Sleeve", "Weighting", "Vol target %", "Max exposure %"]
+PORTFOLIO_DEFAULT_PRESET = "Two-sleeve low drawdown (study)"
+PORTFOLIO_HISTORY = {"All": None, "20y": 20, "10y": 10, "5y": 5, "3y": 3}
+PORTFOLIO_DEFAULTS = {"portfolio_cost": 0.1, "portfolio_history": "All", "portfolio_benchmark": "SPY",
+                      "portfolio_account": 100_000, "portfolio_target_return": 10.0, "portfolio_target_dd": 10.0,
+                      "portfolio_target_year_dd": 15.0}
+
+
+def portfolio_version():
+    return st.session_state.get("portfolio_version", 0)
+
+
+def load_portfolio_preset(name=None):
+    """Put a preset's holdings, sleeve rules, rebalance and leverage into the settings."""
+
+    name = name or st.session_state.get("portfolio_preset", PORTFOLIO_DEFAULT_PRESET)
+    data = portfolio.PRESETS[name]
+    st.session_state["portfolio_holdings"] = pd.DataFrame(data["holdings"], columns=PORTFOLIO_HOLDING_COLUMNS)
+    st.session_state["portfolio_sleeves"] = pd.DataFrame(data.get("sleeves", []), columns=PORTFOLIO_SLEEVE_COLUMNS)
+    st.session_state["portfolio_rebalance"] = data["rebalance"]
+    st.session_state["portfolio_leverage"] = float(data.get("leverage", 1.0))
+    st.session_state["portfolio_band"] = float(data.get("band", 0.0)) * 100
+    st.session_state["portfolio_version"] = portfolio_version() + 1
+
+
+def portfolio_sleeve_table(holdings, sleeves):
+    """One rule row per named sleeve in the holdings (rules kept for sleeves still there, new ones Fixed)."""
+
+    names = [name for name in dict.fromkeys(str(s or "").strip() for s in holdings["Sleeve"]) if name]
+    kept = {row["Sleeve"]: row for _, row in sleeves.iterrows()} if not sleeves.empty else {}
+    rows = [dict(kept[name]) if name in kept else
+            {"Sleeve": name, "Weighting": "Fixed", "Vol target %": 0.0, "Max exposure %": 100.0} for name in names]
+    return pd.DataFrame(rows, columns=PORTFOLIO_SLEEVE_COLUMNS)
+
+
+def portfolio_spec_from_tables(holdings, sleeves):
+    """A PortfolioSpec from the two editor tables, and a list of rows that were left out (and why)."""
+
+    items, skipped = [], []
+    for _, row in holdings.iterrows():
+        ticker = str(row.get("Ticker") or "").strip().upper()
+        weight = pd.to_numeric(row.get("Weight %"), errors="coerce")
+        if not ticker:
+            continue
+        if pd.isna(weight) or weight <= 0:
+            skipped.append(f"{ticker} (no weight)")
+            continue
+        trend = pd.to_numeric(row.get("Trend days"), errors="coerce")
+        items.append(portfolio.Holding(
+            ticker=ticker, weight=float(weight) / 100, sleeve=str(row.get("Sleeve") or "").strip(),
+            trend_days=int(trend) if pd.notna(trend) and trend > 0 else 0,
+            stand_ins=portfolio.parse_stand_ins(row.get("Stand-ins")), note=str(row.get("Note") or "")))
+    rules = {}
+    for _, row in sleeves.iterrows():
+        target = pd.to_numeric(row.get("Vol target %"), errors="coerce")
+        cap = pd.to_numeric(row.get("Max exposure %"), errors="coerce")
+        rules[row["Sleeve"]] = portfolio.SleeveRule(
+            weighting=row.get("Weighting") if row.get("Weighting") in portfolio.WEIGHTINGS else "Fixed",
+            vol_target=float(target) / 100 if pd.notna(target) and target > 0 else 0.0,
+            max_exposure=float(cap) / 100 if pd.notna(cap) and cap > 0 else 1.0)
+    spec = portfolio.PortfolioSpec(
+        holdings=items, sleeves=rules,
+        rebalance=portfolio.REBALANCE_CHOICES[st.session_state.get("portfolio_rebalance", "Weekly (Friday)")],
+        leverage=float(st.session_state.get("portfolio_leverage", 1.0)),
+        cost=float(st.session_state.get("portfolio_cost", 0.1)) / 100,
+        band=float(st.session_state.get("portfolio_band", 0.0)) / 100)
+    return spec, skipped
+
+
+def render_portfolio_tables():
+    """The holdings and sleeve-rule editors; returns the two tables as they now stand."""
+
+    holdings = st.session_state["portfolio_holdings"]
+    st.markdown("**Holdings**")
+    edited = st.data_editor(
+        holdings, hide_index=True, width="stretch", num_rows="dynamic",
+        key=f"portfolio_holdings_{portfolio_version()}_table",
+        column_config={
+            "Sleeve": st.column_config.TextColumn(
+                "Sleeve", help="Rows with the same sleeve name share a rule (the table below). Leave it blank for a "
+                               "holding on its own with a fixed weight."),
+            "Ticker": st.column_config.TextColumn("Ticker", required=True, help="Yahoo Finance symbol."),
+            "Note": st.column_config.TextColumn("Note"),
+            "Weight %": st.column_config.NumberColumn(
+                "Weight %", min_value=0.0, max_value=300.0, format="%.1f",
+                help="Share of the portfolio. A sleeve's total share is the sum of its rows; with Inverse "
+                     "volatility it is split by volatility instead of these numbers. Under 100% in total leaves "
+                     "the rest in cash."),
+            "Trend days": st.column_config.NumberColumn(
+                "Trend days", min_value=0, max_value=400, step=1, format="%d",
+                help="Hold only while the close is above its average of this many trading days; otherwise that "
+                     "share sits in cash. 0 = always held."),
+            "Stand-ins": st.column_config.TextColumn(
+                "Stand-ins", help="Tickers whose returns fill the years before this one existed, first that has a "
+                                  "price wins, e.g. 'IJS' for AVUV or 'VEU, EFA' for VXUS. Blank = none."),
+        })
+    edited = pd.DataFrame(edited, columns=PORTFOLIO_HOLDING_COLUMNS).reset_index(drop=True)
+    sleeves = portfolio_sleeve_table(edited, st.session_state["portfolio_sleeves"])
+    if not edited.equals(holdings.reset_index(drop=True)):
+        st.session_state["portfolio_holdings"] = edited
+        st.session_state["portfolio_sleeves"] = sleeves
+        st.session_state["portfolio_version"] = portfolio_version() + 1
+        st.rerun()
+    if not sleeves.empty:
+        st.markdown("**Sleeve rules**")
+        edited_sleeves = st.data_editor(
+            sleeves, hide_index=True, width="stretch", num_rows="fixed",
+            key=f"portfolio_sleeves_{portfolio_version()}_table",
+            column_config={
+                "Sleeve": st.column_config.TextColumn("Sleeve", disabled=True),
+                "Weighting": st.column_config.SelectboxColumn(
+                    "Weighting", options=portfolio.WEIGHTINGS, required=True,
+                    help="Fixed: the weights typed in. Inverse volatility: the sleeve's share split by 1 / each "
+                         "holding's volatility (63-day), so calmer assets get more (risk parity)."),
+                "Vol target %": st.column_config.NumberColumn(
+                    "Vol target %", min_value=0.0, max_value=100.0, format="%.1f",
+                    help="Scale the sleeve so its recent volatility (20-day) is this much a year; the rest sits in "
+                         "cash. 0 = off."),
+                "Max exposure %": st.column_config.NumberColumn(
+                    "Max exposure %", min_value=0.0, max_value=300.0, format="%.0f",
+                    help="With a volatility target: the most of the sleeve's share it may hold (100 = no borrowing)."),
+            })
+        edited_sleeves = pd.DataFrame(edited_sleeves, columns=PORTFOLIO_SLEEVE_COLUMNS).reset_index(drop=True)
+        if not edited_sleeves.equals(sleeves):
+            st.session_state["portfolio_sleeves"] = edited_sleeves
+            st.session_state["portfolio_version"] = portfolio_version() + 1
+            st.rerun()
+        sleeves = edited_sleeves
+    total = pd.to_numeric(edited["Weight %"], errors="coerce").fillna(0).sum()
+    note = "" if abs(total - 100) < 0.05 else (" The rest sits in cash." if total < 100 else " Above 100% is borrowed.")
+    st.caption(f"Weights add up to {total:.1f}%.{note}")
+    return edited, sleeves
+
+
+def portfolio_cash_returns(index):
+    """Daily return of cash: the 3-month T-bill (FRED DTB3), or 0 with a note when FRED cannot be reached."""
+
+    rates, error = load_fred("DTB3")
+    if rates.empty:
+        return pd.Series(0.0, index=index), "Cash earns 0% here: the T-bill rate could not be loaded from FRED."
+    daily = rates.reindex(rates.index.union(index)).ffill().reindex(index) / 100 / portfolio.TRADING_DAYS
+    return daily.fillna(0.0), ""
+
+
+def run_portfolio(spec, closes, cash, start=None):
+    prices, sources = portfolio.build_prices(closes, spec)
+    returns, held, targets, begin = portfolio.simulate(prices, cash, spec, start=start)
+    return SimpleNamespace(prices=prices, sources=sources, returns=returns, held=held, targets=targets, begin=begin)
+
+
+def portfolio_stats_table(series_by_name, targets):
+    rows = []
+    for name, returns in series_by_name.items():
+        row = portfolio.stats(returns)
+        if not row:
+            continue
+        checks = portfolio.target_check(row, *targets)
+        rows.append({"": name, "From": f"{row['From']:%b %Y}", "Return %/yr": row["Return %/yr"],
+                     "Max drawdown %": row["Max drawdown %"], "Worst year's drawdown %": row["Worst year's drawdown %"],
+                     "Worst year %": row["Worst year %"], "Volatility %/yr": row["Volatility %/yr"],
+                     "Sharpe": row["Sharpe"],
+                     **{f"{label} target": "✓" if ok else "✗" for label, ok in checks.items()}})
+    return pd.DataFrame(rows)
+
+
+PORTFOLIO_TABLE_FORMATS = {"Return %/yr": "{:+.1f}", "Max drawdown %": "{:.1f}", "Worst year's drawdown %": "{:.1f}",
+                           "Worst year %": "{:+.1f}", "Volatility %/yr": "{:.1f}", "Sharpe": "{:.2f}"}
+
+
+def portfolio_figure(returns, bench, bench_name, max_dd):
+    equity = (1 + returns).cumprod() * 100
+    bench_equity = (1 + bench).cumprod() * 100
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.65, 0.35], vertical_spacing=0.06,
+                        subplot_titles=("Growth of 100 (log scale)", "Drawdown from the high %"))
+    fig.add_trace(go.Scatter(x=equity.index, y=equity, name="Portfolio", line=dict(color="#1f77b4", width=2)), 1, 1)
+    fig.add_trace(go.Scatter(x=bench_equity.index, y=bench_equity, name=bench_name,
+                             line=dict(color="#7f7f7f", width=1.5)), 1, 1)
+    fig.add_trace(go.Scatter(x=returns.index, y=portfolio.drawdown(returns) * 100, name="Portfolio drawdown",
+                             line=dict(color="#1f77b4", width=1.5), fill="tozeroy", showlegend=False), 2, 1)
+    fig.add_trace(go.Scatter(x=bench.index, y=portfolio.drawdown(bench) * 100, name=f"{bench_name} drawdown",
+                             line=dict(color="#7f7f7f", width=1), showlegend=False), 2, 1)
+    fig.add_hline(y=-max_dd, line=dict(color="#d62728", dash="dash", width=1), row=2, col=1)
+    fig.update_yaxes(type="log", row=1, col=1)
+    fig.update_layout(height=560, hovermode="x unified", margin=dict(t=70 if MOBILE else 40, b=10),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0))
+    return fig
+
+
+def portfolio_weights_table(spec, result, closes, account):
+    """What to hold from the next rebalance: target weights decided at the last close, next to what is held now."""
+
+    last = result.returns.index[-1]
+    target = result.targets.loc[last]
+    held = result.held.iloc[-1]
+    rows = []
+    notes = {h.ticker: h.note for h in spec.holdings}
+    sleeves_of = {}
+    for h in spec.holdings:
+        sleeves_of.setdefault(h.ticker, []).append(h.sleeve or "-")
+    for h in spec.holdings:
+        if any(row["Ticker"] == h.ticker for row in rows):
+            continue
+        price = closes[h.ticker].dropna() if h.ticker in closes else pd.Series(dtype=float)
+        price_now = float(price.iloc[-1]) if not price.empty else np.nan
+        trend = ""
+        days = max((x.trend_days for x in spec.holdings if x.ticker == h.ticker), default=0)
+        if days:
+            series = result.prices[h.ticker].dropna()
+            average = series.rolling(days).mean().iloc[-1] if len(series) >= days else np.nan
+            if pd.notna(average):
+                gap = (series.iloc[-1] / average - 1) * 100
+                trend = f"{'Above' if gap > 0 else 'Below'} {days}-day avg ({gap:+.1f}%)"
+        dollars = target[h.ticker] * account
+        rows.append({"Ticker": h.ticker, "Note": notes.get(h.ticker, ""), "Sleeve": ", ".join(dict.fromkeys(sleeves_of[h.ticker])),
+                     "Target %": target[h.ticker] * 100, "Held now %": held[h.ticker] * 100,
+                     "Target $": dollars, "Shares": dollars / price_now if price_now > 0 else np.nan,
+                     "Last close": price_now, "Trend": trend})
+    gross = float(target.sum())
+    rows.append({"Ticker": "Cash" if gross <= 1 else "Borrowed", "Note": "T-bills" if gross <= 1 else "margin",
+                 "Sleeve": "", "Target %": (1 - gross) * 100, "Held now %": (1 - float(held.sum())) * 100,
+                 "Target $": (1 - gross) * account, "Shares": np.nan, "Last close": np.nan, "Trend": ""})
+    return pd.DataFrame(rows)
+
+
+def render_portfolio():
+    """Portfolio tab: build a mix, see its history against buy & hold and what to hold at the next rebalance."""
+
+    if "portfolio_holdings" not in st.session_state:
+        st.session_state.setdefault("portfolio_preset", PORTFOLIO_DEFAULT_PRESET)
+        load_portfolio_preset()
+    for key, value in PORTFOLIO_DEFAULTS.items():
+        st.session_state.setdefault(key, value)
+    with settings_panel("Portfolio"):
+        st.selectbox("Start from", list(portfolio.PRESETS), key="portfolio_preset", on_change=load_portfolio_preset,
+                     help="Loads a preset into the tables below; then change anything.")
+        st.selectbox("Rebalance", list(portfolio.REBALANCE_CHOICES), key="portfolio_rebalance",
+                     help="Weights are decided at a close and traded at the close of the next rebalance day (the "
+                          "last trading day of the week, month, quarter or year). In between, holdings drift.")
+        st.slider("Leverage", 1.0, 2.0, step=0.05, key="portfolio_leverage",
+                  help="Every weight times this. Borrowing costs the T-bill rate + 0.5% a year.")
+        st.number_input("Trading cost % of each trade", 0.0, 1.0, step=0.05, key="portfolio_cost")
+        st.number_input("Skip a rebalance when no weight is this far off (points)", 0.0, 10.0, step=0.5,
+                        key="portfolio_band",
+                        help="0 = always trade back to the targets on rebalance days. 2 trades only when some "
+                             "holding is more than 2 points away from its target.")
+        st.select_slider("History", list(PORTFOLIO_HISTORY), key="portfolio_history")
+        st.text_input("Compare with (buy & hold)", key="portfolio_benchmark")
+        st.number_input("Account size ($)", 0, 100_000_000, step=10_000, key="portfolio_account")
+    with settings_panel("Targets", expanded=False):
+        min_return = st.number_input("Return above (%/yr)", -50.0, 100.0, step=0.5, key="portfolio_target_return")
+        max_dd = st.number_input("Max drawdown under (%)", 1.0, 100.0, step=0.5, key="portfolio_target_dd")
+        max_year_dd = st.number_input("Every year's drawdown under (%)", 1.0, 100.0, step=0.5,
+                                      key="portfolio_target_year_dd")
+
+    st.caption("Build a mix of funds or stocks, with an optional trend filter per holding and a volatility rule per "
+               "sleeve, and see how it would have done against buy & hold. Prices include dividends; cash earns the "
+               "3-month T-bill; costs are included. Past results, not a forecast or a recommendation.")
+    holdings, sleeves = render_portfolio_tables()
+    spec, skipped = portfolio_spec_from_tables(holdings, sleeves)
+    if skipped:
+        st.caption("Left out: " + ", ".join(skipped) + ".")
+    if not spec.holdings:
+        st.info("Add at least one ticker with a weight.")
+        return
+    bench_name = (st.session_state.get("portfolio_benchmark") or "SPY").strip().upper() or "SPY"
+    symbols = tuple(sorted(set(spec.all_symbols()) | {bench_name}))
+    with st.spinner("Loading prices..."):
+        closes = load_asset_closes(symbols)
+    if closes.empty:
+        st.warning("No prices were returned. Yahoo Finance may be rate-limiting; try again in a few minutes.")
+        return
+    missing = [t for t in spec.tickers() if t not in closes or closes[t].dropna().empty]
+    if missing:
+        st.warning(f"No prices for {', '.join(missing)}. Check the ticker (Yahoo Finance symbol).")
+        return
+    closes = closes.dropna(how="all")
+    cash, cash_note = portfolio_cash_returns(closes.index)
+    years = PORTFOLIO_HISTORY[st.session_state.get("portfolio_history", "All")]
+    start = closes.index[-1] - pd.DateOffset(years=years) if years else None
+    result = run_portfolio(spec, closes, cash, start=start)
+    if result.returns.empty:
+        st.info("Not enough history for these tickers and rules yet.")
+        return
+    returns = result.returns
+    bench = (portfolio.buy_and_hold(closes[bench_name], returns.index)
+             if bench_name in closes and closes[bench_name].dropna().size else pd.Series(0.0, index=returns.index))
+    targets = (float(min_return), float(max_dd), float(max_year_dd))
+
+    sources = result.sources.set_index("Ticker")
+    limiter = sources["With stand-ins from"].idxmax()
+    st.caption(f"From {result.begin:%d %b %Y} (the first day every ticker has a price, {limiter} being the latest, "
+               f"plus the rules' look-back) to {returns.index[-1]:%d %b %Y}. {cash_note}")
+
+    st.subheader("Result")
+    periods = {"Portfolio": returns, f"{bench_name} buy & hold": bench}
+    for span in (10, 5):
+        cut = returns.index[-1] - pd.DateOffset(years=span)
+        if returns.index[0] < cut - pd.Timedelta(days=180):
+            periods[f"Portfolio, last {span}y"] = returns.loc[cut:]
+            periods[f"{bench_name}, last {span}y"] = bench.loc[cut:]
+    table = portfolio_stats_table(periods, targets)
+    st.dataframe(table.style.format(PORTFOLIO_TABLE_FORMATS, na_rep="-"), hide_index=True, width="stretch",
+                 column_config={"": st.column_config.TextColumn("", pinned=True)})
+    st.caption(f"Targets: return above {min_return:g}% a year, worst fall under {max_dd:g}%, and no calendar year "
+               f"with a fall over {max_year_dd:g}% (counted from the year's start or a later high).")
+    show_chart(portfolio_figure(returns, bench, bench_name, max_dd), width="stretch")
+
+    st.subheader("Calendar years")
+    years_table = portfolio.yearly(returns).join(portfolio.yearly(bench), rsuffix=" bench")
+    years_table.columns = ["Return %", "Worst fall in the year %", f"{bench_name} return %", f"{bench_name} worst fall %"]
+    years_table.index.name = "Year"
+    years_table = years_table.reset_index()
+    years_table["Year"] = years_table["Year"].astype(str)
+    st.dataframe(years_table.style.format({c: "{:+.1f}" for c in years_table.columns if c != "Year"}),
+                 hide_index=True, width="stretch", height=35 * (len(years_table) + 1) + 3, column_config={"Year": st.column_config.TextColumn("Year", pinned=True)})
+
+    st.subheader("What to hold")
+    next_day = portfolio.next_rebalance_day(returns.index[-1], spec.rebalance)
+    account = float(st.session_state.get("portfolio_account") or 0)
+    weights = portfolio_weights_table(spec, result, closes, account)
+    st.caption(f"Targets from the close of {returns.index[-1]:%a %d %b %Y}, to trade at the close of the next "
+               f"rebalance day ({next_day:%a %d %b %Y}"
+               f"{'' if spec.band == 0 else f', if any holding is more than {spec.band * 100:g} points off'}). "
+               "Held now = the weights after drifting since the last rebalance.")
+    st.dataframe(weights.style.format({"Target %": "{:.1f}", "Held now %": "{:.1f}", "Target $": "{:,.0f}",
+                                       "Shares": "{:,.1f}", "Last close": "{:,.2f}"}, na_rep=""),
+                 hide_index=True, width="stretch", column_config={"Ticker": st.column_config.TextColumn("Ticker", pinned=True)})
+
+    with st.expander("Where each ticker's history comes from"):
+        shown = result.sources.copy()
+        for column in ["Own prices from", "With stand-ins from"]:
+            shown[column] = pd.to_datetime(shown[column]).dt.strftime("%d %b %Y")
+        st.dataframe(shown, hide_index=True, width="stretch")
+        st.caption("A stand-in lends its daily returns for the years before the ticker existed; it is not the same "
+                   "fund, so those years are an estimate. SPYM was called SPLG until 2025; Yahoo keeps its history "
+                   "under SPYM.")
+
+    with st.expander("All presets compared"):
+        if st.toggle("Run every preset", key="portfolio_compare_btn"):
+            render_portfolio_presets(cash, targets, start)
+
+
+def render_portfolio_presets(cash, targets, start):
+    specs = {name: portfolio.preset_spec(name) for name in portfolio.PRESETS}
+    symbols = tuple(sorted({s for spec in specs.values() for s in spec.all_symbols()} | {"SPY"}))
+    closes = load_asset_closes(symbols).dropna(how="all")
+    if closes.empty:
+        st.warning("No prices were returned.")
+        return
+    cash = cash.reindex(closes.index).ffill().fillna(0)
+    rows = {}
+    for name, spec in specs.items():
+        returns = run_portfolio(spec, closes, cash, start=start).returns
+        if not returns.empty:
+            rows[name] = returns
+            rows[f"SPY, same years as {name}"] = portfolio.buy_and_hold(closes["SPY"], returns.index)
+    st.dataframe(portfolio_stats_table(rows, targets).style.format(PORTFOLIO_TABLE_FORMATS, na_rep="-"),
+                 hide_index=True, width="stretch", column_config={"": st.column_config.TextColumn("", pinned=True)})
+    st.caption("Each preset over its own history with its own rebalance and leverage, next to SPY over the same days.")
+
+
+# ============================================================
 # Main application
 # ============================================================
 
@@ -8995,6 +9363,8 @@ if check_password():
                 render_supply_chain(main_index_prices)
             elif label == JOURNAL_TAB:
                 render_trade_journal()
+            elif label == PORTFOLIO_TAB:
+                render_portfolio()
             else:
                 strategy = strategy_settings(label)
                 if strategy is None:

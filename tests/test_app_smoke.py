@@ -107,7 +107,7 @@ def test_app_runs_both_tabs(offline):
     app = start_app()
     assert [tab.label for tab in app.tabs] == ["News", "Stock Screener", "Economic analysis", "Market Analysis",
                                                "Industry Analysis", "Stock Fundamentals", "Valuation Model",
-                                               "Semicon Supply Chain", "Backtest",
+                                               "Semicon Supply Chain", "Backtest", "Portfolio",
                                                "Signal Analysis & Trade Plan", "Validate", "Trade Journal"]
     open_tab(app, "Signal Analysis & Trade Plan")
     next(box for box in app.selectbox if box.label == "Signal rule").select("Breakout (new high/low on volume)")
@@ -1199,3 +1199,16 @@ def test_valuation_model_rate_model_and_rate_cases(offline, monkeypatch):
     open_tab(app, "Valuation Model")
     formulas = [element.value for element in app.get("latex")]
     assert any("y_N" in formula and "5.00" in formula for formula in formulas)
+
+
+def test_portfolio_tab(offline):
+    app = open_tab(start_app(), "Portfolio")
+    assert any(header.value == "What to hold" for header in app.subheader)
+    assert any("T-bill rate could not be loaded" in caption.value for caption in app.caption)
+    # A table of your own (what an edit in the holdings grid stores), with a stand-in and a trend filter.
+    app.session_state["portfolio_version"] = 99
+    app.session_state["portfolio_holdings"] = pd.DataFrame(
+        [{"Ticker": "SPYM", "Weight %": 60.0, "Note": "Base", "Sleeve": "", "Trend days": 200, "Stand-ins": "SPY"},
+         {"Ticker": "VXUS", "Weight %": 40.0, "Note": "Non-US", "Sleeve": "", "Trend days": 0, "Stand-ins": ""}])
+    app = open_tab(app, "Portfolio")
+    assert any(header.value == "Calendar years" for header in app.subheader)
