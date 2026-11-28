@@ -157,6 +157,31 @@ def block_hover(result, block, values):
     return "<br>".join(lines)
 
 
+class _Sketch:
+    """Collects a figure's shapes and annotations and sets them at once in ``done()``.
+
+    ``fig.add_shape`` and ``fig.add_annotation`` copy every earlier shape or annotation on each call, so the
+    diagram's hundred or so pieces took over a second when added one by one.
+    """
+
+    def __init__(self, fig):
+        self.fig, self.shapes, self.annotations = fig, [], []
+
+    def add_shape(self, **shape):
+        self.shapes.append(shape)
+
+    def add_annotation(self, **annotation):
+        self.annotations.append(annotation)
+
+    def add_trace(self, trace):
+        self.fig.add_trace(trace)
+
+    def done(self):
+        self.fig.update_layout(shapes=list(self.fig.layout.shapes) + self.shapes,
+                               annotations=list(self.fig.layout.annotations) + self.annotations)
+        return self.fig
+
+
 def _box(fig, centre, fill, line, width=1.0, pill=False):
     x, y = centre
     fig.add_shape(type="rect", x0=x - HALF_WIDTH, x1=x + HALF_WIDTH, y0=y - (0.36 if pill else HALF_HEIGHT),
@@ -193,7 +218,7 @@ def model_diagram(result, selected=None, on=None, mobile=False):
     """
 
     values = latest_values(result, on)
-    fig = go.Figure()
+    fig = _Sketch(go.Figure())
     small = 9 if mobile else 11
     title_size = 10 if mobile else 12
 
@@ -294,6 +319,7 @@ def model_diagram(result, selected=None, on=None, mobile=False):
             text=(f"<b><span style='color:{NOW_COLOR}'>model {pair[0]}</span></b><br>"
                   f"<span style='color:{FORWARD_COLOR}'>risk-adj {pair[1]}</span>"))
 
+    fig = fig.done()
     keys = list(BLOCKS)
     fig.add_trace(go.Scatter(
         x=[POSITIONS[key][0] for key in keys], y=[POSITIONS[key][1] for key in keys], mode="markers",
@@ -435,9 +461,10 @@ def model_price_figure(result, ticker="", mobile=False):
     fig.add_hline(y=0, line=dict(color="gray", width=1, dash="dot"), row=3, col=1)
     # A dotted line at every update of the quarterly part that falls in the window.
     if len(daily):
-        for when in quarterly.index[(quarterly.index >= daily.index[0]) & (quarterly.index <= daily.index[-1])]:
-            fig.add_shape(type="line", x0=when, x1=when, y0=0, y1=1, xref="x", yref="paper", layer="below",
-                          line=dict(color="rgba(120, 120, 120, 0.35)", width=1, dash="dot"))
+        inside = quarterly.index[(quarterly.index >= daily.index[0]) & (quarterly.index <= daily.index[-1])]
+        fig.layout.shapes = list(fig.layout.shapes) + [
+            dict(type="line", x0=when, x1=when, y0=0, y1=1, xref="x", yref="paper", layer="below",
+                 line=dict(color="rgba(120, 120, 120, 0.35)", width=1, dash="dot")) for when in inside]
     for annotation in fig.layout.annotations:
         annotation.update(font=dict(size=10 if mobile else 12), x=0, xanchor="left")
     fig.update_layout(height=height, hovermode="x unified", margin=dict(l=10, r=10, t=40, b=40))

@@ -1780,6 +1780,16 @@ def implied_dials(result, on=None):
     item is tried too: its row shows what it would have to be to explain the gap on its own.
     """
 
+    # The dials take seconds (a root search per dial), and the market check, the sensitivities and the model check
+    # all ask for them on the same result: work them out once per result and day.
+    memo = result.setdefault("_dials", {})
+    key = None if on is None else pd.Timestamp(on)
+    if key not in memo:
+        memo[key] = _implied_dials(result, on)
+    return memo[key].copy()
+
+
+def _implied_dials(result, on=None):
     values = latest_values(result, on)
     if not values or not np.isfinite(values.get("close", np.nan)) or not np.isfinite(values.get("model_price", np.nan)):
         return pd.DataFrame(columns=DIAL_COLUMNS)
