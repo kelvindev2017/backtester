@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.valuation_model import (
+    build_up_growth,
     SCENARIOS, build_up_inputs, case_effects, latest_values, rate_adjusted_pe, rate_weight, scenario_weights,
 )
 
@@ -205,11 +206,15 @@ def _build_up_worked(values, params, get):
     price = inputs["bu_price"]
     dilution = inputs["bu_shares"] * inputs["bu_creep_pct"] / 100
     retired = inputs["bu_buybacks"] / price if price > 0 else 0.0
-    growth = get("revenue_total_yoy")
+    growth = build_up_growth(values, params)
     base = get("growth_base")
-    lines = [rf"g = {_n(growth, 1)}\% \ \text{{(total revenue, last 4q vs 4q before)}}",
+    latest = params.get("growth_basis", "Latest quarter") == "Latest quarter"
+    limited = params["growth_floor"] > -100 or params["growth_cap"] < 1000
+    rule = (rf" = \min\!\big({_n(params['growth_cap'], 0)},\ \max({_n(params['growth_floor'], 0)},\ {_n(params['growth_follow'])} \times g)\big)"
+            if limited else rf" = {_n(params['growth_follow'])} \times g")
+    lines = [rf"g = {_n(growth, 1)}\% \ \text{{(total revenue, " + ("latest quarter vs a year ago" if latest else "last 4q vs 4q before") + ")}",
              rf"g_{{\text{{base}}}} = {_n(base, 1)}\%" + (r"\ \text{(yours)}" if np.isfinite(params.get("forward_growth", np.nan))
-                                                         else rf" = \min\!\big({_n(params['growth_cap'], 0)},\ \max({_n(params['growth_floor'], 0)},\ {_n(params['growth_follow'])} \times g)\big)"),
+                                                         else rule),
              rf"M_{{\text{{base}}}} = {_n(get('margin_base'), 1)}\% \ \text{{(EBIT margin {_n(inputs['ebit_margin'], 1)}\%)}}",
              rf"M = \max\Big(\frac{{\text{{EBIT}} + {_n(get('bu_one_offs') / 1e9 if np.isfinite(get('bu_one_offs')) else 0.0, 2)}\ \text{{(one-offs)}}}}{{R_0}},\ f \times M_{{\text{{reported}}}}\Big) = \max\big({_n(get('ebit_margin_gaap'), 1)},\ "
              rf"{_n(get('bu_margin_floor'), 1)}\big)\%",

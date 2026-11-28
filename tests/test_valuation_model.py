@@ -58,7 +58,9 @@ def test_haircut_events_and_fallbacks():
     assert point["growth_base"] == pytest.approx(15.0)
     assert point["eps_base"] == pytest.approx(3.6 * 1.15 * 0.95)
     # Growth is capped, and weights are normalised.
-    assert scenario_point(4.0, 500.0, 20.0, model_params())["growth_base"] == pytest.approx(40.0)
+    # No limit by default; a cap you set still holds.
+    assert scenario_point(4.0, 500.0, 20.0, model_params())["growth_base"] == pytest.approx(250.0)
+    assert scenario_point(4.0, 500.0, 20.0, model_params({"growth_cap": 40.0}))["growth_base"] == pytest.approx(40.0)
     assert scenario_weights(model_params({"weight_bear": 1, "weight_base": 1, "weight_bull": 2})).tolist() == [0.25, 0.25, 0.5]
     assert scenario_weights(model_params({"weight_bear": 0, "weight_base": 0, "weight_bull": 0})).sum() == pytest.approx(1)
 
@@ -1096,3 +1098,21 @@ def test_one_off_costs_are_left_out_of_ebit():
     assert left_out["ebit_margin"] == pytest.approx(25.0) and kept["ebit_margin"] == pytest.approx(5.0)
     assert left_out["bu_one_offs"] == pytest.approx(hit["One_Off_Costs"].iloc[-4:].sum())
     assert left_out["eps_base"] > 3 * kept["eps_base"]
+
+
+def test_build_up_growth_starts_from_the_latest_quarter_without_limits():
+    from analysis.valuation_model import build_up_growth, growth_flip_warning
+    values = {"revenue_quarter_total_yoy": 120.0, "revenue_total_yoy": 60.0}
+    assert build_up_growth(values, model_params()) == 120.0
+    assert build_up_growth(values, model_params({"growth_basis": "4 quarters"})) == 60.0
+    assert build_up_growth({"revenue_total_yoy": 60.0}, model_params()) == 60.0
+    # No limit by default: half of 120% is 60%, not cut to 40%.
+    quarters = build_up_quarters(count=16)
+    quarters.loc[quarters.index[-1], "Revenue"] *= 2.0
+    last = run_model(quarters, make_close(quarters), None, model_params())["quarterly"].iloc[-1]
+    assert last["growth_base"] == pytest.approx(0.5 * last["revenue_quarter_total_yoy"])
+    assert last["growth_base"] > 40
+    # A change of sign at the latest release is flagged.
+    flip = pd.DataFrame({"revenue_quarter_total_yoy": [5.0, 3.0, -2.0]}, index=pd.date_range("2026-01-31", periods=3, freq="QE"))
+    assert "turned negative" in growth_flip_warning(flip)
+    assert growth_flip_warning(flip.iloc[:2]) is None
