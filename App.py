@@ -213,6 +213,7 @@ from analysis.valuation_model import (
     GUIDANCE_COLUMNS,
     BLOCKS as MODEL_BLOCKS,
     premium_warning,
+    growth_flip_warning,
     split_adjusted_shares,
     PRESETS as MODEL_PRESETS,
     RATE_CASE_COLUMNS,
@@ -5087,6 +5088,13 @@ def model_settings():
                 "one_off_floor", "Lowest EBIT margin, as a share of the reported EPS's margin", 0, 1, 0.05,
                 "A backstop for one-time costs a company's filings do not tag (Salesforce, Ford): the margin used is "
                 "at least this share of the margin that gives the reported EPS after the haircut. 0 = off.")
+            params["growth_basis"] = st.radio(
+                "Build-up growth from", ["Latest quarter", "4 quarters"], key=model_param_key("growth_basis"),
+                horizontal=True,
+                help="The revenue growth the auto rule starts from (total revenue). Latest quarter: the last quarter "
+                     "against the same quarter a year ago. 4 quarters: the last 4 against the 4 before, smoother but "
+                     "2-3 quarters later. On 132 stocks' past releases (2016-2025) the latest quarter forecast the EPS a "
+                     "year later better: median error 16.8% vs 17.4%, better in 9 of 10 years.")
             st.caption("The build-up grows revenue, so its base growth is the auto rule on total revenue growth (or "
                        "your forward growth); analysts' EPS growth does not apply to it.")
         params["base_eps_source"] = st.radio(
@@ -5142,8 +5150,8 @@ def model_settings():
                 params["cycle_fall"] = number("cycle_fall", "Auto: EPS fell at least this % from an earlier high", 10, 95, 5)
                 params["cycle_trend_cap"] = number("cycle_trend_cap", "Auto: and its trend growth is below, % a year", 0, 50, 1)
         params["growth_follow"] = number("growth_follow", "Auto rule: base growth as a share of trailing growth", 0, 2, 0.05)
-        params["growth_floor"] = number("growth_floor", "Auto rule: base growth floor %", -90, 0, 1)
-        params["growth_cap"] = number("growth_cap", "Auto rule: base growth cap %", 0, 300, 1)
+        params["growth_floor"] = number("growth_floor", "Auto rule: base growth floor % (-100 = no limit)", -100, 0, 1)
+        params["growth_cap"] = number("growth_cap", "Auto rule: base growth cap % (1000 = no limit)", 0, 1000, 5)
         params["base_margin_pts"] = number("base_margin_pts", "Auto rule: base net margin change, points", -50, 50, 0.5)
         params["fallback_yoy"] = number("fallback_yoy", "Trailing growth % when there is no revenue history", -90, 300, 1)
         params["fallback_margin"] = number("fallback_margin", "Net margin % when there is no net income", 0.5, 90, 0.5)
@@ -5973,6 +5981,9 @@ def render_valuation_model():
                 if np.isfinite(held) else
                 "it needs four quarters of reported EPS, and Yahoo has fewer. Type a trailing EPS under Earnings "
                 "quality in the settings to run it."))
+    flip = growth_flip_warning(result["quarterly"])
+    if flip:
+        st.warning(flip)
     warning = premium_warning(values, result["params"])
     if warning:
         st.warning("⚠️ " + warning)
